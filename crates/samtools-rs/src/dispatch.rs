@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use crate::commands;
-use crate::logging::apply_global_verbosity;
+use crate::sam_global::apply_top_level_global_args;
 use crate::version::{HTSLIB_VERSION, SAMTOOLS_VERSION};
 
 /// Subcommand entry-point signature. Each subcommand receives its own
@@ -31,8 +31,8 @@ pub struct Subcommand {
 /// Top-level entry point used by the binary crate. Parses
 /// `argv[1]` and dispatches to the matching subcommand, or prints help.
 pub fn run(args: Vec<OsString>) -> ExitCode {
-    let args = match apply_global_verbosity(args) {
-        Ok(args) => args,
+    let args = match apply_top_level_global_args(args) {
+        Ok((args, _globals)) => args,
         Err(e) => {
             let _ = writeln!(io::stderr(), "[main] {e}");
             return ExitCode::from(1);

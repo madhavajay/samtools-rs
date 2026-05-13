@@ -23,7 +23,7 @@ htslib-rs extensions landed during this work:
 - BAM/CRAM region and flag-filter writers: `write_bam_regions_from_path`, `write_bam_records_with_required_flags_from_path`, `write_cram_regions_as_bam_from_path_with_reference`, `write_cram_records_with_required_flags_as_bam_from_path_with_reference`
 - FASTQ import helpers: paired FASTQ input, index FASTQ input, aux-tag allow-listing, barcode quality tags, and read group tag insertion.
 
-Rust tests: 112 currently passing (quickcheck:6, flags:3, dict:1, view:4, head:3, sort_merge:4, misc:52, stats_wave_d:20, test_status:1, library/command unit tests:18) — `cargo test -p samtools-rs` green; `cargo fmt --check` and `cargo clippy -p samtools-rs --all-targets -- -D warnings` also clean.
+Rust tests: 117 currently passing (quickcheck:6, flags:3, dict:1, view:4, head:3, sort_merge:4, misc:52, stats_wave_d:20, test_status:1, library/command unit tests:23) — `cargo test -p samtools-rs` green; `cargo fmt --check` and `cargo clippy -p samtools-rs --all-targets -- -D warnings` also clean as of the latest full run.
 
 ## What's Next — Decision Points
 
@@ -136,7 +136,7 @@ These are used by nearly every subcommand and must exist before subcommands can 
 
 - [x] **CLI dispatcher** (`samtools-rs/src/dispatch.rs`): ports `bamtk.c:227-319`. Subcommand table with aliases. `samtools --version`, `samtools --version-only`, `samtools help [cmd]`. Unknown-subcommand error matches upstream wording.
 - [x] **Version + feature string** (`samtools-rs/src/version.rs`): exports `SAMTOOLS_VERSION` constant (currently pinned to `1.23.1`, the upstream tag tracked by the `samtools/` submodule). `long_version` prints both samtools and htslib-rs versions.
-- [ ] **Global args** (`samtools-rs/src/sam_global.rs`): port `sam_opts.h` / `sam_opts.c`. The shared `--input-fmt`, `--input-fmt-option`, `--output-fmt`, `--output-fmt-option`, `--reference`, `--threads`, `--write-index`, `--verbosity` long options. Re-usable clap fragment that subcommands inject. **(Currently each subcommand parses args locally; promote to a shared helper as Wave A grows.)**
+- [~] **Global args** (`samtools-rs/src/sam_global.rs`): partial port of `sam_opts.h` / `sam_opts.c`. Top-level parsing now strips and records shared `--input-fmt`, `--input-fmt-option`, `--output-fmt`, `--output-fmt-option`, `--reference`, `--threads`, `--write-index`, and `--verbosity` long options before dispatch, with `--verbosity` applied through `htslib-rs::log_compat`. **Pending:** thread/reference/format/write-index state still needs to be injected into command I/O paths, and subcommands that accept these options locally still parse them themselves.
 - [ ] **Open/close helpers** (`samtools-rs/src/io.rs`):
   - `sam_open_format` / `sam_open_mode` equivalents over `htslib-rs::format` (extension- and content-based format detection).
   - `auto_index` — write an associated index alongside a writer (BAI/CSI/CRAI/TBI).

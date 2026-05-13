@@ -2,6 +2,8 @@
 
 use std::ffi::OsString;
 
+use crate::sam_global::parse_verbosity;
+
 /// Applies top-level `--verbosity` options and returns argv without them.
 pub fn apply_global_verbosity(args: Vec<OsString>) -> Result<Vec<OsString>, String> {
     let mut out = Vec::with_capacity(args.len());
@@ -34,9 +36,7 @@ pub fn apply_global_verbosity(args: Vec<OsString>) -> Result<Vec<OsString>, Stri
 }
 
 fn set_verbosity(raw: &str) -> Result<(), String> {
-    let value = raw
-        .parse::<i32>()
-        .map_err(|_| format!("invalid --verbosity value \"{raw}\""))?;
+    let value = parse_verbosity(raw)?;
     htslib_rs::log_compat::set_hts_verbose(value);
     Ok(())
 }
