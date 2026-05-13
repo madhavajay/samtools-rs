@@ -23,7 +23,7 @@ htslib-rs extensions landed during this work:
 - BAM/CRAM region and flag-filter writers: `write_bam_regions_from_path`, `write_bam_records_with_required_flags_from_path`, `write_cram_regions_as_bam_from_path_with_reference`, `write_cram_records_with_required_flags_as_bam_from_path_with_reference`
 - FASTQ import helpers: paired FASTQ input, index FASTQ input, aux-tag allow-listing, barcode quality tags, and read group tag insertion.
 
-Rust tests: 109 currently passing (quickcheck:6, flags:3, dict:1, view:4, head:3, sort_merge:4, misc:52, stats_wave_d:20, test_status:1, library/command unit tests:15) — `cargo test -p samtools-rs` green; `cargo fmt --check` and `cargo clippy -p samtools-rs --all-targets -- -D warnings` also clean.
+Rust tests: 112 currently passing (quickcheck:6, flags:3, dict:1, view:4, head:3, sort_merge:4, misc:52, stats_wave_d:20, test_status:1, library/command unit tests:18) — `cargo test -p samtools-rs` green; `cargo fmt --check` and `cargo clippy -p samtools-rs --all-targets -- -D warnings` also clean.
 
 ## What's Next — Decision Points
 
@@ -151,7 +151,7 @@ These are used by nearly every subcommand and must exist before subcommands can 
 - [ ] **BED index** (`samtools-rs/src/bedidx.rs`): port `bedidx.c` (interval tree over BED regions). Used by `view -L`, `bedcov`, `ampliconclip`, `mpileup`.
 - [ ] **Reference helpers** (`samtools-rs/src/reference.rs`): mmap FASTA / `--reference` handling shared by `calmd`, `consensus`, `mpileup`, `phase`, `import`.
 - [ ] **Temp file helper** (`samtools-rs/src/tmp_file.rs`): port `tmp_file.c` (BAM record temp spooling with optional lz4 compression). Used by `sort`, `collate`.
-- [ ] **Logging passthrough**: bridge to `htslib-rs::log_compat` so `--verbosity` flows correctly.
+- [x] **Logging passthrough**: bridge to `htslib-rs::log_compat` so top-level `--verbosity` flows correctly.
 
 ## Phase 2: Subcommand Surface Mapping
 

@@ -15,6 +15,7 @@ pub mod diagnostics;
 pub mod dispatch;
 pub mod error;
 pub mod header_text;
+pub mod logging;
 pub mod native;
 pub mod version;
 
