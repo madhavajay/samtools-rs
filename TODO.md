@@ -19,9 +19,11 @@ Remaining subcommands and their blockers:
 htslib-rs extensions landed during this work:
 - `AlignmentRecordSummary` accessors: `flags`, `reference_sequence_id`, `mate_reference_sequence_id`, `mapping_quality`
 - `summarize_bam_records_from_path`
-- `view_bam_as_fastq_text_from_path_with_limit` / `view_bam_as_fasta_text_from_path_with_limit`
+- BAM/SAM FASTA/FASTQ helpers: limit, flag-filter, suffix, split `-1`/`-2`/`-s`, and selected aux tag preservation paths.
+- BAM/CRAM region and flag-filter writers: `write_bam_regions_from_path`, `write_bam_records_with_required_flags_from_path`, `write_cram_regions_as_bam_from_path_with_reference`, `write_cram_records_with_required_flags_as_bam_from_path_with_reference`
+- FASTQ import helpers: paired FASTQ input, index FASTQ input, aux-tag allow-listing, barcode quality tags, and read group tag insertion.
 
-Rust tests: 88 currently passing (quickcheck:6, flags:3, dict:1, view:4, head:3, sort_merge:4, misc:52, stats_wave_d:10, test_status:1, command unit tests:4) — full workspace `cargo test` green; `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings` also clean.
+Rust tests: 106 currently passing (quickcheck:6, flags:3, dict:1, view:4, head:3, sort_merge:4, misc:52, stats_wave_d:20, test_status:1, library/command unit tests:12) — `cargo test -p samtools-rs` green; `cargo fmt --check` and `cargo clippy -p samtools-rs --all-targets -- -D warnings` also clean.
 
 ## What's Next — Decision Points
 
