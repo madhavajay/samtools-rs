@@ -12,8 +12,8 @@
 //!    NH, HI) by default
 //!
 //! Reverse-strand sequence/quality re-reversal is **not yet implemented**.
-//! `--no-RG`, `--reject-PG`, `--no-PG`, `-x`/`--keep-tag` are accepted but
-//! only the default tag-stripping set is honored.
+//! `--no-RG`, `--reject-PG`, `--no-PG`, and `--dupflag` are accepted but
+//! ignored for now. `-x`/`--keep-tag` aux-tag filtering is honored.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -30,6 +30,7 @@ use htslib_rs::sam::{
     alignment::{RecordBuf, record::Flags},
 };
 
+use crate::aux_list::{AuxTag, parse_aux_list};
 use crate::diagnostics::{print_error, print_error_errno};
 
 const DEFAULT_DROP_TAGS: &[&[u8; 2]] = &[
@@ -41,8 +42,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut output: Option<PathBuf> = None;
     let mut input: Option<PathBuf> = None;
     let mut output_fmt = OutFmt::Bam;
-    let mut extra_drop: Vec<[u8; 2]> = Vec::new();
-    let mut keep_only: Option<HashSet<[u8; 2]>> = None;
+    let mut extra_drop: Vec<AuxTag> = Vec::new();
+    let mut keep_only: Option<HashSet<AuxTag>> = None;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -62,19 +63,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-x" | "--remove-tag" | "--remove-tags" => {
                 if let Some(v) = iter.next().and_then(|a| a.to_str()) {
                     if let Some(rest) = v.strip_prefix('^') {
-                        let mut set: HashSet<[u8; 2]> = HashSet::new();
-                        for piece in rest.split(',') {
-                            if piece.len() == 2 {
-                                let b = piece.as_bytes();
-                                set.insert([b[0], b[1]]);
+                        match parse_aux_list(rest) {
+                            Ok(tags) => keep_only = Some(tags),
+                            Err(e) => {
+                                print_error("reset", format!("invalid -x value \"{rest}\": {e}"));
+                                return ExitCode::from(1);
                             }
                         }
-                        keep_only = Some(set);
                     } else {
-                        for piece in v.split(',') {
-                            if piece.len() == 2 {
-                                let b = piece.as_bytes();
-                                extra_drop.push([b[0], b[1]]);
+                        match parse_aux_list(v) {
+                            Ok(tags) => extra_drop.extend(tags),
+                            Err(e) => {
+                                print_error("reset", format!("invalid -x value \"{v}\": {e}"));
+                                return ExitCode::from(1);
                             }
                         }
                     }
@@ -82,14 +83,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
             "--keep-tag" | "--keep-tags" => {
                 if let Some(v) = iter.next().and_then(|a| a.to_str()) {
-                    let mut set: HashSet<[u8; 2]> = HashSet::new();
-                    for piece in v.split(',') {
-                        if piece.len() == 2 {
-                            let b = piece.as_bytes();
-                            set.insert([b[0], b[1]]);
+                    match parse_aux_list(v) {
+                        Ok(tags) => keep_only = Some(tags),
+                        Err(e) => {
+                            print_error("reset", format!("invalid --keep-tag value \"{v}\": {e}"));
+                            return ExitCode::from(1);
                         }
                     }
-                    keep_only = Some(set);
                 }
             }
             "--no-RG" | "--reject-PG" | "--no-PG" | "--dupflag" | "-T" => {

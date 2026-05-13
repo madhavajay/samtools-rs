@@ -8,6 +8,7 @@
 //! noodles. Direct use of noodles from this crate is reserved for cases that
 //! have no HTSlib analogue; HTSlib-shaped helpers belong in `htslib-rs`.
 
+pub mod aux_list;
 pub mod bam_flag;
 pub mod commands;
 pub mod diagnostics;

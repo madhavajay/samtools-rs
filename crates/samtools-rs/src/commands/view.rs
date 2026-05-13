@@ -33,6 +33,7 @@ use std::process::ExitCode;
 use flate2::read::MultiGzDecoder;
 use htslib_rs::format::{Category, Exact, detect_path};
 
+use crate::aux_list::{AuxTag, parse_aux_list};
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::header_text::read_raw_header_text_with_format;
 
@@ -120,9 +121,9 @@ struct Opts {
     /// `-L FILE` — BED file; only records overlapping a BED interval pass.
     bed_path: Option<PathBuf>,
     /// `-x TAG` (repeatable) — aux tags to strip from SAM-output records.
-    remove_tags: Vec<String>,
+    remove_tags: Vec<AuxTag>,
     /// `--keep-tag TAG` (repeatable) — only these aux tags are kept.
-    keep_tags: Vec<String>,
+    keep_tags: Vec<AuxTag>,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -293,13 +294,9 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
                     .and_then(|a| a.to_str())
                     .ok_or_else(|| ParseError::Err("missing value for -x".into()))?;
                 if let Some(rest) = v.strip_prefix('^') {
-                    for tag in rest.split(',') {
-                        opts.keep_tags.push(tag.to_string());
-                    }
+                    extend_aux_tags(&mut opts.keep_tags, rest, "-x")?;
                 } else {
-                    for tag in v.split(',') {
-                        opts.remove_tags.push(tag.to_string());
-                    }
+                    extend_aux_tags(&mut opts.remove_tags, v, "-x")?;
                 }
                 i += 1;
             }
@@ -309,9 +306,7 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
                     .get(i)
                     .and_then(|a| a.to_str())
                     .ok_or_else(|| ParseError::Err("missing value for --keep-tag".into()))?;
-                for tag in v.split(',') {
-                    opts.keep_tags.push(tag.to_string());
-                }
+                extend_aux_tags(&mut opts.keep_tags, v, "--keep-tag")?;
                 i += 1;
             }
             "-L" | "--target-file" => {
@@ -668,11 +663,11 @@ fn apply_tag_filter(line: &[u8], opts: &Opts) -> Vec<u8> {
             out.extend_from_slice(field);
             continue;
         }
-        let tag = std::str::from_utf8(&field[..2]).unwrap_or("");
+        let tag = [field[0], field[1]];
         let keep = if !opts.keep_tags.is_empty() {
-            opts.keep_tags.iter().any(|t| t == tag)
+            opts.keep_tags.contains(&tag)
         } else {
-            !opts.remove_tags.iter().any(|t| t == tag)
+            !opts.remove_tags.contains(&tag)
         };
         if keep {
             out.extend_from_slice(field);
@@ -684,6 +679,13 @@ fn apply_tag_filter(line: &[u8], opts: &Opts) -> Vec<u8> {
         }
     }
     out
+}
+
+fn extend_aux_tags(dst: &mut Vec<AuxTag>, raw: &str, option: &str) -> Result<(), ParseError> {
+    let tags = parse_aux_list(raw)
+        .map_err(|e| ParseError::Err(format!("invalid {option} value \"{raw}\": {e}")))?;
+    dst.extend(tags);
+    Ok(())
 }
 
 /// Apply view filters to a SAM record line, returning whether it should

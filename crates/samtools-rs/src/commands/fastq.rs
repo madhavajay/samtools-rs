@@ -16,6 +16,7 @@ use std::process::ExitCode;
 
 use htslib_rs::format::{Exact, detect_path};
 
+use crate::aux_list::parse_aux_list;
 use crate::diagnostics::{print_error, print_error_errno};
 
 /// Entry point for `samtools fastq` / `samtools fasta` / `samtools bam2fq`.
@@ -76,7 +77,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     print_error(sub_name, "missing value for -T");
                     return ExitCode::from(1);
                 };
-                aux_tags = parse_aux_tag_list(raw);
+                aux_tags = match parse_aux_list(raw) {
+                    Ok(tags) => tags.into_iter().collect(),
+                    Err(e) => {
+                        print_error(sub_name, format!("invalid -T value \"{raw}\": {e}"));
+                        return ExitCode::from(1);
+                    }
+                };
             }
             "-n" => {
                 append_read_number_override = Some(false);
@@ -421,15 +428,6 @@ fn parse_flag_arg(arg: Option<&OsString>, opt: &str, sub_name: &str) -> Result<u
             Err(ExitCode::from(1))
         }
     }
-}
-
-fn parse_aux_tag_list(raw: &str) -> Vec<[u8; 2]> {
-    raw.split(',')
-        .filter_map(|tag| {
-            let bytes = tag.as_bytes();
-            (bytes.len() == 2).then_some([bytes[0], bytes[1]])
-        })
-        .collect()
 }
 
 fn print_usage(sub: &str) -> io::Result<()> {
