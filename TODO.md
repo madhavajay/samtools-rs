@@ -23,7 +23,7 @@ htslib-rs extensions landed during this work:
 - BAM/CRAM region and flag-filter writers: `write_bam_regions_from_path`, `write_bam_records_with_required_flags_from_path`, `write_cram_regions_as_bam_from_path_with_reference`, `write_cram_records_with_required_flags_as_bam_from_path_with_reference`
 - FASTQ import helpers: paired FASTQ input, index FASTQ input, aux-tag allow-listing, barcode quality tags, and read group tag insertion.
 
-Rust tests: 127 currently passing (quickcheck:6, flags:3, dict:1, view:4, head:3, sort_merge:4, misc:52, stats_wave_d:20, test_status:1, library/command unit tests:33) — `cargo test -p samtools-rs` green; `cargo fmt --check` and `cargo clippy -p samtools-rs --all-targets -- -D warnings` also clean as of the latest full run.
+Rust tests: 130 currently passing (quickcheck:6, flags:3, dict:1, view:4, head:3, sort_merge:4, misc:52, stats_wave_d:20, test_status:1, library/command unit tests:36) — `cargo test -p samtools-rs` green; `cargo fmt --check` and `cargo clippy -p samtools-rs --all-targets -- -D warnings` also clean as of the latest full run.
 
 ## What's Next — Decision Points
 
@@ -192,7 +192,7 @@ The waves are ordered to land foundational machinery first (read/write/index) an
 
 ### Wave C — Editing / Mate-aware
 
-- [~] `fixmate` (`bam_mate.c`) — basic mate flag/pos fixup for adjacent paired records in name-sorted BAM (`FMUNMAP`, `FMATE_REVERSE_COMPLEMENTED`, `mate_reference_sequence_id`, `mate_alignment_start`). **Pending:** MC/MQ aux tags, `-r`/`-c`/`-m` modes, CRAM, mate-rescore.
+- [~] `fixmate` (`bam_mate.c`) — basic mate flag/pos fixup for adjacent paired records in name-sorted BAM (`FMUNMAP`, `FMATE_REVERSE_COMPLEMENTED`, `mate_reference_sequence_id`, `mate_alignment_start`). `-z`/`--sanitize` now parses and validates through the shared sanitizer option parser. **Pending:** record-level sanitizer mutation, MC/MQ aux tags, `-r`/`-c`/`-m` modes, CRAM, mate-rescore.
 - [ ] `markdup` (`bam_markdup.c`, 89k) — duplicate marking (single + paired), barcode-aware, `-r`/`-l`/`-s` modes, opt distance.
 - [~] `rmdup` (`bam_rmdup.c` + `bam_rmdupse.c`) — single-end duplicate removal (by `(tid, pos, reverse-flag)`, keeping highest MAPQ). **Pending:** paired-end mode, CRAM/SAM.
 - [~] `calmd` / `fillmd` (`bam_md.c`) — BAQ paths (`-r`, `-r -e`, `-E`) wired through `htslib_rs::alignment_compat::recalculate_baq_*` and `apply_existing_baq_from_sam_path`. SAM input only. **Pending:** MD/NM tag recomputation against the reference (per-base diff), BAM/CRAM I/O, `-A`/`-d`/`-C cap`.

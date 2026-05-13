@@ -23,49 +23,25 @@ use htslib_rs::sam::{
 };
 
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::sanitize::{SanitizeFlags, parse_sanitize_options};
 
 /// Entry point for `samtools fixmate`.
 pub fn main(args: &[OsString]) -> ExitCode {
-    let mut output: Option<PathBuf> = None;
-    let mut input: Option<PathBuf> = None;
-    let mut output_fmt = OutFmt::Bam;
-    let mut iter = args.iter().skip(1).peekable();
-    while let Some(arg) = iter.next() {
-        let s = arg.to_str().unwrap_or("");
-        match s {
-            "-O" | "--output-fmt" => {
-                let v = iter.next().and_then(|a| a.to_str()).unwrap_or("bam");
-                output_fmt = match v.to_lowercase().as_str() {
-                    "sam" => OutFmt::Sam,
-                    "bam" => OutFmt::Bam,
-                    _ => OutFmt::Bam,
-                };
-            }
-            "-@" | "--threads" | "-l" => {
-                let _ = iter.next();
-            }
-            "-r" | "-c" | "-m" | "-p" | "-z" | "--no-PG" => {
-                // Accepted but not yet implemented.
-            }
-            "--help" => {
-                let _ = print_usage();
-                return ExitCode::SUCCESS;
-            }
-            _ if s.starts_with('-') && s != "-" => {
-                print_error("fixmate", format!("unknown option {}", s));
-                return ExitCode::from(1);
-            }
-            _ => {
-                if input.is_none() {
-                    input = Some(PathBuf::from(arg));
-                } else if output.is_none() {
-                    output = Some(PathBuf::from(arg));
-                }
-            }
+    let opts = match parse_args(args) {
+        Ok(opts) => opts,
+        Err(ParseError::Usage) => {
+            let _ = print_usage();
+            return ExitCode::SUCCESS;
         }
-    }
+        Err(ParseError::Err(e)) => {
+            print_error("fixmate", e);
+            return ExitCode::from(1);
+        }
+    };
 
-    let Some(input) = input else {
+    let _ = opts.sanitize_flags; // Parsed for parity; record mutation is still TODO.
+
+    let Some(input) = opts.input else {
         let _ = print_usage();
         return ExitCode::from(1);
     };
@@ -88,7 +64,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    match run_fixmate(&input, output.as_deref(), output_fmt) {
+    match run_fixmate(&input, opts.output.as_deref(), opts.output_fmt) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             print_error_errno("fixmate", "fixmate failed", &e);
@@ -97,7 +73,83 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Opts {
+    output: Option<PathBuf>,
+    input: Option<PathBuf>,
+    output_fmt: OutFmt,
+    sanitize_flags: Option<SanitizeFlags>,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Self {
+            output: None,
+            input: None,
+            output_fmt: OutFmt::Bam,
+            sanitize_flags: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ParseError {
+    Usage,
+    Err(String),
+}
+
+fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
+    let mut opts = Opts::default();
+    let mut iter = args.iter().skip(1);
+
+    while let Some(arg) = iter.next() {
+        let s = arg.to_str().unwrap_or("");
+        match s {
+            "-O" | "--output-fmt" => {
+                let v = next_value(&mut iter, s)?;
+                opts.output_fmt = match v.to_lowercase().as_str() {
+                    "sam" => OutFmt::Sam,
+                    "bam" => OutFmt::Bam,
+                    _ => OutFmt::Bam,
+                };
+            }
+            "-@" | "--threads" | "-l" => {
+                let _ = next_value(&mut iter, s)?;
+            }
+            "-z" | "--sanitize" => {
+                let v = next_value(&mut iter, s)?;
+                opts.sanitize_flags = Some(parse_sanitize_options(&v).map_err(ParseError::Err)?);
+            }
+            "-r" | "-c" | "-m" | "-p" | "--no-PG" => {
+                // Accepted but not yet implemented.
+            }
+            "--help" => return Err(ParseError::Usage),
+            _ if s.starts_with('-') && s != "-" => {
+                return Err(ParseError::Err(format!("unknown option {}", s)));
+            }
+            _ => {
+                if opts.input.is_none() {
+                    opts.input = Some(PathBuf::from(arg));
+                } else if opts.output.is_none() {
+                    opts.output = Some(PathBuf::from(arg));
+                }
+            }
+        }
+    }
+
+    Ok(opts)
+}
+
+fn next_value<'a, I>(iter: &mut I, option: &str) -> Result<String, ParseError>
+where
+    I: Iterator<Item = &'a OsString>,
+{
+    iter.next()
+        .and_then(|a| a.to_str().map(str::to_owned))
+        .ok_or_else(|| ParseError::Err(format!("missing value for {option}")))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OutFmt {
     Sam,
     Bam,
@@ -233,5 +285,42 @@ fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
     writeln!(w, "Usage: samtools fixmate [options] <in.bam> [<out.bam>]")?;
     writeln!(w, "  -O sam|bam   output format (default: bam)")?;
+    writeln!(w, "  -z, --sanitize FLAG[,FLAG]")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(rest: &[&str]) -> Vec<OsString> {
+        std::iter::once(OsString::from("fixmate"))
+            .chain(rest.iter().map(OsString::from))
+            .collect()
+    }
+
+    #[test]
+    fn parses_sanitize_option_without_treating_value_as_input() {
+        let opts = parse_args(&argv(&["-z", "on", "in.bam", "out.bam"])).unwrap();
+
+        assert_eq!(opts.input.as_deref(), Some(Path::new("in.bam")));
+        assert_eq!(opts.output.as_deref(), Some(Path::new("out.bam")));
+        assert!(opts.sanitize_flags.unwrap().contains(SanitizeFlags::CIGAR));
+    }
+
+    #[test]
+    fn rejects_missing_sanitize_value() {
+        assert_eq!(
+            parse_args(&argv(&["--sanitize"])).unwrap_err(),
+            ParseError::Err(String::from("missing value for --sanitize"))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_sanitize_value() {
+        assert_eq!(
+            parse_args(&argv(&["--sanitize", "nope"])).unwrap_err(),
+            ParseError::Err(String::from("unrecognised sanitize keyword \"nope\""))
+        );
+    }
 }
