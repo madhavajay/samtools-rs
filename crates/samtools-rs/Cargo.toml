@@ -1,0 +1,24 @@
+[package]
+name = "samtools-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure Rust port of samtools, the SAM/BAM/CRAM toolkit."
+
+[lints]
+workspace = true
+
+[dependencies]
+htslib-rs.workspace = true
+anyhow.workspace = true
+bstr.workspace = true
+bytes.workspace = true
+clap.workspace = true
+flate2.workspace = true
+indexmap.workspace = true
+libdeflater.workspace = true
+md-5 = { workspace = true }
+memchr.workspace = true
+regex.workspace = true
+thiserror.workspace = true

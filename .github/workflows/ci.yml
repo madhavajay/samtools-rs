@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust-gate:
+    name: Rust gate (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+          rustup default stable
+
+      - name: Cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Cargo test
+        run: cargo test --workspace
+
+  parity-gate:
+    name: Parity gate (samtools test.pl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install Perl + Carp
+        run: sudo apt-get update && sudo apt-get install -y perl
+
+      - name: Build release binary
+        run: cargo build --release -p samtools-rs-cli
+
+      - name: Run samtools/test/test.pl against Rust binary
+        run: |
+          cd samtools/test
+          perl test.pl -e samtools="$GITHUB_WORKSPACE/target/release/samtools" || true
+          # Note: tests are expected to fail until subcommands are implemented.
+          # This step is kept in CI as a regression watch — the exit code is
+          # intentionally not propagated yet. Phase 4 of TODO.md flips this.

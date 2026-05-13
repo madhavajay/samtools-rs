@@ -1,0 +1,57 @@
+[workspace]
+members = [
+    "crates/samtools-rs",
+    "crates/samtools-rs-cli",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.89.0"
+license = "MIT"
+version = "0.0.1"
+
+# Most workspace.dependencies entries below mirror htslib-rs's and noodles'
+# workspace.dependencies so that path-dep inheritance resolves cleanly when
+# we consume htslib-rs (and transitively noodles) from this workspace.
+[workspace.dependencies]
+samtools-rs = { path = "crates/samtools-rs" }
+htslib-rs = { path = "htslib-rs/crates/htslib-rs" }
+noodles = { path = "htslib-rs/noodles/noodles", features = [
+    "bam",
+    "bcf",
+    "bgzf",
+    "core",
+    "cram",
+    "csi",
+    "fasta",
+    "fastq",
+    "refget",
+    "sam",
+    "tabix",
+    "vcf",
+] }
+
+anyhow = "1"
+bitflags = "2.0.2"
+bstr = { version = "1.9.0", default-features = false, features = ["std"] }
+bytes = "1.10.0"
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "wrap_help"] }
+flate2 = { version = "1.1.0", default-features = false, features = ["zlib-rs"] }
+futures = { version = "0.3.15", default-features = false }
+indexmap = "2.0.0"
+lexical-core = "1.0.0"
+libdeflater = "1.19.0"
+md-5 = "0.10"
+memchr = "2.3.3"
+percent-encoding = "2.1.0"
+pin-project-lite = "0.2.6"
+regex = "1.11.1"
+reqwest = { version = "0.13.1", default-features = false, features = ["json", "stream"] }
+serde = { version = "1.0.136", features = ["derive"] }
+thiserror = "2"
+tokio = "1.10.0"
+url = "2.2.2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
