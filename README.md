@@ -85,6 +85,11 @@ CI does not build C samtools.
 `@PG VN:` field emitted into output headers uses the same string so that
 upstream's byte-comparison tests pass.
 
+Current submodule pins:
+
+- `samtools/`: upstream tag `1.23.1`, commit `6efb9b6da35224cf804921dedecf9fb8f411365d`.
+- `htslib-rs/`: commit `88bd29f5f0d5e87d3f5d28da1f106a4b518e3926`.
+
 ## License
 
 MIT, matching upstream samtools and htslib.
