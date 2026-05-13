@@ -1,0 +1,6 @@
+[submodule "samtools"]
+	path = samtools
+	url = git@github.com:madhavajay/samtools.git
+[submodule "htslib-rs"]
+	path = htslib-rs
+	url = git@github.com:madhavajay/htslib-rs.git
