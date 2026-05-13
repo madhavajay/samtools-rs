@@ -232,13 +232,13 @@ pub(crate) fn run_depth(
         regions.extend(load_bed_regions(bed)?);
     }
 
+    let mut per_input_targets = Vec::with_capacity(inputs.len());
     for path in inputs {
         let format = sam_io::sam_open_format(path)?;
-        match format.exact {
-            Exact::Bam => run_bam_depth(path, out, walk, &regions)?,
-            Exact::Cram => run_cram_depth(
+        let targets = match format.exact {
+            Exact::Bam => collect_bam_depth(path, walk, &regions)?,
+            Exact::Cram => collect_cram_depth(
                 path,
-                out,
                 config.reference.ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -254,17 +254,18 @@ pub(crate) fn run_depth(
                     "only BAM and reference-backed CRAM input are currently supported",
                 ));
             }
-        }
+        };
+        per_input_targets.push(targets);
     }
-    Ok(())
+
+    emit_depths(out, &per_input_targets, walk.min_depth, walk.a_mode)
 }
 
-fn run_bam_depth(
+fn collect_bam_depth(
     path: &Path,
-    out: &mut dyn Write,
     config: DepthWalkConfig,
     regions: &[Region],
-) -> io::Result<()> {
+) -> io::Result<Vec<DepthTarget>> {
     let mut reader = bam::io::Reader::new(File::open(path)?);
     let header = reader.read_header()?;
     let mut targets = depth_targets(&header, regions)?;
@@ -298,16 +299,15 @@ fn run_bam_depth(
         }
     }
 
-    emit_depths(out, &targets, config.min_depth, config.a_mode)
+    Ok(targets)
 }
 
-fn run_cram_depth(
+fn collect_cram_depth(
     path: &Path,
-    out: &mut dyn Write,
     reference: &Path,
     config: DepthWalkConfig,
     regions: &[Region],
-) -> io::Result<()> {
+) -> io::Result<Vec<DepthTarget>> {
     let header = htslib_rs::alignment_compat::read_cram_header_from_path(path)?;
     let mut targets = depth_targets(&header, regions)?;
 
@@ -342,7 +342,7 @@ fn run_cram_depth(
         }
     }
 
-    emit_depths(out, &targets, config.min_depth, config.a_mode)
+    Ok(targets)
 }
 
 fn target_region(target: &DepthTarget) -> io::Result<Region> {
@@ -374,23 +374,64 @@ fn load_bed_regions(path: &Path) -> io::Result<Vec<Region>> {
 
 fn emit_depths(
     out: &mut dyn Write,
-    targets: &[DepthTarget],
+    per_input_targets: &[Vec<DepthTarget>],
     min_depth: u32,
     a_mode: AMode,
 ) -> io::Result<()> {
-    for target in targets {
-        let has_any = target.depths.iter().any(|&d| d > 0);
+    let Some(first_targets) = per_input_targets.first() else {
+        return Ok(());
+    };
+
+    for targets in &per_input_targets[1..] {
+        ensure_compatible_targets(first_targets, targets)?;
+    }
+
+    for (target_index, target) in first_targets.iter().enumerate() {
+        let has_any = per_input_targets
+            .iter()
+            .any(|targets| targets[target_index].depths.iter().any(|&d| d > 0));
         if !has_any && !matches!(a_mode, AMode::AllRefsAllPositions) {
             continue;
         }
-        for (i, &d) in target.depths.iter().enumerate() {
-            if d == 0 && a_mode == AMode::None {
+        for i in 0..target.depths.len() {
+            let depths = per_input_targets
+                .iter()
+                .map(|targets| targets[target_index].depths[i]);
+            if a_mode == AMode::None && !depths.clone().any(|d| d > 0) {
                 continue;
             }
-            if d < min_depth && a_mode == AMode::None {
+            if a_mode == AMode::None && !depths.clone().any(|d| d >= min_depth) {
                 continue;
             }
-            writeln!(out, "{}\t{}\t{}", target.name, target.output_start + i, d)?;
+            write!(out, "{}\t{}", target.name, target.output_start + i)?;
+            for d in depths {
+                write!(out, "\t{}", d)?;
+            }
+            writeln!(out)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_compatible_targets(expected: &[DepthTarget], actual: &[DepthTarget]) -> io::Result<()> {
+    if expected.len() != actual.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "depth inputs have incompatible reference dictionaries",
+        ));
+    }
+
+    for (left, right) in expected.iter().zip(actual) {
+        if left.name != right.name
+            || left.output_start != right.output_start
+            || left.start0 != right.start0
+            || left.end0 != right.end0
+            || left.depths.len() != right.depths.len()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "depth inputs have incompatible reference dictionaries",
+            ));
         }
     }
     Ok(())

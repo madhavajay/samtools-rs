@@ -60,8 +60,6 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     }
 
-    let _ = no_pg; // currently we never add a @PG line ourselves.
-
     if inputs.is_empty() {
         let _ = writeln!(
             io::stderr(),
@@ -87,7 +85,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    match run_bam_cat(&inputs, header_file.as_deref(), output.as_deref()) {
+    match run_bam_cat(
+        &inputs,
+        header_file.as_deref(),
+        output.as_deref(),
+        !no_pg,
+        args,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             print_error_errno("cat", "concatenation failed", &e);
@@ -100,10 +104,12 @@ fn run_bam_cat(
     inputs: &[PathBuf],
     header_file: Option<&Path>,
     output: Option<&Path>,
+    add_pg: bool,
+    argv: &[OsString],
 ) -> io::Result<()> {
     // Pick the header. If -h <hdr.sam>, parse that; otherwise use the first
     // input file's header.
-    let header: sam::Header = match header_file {
+    let mut header: sam::Header = match header_file {
         Some(p) => {
             let mut reader = sam::io::Reader::new(BufReader::new(File::open(p)?));
             reader.read_header()?
@@ -113,6 +119,9 @@ fn run_bam_cat(
             reader.read_header()?
         }
     };
+    if add_pg {
+        header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
+    }
 
     // Open output writer.
     let mut writer: Box<dyn BamSink> = match output {

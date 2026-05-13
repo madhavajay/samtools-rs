@@ -52,8 +52,6 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     }
 
-    let _ = no_pg;
-
     if external_cmd.is_some() {
         print_error(
             "reheader",
@@ -92,7 +90,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    match run_reheader(new_header_path, input_bam_path) {
+    match run_reheader(new_header_path, input_bam_path, !no_pg, args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             print_error_errno("reheader", "reheader failed", &e);
@@ -101,16 +99,38 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 }
 
-fn run_reheader(new_header_path: &Path, input_bam: &Path) -> io::Result<()> {
+fn run_reheader(
+    new_header_path: &Path,
+    input_bam: &Path,
+    add_pg: bool,
+    argv: &[OsString],
+) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    run_reheader_to_writer(new_header_path, input_bam, add_pg, argv, &mut handle)
+}
+
+pub(crate) fn run_reheader_to_writer<W: Write>(
+    new_header_path: &Path,
+    input_bam: &Path,
+    add_pg: bool,
+    argv: &[OsString],
+    output: W,
+) -> io::Result<()> {
     let new_header: sam::Header = {
         let mut reader = sam::io::Reader::new(BufReader::new(File::open(new_header_path)?));
         reader.read_header()?
+    };
+    let new_header = if add_pg {
+        crate::pg::add_samtools_pg_to_header(&new_header, argv)?
+    } else {
+        new_header
     };
 
     let mut input = bam::io::Reader::new(File::open(input_bam)?);
     let input_header = input.read_header()?;
 
-    let mut writer = bam::io::Writer::new(io::stdout());
+    let mut writer = bam::io::Writer::new(output);
     writer.write_header(&new_header)?;
 
     let mut record = bam::Record::default();
@@ -138,4 +158,72 @@ fn print_usage() -> io::Result<()> {
         "  -c, --command CMD pipe existing header through CMD (TODO)"
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixtures_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("samtools")
+            .join("test")
+    }
+
+    fn tmp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "samtools-rs-reheader-{}-{}",
+            name,
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn reheader_adds_pg_by_default() {
+        let fixtures = fixtures_dir();
+        let header = fixtures.join("reheader").join("hdr.sam");
+        let input = fixtures.join("checksum").join("chk1.bam");
+        let output = tmp_path("pg.bam");
+        let argv = [
+            OsString::from("reheader"),
+            header.clone().into(),
+            input.clone().into(),
+        ];
+
+        {
+            let out = File::create(&output).unwrap();
+            run_reheader_to_writer(&header, &input, true, &argv, out).unwrap();
+        }
+
+        let header_text = crate::header_text::read_raw_header_text(&output).unwrap();
+        assert!(header_text.contains("\tPN:samtools\tVN:"));
+        assert!(header_text.contains("\tCL:reheader "));
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn reheader_no_pg_suppresses_pg() {
+        let fixtures = fixtures_dir();
+        let header = fixtures.join("reheader").join("hdr.sam");
+        let input = fixtures.join("checksum").join("chk1.bam");
+        let output = tmp_path("no-pg.bam");
+        let argv = [
+            OsString::from("reheader"),
+            header.clone().into(),
+            input.clone().into(),
+        ];
+
+        {
+            let out = File::create(&output).unwrap();
+            run_reheader_to_writer(&header, &input, false, &argv, out).unwrap();
+        }
+
+        let header_text = crate::header_text::read_raw_header_text(&output).unwrap();
+        assert!(!header_text.contains("\tCL:reheader "));
+        let _ = std::fs::remove_file(output);
+    }
 }

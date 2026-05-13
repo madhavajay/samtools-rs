@@ -1,7 +1,7 @@
 //! `samtools fixmate` — fix mate-related flags and positions on paired records.
 //!
 //! Mirrors `bam_mate.c` in upstream samtools. Initial Rust port handles
-//! **name-sorted BAM input**: adjacent records with the same `qname` are
+//! **name-sorted BAM/SAM input**: adjacent records with the same `qname` are
 //! paired up and their `FMUNMAP`/`FMREVERSE` flags + `mate_reference_sequence_id`
 //! + `mate_alignment_start` are made consistent.
 //!
@@ -10,7 +10,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -54,10 +54,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if format.exact != Exact::Bam {
+    if !matches!(format.exact, Exact::Sam | Exact::Bam) {
         print_error(
             "fixmate",
-            "only BAM input is currently supported (SAM/CRAM TODO)",
+            "only SAM and BAM input are currently supported (CRAM TODO)",
         );
         return ExitCode::from(1);
     }
@@ -154,38 +154,76 @@ enum OutFmt {
 }
 
 fn run_fixmate(input: &Path, output: Option<&Path>, fmt: OutFmt) -> io::Result<()> {
+    let format = sam_io::sam_open_format(input)?;
+    match format.exact {
+        Exact::Sam => run_fixmate_sam(input, output, fmt),
+        Exact::Bam => run_fixmate_bam(input, output, fmt),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only SAM and BAM input are currently supported (CRAM TODO)",
+        )),
+    }
+}
+
+fn run_fixmate_bam(input: &Path, output: Option<&Path>, fmt: OutFmt) -> io::Result<()> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let header = reader.read_header()?;
-
-    let mut pending: Option<RecordBuf> = None;
     let mut sink = open_output(output, fmt, &header)?;
-
+    let mut pending: Option<RecordBuf> = None;
     let mut next = RecordBuf::default();
     loop {
         let n = reader.read_record_buf(&header, &mut next)?;
         if n == 0 {
             break;
         }
-        match pending.take() {
-            None => pending = Some(next.clone()),
-            Some(prev) => {
-                let prev_name = prev.name().map(|n| n.to_vec());
-                let next_name = next.name().map(|n| n.to_vec());
-                if prev_name == next_name && next_name.is_some() {
-                    let (a, b) = pair_fixmate(prev, next.clone());
-                    sink.write_record(&header, &a)?;
-                    sink.write_record(&header, &b)?;
-                    pending = None;
-                } else {
-                    // Singleton: emit prev as-is.
-                    sink.write_record(&header, &prev)?;
-                    pending = Some(next.clone());
-                }
-            }
-        }
+        write_fixed_record(&header, sink.as_mut(), &mut pending, next.clone())?;
     }
     if let Some(rec) = pending {
         sink.write_record(&header, &rec)?;
+    }
+    Ok(())
+}
+
+fn run_fixmate_sam(input: &Path, output: Option<&Path>, fmt: OutFmt) -> io::Result<()> {
+    let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
+    let header = reader.read_header()?;
+    let mut sink = open_output(output, fmt, &header)?;
+    let mut pending: Option<RecordBuf> = None;
+    let mut next = RecordBuf::default();
+    loop {
+        let n = reader.read_record_buf(&header, &mut next)?;
+        if n == 0 {
+            break;
+        }
+        write_fixed_record(&header, sink.as_mut(), &mut pending, next.clone())?;
+    }
+    if let Some(rec) = pending {
+        sink.write_record(&header, &rec)?;
+    }
+    Ok(())
+}
+
+fn write_fixed_record(
+    header: &sam::Header,
+    sink: &mut dyn Sink,
+    pending: &mut Option<RecordBuf>,
+    next: RecordBuf,
+) -> io::Result<()> {
+    match pending.take() {
+        None => *pending = Some(next),
+        Some(prev) => {
+            let prev_name = prev.name().map(|n| n.to_vec());
+            let next_name = next.name().map(|n| n.to_vec());
+            if prev_name == next_name && next_name.is_some() {
+                let (a, b) = pair_fixmate(prev, next);
+                sink.write_record(header, &a)?;
+                sink.write_record(header, &b)?;
+                *pending = None;
+            } else {
+                sink.write_record(header, &prev)?;
+                *pending = Some(next);
+            }
+        }
     }
     Ok(())
 }
