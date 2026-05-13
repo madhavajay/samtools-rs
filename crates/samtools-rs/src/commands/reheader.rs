@@ -14,10 +14,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use htslib_rs::bam;
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
 use htslib_rs::sam;
 
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
 
 /// Entry point for `samtools reheader`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -76,17 +77,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let new_header_path = &positional[0];
     let input_bam_path = &positional[1];
 
-    let format = match detect_path(input_bam_path) {
+    let format = match sam_io::sam_open_format(input_bam_path) {
         Ok(f) => f,
         Err(e) => {
-            print_error(
-                "reheader",
-                format!(
-                    "failed to detect format of \"{}\": {}",
-                    input_bam_path.display(),
-                    e
-                ),
-            );
+            print_error("reheader", e.to_string());
             return ExitCode::from(1);
         }
     };

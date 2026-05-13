@@ -17,6 +17,8 @@
 //!  - `--no-PG` — do not add a `@PG` line.
 //!  - `-c` — count matching records and print the count.
 //!  - `-o FILE` — write output to FILE (default stdout).
+//!  - `-U FILE` — for SAM output, write records not selected by flag/MAPQ filters to FILE.
+//!  - `-p` — for SAM output, set UNMAP on records not selected by flag/MAPQ filters.
 //!  - `-T FILE` / `--reference FILE` — reference for CRAM I/O.
 //!  - `-u` — write uncompressed BAM (accepted; treated as `-b -1` for now).
 //!  - `-1` — fast compression level (accepted; treated as `-b` default for now).
@@ -31,11 +33,14 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use flate2::read::MultiGzDecoder;
-use htslib_rs::format::{Category, Exact, detect_path};
+use htslib_rs::format::{Category, Exact};
 
 use crate::aux_list::{AuxTag, parse_aux_list};
+use crate::bedidx::load_bed_index;
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::header_text::read_raw_header_text_with_format;
+use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
 /// Entry point for `samtools view`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -52,12 +57,47 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     };
 
-    let Some(input) = opts.input.clone() else {
-        print_error("view", "no input file (stdin not yet supported)");
-        return ExitCode::from(1);
-    };
+    let stdin_input = opts
+        .input
+        .as_deref()
+        .is_none_or(|path| path == Path::new("-"));
 
-    let format = match detect_path(&input) {
+    let mut opts = opts;
+    if let Some(bed) = opts.bed_path.clone() {
+        match load_bed_regions(&bed) {
+            Ok(more) => opts.regions.extend(more),
+            Err(e) => {
+                print_error_errno("view", format!("failed to read \"{}\"", bed.display()), &e);
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    if stdin_input {
+        let mut data = Vec::new();
+        if let Err(e) = io::stdin().lock().read_to_end(&mut data) {
+            print_error_errno("view", "failed to read stdin", &e);
+            return ExitCode::from(1);
+        }
+
+        let result = match stdin_format(&data) {
+            StdinFormat::Sam => run_sam_stdin(&opts, &data),
+            StdinFormat::Bam => run_bam_stdin(&opts, &data),
+            StdinFormat::Cram => run_cram_stdin(&opts, &data),
+        };
+
+        return match result {
+            Ok(code) => code,
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+            Err(e) => {
+                print_error_errno("view", "I/O error during view", &e);
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    let input = opts.input.clone().expect("non-stdin input exists");
+    let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,
         Err(e) => {
             print_error(
@@ -70,18 +110,6 @@ pub fn main(args: &[OsString]) -> ExitCode {
     if format.category != Category::SequenceData {
         print_error("view", format!("{} is not sequence data", input.display()));
         return ExitCode::from(1);
-    }
-
-    // If a -L BED file was given, expand its entries into region strings.
-    let mut opts = opts;
-    if let Some(bed) = opts.bed_path.clone() {
-        match load_bed_regions(&bed) {
-            Ok(more) => opts.regions.extend(more),
-            Err(e) => {
-                print_error_errno("view", format!("failed to read \"{}\"", bed.display()), &e);
-                return ExitCode::from(1);
-            }
-        }
     }
 
     match run(&opts, &input, format.exact) {
@@ -100,10 +128,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
 struct Opts {
     input: Option<PathBuf>,
     output: Option<PathBuf>,
+    unselected_output: Option<PathBuf>,
     output_fmt: OutputFmt,
     header: HeaderMode,
     count: bool,
     no_pg: bool,
+    unmap_unselected: bool,
     reference: Option<PathBuf>,
     /// `-f INT` — require ALL these flag bits to be set on the record.
     require_flags: u32,
@@ -240,6 +270,10 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
                 opts.count = true;
                 i += 1;
             }
+            "-p" | "--unmap" => {
+                opts.unmap_unselected = true;
+                i += 1;
+            }
             "--no-PG" => {
                 opts.no_pg = true;
                 i += 1;
@@ -250,6 +284,14 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
                     .get(i)
                     .ok_or_else(|| ParseError::Err("missing value for -o".into()))?;
                 opts.output = Some(PathBuf::from(v));
+                i += 1;
+            }
+            "-U" | "--unoutput" | "--output-unselected" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| ParseError::Err("missing value for -U".into()))?;
+                opts.unselected_output = Some(PathBuf::from(v));
                 i += 1;
             }
             "-f" => {
@@ -372,27 +414,23 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
 }
 
 fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
-    let effective_out_fmt = resolved_output_fmt(opts);
+    let effective_out_fmt = resolved_output_fmt(opts)?;
 
     // Count-only mode.
     if opts.count {
+        reject_unselected_for_count(opts)?;
         let n = if let Some(expr) = opts.filter_expr.as_ref() {
-            if input_exact != Exact::Sam {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "`-e EXPR` is currently wired up for SAM input only",
-                ));
-            }
-            htslib_rs::alignment_compat::count_sam_records_matching_filter_from_path(input, expr)?
+            count_expr_records(input, input_exact, opts, expr)?
         } else if !opts.regions.is_empty() {
             count_region_records(input, input_exact, opts)?
         } else if has_filters(opts) {
             count_filtered_records(input, input_exact, opts)?
         } else {
-            count_records(input, input_exact)?
+            count_records(input, input_exact, opts)?
         };
         let mut out = open_text_output(opts)?;
         writeln!(out, "{}", n)?;
+        sam_io::check_sam_close(&mut out)?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -401,12 +439,15 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
         let header_text = read_raw_header_text_with_format(input, input_exact)?;
         let mut out = open_text_output(opts)?;
         out.write_all(header_text.as_bytes())?;
+        sam_io::check_sam_close(&mut out)?;
         return Ok(ExitCode::SUCCESS);
     }
 
     // SAM output paths.
     if effective_out_fmt == OutputFmt::Sam {
+        validate_unselected_sam_output(opts)?;
         let mut out = open_text_output(opts)?;
+        let mut unselected = open_unselected_text_output(opts)?;
         // Upstream default for SAM output is records-only; `-h` opts in
         // to including the header.
         let include_header = match opts.header {
@@ -417,13 +458,22 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
         if include_header {
             let header_text = read_raw_header_text_with_format(input, input_exact)?;
             out.write_all(header_text.as_bytes())?;
+            if let Some(unselected) = unselected.as_mut() {
+                unselected.write_all(header_text.as_bytes())?;
+            }
         }
-        write_records_as_sam(&mut out, input, input_exact, opts)?;
+        write_records_as_sam(&mut out, &mut unselected, input, input_exact, opts)?;
+        sam_io::check_sam_close(&mut out)?;
+        if let Some(unselected) = unselected.as_mut() {
+            sam_io::check_sam_close(unselected)?;
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
     // BAM output.
     if effective_out_fmt == OutputFmt::Bam {
+        reject_unselected_binary_output(opts)?;
+        reject_binary_line_filters(input_exact, opts)?;
         let dst = opts
             .output
             .clone()
@@ -431,22 +481,71 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
         let dst_file = File::create(&dst)?;
         match input_exact {
             Exact::Sam => {
-                htslib_rs::alignment_compat::write_bam_from_sam_path(input, dst_file)?;
+                if let Some(expr) = opts.filter_expr.as_ref() {
+                    htslib_rs::alignment_compat::write_bam_matching_filter_from_sam_path(
+                        input, expr, dst_file,
+                    )?;
+                } else if has_filters(opts) {
+                    let filtered = filtered_sam_text_from_path(input, opts)?;
+                    htslib_rs::alignment_compat::write_bam_from_sam_reader(
+                        BufReader::new(io::Cursor::new(filtered)),
+                        dst_file,
+                    )?;
+                } else {
+                    htslib_rs::alignment_compat::write_bam_from_sam_path(input, dst_file)?;
+                }
             }
             Exact::Bam => {
                 if opts.regions.is_empty() {
-                    htslib_rs::alignment_compat::write_bam_from_path(input, dst_file)?;
+                    if let Some(expr) = opts.filter_expr.as_ref() {
+                        htslib_rs::alignment_compat::write_bam_matching_filter_from_path(
+                            input, expr, dst_file,
+                        )?;
+                    } else {
+                        htslib_rs::alignment_compat::write_bam_from_path(input, dst_file)?;
+                    }
                 } else {
                     let regions = parse_region_strings(input, &opts.regions)?;
-                    htslib_rs::alignment_compat::write_bam_regions_from_path(
-                        input, &regions, dst_file,
-                    )?;
+                    if let Some(expr) = opts.filter_expr.as_ref() {
+                        htslib_rs::alignment_compat::write_bam_regions_matching_filter_from_path(
+                            input, &regions, expr, dst_file,
+                        )?;
+                    } else {
+                        htslib_rs::alignment_compat::write_bam_regions_from_path(
+                            input, &regions, dst_file,
+                        )?;
+                    }
+                }
+            }
+            Exact::Cram => {
+                let reference = cram_reference(opts)?;
+                if opts.regions.is_empty() {
+                    if let Some(expr) = opts.filter_expr.as_ref() {
+                        htslib_rs::alignment_compat::write_cram_records_matching_filter_as_bam_from_path_with_reference(
+                            input, reference, expr, dst_file,
+                        )?;
+                    } else {
+                        htslib_rs::alignment_compat::write_cram_records_with_required_flags_as_bam_from_path_with_reference(
+                            input, reference, 0, dst_file,
+                        )?;
+                    }
+                } else {
+                    let regions = parse_region_strings(input, &opts.regions)?;
+                    if let Some(expr) = opts.filter_expr.as_ref() {
+                        htslib_rs::alignment_compat::write_cram_regions_matching_filter_as_bam_from_path_with_reference(
+                            input, reference, &regions, expr, dst_file,
+                        )?;
+                    } else {
+                        htslib_rs::alignment_compat::write_cram_regions_as_bam_from_path_with_reference(
+                            input, reference, &regions, dst_file,
+                        )?;
+                    }
                 }
             }
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "CRAM->BAM via samtools-rs view is not yet wired up",
+                    "this input format cannot be written as BAM yet",
                 ));
             }
         }
@@ -454,27 +553,85 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
     }
 
     if effective_out_fmt == OutputFmt::Cram {
+        reject_unselected_binary_output(opts)?;
+        reject_binary_line_filters(input_exact, opts)?;
         let dst = opts
             .output
             .clone()
             .ok_or_else(|| io::Error::other("CRAM output to stdout requires -o file (TODO)"))?;
-        let reference = opts.reference.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "CRAM output requires --reference / -T",
-            )
-        })?;
+        let reference = cram_reference(opts)?;
         let dst_file = File::create(&dst)?;
         match input_exact {
             Exact::Sam => {
-                htslib_rs::alignment_compat::write_cram_from_sam_path_with_reference(
-                    input, reference, dst_file,
-                )?;
+                if let Some(expr) = opts.filter_expr.as_ref() {
+                    htslib_rs::alignment_compat::write_cram_matching_filter_from_sam_path_with_reference(
+                        input, reference, expr, dst_file,
+                    )?;
+                } else if has_filters(opts) {
+                    let filtered = filtered_sam_text_from_path(input, opts)?;
+                    let mut reader =
+                        htslib_rs::sam::io::Reader::new(BufReader::new(io::Cursor::new(filtered)));
+                    htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
+                        &mut reader,
+                        reference,
+                        dst_file,
+                    )?;
+                } else {
+                    htslib_rs::alignment_compat::write_cram_from_sam_path_with_reference(
+                        input, reference, dst_file,
+                    )?;
+                }
+            }
+            Exact::Bam if opts.regions.is_empty() => {
+                if let Some(expr) = opts.filter_expr.as_ref() {
+                    htslib_rs::alignment_compat::write_cram_matching_filter_from_bam_path_with_reference(
+                        input, reference, expr, dst_file,
+                    )?;
+                } else {
+                    htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+                        input, reference, dst_file,
+                    )?;
+                }
+            }
+            Exact::Bam => {
+                let regions = parse_region_strings(input, &opts.regions)?;
+                if let Some(expr) = opts.filter_expr.as_ref() {
+                    htslib_rs::alignment_compat::write_bam_regions_matching_filter_as_cram_from_path_with_reference(
+                        input, reference, &regions, expr, dst_file,
+                    )?;
+                } else {
+                    htslib_rs::alignment_compat::write_bam_regions_as_cram_from_path_with_reference(
+                        input, reference, &regions, dst_file,
+                    )?;
+                }
+            }
+            Exact::Cram if opts.regions.is_empty() => {
+                if let Some(expr) = opts.filter_expr.as_ref() {
+                    htslib_rs::alignment_compat::write_cram_matching_filter_from_path_with_reference(
+                        input, reference, expr, dst_file,
+                    )?;
+                } else {
+                    htslib_rs::alignment_compat::write_cram_from_path_with_reference(
+                        input, reference, dst_file,
+                    )?;
+                }
+            }
+            Exact::Cram => {
+                let regions = parse_region_strings(input, &opts.regions)?;
+                if let Some(expr) = opts.filter_expr.as_ref() {
+                    htslib_rs::alignment_compat::write_cram_regions_matching_filter_from_path_with_reference(
+                        input, reference, &regions, expr, dst_file,
+                    )?;
+                } else {
+                    htslib_rs::alignment_compat::write_cram_regions_from_path_with_reference(
+                        input, reference, &regions, dst_file,
+                    )?;
+                }
             }
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "BAM/CRAM -> CRAM via samtools-rs view is not yet wired up",
+                    "this input/output CRAM conversion is not yet wired up",
                 ));
             }
         }
@@ -484,55 +641,471 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
     Err(io::Error::other("unsupported output combination"))
 }
 
-fn resolved_output_fmt(opts: &Opts) -> OutputFmt {
-    if opts.output_fmt != OutputFmt::Auto {
-        return opts.output_fmt;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StdinFormat {
+    Sam,
+    Bam,
+    Cram,
+}
+
+fn stdin_format(input: &[u8]) -> StdinFormat {
+    if input.starts_with(b"CRAM") {
+        StdinFormat::Cram
+    } else if input.starts_with(b"\x1f\x8b") || input.starts_with(b"BAM\x01") {
+        StdinFormat::Bam
+    } else {
+        StdinFormat::Sam
     }
-    // Auto: infer from output extension if any, else SAM (stdout default).
-    if let Some(p) = opts.output.as_ref()
-        && let Some(ext) = p.extension().and_then(|e| e.to_str())
-    {
-        return match ext {
-            "sam" => OutputFmt::Sam,
-            "bam" => OutputFmt::Bam,
-            "cram" => OutputFmt::Cram,
-            _ => OutputFmt::Sam,
+}
+
+fn run_sam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
+    if !opts.regions.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "region queries on stdin require an index (BAM/CRAM file input only)",
+        ));
+    }
+
+    let effective_out_fmt = resolved_output_fmt(opts)?;
+
+    if opts.count {
+        reject_unselected_for_count(opts)?;
+        let n = if let Some(expr) = opts.filter_expr.as_ref() {
+            htslib_rs::alignment_compat::count_sam_records_matching_filter(
+                BufReader::new(io::Cursor::new(input)),
+                expr,
+            )?
+        } else {
+            count_sam_text_records(input, opts)
         };
+        let mut out = open_text_output(opts)?;
+        writeln!(out, "{}", n)?;
+        sam_io::check_sam_close(&mut out)?;
+        return Ok(ExitCode::SUCCESS);
     }
-    OutputFmt::Sam
+
+    if opts.header == HeaderMode::HeaderOnly {
+        let mut out = open_text_output(opts)?;
+        out.write_all(sam_header_lines(input))?;
+        sam_io::check_sam_close(&mut out)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if effective_out_fmt == OutputFmt::Sam {
+        validate_unselected_sam_output(opts)?;
+        let mut out = open_text_output(opts)?;
+        let mut unselected = open_unselected_text_output(opts)?;
+        if opts.header == HeaderMode::Include {
+            out.write_all(sam_header_lines(input))?;
+            if let Some(unselected) = unselected.as_mut() {
+                unselected.write_all(sam_header_lines(input))?;
+            }
+        }
+        if let Some(expr) = opts.filter_expr.as_ref() {
+            let text = htslib_rs::alignment_compat::view_sam_text_matching_filter(
+                BufReader::new(io::Cursor::new(input)),
+                expr,
+            )?;
+            write_sam_text_records_split(&mut out, &mut unselected, text.as_bytes(), opts)?;
+        } else {
+            write_sam_text_records_split(&mut out, &mut unselected, input, opts)?;
+        }
+        sam_io::check_sam_close(&mut out)?;
+        if let Some(unselected) = unselected.as_mut() {
+            sam_io::check_sam_close(unselected)?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if effective_out_fmt == OutputFmt::Bam {
+        reject_unselected_binary_output(opts)?;
+        let dst = opts
+            .output
+            .clone()
+            .ok_or_else(|| io::Error::other("BAM output to stdout requires -o file (TODO)"))?;
+        let dst_file = File::create(&dst)?;
+        if let Some(expr) = opts.filter_expr.as_ref() {
+            let mut reader =
+                htslib_rs::sam::io::Reader::new(BufReader::new(io::Cursor::new(input)));
+            htslib_rs::alignment_compat::write_bam_matching_filter_from_sam_reader(
+                &mut reader,
+                expr,
+                dst_file,
+            )?;
+        } else {
+            let reader_input = if has_filters(opts) {
+                filtered_sam_text(input, opts)?
+            } else {
+                input.to_vec()
+            };
+            htslib_rs::alignment_compat::write_bam_from_sam_reader(
+                BufReader::new(io::Cursor::new(reader_input)),
+                dst_file,
+            )?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if effective_out_fmt == OutputFmt::Cram {
+        reject_unselected_binary_output(opts)?;
+        let dst = opts
+            .output
+            .clone()
+            .ok_or_else(|| io::Error::other("CRAM output to stdout requires -o file (TODO)"))?;
+        let reference = cram_reference(opts)?;
+        let dst_file = File::create(&dst)?;
+        if let Some(expr) = opts.filter_expr.as_ref() {
+            let mut reader =
+                htslib_rs::sam::io::Reader::new(BufReader::new(io::Cursor::new(input)));
+            htslib_rs::alignment_compat::write_cram_matching_filter_from_sam_reader_with_reference(
+                &mut reader,
+                reference,
+                expr,
+                dst_file,
+            )?;
+        } else {
+            let reader_input = if has_filters(opts) {
+                filtered_sam_text(input, opts)?
+            } else {
+                input.to_vec()
+            };
+            let mut reader =
+                htslib_rs::sam::io::Reader::new(BufReader::new(io::Cursor::new(reader_input)));
+            htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
+                &mut reader,
+                reference,
+                dst_file,
+            )?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    Err(io::Error::other("unsupported stdin output combination"))
+}
+
+fn run_bam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
+    if !opts.regions.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "region queries on stdin require an index (BAM/CRAM file input only)",
+        ));
+    }
+
+    let effective_out_fmt = resolved_output_fmt(opts)?;
+
+    if opts.count {
+        reject_unselected_for_count(opts)?;
+        let n = if let Some(expr) = opts.filter_expr.as_ref() {
+            htslib_rs::alignment_compat::count_bam_records_matching_filter(
+                io::Cursor::new(input),
+                expr,
+            )?
+        } else {
+            let text =
+                htslib_rs::alignment_compat::view_bam_as_sam_text(io::Cursor::new(input), None)?;
+            count_sam_text_records(text.as_bytes(), opts)
+        };
+        let mut out = open_text_output(opts)?;
+        writeln!(out, "{}", n)?;
+        sam_io::check_sam_close(&mut out)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if opts.header == HeaderMode::HeaderOnly {
+        let text =
+            htslib_rs::alignment_compat::view_bam_as_sam_text(io::Cursor::new(input), Some(0))?;
+        let mut out = open_text_output(opts)?;
+        out.write_all(text.as_bytes())?;
+        sam_io::check_sam_close(&mut out)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if effective_out_fmt == OutputFmt::Sam {
+        validate_unselected_sam_output(opts)?;
+        let text = if let Some(expr) = opts.filter_expr.as_ref() {
+            htslib_rs::alignment_compat::view_bam_as_sam_text_matching_filter(
+                io::Cursor::new(input),
+                expr,
+            )?
+        } else {
+            htslib_rs::alignment_compat::view_bam_as_sam_text(io::Cursor::new(input), None)?
+        };
+        let mut out = open_text_output(opts)?;
+        let mut unselected = open_unselected_text_output(opts)?;
+        if opts.header == HeaderMode::Include {
+            out.write_all(sam_header_lines(text.as_bytes()))?;
+            if let Some(unselected) = unselected.as_mut() {
+                unselected.write_all(sam_header_lines(text.as_bytes()))?;
+            }
+        }
+        write_sam_text_records_split(&mut out, &mut unselected, text.as_bytes(), opts)?;
+        sam_io::check_sam_close(&mut out)?;
+        if let Some(unselected) = unselected.as_mut() {
+            sam_io::check_sam_close(unselected)?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if effective_out_fmt == OutputFmt::Bam {
+        reject_unselected_binary_output(opts)?;
+        reject_binary_line_filters(Exact::Bam, opts)?;
+        let dst = opts
+            .output
+            .clone()
+            .ok_or_else(|| io::Error::other("BAM output to stdout requires -o file (TODO)"))?;
+        let dst_file = File::create(&dst)?;
+        if let Some(expr) = opts.filter_expr.as_ref() {
+            htslib_rs::alignment_compat::write_bam_matching_filter(
+                io::Cursor::new(input),
+                expr,
+                dst_file,
+            )?;
+        } else {
+            htslib_rs::alignment_compat::write_bam(io::Cursor::new(input), dst_file)?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if effective_out_fmt == OutputFmt::Cram {
+        reject_unselected_binary_output(opts)?;
+        reject_binary_line_filters(Exact::Bam, opts)?;
+        let dst = opts
+            .output
+            .clone()
+            .ok_or_else(|| io::Error::other("CRAM output to stdout requires -o file (TODO)"))?;
+        let reference = cram_reference(opts)?;
+        let dst_file = File::create(&dst)?;
+        if let Some(expr) = opts.filter_expr.as_ref() {
+            htslib_rs::alignment_compat::write_cram_matching_filter_from_bam_reader_with_reference(
+                io::Cursor::new(input),
+                &reference,
+                expr,
+                dst_file,
+            )?;
+        } else {
+            htslib_rs::alignment_compat::write_cram_from_bam_reader_with_reference(
+                io::Cursor::new(input),
+                &reference,
+                dst_file,
+            )?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    Err(io::Error::other("unsupported stdin output combination"))
+}
+
+fn run_cram_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
+    if !opts.regions.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "region queries on stdin require an index (BAM/CRAM file input only)",
+        ));
+    }
+
+    let reference = cram_reference(opts)?;
+    let effective_out_fmt = resolved_output_fmt(opts)?;
+
+    if opts.count {
+        reject_unselected_for_count(opts)?;
+        let n = if let Some(expr) = opts.filter_expr.as_ref() {
+            htslib_rs::alignment_compat::count_cram_records_matching_filter_with_reference(
+                io::Cursor::new(input),
+                &reference,
+                expr,
+            )?
+        } else {
+            let text = htslib_rs::alignment_compat::view_cram_as_sam_text_with_reference(
+                io::Cursor::new(input),
+                &reference,
+                None,
+            )?;
+            count_sam_text_records(text.as_bytes(), opts)
+        };
+        let mut out = open_text_output(opts)?;
+        writeln!(out, "{}", n)?;
+        sam_io::check_sam_close(&mut out)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if opts.header == HeaderMode::HeaderOnly {
+        let text = htslib_rs::alignment_compat::view_cram_as_sam_text_with_reference(
+            io::Cursor::new(input),
+            &reference,
+            Some(0),
+        )?;
+        let mut out = open_text_output(opts)?;
+        out.write_all(text.as_bytes())?;
+        sam_io::check_sam_close(&mut out)?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if effective_out_fmt == OutputFmt::Sam {
+        validate_unselected_sam_output(opts)?;
+        let text = if let Some(expr) = opts.filter_expr.as_ref() {
+            htslib_rs::alignment_compat::view_cram_as_sam_text_matching_filter_with_reference(
+                io::Cursor::new(input),
+                &reference,
+                expr,
+            )?
+        } else {
+            htslib_rs::alignment_compat::view_cram_as_sam_text_with_reference(
+                io::Cursor::new(input),
+                &reference,
+                None,
+            )?
+        };
+        let mut out = open_text_output(opts)?;
+        let mut unselected = open_unselected_text_output(opts)?;
+        if opts.header == HeaderMode::Include {
+            out.write_all(sam_header_lines(text.as_bytes()))?;
+            if let Some(unselected) = unselected.as_mut() {
+                unselected.write_all(sam_header_lines(text.as_bytes()))?;
+            }
+        }
+        write_sam_text_records_split(&mut out, &mut unselected, text.as_bytes(), opts)?;
+        sam_io::check_sam_close(&mut out)?;
+        if let Some(unselected) = unselected.as_mut() {
+            sam_io::check_sam_close(unselected)?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if effective_out_fmt == OutputFmt::Bam {
+        reject_unselected_binary_output(opts)?;
+        reject_binary_line_filters(Exact::Cram, opts)?;
+        let dst = opts
+            .output
+            .clone()
+            .ok_or_else(|| io::Error::other("BAM output to stdout requires -o file (TODO)"))?;
+        let dst_file = File::create(&dst)?;
+        if let Some(expr) = opts.filter_expr.as_ref() {
+            htslib_rs::alignment_compat::write_cram_records_matching_filter_as_bam_with_reference(
+                io::Cursor::new(input),
+                &reference,
+                expr,
+                dst_file,
+            )?;
+        } else {
+            htslib_rs::alignment_compat::write_cram_records_with_required_flags_as_bam_with_reference(
+                io::Cursor::new(input),
+                &reference,
+                0,
+                dst_file,
+            )?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if effective_out_fmt == OutputFmt::Cram {
+        reject_unselected_binary_output(opts)?;
+        reject_binary_line_filters(Exact::Cram, opts)?;
+        let dst = opts
+            .output
+            .clone()
+            .ok_or_else(|| io::Error::other("CRAM output to stdout requires -o file (TODO)"))?;
+        let dst_file = File::create(&dst)?;
+        if let Some(expr) = opts.filter_expr.as_ref() {
+            htslib_rs::alignment_compat::write_cram_matching_filter_from_reader_with_reference(
+                io::Cursor::new(input),
+                &reference,
+                expr,
+                dst_file,
+            )?;
+        } else {
+            htslib_rs::alignment_compat::write_cram_from_reader_with_reference(
+                io::Cursor::new(input),
+                &reference,
+                dst_file,
+            )?;
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    Err(io::Error::other("unsupported stdin output combination"))
+}
+
+fn resolved_output_fmt(opts: &Opts) -> io::Result<OutputFmt> {
+    let explicit = match opts.output_fmt {
+        OutputFmt::Auto => None,
+        OutputFmt::Sam => Some(Exact::Sam),
+        OutputFmt::Bam => Some(Exact::Bam),
+        OutputFmt::Cram => Some(Exact::Cram),
+    };
+    let mode = sam_io::sam_open_mode(opts.output.as_deref(), explicit, Exact::Sam)?;
+    match mode.exact {
+        Exact::Sam => Ok(OutputFmt::Sam),
+        Exact::Bam => Ok(OutputFmt::Bam),
+        Exact::Cram => Ok(OutputFmt::Cram),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported output format inferred from {:?}", opts.output),
+        )),
+    }
 }
 
 fn open_text_output(opts: &Opts) -> io::Result<Box<dyn Write>> {
-    match opts.output.as_ref() {
-        Some(p) => Ok(Box::new(File::create(p)?)),
-        None => Ok(Box::new(io::stdout().lock())),
+    sam_io::open_text_output(opts.output.as_deref())
+}
+
+fn open_unselected_text_output(opts: &Opts) -> io::Result<Option<Box<dyn Write>>> {
+    opts.unselected_output
+        .as_deref()
+        .map(|path| sam_io::open_text_output(Some(path)))
+        .transpose()
+}
+
+fn validate_unselected_sam_output(opts: &Opts) -> io::Result<()> {
+    if opts.unselected_output.is_none() && !opts.unmap_unselected {
+        return Ok(());
     }
+    if opts.unselected_output.is_some() && opts.unmap_unselected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "`-U/--output-unselected` and `-p/--unmap` are mutually exclusive",
+        ));
+    }
+    if opts.filter_expr.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "`-U/--output-unselected` and `-p/--unmap` with `-e EXPR` are not yet supported",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_unselected_for_count(opts: &Opts) -> io::Result<()> {
+    if opts.unselected_output.is_some() || opts.unmap_unselected {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "`-U/--output-unselected` and `-p/--unmap` are not supported with `-c` count output yet",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_unselected_binary_output(opts: &Opts) -> io::Result<()> {
+    if opts.unselected_output.is_some() || opts.unmap_unselected {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "`-U/--output-unselected` and `-p/--unmap` are only wired up for SAM output so far",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_binary_line_filters(input_exact: Exact, opts: &Opts) -> io::Result<()> {
+    if has_filters(opts) && input_exact != Exact::Sam {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "`-f/-F/-G/-q` filters for BAM/CRAM output are only wired up for SAM input so far",
+        ));
+    }
+    Ok(())
 }
 
 fn load_bed_regions(path: &Path) -> io::Result<Vec<String>> {
-    let file = File::open(path)?;
-    let mut out = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        let s = line.trim_end();
-        if s.is_empty()
-            || s.starts_with('#')
-            || s.starts_with("track ")
-            || s.starts_with("browser ")
-        {
-            continue;
-        }
-        let mut fields = s.split('\t');
-        let chrom = fields.next().unwrap_or("");
-        let beg: u64 = fields.next().and_then(|t| t.parse().ok()).unwrap_or(0);
-        let end: u64 = fields.next().and_then(|t| t.parse().ok()).unwrap_or(0);
-        if chrom.is_empty() || end <= beg {
-            continue;
-        }
-        // HTSlib region format is 1-based inclusive.
-        out.push(format!("{}:{}-{}", chrom, beg + 1, end));
-    }
-    Ok(out)
+    Ok(load_bed_index(path)?.to_region_strings())
 }
 
 fn parse_region_strings(
@@ -553,28 +1126,47 @@ fn parse_region_strings(
 }
 
 fn count_region_records(path: &Path, exact: Exact, opts: &Opts) -> io::Result<usize> {
-    if exact != Exact::Bam {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "region count is only wired up for BAM input",
-        ));
-    }
     let regions = parse_region_strings(path, &opts.regions)?;
-    let mut n = 0usize;
-    for region in &regions {
-        n += htslib_rs::alignment_compat::count_bam_records_in_region_from_path(path, region)?;
+    match exact {
+        Exact::Bam => {
+            let mut n = 0usize;
+            for region in &regions {
+                n += htslib_rs::alignment_compat::count_bam_records_in_region_from_path(
+                    path, region,
+                )?;
+            }
+            Ok(n)
+        }
+        Exact::Cram => {
+            let reference = cram_reference(opts)?;
+            let text =
+                htslib_rs::alignment_compat::view_cram_regions_as_sam_text_from_path_with_reference_and_limit(
+                    path,
+                    reference,
+                    &regions,
+                    None,
+                )?;
+            Ok(count_sam_text_records(text.as_bytes(), opts))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "region count is only wired up for BAM/CRAM input",
+        )),
     }
-    Ok(n)
 }
 
-fn count_records(path: &Path, exact: Exact) -> io::Result<usize> {
+fn count_records(path: &Path, exact: Exact, opts: &Opts) -> io::Result<usize> {
     match exact {
         Exact::Sam => htslib_rs::alignment_compat::count_sam_records_from_path(path),
         Exact::Bam => htslib_rs::alignment_compat::count_bam_records_from_path(path),
-        Exact::Cram => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "CRAM counting via samtools-rs view is not yet wired up",
-        )),
+        Exact::Cram => {
+            let reference = cram_reference(opts)?;
+            let text =
+                htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+                    path, reference, None,
+                )?;
+            Ok(count_sam_text_records(text.as_bytes(), opts))
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported format",
@@ -584,6 +1176,7 @@ fn count_records(path: &Path, exact: Exact) -> io::Result<usize> {
 
 fn write_records_as_sam<W: Write>(
     out: &mut W,
+    unselected: &mut Option<Box<dyn Write>>,
     path: &Path,
     exact: Exact,
     opts: &Opts,
@@ -596,37 +1189,75 @@ fn write_records_as_sam<W: Write>(
                     "region queries on SAM input require an index (BAM/CRAM only)",
                 ));
             }
-            stream_sam_records(out, path, opts)
+            if let Some(expr) = opts.filter_expr.as_ref() {
+                let text = htslib_rs::alignment_compat::view_sam_text_matching_filter_from_path(
+                    path, expr,
+                )?;
+                return write_sam_text_records_split(out, unselected, text.as_bytes(), opts);
+            }
+            stream_sam_records(out, unselected, path, opts)
         }
         Exact::Bam => {
             let text = if opts.regions.is_empty() {
-                htslib_rs::alignment_compat::view_bam_as_sam_text_from_path_with_limit(path, None)?
+                if let Some(expr) = opts.filter_expr.as_ref() {
+                    htslib_rs::alignment_compat::view_bam_as_sam_text_matching_filter_from_path(
+                        path, expr,
+                    )?
+                } else {
+                    htslib_rs::alignment_compat::view_bam_as_sam_text_from_path_with_limit(
+                        path, None,
+                    )?
+                }
             } else {
                 let regions = parse_region_strings(path, &opts.regions)?;
-                htslib_rs::alignment_compat::view_bam_regions_as_sam_text_from_path(path, &regions)?
+                if let Some(expr) = opts.filter_expr.as_ref() {
+                    htslib_rs::alignment_compat::view_bam_regions_as_sam_text_matching_filter_from_path(
+                        path,
+                        &regions,
+                        expr,
+                    )?
+                } else {
+                    htslib_rs::alignment_compat::view_bam_regions_as_sam_text_from_path(
+                        path, &regions,
+                    )?
+                }
             };
             let tail = strip_header_lines(text.as_bytes());
             // For BAM input we already have SAM text. Apply filters
             // line-by-line if any are set.
-            if has_filters(opts) {
-                for line in tail.split(|&b| b == b'\n') {
-                    if line.is_empty() {
-                        continue;
-                    }
-                    if line_passes(line, opts) {
-                        out.write_all(line)?;
-                        out.write_all(b"\n")?;
-                    }
-                }
-                Ok(())
-            } else {
-                out.write_all(tail)
-            }
+            write_sam_text_records_split(out, unselected, tail, opts)
         }
-        Exact::Cram => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "CRAM -> SAM via samtools-rs view is not yet wired up",
-        )),
+        Exact::Cram => {
+            let reference = cram_reference(opts)?;
+            let text = if opts.regions.is_empty() {
+                if let Some(expr) = opts.filter_expr.as_ref() {
+                    htslib_rs::alignment_compat::view_cram_as_sam_text_matching_filter_from_path_with_reference(
+                        path, reference, expr,
+                    )?
+                } else {
+                    htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+                        path,
+                        reference,
+                        None,
+                    )?
+                }
+            } else {
+                let regions = parse_region_strings(path, &opts.regions)?;
+                if let Some(expr) = opts.filter_expr.as_ref() {
+                    htslib_rs::alignment_compat::view_cram_regions_as_sam_text_matching_filter_from_path_with_reference(
+                        path,
+                        reference,
+                        &regions,
+                        expr,
+                    )?
+                } else {
+                    htslib_rs::alignment_compat::view_cram_regions_as_sam_text_from_path_with_reference(
+                        path, reference, &regions, false,
+                    )?
+                }
+            };
+            write_sam_text_records_split(out, unselected, text.as_bytes(), opts)
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported format",
@@ -634,11 +1265,91 @@ fn write_records_as_sam<W: Write>(
     }
 }
 
+fn cram_reference(opts: &Opts) -> io::Result<PathBuf> {
+    opts.reference
+        .clone()
+        .or_else(|| current_global_args().reference)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CRAM input requires --reference / -T",
+            )
+        })
+}
+
 fn has_filters(opts: &Opts) -> bool {
     opts.require_flags != 0
         || opts.exclude_flags != 0
         || opts.exclude_all_flags != 0
         || opts.min_mapq != 0
+}
+
+fn count_sam_text_records(bytes: &[u8], opts: &Opts) -> usize {
+    strip_header_lines(bytes)
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.is_empty())
+        .filter(|line| !has_filters(opts) || line_passes(line, opts))
+        .count()
+}
+
+fn filtered_sam_text_from_path(path: &Path, opts: &Opts) -> io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let mut bytes = Vec::new();
+    if is_bgzf_path(path)? {
+        MultiGzDecoder::new(file).read_to_end(&mut bytes)?;
+    } else {
+        BufReader::new(file).read_to_end(&mut bytes)?;
+    }
+    filtered_sam_text(&bytes, opts)
+}
+
+fn filtered_sam_text(bytes: &[u8], opts: &Opts) -> io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(sam_header_lines(bytes));
+    write_sam_text_records_split(&mut out, &mut None, bytes, opts)?;
+    Ok(out)
+}
+
+fn write_sam_text_records_split<W: Write>(
+    out: &mut W,
+    unselected: &mut Option<Box<dyn Write>>,
+    bytes: &[u8],
+    opts: &Opts,
+) -> io::Result<()> {
+    let tail = strip_header_lines(bytes);
+    if has_filters(opts) || has_tag_filter(opts) || unselected.is_some() || opts.unmap_unselected {
+        for line in tail.split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            if has_filters(opts) && !line_passes(line, opts) {
+                if let Some(unselected) = unselected.as_mut() {
+                    write_sam_record_line(unselected.as_mut(), line, opts)?;
+                } else if opts.unmap_unselected {
+                    write_sam_unmapped_record_line(out, line, opts)?;
+                }
+                continue;
+            }
+            write_sam_record_line(out, line, opts)?;
+        }
+        Ok(())
+    } else {
+        out.write_all(tail)
+    }
+}
+
+fn write_sam_record_line<W: Write + ?Sized>(
+    out: &mut W,
+    line: &[u8],
+    opts: &Opts,
+) -> io::Result<()> {
+    if has_tag_filter(opts) {
+        let filtered = apply_tag_filter(line, opts);
+        out.write_all(&filtered)?;
+    } else {
+        out.write_all(line)?;
+    }
+    out.write_all(b"\n")
 }
 
 fn has_tag_filter(opts: &Opts) -> bool {
@@ -708,6 +1419,44 @@ fn line_passes(line: &[u8], opts: &Opts) -> bool {
     record_passes(flag, mapq, opts)
 }
 
+fn count_expr_records(path: &Path, exact: Exact, opts: &Opts, expr: &str) -> io::Result<usize> {
+    match exact {
+        Exact::Sam if !opts.regions.is_empty() => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "region queries on SAM input require an index (BAM/CRAM only)",
+        )),
+        Exact::Sam => {
+            htslib_rs::alignment_compat::count_sam_records_matching_filter_from_path(path, expr)
+        }
+        Exact::Bam if !opts.regions.is_empty() => {
+            let regions = parse_region_strings(path, &opts.regions)?;
+            htslib_rs::alignment_compat::count_bam_records_in_regions_matching_filter_from_path(
+                path, &regions, expr,
+            )
+        }
+        Exact::Bam => {
+            htslib_rs::alignment_compat::count_bam_records_matching_filter_from_path(path, expr)
+        }
+        Exact::Cram if !opts.regions.is_empty() => {
+            let reference = cram_reference(opts)?;
+            let regions = parse_region_strings(path, &opts.regions)?;
+            htslib_rs::alignment_compat::count_cram_records_in_regions_matching_filter_from_path_with_reference(
+                path, reference, &regions, expr,
+            )
+        }
+        Exact::Cram => {
+            let reference = cram_reference(opts)?;
+            htslib_rs::alignment_compat::count_cram_records_matching_filter_from_path_with_reference(
+                path, reference, expr,
+            )
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "`-e EXPR` count is only wired up for SAM/BAM/CRAM input",
+        )),
+    }
+}
+
 fn count_filtered_records(path: &Path, exact: Exact, opts: &Opts) -> io::Result<usize> {
     let mut count = 0usize;
     match exact {
@@ -756,6 +1505,14 @@ fn count_filtered_records(path: &Path, exact: Exact, opts: &Opts) -> io::Result<
                 }
             }
         }
+        Exact::Cram => {
+            let reference = cram_reference(opts)?;
+            let text =
+                htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+                    path, reference, None,
+                )?;
+            count = count_sam_text_records(text.as_bytes(), opts);
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -766,7 +1523,12 @@ fn count_filtered_records(path: &Path, exact: Exact, opts: &Opts) -> io::Result<
     Ok(count)
 }
 
-fn stream_sam_records<W: Write>(out: &mut W, path: &Path, opts: &Opts) -> io::Result<()> {
+fn stream_sam_records<W: Write>(
+    out: &mut W,
+    unselected: &mut Option<Box<dyn Write>>,
+    path: &Path,
+    opts: &Opts,
+) -> io::Result<()> {
     let file = File::open(path)?;
     let bgzf = is_bgzf_path(path)?;
     let reader: Box<dyn BufRead> = if bgzf {
@@ -796,12 +1558,15 @@ fn stream_sam_records<W: Write>(out: &mut W, path: &Path, opts: &Opts) -> io::Re
             &line[..]
         };
         if filtering && !line_passes(body, opts) {
+            if let Some(unselected) = unselected.as_mut() {
+                write_sam_record_line(unselected.as_mut(), body, opts)?;
+            } else if opts.unmap_unselected {
+                write_sam_unmapped_record_line(out, body, opts)?;
+            }
             continue;
         }
-        if has_tag_filter(opts) {
-            let filtered = apply_tag_filter(body, opts);
-            out.write_all(&filtered)?;
-            out.write_all(b"\n")?;
+        if has_tag_filter(opts) || unselected.is_some() || opts.unmap_unselected {
+            write_sam_record_line(out, body, opts)?;
         } else {
             out.write_all(&line)?;
         }
@@ -828,6 +1593,33 @@ fn strip_header_lines(bytes: &[u8]) -> &[u8] {
     tail
 }
 
+fn write_sam_unmapped_record_line<W: Write + ?Sized>(
+    out: &mut W,
+    line: &[u8],
+    opts: &Opts,
+) -> io::Result<()> {
+    let mut fields: Vec<Vec<u8>> = line.split(|&b| b == b'\t').map(Vec::from).collect();
+    if fields.len() >= 11 {
+        let flag = std::str::from_utf8(&fields[1])
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0)
+            | 0x4;
+        fields[1] = flag.to_string().into_bytes();
+        fields[4] = b"0".to_vec();
+        fields[5] = b"*".to_vec();
+        fields[8] = b"0".to_vec();
+    }
+    let unmapped = fields.join(&b'\t');
+    write_sam_record_line(out, &unmapped, opts)
+}
+
+fn sam_header_lines(bytes: &[u8]) -> &[u8] {
+    let tail = strip_header_lines(bytes);
+    let len = bytes.len() - tail.len();
+    &bytes[..len]
+}
+
 fn write_usage<W: Write>(w: &mut W) -> io::Result<()> {
     writeln!(
         w,
@@ -839,6 +1631,11 @@ fn write_usage<W: Write>(w: &mut W) -> io::Result<()> {
     writeln!(w, "  -C           output CRAM (requires -T)")?;
     writeln!(w, "  -c           count records and print the count")?;
     writeln!(w, "  -o FILE      output FILE")?;
+    writeln!(w, "  -U FILE      output records not selected by filters")?;
+    writeln!(
+        w,
+        "  -p           set UNMAP on records not selected by filters"
+    )?;
     writeln!(w, "  -T FILE      reference (for CRAM)")?;
     writeln!(w, "  --no-PG      do not add a @PG line")?;
     writeln!(w)?;
@@ -852,4 +1649,203 @@ fn write_usage<W: Write>(w: &mut W) -> io::Result<()> {
     )?;
     writeln!(w, "      manipulation, etc. are not yet supported.")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn tmp_path(name: &str, ext: &str) -> PathBuf {
+        static NEXT_TMP_ID: AtomicUsize = AtomicUsize::new(0);
+
+        let id = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "samtools-rs-view-stdin-{}-{}-{}.{}",
+            name,
+            std::process::id(),
+            id,
+            ext
+        ))
+    }
+
+    fn htslib_fixtures_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("htslib-rs")
+            .join("htslib")
+            .join("test")
+    }
+
+    fn stdin_sam() -> &'static [u8] {
+        b"@HD\tVN:1.6\n@SQ\tSN:ref\tLN:100\nr1\t0\tref\t1\t20\t2M\t*\t0\t0\tAC\t!!\nr2\t4\t*\t0\t0\t*\t*\t0\t0\tTG\t##\n"
+    }
+
+    fn stdin_bam() -> Vec<u8> {
+        htslib_rs::alignment_compat::write_bam_from_sam_reader(
+            BufReader::new(io::Cursor::new(stdin_sam())),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn stdin_count_expr_succeeds() {
+        let out = tmp_path("count-expr", "txt");
+        let opts = Opts {
+            output: Some(out.clone()),
+            count: true,
+            filter_expr: Some("mapq >= 10".to_string()),
+            ..Opts::default()
+        };
+
+        assert_eq!(
+            run_sam_stdin(&opts, stdin_sam()).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "1\n");
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn stdin_bam_output_succeeds() {
+        let out = tmp_path("bam", "bam");
+        let opts = Opts {
+            output: Some(out.clone()),
+            output_fmt: OutputFmt::Bam,
+            ..Opts::default()
+        };
+
+        assert_eq!(
+            run_sam_stdin(&opts, stdin_sam()).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            htslib_rs::alignment_compat::count_bam_records_from_path(&out).unwrap(),
+            2
+        );
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn stdin_cram_output_honors_mapq_filter() {
+        let out = tmp_path("cram-filter", "cram");
+        let reference = tmp_path("cram-filter-ref", "fa");
+        std::fs::write(
+            &reference,
+            b">ref\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n",
+        )
+        .unwrap();
+        let reference_index = crate::reference::ensure_fai_index(&reference, None).unwrap();
+        let opts = Opts {
+            output: Some(out.clone()),
+            output_fmt: OutputFmt::Cram,
+            reference: Some(reference.clone()),
+            min_mapq: 10,
+            ..Opts::default()
+        };
+
+        assert_eq!(
+            run_sam_stdin(&opts, stdin_sam()).unwrap(),
+            ExitCode::SUCCESS
+        );
+        let text =
+            htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+                &out, &reference, None,
+            )
+            .unwrap();
+        let records: Vec<&str> = text.lines().filter(|line| !line.starts_with('@')).collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].split('\t').next(), Some("r1"));
+        assert_eq!(records[0].split('\t').nth(4), Some("20"));
+        let _ = std::fs::remove_file(out);
+        let _ = std::fs::remove_file(reference);
+        let _ = std::fs::remove_file(reference_index);
+    }
+
+    #[test]
+    fn stdin_bam_count_expr_succeeds() {
+        let out = tmp_path("bam-count-expr", "txt");
+        let opts = Opts {
+            output: Some(out.clone()),
+            count: true,
+            filter_expr: Some("mapq >= 10".to_string()),
+            ..Opts::default()
+        };
+
+        assert_eq!(
+            run_bam_stdin(&opts, &stdin_bam()).unwrap(),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "1\n");
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn stdin_bam_sam_output_succeeds() {
+        let out = tmp_path("bam-sam", "sam");
+        let opts = Opts {
+            output: Some(out.clone()),
+            header: HeaderMode::Include,
+            min_mapq: 10,
+            ..Opts::default()
+        };
+
+        assert_eq!(
+            run_bam_stdin(&opts, &stdin_bam()).unwrap(),
+            ExitCode::SUCCESS
+        );
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.starts_with("@HD\t"));
+        assert!(text.contains("\tr1\t") || text.contains("\nr1\t"));
+        assert!(!text.contains("\nr2\t"));
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn stdin_cram_count_expr_succeeds() {
+        let fixtures = htslib_fixtures_dir();
+        let reference = fixtures.join("ce.fa");
+        let cram = std::fs::read(fixtures.join("range.cram")).unwrap();
+        let out = tmp_path("cram-count-expr", "txt");
+        let opts = Opts {
+            output: Some(out.clone()),
+            count: true,
+            reference: Some(reference),
+            filter_expr: Some("mapq >= 20".to_string()),
+            ..Opts::default()
+        };
+
+        assert_eq!(run_cram_stdin(&opts, &cram).unwrap(), ExitCode::SUCCESS);
+        let count = std::fs::read_to_string(&out)
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        assert!(count > 0);
+        let _ = std::fs::remove_file(out);
+    }
+
+    #[test]
+    fn stdin_cram_bam_output_succeeds() {
+        let fixtures = htslib_fixtures_dir();
+        let reference = fixtures.join("ce.fa");
+        let cram = std::fs::read(fixtures.join("range.cram")).unwrap();
+        let out = tmp_path("cram-bam", "bam");
+        let opts = Opts {
+            output: Some(out.clone()),
+            output_fmt: OutputFmt::Bam,
+            reference: Some(reference),
+            filter_expr: Some("mapq >= 20".to_string()),
+            ..Opts::default()
+        };
+
+        assert_eq!(run_cram_stdin(&opts, &cram).unwrap(), ExitCode::SUCCESS);
+        assert!(htslib_rs::alignment_compat::count_bam_records_from_path(&out).unwrap() > 0);
+        let _ = std::fs::remove_file(out);
+    }
 }

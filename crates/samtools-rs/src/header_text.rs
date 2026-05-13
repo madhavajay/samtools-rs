@@ -12,13 +12,14 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
 use flate2::read::MultiGzDecoder;
-use htslib_rs::format::{Category, Exact, detect_path};
+use htslib_rs::format::{Category, Exact};
+
+use crate::io as sam_io;
 
 /// Read the raw header text from a SAM/BAM/CRAM file as it was stored on
 /// disk, preserving the original line order.
 pub fn read_raw_header_text(path: &Path) -> io::Result<String> {
-    let format =
-        detect_path(path).map_err(|e| io::Error::other(format!("failed to detect format: {e}")))?;
+    let format = sam_io::sam_open_format(path)?;
     if format.category != Category::SequenceData {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

@@ -5,11 +5,15 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use flate2::read::MultiGzDecoder;
 use samtools_rs::commands::{bedcov, coverage, depth, index, view};
 use samtools_rs::native;
+use samtools_rs::run as samtools_run;
+
+static GLOBAL_ARGS_LOCK: Mutex<()> = Mutex::new(());
 
 fn fixtures_dir() -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -146,6 +150,57 @@ fn depth_bed_outputs_only_bed_interval() {
 }
 
 #[test]
+fn depth_cram_region_uses_top_level_reference() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("depth-cram");
+    let out = tmp.join("depth.tsv");
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "depth",
+                "-r",
+                "CHROMOSOME_II:2980-2980",
+                "-o",
+                out.to_str().unwrap(),
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        "CHROMOSOME_II\t2980\t1\n"
+    );
+}
+
+#[test]
+fn depth_cram_without_reference_fails_cleanly() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let cram = htslib_fixtures_dir().join("range.cram");
+
+    assert_ne!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "depth",
+                "-r",
+                "CHROMOSOME_II:2980-2980",
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+}
+
+#[test]
 fn coverage_outputs_per_ref() {
     let p = indexed_bam();
     assert_eq!(
@@ -177,6 +232,94 @@ fn coverage_region_outputs_requested_interval() {
     let rows: Vec<_> = text.lines().filter(|line| !line.starts_with('#')).collect();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].starts_with("17\t1\t10000\t"));
+}
+
+#[test]
+fn coverage_cram_region_uses_top_level_reference() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("coverage-cram");
+    let out = tmp.join("coverage.tsv");
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "coverage",
+                "-r",
+                "CHROMOSOME_II:2980-2980",
+                "-o",
+                out.to_str().unwrap(),
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(
+        text.contains(
+            "CHROMOSOME_II\t2980\t2980\t1\t1\t100.000000\t1.000000\t0.000000\t60.000000\n"
+        )
+    );
+}
+
+#[test]
+fn coverage_cram_without_reference_fails_cleanly() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let cram = htslib_fixtures_dir().join("range.cram");
+
+    assert_ne!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "coverage",
+                "-r",
+                "CHROMOSOME_II:2980-2980",
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+}
+
+#[test]
+fn stats_cram_uses_top_level_reference() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "stats",
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+}
+
+#[test]
+fn stats_cram_without_reference_fails_cleanly() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let cram = htslib_fixtures_dir().join("range.cram");
+
+    assert_ne!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &["stats", cram.to_str().unwrap()],
+        ))),
+        0
+    );
 }
 
 #[test]
@@ -219,6 +362,48 @@ fn bedcov_depth_column_succeeds() {
         exit_to_u8(bedcov::main(&argv(
             "bedcov",
             &["-d", "2", bed.to_str().unwrap(), bam.to_str().unwrap()]
+        ))),
+        0
+    );
+}
+
+#[test]
+fn bedcov_cram_uses_top_level_reference() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("bedcov-cram");
+    let bed = tmp.join("r.bed");
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+    std::fs::write(&bed, "CHROMOSOME_II\t2979\t2980\n").unwrap();
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "bedcov",
+                bed.to_str().unwrap(),
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+}
+
+#[test]
+fn bedcov_cram_without_reference_fails_cleanly() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("bedcov-cram-no-ref");
+    let bed = tmp.join("r.bed");
+    let cram = htslib_fixtures_dir().join("range.cram");
+    std::fs::write(&bed, "CHROMOSOME_II\t2979\t2980\n").unwrap();
+
+    assert_ne!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &["bedcov", bed.to_str().unwrap(), cram.to_str().unwrap()],
         ))),
         0
     );

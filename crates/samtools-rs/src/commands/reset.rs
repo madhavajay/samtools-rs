@@ -24,7 +24,7 @@ use std::process::ExitCode;
 
 use htslib_rs::bam;
 use htslib_rs::bgzf;
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
 use htslib_rs::sam::{
     self,
     alignment::{RecordBuf, record::Flags},
@@ -32,6 +32,7 @@ use htslib_rs::sam::{
 
 use crate::aux_list::{AuxTag, parse_aux_list};
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
 
 const DEFAULT_DROP_TAGS: &[&[u8; 2]] = &[
     b"NM", b"MD", b"AS", b"XS", b"SA", b"MC", b"MQ", b"NH", b"HI", b"ms",
@@ -121,13 +122,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
-    let format = match detect_path(&input) {
+    let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,
         Err(e) => {
-            print_error(
-                "reset",
-                format!("failed to detect format of \"{}\": {}", input.display(), e),
-            );
+            print_error("reset", e.to_string());
             return ExitCode::from(1);
         }
     };

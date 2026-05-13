@@ -15,13 +15,15 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use htslib_rs::alignment_compat::AlignmentRecordSummary;
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
 
 use crate::bam_flag::{
     BAM_FDUP, BAM_FMUNMAP, BAM_FPAIRED, BAM_FPROPER_PAIR, BAM_FQCFAIL, BAM_FREAD1, BAM_FREAD2,
     BAM_FSECONDARY, BAM_FUNMAP,
 };
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 use crate::version::SAMTOOLS_VERSION;
 
 /// Entry point for `samtools stats`.
@@ -65,13 +67,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
-    let format = match detect_path(&input) {
+    let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,
         Err(e) => {
-            print_error(
-                "stats",
-                format!("failed to detect format of \"{}\": {}", input.display(), e),
-            );
+            print_error("stats", e.to_string());
             return ExitCode::from(1);
         }
     };
@@ -79,10 +78,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let summaries = match format.exact {
         Exact::Sam => htslib_rs::alignment_compat::summarize_sam_records_from_path(&input),
         Exact::Bam => htslib_rs::alignment_compat::summarize_bam_records_from_path(&input),
+        Exact::Cram => {
+            let Some(reference) = current_global_args().reference else {
+                print_error("stats", "CRAM input requires top-level --reference FILE");
+                return ExitCode::from(1);
+            };
+            htslib_rs::alignment_compat::summarize_cram_records_from_path_with_reference(
+                &input, reference,
+            )
+        }
         _ => {
             print_error(
                 "stats",
-                "only SAM and BAM input are currently supported (CRAM TODO)",
+                "only SAM, BAM, and CRAM input are currently supported",
             );
             return ExitCode::from(1);
         }
@@ -99,21 +107,28 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     };
 
-    let mut writer: Box<dyn Write> = match output.as_ref() {
-        Some(p) => match std::fs::File::create(p) {
-            Ok(f) => Box::new(f),
-            Err(e) => {
-                print_error_errno("stats", "open -o output", &e);
-                return ExitCode::from(1);
-            }
-        },
-        None => Box::new(io::stdout().lock()),
+    let mut writer = match sam_io::open_text_output(output.as_deref()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            print_error_errno("stats", "open -o output", &e);
+            return ExitCode::from(1);
+        }
     };
     if let Err(e) = write_stats(&mut writer, &summaries) {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            return ExitCode::SUCCESS;
+        }
         print_error_errno("stats", "write failed", &e);
         return ExitCode::from(1);
     }
-    ExitCode::SUCCESS
+    match sam_io::check_sam_close(&mut writer) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => {
+            print_error_errno("stats", "close output", &e);
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn write_stats(out: &mut dyn Write, recs: &[AlignmentRecordSummary]) -> io::Result<()> {

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
 
 /// Entry point for `samtools faidx`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -231,10 +232,7 @@ fn run_retrieval(input: &Path, opts: &Opts) -> Result<(), String> {
         return Err("no regions specified".into());
     }
 
-    let mut out: Box<dyn Write> = match opts.output.as_deref() {
-        Some(path) => Box::new(File::create(path).map_err(|e| e.to_string())?),
-        None => Box::new(io::stdout().lock()),
-    };
+    let mut out = sam_io::open_text_output(opts.output.as_deref()).map_err(|e| e.to_string())?;
 
     if opts.is_fastq {
         let index = read_or_build_fastq_index(input, opts.fai_path.as_deref())?;
@@ -299,6 +297,7 @@ fn run_retrieval(input: &Path, opts: &Opts) -> Result<(), String> {
         }
     }
 
+    sam_io::check_sam_close(&mut out).map_err(|e| e.to_string())?;
     Ok(())
 }
 

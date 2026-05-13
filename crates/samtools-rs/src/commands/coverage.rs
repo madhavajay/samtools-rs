@@ -18,15 +18,18 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use htslib_rs::bam;
 use htslib_rs::core::Region;
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
+use htslib_rs::sam;
 
 use crate::bam_flag::{BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FUNMAP};
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
 /// Entry point for `samtools coverage`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -78,35 +81,46 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    let mut has_cram = false;
     for path in &inputs {
-        let format = match detect_path(path) {
+        let format = match sam_io::sam_open_format(path) {
             Ok(f) => f,
             Err(e) => {
-                print_error(
-                    "coverage",
-                    format!("failed to detect format of \"{}\": {}", path.display(), e),
-                );
+                print_error("coverage", e.to_string());
                 return ExitCode::from(1);
             }
         };
-        if format.exact != Exact::Bam {
-            print_error(
-                "coverage",
-                "only BAM input is currently supported (SAM/CRAM TODO)",
-            );
-            return ExitCode::from(1);
+        match format.exact {
+            Exact::Bam => {}
+            Exact::Cram => has_cram = true,
+            _ => {
+                print_error(
+                    "coverage",
+                    "only BAM and reference-backed CRAM input are currently supported (SAM TODO)",
+                );
+                return ExitCode::from(1);
+            }
         }
     }
 
-    let mut writer: Box<dyn Write> = match output.as_ref() {
-        Some(p) => match File::create(p) {
-            Ok(f) => Box::new(f),
-            Err(e) => {
-                print_error_errno("coverage", "open -o output", &e);
+    let reference = if has_cram {
+        match current_global_args().reference {
+            Some(reference) => Some(reference),
+            None => {
+                print_error("coverage", "CRAM input requires top-level --reference FILE");
                 return ExitCode::from(1);
             }
-        },
-        None => Box::new(io::stdout().lock()),
+        }
+    } else {
+        None
+    };
+
+    let mut writer = match sam_io::open_text_output(output.as_deref()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            print_error_errno("coverage", "open -o output", &e);
+            return ExitCode::from(1);
+        }
     };
 
     if !no_header {
@@ -116,8 +130,22 @@ pub fn main(args: &[OsString]) -> ExitCode {
         );
     }
 
-    match run_coverage(&inputs, &mut *writer, min_mapq, region.as_deref()) {
-        Ok(()) => ExitCode::SUCCESS,
+    match run_coverage(
+        &inputs,
+        &mut *writer,
+        min_mapq,
+        region.as_deref(),
+        reference.as_deref(),
+    ) {
+        Ok(()) => match sam_io::check_sam_close(&mut writer) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+            Err(e) => {
+                print_error_errno("coverage", "close output", &e);
+                ExitCode::from(1)
+            }
+        },
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(e) => {
             print_error_errno("coverage", "coverage failed", &e);
             ExitCode::from(1)
@@ -130,70 +158,155 @@ fn run_coverage(
     out: &mut dyn Write,
     min_mapq: u8,
     region: Option<&str>,
+    reference: Option<&Path>,
 ) -> io::Result<()> {
     let exclude_flags = BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP;
-    let region = region
-        .map(|s| {
-            s.parse::<Region>().map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid region \"{}\": {}", s, e),
-                )
-            })
-        })
-        .transpose()?;
+    let region = region.map(parse_region).transpose()?;
 
     for path in inputs {
-        let mut reader = bam::io::Reader::new(File::open(path)?);
-        let header = reader.read_header()?;
-        let mut refs = coverage_targets(&header, region.as_ref())?;
-
-        if let Some(region) = region.as_ref() {
-            for record in htslib_rs::alignment_compat::query_bam_records_from_path(path, region)? {
-                update_targets(&mut refs, &record, exclude_flags, min_mapq);
-            }
-        } else {
-            let mut record = bam::Record::default();
-            loop {
-                let n = reader.read_record(&mut record)?;
-                if n == 0 {
-                    break;
-                }
-                update_targets(&mut refs, &record, exclude_flags, min_mapq);
-            }
-        }
-
-        for rs in &refs {
-            let covbases = rs.covered.iter().filter(|&&b| b).count();
-            let coverage_pct = if rs.length > 0 {
-                covbases as f64 / rs.length as f64 * 100.0
-            } else {
-                0.0
-            };
-            let meandepth = if rs.length > 0 {
-                rs.aligned_bases as f64 / rs.length as f64
-            } else {
-                0.0
-            };
-            let meanmapq = if rs.num_reads > 0 {
-                rs.mapq_sum as f64 / rs.num_reads as f64
-            } else {
-                0.0
-            };
-            writeln!(
+        match sam_io::sam_open_format(path)?.exact {
+            Exact::Bam => run_bam_coverage(path, out, exclude_flags, min_mapq, region.as_ref())?,
+            Exact::Cram => run_cram_coverage(
+                path,
                 out,
-                "{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
-                rs.name,
-                rs.output_start,
-                rs.output_end,
-                rs.num_reads,
-                covbases,
-                coverage_pct,
-                meandepth,
-                0.0_f64, // meanbaseq — not computed without per-base access
-                meanmapq,
-            )?;
+                reference.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "CRAM input requires top-level --reference FILE",
+                    )
+                })?,
+                exclude_flags,
+                min_mapq,
+                region.as_ref(),
+            )?,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "only BAM and reference-backed CRAM input are currently supported",
+                ));
+            }
         }
+    }
+    Ok(())
+}
+
+fn parse_region(s: &str) -> io::Result<Region> {
+    s.parse::<Region>().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid region \"{}\": {}", s, e),
+        )
+    })
+}
+
+fn run_bam_coverage(
+    path: &Path,
+    out: &mut dyn Write,
+    exclude_flags: u32,
+    min_mapq: u8,
+    region: Option<&Region>,
+) -> io::Result<()> {
+    let mut reader = bam::io::Reader::new(File::open(path)?);
+    let header = reader.read_header()?;
+    let mut refs = coverage_targets(&header, region)?;
+
+    if let Some(region) = region {
+        for record in htslib_rs::alignment_compat::query_bam_records_from_path(path, region)? {
+            update_targets(&header, &mut refs, &record, exclude_flags, min_mapq);
+        }
+    } else {
+        let mut record = bam::Record::default();
+        loop {
+            let n = reader.read_record(&mut record)?;
+            if n == 0 {
+                break;
+            }
+            update_targets(&header, &mut refs, &record, exclude_flags, min_mapq);
+        }
+    }
+
+    emit_coverage(out, &refs)
+}
+
+fn run_cram_coverage(
+    path: &Path,
+    out: &mut dyn Write,
+    reference: &Path,
+    exclude_flags: u32,
+    min_mapq: u8,
+    region: Option<&Region>,
+) -> io::Result<()> {
+    let header = htslib_rs::alignment_compat::read_cram_header_from_path(path)?;
+    let mut refs = coverage_targets(&header, region)?;
+
+    if let Some(region) = region {
+        for record in htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
+            path, region, reference,
+        )? {
+            update_targets(&header, &mut refs, &record, exclude_flags, min_mapq);
+        }
+    } else {
+        for rs in &mut refs {
+            let region = ref_region(rs)?;
+            for record in htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
+                path, &region, reference,
+            )? {
+                update_target(&header, rs, &record, exclude_flags, min_mapq);
+            }
+        }
+    }
+
+    emit_coverage(out, &refs)
+}
+
+fn ref_region(target: &RefStats) -> io::Result<Region> {
+    format!(
+        "{}:{}-{}",
+        target.name, target.output_start, target.output_end
+    )
+    .parse::<Region>()
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "region \"{}:{}-{}\": {}",
+                target.name, target.output_start, target.output_end, e
+            ),
+        )
+    })
+}
+
+fn emit_coverage(out: &mut dyn Write, refs: &[RefStats]) -> io::Result<()> {
+    for rs in refs {
+        let covbases = rs.covered.iter().filter(|&&b| b).count();
+        let coverage_pct = if rs.length > 0 {
+            covbases as f64 / rs.length as f64 * 100.0
+        } else {
+            0.0
+        };
+        let meandepth = if rs.length > 0 {
+            rs.aligned_bases as f64 / rs.length as f64
+        } else {
+            0.0
+        };
+        let meanmapq = if rs.num_reads > 0 {
+            rs.mapq_sum as f64 / rs.num_reads as f64
+        } else {
+            0.0
+        };
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+            rs.name,
+            rs.output_start,
+            rs.output_end,
+            rs.num_reads,
+            covbases,
+            coverage_pct,
+            meandepth,
+            0.0_f64,
+            meanmapq,
+        )?;
     }
     Ok(())
 }
@@ -286,25 +399,81 @@ fn coverage_targets(
     }
 }
 
-fn update_targets(refs: &mut [RefStats], record: &bam::Record, exclude_flags: u32, min_mapq: u8) {
-    let flag = u16::from(record.flags()) as u32;
+fn update_targets(
+    header: &sam::Header,
+    refs: &mut [RefStats],
+    record: &(impl sam::alignment::Record + ?Sized),
+    exclude_flags: u32,
+    min_mapq: u8,
+) {
+    let flag = match record.flags() {
+        Ok(flags) => u16::from(flags) as u32,
+        Err(_) => return,
+    };
     if flag & exclude_flags != 0 {
         return;
     }
-    let mapq = record.mapping_quality().map(u8::from).unwrap_or(0);
+    let mapq = match record.mapping_quality() {
+        Some(Ok(q)) => u8::from(q),
+        Some(Err(_)) => return,
+        None => 0,
+    };
     if mapq < min_mapq {
         return;
     }
-    let tid = match record.reference_sequence_id().and_then(|r| r.ok()) {
-        Some(t) => t,
-        None => return,
-    };
-    let start = match record.alignment_start().and_then(|r| r.ok()) {
-        Some(p) => usize::from(p) - 1,
-        None => return,
+    let tid = match record.reference_sequence_id(header).transpose() {
+        Ok(Some(t)) => t,
+        _ => return,
     };
     let Some(rs) = refs.iter_mut().find(|rs| rs.tid == tid) else {
         return;
+    };
+
+    update_target_after_filter(rs, record, mapq);
+}
+
+fn update_target(
+    header: &sam::Header,
+    rs: &mut RefStats,
+    record: &(impl sam::alignment::Record + ?Sized),
+    exclude_flags: u32,
+    min_mapq: u8,
+) {
+    let flag = match record.flags() {
+        Ok(flags) => u16::from(flags) as u32,
+        Err(_) => return,
+    };
+    if flag & exclude_flags != 0 {
+        return;
+    }
+    let mapq = match record.mapping_quality() {
+        Some(Ok(q)) => u8::from(q),
+        Some(Err(_)) => return,
+        None => 0,
+    };
+    if mapq < min_mapq {
+        return;
+    }
+    if record
+        .reference_sequence_id(header)
+        .transpose()
+        .unwrap_or_default()
+        != Some(rs.tid)
+    {
+        return;
+    }
+
+    update_target_after_filter(rs, record, mapq);
+}
+
+fn update_target_after_filter(
+    rs: &mut RefStats,
+    record: &(impl sam::alignment::Record + ?Sized),
+    mapq: u8,
+) {
+    let start = match record.alignment_start().transpose() {
+        Ok(Some(p)) => usize::from(p) - 1,
+        _ => return,
     };
 
     rs.num_reads += 1;

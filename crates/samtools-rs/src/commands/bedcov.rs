@@ -13,10 +13,14 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
+use htslib_rs::sam;
 
 use crate::bam_flag::{BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FUNMAP};
+use crate::bedidx::parse_bed_line;
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
 /// Entry point for `samtools bedcov`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -76,31 +80,46 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let bed = positionals[0].clone();
     let bams: Vec<PathBuf> = positionals[1..].to_vec();
 
+    let mut has_cram = false;
     for path in &bams {
-        let format = match detect_path(path) {
+        let format = match sam_io::sam_open_format(path) {
             Ok(f) => f,
             Err(e) => {
-                print_error(
-                    "bedcov",
-                    format!("failed to detect format of \"{}\": {}", path.display(), e),
-                );
+                print_error("bedcov", e.to_string());
                 return ExitCode::from(1);
             }
         };
-        if format.exact != Exact::Bam {
-            print_error(
-                "bedcov",
-                "only BAM input is currently supported (SAM/CRAM TODO)",
-            );
-            return ExitCode::from(1);
+        match format.exact {
+            Exact::Bam => {}
+            Exact::Cram => has_cram = true,
+            _ => {
+                print_error(
+                    "bedcov",
+                    "only BAM and reference-backed CRAM input are currently supported (SAM TODO)",
+                );
+                return ExitCode::from(1);
+            }
         }
     }
+
+    let reference = if has_cram {
+        match current_global_args().reference {
+            Some(reference) => Some(reference),
+            None => {
+                print_error("bedcov", "CRAM input requires top-level --reference FILE");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
 
     let opts = BedcovOpts {
         min_mapq,
         print_header,
         print_read_count,
         min_depth,
+        reference: reference.as_deref(),
     };
     let mut stdout = io::stdout().lock();
     match run_bedcov(&mut stdout, &bed, &bams, &opts) {
@@ -113,14 +132,15 @@ pub fn main(args: &[OsString]) -> ExitCode {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct BedcovOpts {
+struct BedcovOpts<'a> {
     min_mapq: u8,
     print_header: bool,
     print_read_count: bool,
     min_depth: Option<u32>,
+    reference: Option<&'a Path>,
 }
 
-fn run_bedcov<W>(out: &mut W, bed: &Path, bams: &[PathBuf], opts: &BedcovOpts) -> io::Result<()>
+fn run_bedcov<W>(out: &mut W, bed: &Path, bams: &[PathBuf], opts: &BedcovOpts<'_>) -> io::Result<()>
 where
     W: Write + ?Sized,
 {
@@ -151,20 +171,27 @@ where
             wrote_header = true;
         }
 
-        let mut fields = trimmed.split('\t');
-        let chrom = fields.next().unwrap_or("");
-        let beg: i64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        let end: i64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        if chrom.is_empty() || end <= beg {
+        let Some(interval) = parse_bed_line(trimmed) else {
             continue;
-        }
+        };
+        let (Ok(start), Ok(end)) = (i64::try_from(interval.start), i64::try_from(interval.end))
+        else {
+            continue;
+        };
 
         write!(out, "{}", trimmed)?;
         let mut depth_counts = Vec::new();
         let mut read_counts = Vec::new();
         for bam_path in bams {
-            let metrics =
-                compute_region_metrics(bam_path, chrom, beg, end, opts.min_mapq, opts.min_depth)?;
+            let metrics = compute_region_metrics(
+                bam_path,
+                &interval.chrom,
+                start,
+                end,
+                opts.min_mapq,
+                opts.min_depth,
+                opts.reference,
+            )?;
             let cov = metrics.coverage;
             write!(out, "\t{}", cov)?;
             if opts.min_depth.is_some() {
@@ -190,7 +217,7 @@ fn write_bedcov_header<W>(
     bed_header: Option<&str>,
     field_count: usize,
     bams: &[PathBuf],
-    opts: &BedcovOpts,
+    opts: &BedcovOpts<'_>,
 ) -> io::Result<()>
 where
     W: Write + ?Sized,
@@ -249,13 +276,22 @@ struct RegionMetrics {
     read_count: u64,
 }
 
+#[derive(Clone, Copy)]
+struct RegionMetricConfig {
+    beg: i64,
+    end: i64,
+    exclude_flags: u32,
+    min_mapq: u8,
+}
+
 fn compute_region_metrics(
-    bam_path: &Path,
+    alignment_path: &Path,
     chrom: &str,
     beg: i64,
     end: i64,
     min_mapq: u8,
     min_depth: Option<u32>,
+    reference: Option<&Path>,
 ) -> io::Result<RegionMetrics> {
     let region_str = format!("{}:{}-{}", chrom, beg + 1, end);
     let region: htslib_rs::core::Region = region_str.parse().map_err(|e| {
@@ -264,7 +300,6 @@ fn compute_region_metrics(
             format!("invalid region \"{}\": {}", region_str, e),
         )
     })?;
-    let records = htslib_rs::alignment_compat::query_bam_records_from_path(bam_path, &region)?;
     let exclude_flags = BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP;
     let mut depths = if min_depth.is_some() && end > beg {
         Some(vec![0u32; (end - beg) as usize])
@@ -273,55 +308,61 @@ fn compute_region_metrics(
     };
 
     let mut metrics = RegionMetrics::default();
-    for rec in records {
-        let flag = u16::from(rec.flags()) as u32;
-        if flag & exclude_flags != 0 {
-            continue;
-        }
-        let mapq = rec.mapping_quality().map(u8::from).unwrap_or(0);
-        if mapq < min_mapq {
-            continue;
-        }
-        metrics.read_count += 1;
-        let start = rec
-            .alignment_start()
-            .and_then(|res| res.ok())
-            .map(|p| usize::from(p) as i64)
-            .unwrap_or(0);
-        let mut ref_pos = start - 1; // 0-based
-        for op_result in rec.cigar().iter() {
-            let op = match op_result {
-                Ok(op) => op,
-                Err(_) => break,
-            };
-            let kind = op.kind();
-            let len = op.len() as i64;
-            use htslib_rs::sam::alignment::record::cigar::op::Kind;
-            match kind {
-                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                    // Aligned to reference; count overlap with [beg, end).
-                    let op_end = ref_pos + len;
-                    let lo = ref_pos.max(beg);
-                    let hi = op_end.min(end);
-                    if hi > lo {
-                        metrics.coverage += hi - lo;
-                        if let Some(depths) = depths.as_mut() {
-                            let offset_start = (lo - beg) as usize;
-                            let offset_end = (hi - beg) as usize;
-                            for depth in &mut depths[offset_start..offset_end] {
-                                *depth = depth.saturating_add(1);
-                            }
-                        }
-                    }
-                    ref_pos = op_end;
-                }
-                Kind::Deletion | Kind::Skip => {
-                    ref_pos += len;
-                }
-                Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
+    match sam_io::sam_open_format(alignment_path)?.exact {
+        Exact::Bam => {
+            let header = htslib_rs::alignment_compat::read_bam_header_from_path(alignment_path)?;
+            for rec in
+                htslib_rs::alignment_compat::query_bam_records_from_path(alignment_path, &region)?
+            {
+                update_region_metrics(
+                    &header,
+                    &rec,
+                    RegionMetricConfig {
+                        beg,
+                        end,
+                        exclude_flags,
+                        min_mapq,
+                    },
+                    &mut metrics,
+                    depths.as_mut(),
+                );
             }
         }
+        Exact::Cram => {
+            let Some(reference) = reference else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "CRAM input requires top-level --reference FILE",
+                ));
+            };
+            let header = htslib_rs::alignment_compat::read_cram_header_from_path(alignment_path)?;
+            for rec in htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
+                alignment_path,
+                &region,
+                reference,
+            )? {
+                update_region_metrics(
+                    &header,
+                    &rec,
+                    RegionMetricConfig {
+                        beg,
+                        end,
+                        exclude_flags,
+                        min_mapq,
+                    },
+                    &mut metrics,
+                    depths.as_mut(),
+                );
+            }
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only BAM and reference-backed CRAM input are currently supported",
+            ));
+        }
     }
+
     if let Some(min_depth) = min_depth {
         metrics.depth_bases = depths
             .as_deref()
@@ -331,6 +372,72 @@ fn compute_region_metrics(
             .count() as u64;
     }
     Ok(metrics)
+}
+
+fn update_region_metrics(
+    header: &sam::Header,
+    rec: &(impl sam::alignment::Record + ?Sized),
+    config: RegionMetricConfig,
+    metrics: &mut RegionMetrics,
+    mut depths: Option<&mut Vec<u32>>,
+) {
+    let flag = match rec.flags() {
+        Ok(flags) => u16::from(flags) as u32,
+        Err(_) => return,
+    };
+    if flag & config.exclude_flags != 0 {
+        return;
+    }
+    let mapq = match rec.mapping_quality() {
+        Some(Ok(q)) => u8::from(q),
+        Some(Err(_)) => return,
+        None => 0,
+    };
+    if mapq < config.min_mapq {
+        return;
+    }
+    if rec.reference_sequence_id(header).transpose().is_err() {
+        return;
+    }
+
+    metrics.read_count += 1;
+    let start = match rec.alignment_start().transpose() {
+        Ok(Some(p)) => usize::from(p) as i64,
+        _ => return,
+    };
+    let mut ref_pos = start - 1; // 0-based
+    for op_result in rec.cigar().iter() {
+        let op = match op_result {
+            Ok(op) => op,
+            Err(_) => break,
+        };
+        let kind = op.kind();
+        let len = op.len() as i64;
+        use htslib_rs::sam::alignment::record::cigar::op::Kind;
+        match kind {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                // Aligned to reference; count overlap with [beg, end).
+                let op_end = ref_pos + len;
+                let lo = ref_pos.max(config.beg);
+                let hi = op_end.min(config.end);
+                if hi > lo {
+                    metrics.coverage += hi - lo;
+                    if let Some(depths) = depths.as_deref_mut() {
+                        let offset_start = (lo - config.beg) as usize;
+                        let offset_end = (hi - config.beg) as usize;
+                        for depth in &mut depths[offset_start..offset_end] {
+                            *depth = depth.saturating_add(1);
+                        }
+                    }
+                }
+                ref_pos = op_end;
+            }
+            Kind::Deletion | Kind::Skip => {
+                ref_pos += len;
+            }
+            Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
+        }
+    }
 }
 
 fn print_usage() -> io::Result<()> {

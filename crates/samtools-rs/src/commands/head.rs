@@ -11,10 +11,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use flate2::read::MultiGzDecoder;
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
 
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::header_text::read_raw_header_text;
+use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
 /// Entry point for `samtools head`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -170,8 +172,7 @@ fn is_bgzf_path(path: &Path) -> io::Result<bool> {
 /// has already been emitted by the caller.
 fn write_first_records<W: Write>(out: &mut W, path: &Path, n: u64) -> io::Result<()> {
     let limit = usize::try_from(n).unwrap_or(usize::MAX);
-    let format =
-        detect_path(path).map_err(|e| io::Error::other(format!("failed to detect format: {e}")))?;
+    let format = sam_io::sam_open_format(path)?;
     match format.exact {
         Exact::Sam => stream_sam_records(out, path, limit),
         Exact::Bam => {
@@ -184,10 +185,22 @@ fn write_first_records<W: Write>(out: &mut W, path: &Path, n: u64) -> io::Result
             let tail = strip_header_lines(text.as_bytes());
             out.write_all(tail)
         }
-        Exact::Cram => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "CRAM record extraction requires a reference (not yet wired up for head)",
-        )),
+        Exact::Cram => {
+            let reference = current_global_args().reference.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "CRAM record extraction requires --reference",
+                )
+            })?;
+            let text =
+                htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+                    path,
+                    reference,
+                    Some(limit),
+                )?;
+            let tail = strip_header_lines(text.as_bytes());
+            out.write_all(tail)
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported format",

@@ -13,10 +13,11 @@ use std::process::ExitCode;
 
 use htslib_rs::bam;
 use htslib_rs::bgzf;
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
 use htslib_rs::sam;
 
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
 
 /// Entry point for `samtools merge`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -97,13 +98,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     for path in &inputs {
-        let format = match detect_path(path) {
+        let format = match sam_io::sam_open_format(path) {
             Ok(f) => f,
             Err(e) => {
-                print_error(
-                    "merge",
-                    format!("failed to detect format of \"{}\": {}", path.display(), e),
-                );
+                print_error("merge", e.to_string());
                 return ExitCode::from(1);
             }
         };

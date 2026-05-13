@@ -12,9 +12,10 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use htslib_rs::format::{Category, Exact, detect_path};
+use htslib_rs::format::{Category, Exact};
 
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
 
 /// Entry point for `samtools index`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -154,7 +155,7 @@ fn nonexistent_or_index(path: &Path) -> bool {
         return true;
     }
     matches!(
-        detect_path(path).map(|f| f.category),
+        sam_io::sam_open_format(path).map(|f| f.category),
         Ok(Category::IndexFile)
     )
 }
@@ -165,8 +166,7 @@ fn build_index(
     csi: bool,
     min_shift: Option<u8>,
 ) -> std::io::Result<()> {
-    let format = detect_path(src)
-        .map_err(|e| std::io::Error::other(format!("failed to detect format: {e}")))?;
+    let format = sam_io::sam_open_format(src)?;
     match format.exact {
         Exact::Bam => {
             if csi {

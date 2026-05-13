@@ -29,10 +29,11 @@ use std::process::ExitCode;
 
 use htslib_rs::bam;
 use htslib_rs::bgzf;
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
 use htslib_rs::sam;
 
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
 
 /// Entry point for `samtools sort`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -97,13 +98,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
-    let format = match detect_path(&input) {
+    let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,
         Err(e) => {
-            print_error(
-                "sort",
-                format!("failed to detect format of \"{}\": {}", input.display(), e),
-            );
+            print_error("sort", e.to_string());
             return ExitCode::from(1);
         }
     };

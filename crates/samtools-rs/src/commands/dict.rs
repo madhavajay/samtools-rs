@@ -20,6 +20,7 @@ use flate2::read::MultiGzDecoder;
 use md5::{Digest, Md5};
 
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
 
 /// Entry point for `samtools dict`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -49,19 +50,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
         None => None,
     };
 
-    let mut out: Box<dyn Write> = match opts.output_path.as_ref() {
-        Some(p) => match File::create(p) {
-            Ok(f) => Box::new(f),
-            Err(e) => {
-                print_error_errno(
-                    "dict",
-                    format!("Cannot open {} for writing", p.display()),
-                    &e,
-                );
-                return ExitCode::from(1);
-            }
-        },
-        None => Box::new(io::stdout().lock()),
+    let mut out = match sam_io::open_text_output(opts.output_path.as_deref()) {
+        Ok(out) => out,
+        Err(e) => {
+            let msg = opts
+                .output_path
+                .as_ref()
+                .map(|p| format!("Cannot open {} for writing", p.display()))
+                .unwrap_or_else(|| "Cannot open stdout for writing".to_string());
+            print_error_errno("dict", msg, &e);
+            return ExitCode::from(1);
+        }
     };
 
     if opts.header {
@@ -69,7 +68,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     match write_dict(&mut out, &input_path, &opts, is_alt.as_ref()) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => match sam_io::check_sam_close(&mut out) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+            Err(e) => {
+                print_error_errno("dict", "close output", &e);
+                ExitCode::from(1)
+            }
+        },
         Err(e) => {
             print_error_errno("dict", format!("Cannot open {}", input_path.display()), &e);
             ExitCode::from(1)

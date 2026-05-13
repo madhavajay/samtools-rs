@@ -15,10 +15,11 @@ use std::process::ExitCode;
 
 use htslib_rs::bam;
 use htslib_rs::bgzf;
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
 use htslib_rs::sam;
 
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
 
 /// Entry point for `samtools cat`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -70,17 +71,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     // Determine input format from the first file.
-    let format = match detect_path(&inputs[0]) {
+    let format = match sam_io::sam_open_format(&inputs[0]) {
         Ok(f) => f,
         Err(e) => {
-            print_error(
-                "cat",
-                format!(
-                    "failed to detect format of \"{}\": {}",
-                    inputs[0].display(),
-                    e
-                ),
-            );
+            print_error("cat", e.to_string());
             return ExitCode::from(1);
         }
     };

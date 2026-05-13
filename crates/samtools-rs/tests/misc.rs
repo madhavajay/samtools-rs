@@ -4,11 +4,15 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Mutex;
 
 use samtools_rs::commands::{
     bedcov, cat, faidx, fastq, flagstat, fqidx, idxstats, import, index, reheader, rmdup, samples,
     split,
 };
+use samtools_rs::run as samtools_run;
+
+static GLOBAL_ARGS_LOCK: Mutex<()> = Mutex::new(());
 
 fn fixtures_dir() -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -18,6 +22,18 @@ fn fixtures_dir() -> PathBuf {
         .parent()
         .unwrap()
         .join("samtools")
+        .join("test")
+}
+
+fn htslib_fixtures_dir() -> PathBuf {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    PathBuf::from(manifest)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("htslib-rs")
+        .join("htslib")
         .join("test")
 }
 
@@ -51,6 +67,41 @@ fn flagstat_succeeds() {
     let p = sample_bam();
     assert_eq!(
         exit_to_u8(flagstat::main(&argv("flagstat", &[p.to_str().unwrap()]))),
+        0
+    );
+}
+
+#[test]
+fn flagstat_cram_uses_top_level_reference() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "flagstat",
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+}
+
+#[test]
+fn flagstat_cram_without_reference_fails_cleanly() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let cram = htslib_fixtures_dir().join("range.cram");
+
+    assert_ne!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &["flagstat", cram.to_str().unwrap()],
+        ))),
         0
     );
 }
@@ -101,6 +152,41 @@ fn idxstats_sam_uses_slow_path() {
     .unwrap();
     assert_eq!(
         exit_to_u8(idxstats::main(&argv("idxstats", &[sam.to_str().unwrap()]))),
+        0
+    );
+}
+
+#[test]
+fn idxstats_cram_uses_top_level_reference() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "idxstats",
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+}
+
+#[test]
+fn idxstats_cram_without_reference_fails_cleanly() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let cram = htslib_fixtures_dir().join("range.cram");
+
+    assert_ne!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &["idxstats", cram.to_str().unwrap()],
+        ))),
         0
     );
 }
