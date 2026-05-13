@@ -17,6 +17,7 @@ pub mod error;
 pub mod header_text;
 pub mod logging;
 pub mod native;
+pub mod pg;
 pub mod sam_global;
 pub mod version;
 
