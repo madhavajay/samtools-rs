@@ -63,7 +63,7 @@ Three roughly orthogonal directions, each substantial:
 
 1. **Unblock the pileup-dependent subcommands.** Add a `bam_plp_*`-shaped iterator API to `htslib-rs::alignment_compat`. Unlocks: `mpileup`, `consensus`, `targetcut`, `phase`, `ampliconstats`, and the exact (byte-parity) versions of `depth`/`coverage`/`bedcov`. Estimate: days of careful design in `htslib-rs`, then each subcommand is its own piece on top.
 2. **Deepen the existing 27 partials toward byte-parity.** Pick a subcommand (probably `view` as the anchor) and drive every flag combination from `test.pl` to byte-for-byte. This is where `@PG` insertion, full filter expression support, and CRAM I/O need to land. Estimate: each `test_<name>` group is hours-to-a-day.
-3. **Wire the upstream `test.pl` as a gating CI run.** Currently parity-gate fires `|| true`. Flip it as subcommands land, using `docs/test-status.md` to track per-test status (passing / skipped / not-yet-ported / cosmetic-diff). Forces parity attention.
+3. **Wire the upstream `test.pl` as a gating CI run.** The parity job stages the Rust binary at the harness' ignored `samtools/samtools` path and still fires `|| true`. Flip it as subcommands land, using `docs/test-status.md` to track per-test status (passing / skipped / not-yet-ported / cosmetic-diff). Forces parity attention.
 
 Pick a direction and the per-subcommand TODOs below get rearranged accordingly.
 
@@ -219,7 +219,7 @@ The waves are ordered to land foundational machinery first (read/write/index) an
 
 ## Phase 4: Test Harness Integration
 
-- [ ] **Parity gate setup**: confirm `samtools/test/test.pl` can be driven via `-e samtools=<rust-binary-path>` without modifying the harness. Verify `regression.sh` still works.
+- [~] **Parity gate setup**: confirmed the pinned upstream harness does not honor `-e samtools=<rust-binary-path>` for most commands because it constructs commands from `$$opts{bin}/samtools` after option parsing. CI now stages the Rust binary at the ignored `samtools/samtools` path and runs `cd samtools && perl test/test.pl || true` without modifying the harness. **Pending:** verify `regression.sh` and flip the parity job from advisory to required once the tracked groups pass.
 - [ ] **`@PG` handling**: where upstream expected outputs include `@PG` lines with a specific VN that we cannot reproduce, set `ignore_pg_header => 1` in those tests. Avoid touching the actual expected output files.
 - [x] **Status ledger**: `docs/test-status.md` tracks the upstream `test.pl` groups as `passing` / `partial` / `not-yet-ported` / `blocked`, including why CI still runs the parity harness with `|| true`.
 - [ ] **Run progressively**: as each subcommand lands in Phase 3, enable its `test_<name>` in CI. Disabled tests should be tracked in `docs/test-status.md` as `not-yet-ported` (NOT just commented out).
@@ -277,7 +277,8 @@ cargo test --workspace
 
 # parity gate (against checked-in expected outputs)
 cargo build --release
-cd samtools/test && perl test.pl -e samtools=$PWD/../../target/release/samtools
+cp target/release/samtools samtools/samtools
+cd samtools && perl test/test.pl
 
 # optional: refresh expected outputs from C samtools (local dev only)
 cd samtools && autoreconf -i && ./configure && make

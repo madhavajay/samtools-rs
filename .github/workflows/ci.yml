@@ -45,16 +45,17 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Install Perl + Carp
-        run: sudo apt-get update && sudo apt-get install -y perl
+      - name: Install Perl + bgzip
+        run: sudo apt-get update && sudo apt-get install -y perl tabix
 
       - name: Build release binary
         run: cargo build --release -p samtools-rs-cli
 
       - name: Run samtools/test/test.pl against Rust binary
         run: |
-          cd samtools/test
-          perl test.pl -e samtools="$GITHUB_WORKSPACE/target/release/samtools" || true
+          cp "$GITHUB_WORKSPACE/target/release/samtools" "$GITHUB_WORKSPACE/samtools/samtools"
+          cd samtools
+          perl test/test.pl || true
           # Note: tests are expected to fail until subcommands are implemented.
           # This step is kept in CI as a regression watch — the exit code is
           # intentionally not propagated yet. Phase 4 of TODO.md flips this.

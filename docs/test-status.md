@@ -20,8 +20,8 @@ Status values:
 
 - Rust gate: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   and `cargo test --workspace` are expected to pass.
-- Parity gate: `.github/workflows/ci.yml` runs
-  `perl test.pl -e samtools="$GITHUB_WORKSPACE/target/release/samtools" || true`.
+- Parity gate: `.github/workflows/ci.yml` stages the Rust binary at the ignored
+  `samtools/samtools` path and runs `cd samtools && perl test/test.pl || true`.
   Remove `|| true` only after the rows below are all `passing` or explicitly
   skipped with documented rationale.
 
