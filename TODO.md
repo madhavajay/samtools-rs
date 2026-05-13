@@ -23,7 +23,7 @@ htslib-rs extensions landed during this work:
 - BAM/CRAM region and flag-filter writers: `write_bam_regions_from_path`, `write_bam_records_with_required_flags_from_path`, `write_cram_regions_as_bam_from_path_with_reference`, `write_cram_records_with_required_flags_as_bam_from_path_with_reference`
 - FASTQ import helpers: paired FASTQ input, index FASTQ input, aux-tag allow-listing, barcode quality tags, and read group tag insertion.
 
-Rust tests: 121 currently passing (quickcheck:6, flags:3, dict:1, view:4, head:3, sort_merge:4, misc:52, stats_wave_d:20, test_status:1, library/command unit tests:27) — `cargo test -p samtools-rs` green; `cargo fmt --check` and `cargo clippy -p samtools-rs --all-targets -- -D warnings` also clean as of the latest full run.
+Rust tests: 127 currently passing (quickcheck:6, flags:3, dict:1, view:4, head:3, sort_merge:4, misc:52, stats_wave_d:20, test_status:1, library/command unit tests:33) — `cargo test -p samtools-rs` green; `cargo fmt --check` and `cargo clippy -p samtools-rs --all-targets -- -D warnings` also clean as of the latest full run.
 
 ## What's Next — Decision Points
 
@@ -145,7 +145,7 @@ These are used by nearly every subcommand and must exist before subcommands can 
 - [x] **`print_error` / `print_error_errno`** (`samtools-rs/src/diagnostics.rs`): subcommand-prefixed stderr printers matching upstream's `samtools <subcommand>: message` format and errno appending.
 - [x] **BAM flag bits + parse/format** (`samtools-rs/src/bam_flag.rs`): the `BAM_F*` constants plus `bam_str2flag` / `bam_flag2str` equivalents. Used by `flags` and (later) `view` / `flagstat`.
 - [x] **Raw header text extractor** (`samtools-rs/src/header_text.rs`): preserves original `@`-line order for SAM, BAM, and CRAM inputs. Required by `head`, `view -h`, `samples`, etc. — noodles' canonical writer reorders headers, which breaks byte parity.
-- [ ] **BAM sanitizer** (`samtools-rs/src/sanitize.rs`): port `samtools.h`'s `FIX_*` flags and `bam_sanitize` / `bam_sanitize_options`. Used by sort/merge/view/markdup.
+- [~] **BAM sanitizer** (`samtools-rs/src/sanitize.rs`): partial port of `samtools.h`'s `FIX_*` flags and `bam_sanitize_options`, including upstream reset semantics for `all` / `none` / `off`, `cigarx` implying `cigdup`, and the parser's special `on` behavior. **Pending:** record-level `bam_sanitize` mutation for position, mapping quality, unmapped CIGAR clearing, NM/MD/CG/SM aux stripping, CIGAR `=`/`X` conversion, and duplicate CIGAR op merging.
 - [~] **@PG add helper** (`samtools-rs/src/pg.rs`): shared helper now builds raw-header `@PG` lines with HTSlib-style argv stringification, generated unique IDs, `PN`, `VN`, `CL`, and `PP` links for terminal program chains. **Pending:** integrate it into output-producing subcommands and verify byte-parity against upstream `sam_hdr_add_pg` for complex merge/split/reheader cases.
 - [x] **Aux-tag list parser** (`samtools-rs/src/aux_list.rs`): port `parse_aux_list` from `sam_utils.c`. Used by `view`, `reset`, `fastq`, and future aux-aware commands.
 - [ ] **BED index** (`samtools-rs/src/bedidx.rs`): port `bedidx.c` (interval tree over BED regions). Used by `view -L`, `bedcov`, `ampliconclip`, `mpileup`.

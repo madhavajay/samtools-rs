@@ -19,6 +19,7 @@ pub mod logging;
 pub mod native;
 pub mod pg;
 pub mod sam_global;
+pub mod sanitize;
 pub mod version;
 
 pub use dispatch::run;
