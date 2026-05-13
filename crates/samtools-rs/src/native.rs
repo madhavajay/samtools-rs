@@ -125,7 +125,7 @@ where
         htslib_rs::alignment_compat::view_bam_as_fastq_split_text_from_path_with_flag_filter_and_suffix(
             source,
             0,
-            0,
+            0x900,
             0,
             false,
         )?;
@@ -437,6 +437,47 @@ where
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "view_region currently supports BAM and CRAM input",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Writes all BAM records for templates overlapping one indexed region.
+///
+/// This is the native equivalent of the VNtyper extraction shape
+/// `samtools view -P -b input.bam region -o slice.bam`.
+pub fn view_region_templates_native<P, Q, S>(
+    input_bam: P,
+    region: S,
+    output_bam: Q,
+    include_unmapped: bool,
+    _threads: Option<usize>,
+) -> io::Result<()>
+where
+    P: AsRef<Path>,
+    Q: AsRef<Path>,
+    S: AsRef<str>,
+{
+    let input = input_bam.as_ref();
+    let region = parse_region(region.as_ref())?;
+    let output = File::create(output_bam)?;
+    match detect_path(input)
+        .map_err(|e| io::Error::other(format!("failed to detect input format: {e}")))?
+        .exact
+    {
+        Exact::Bam => {
+            htslib_rs::alignment_compat::write_bam_templates_from_region_path(
+                input,
+                &region,
+                include_unmapped,
+                output,
+            )?;
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "view_region_templates currently supports BAM input",
             ));
         }
     }
