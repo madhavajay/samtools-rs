@@ -25,21 +25,37 @@ Rust tests: 88 currently passing (quickcheck:6, flags:3, dict:1, view:4, head:3,
 
 ## What's Next — Decision Points
 
-### Temporary Priority: BioScript VNtyper BAM Path
+### BioScript VNtyper Native API Status
 
-Until this section is retired, prioritize the API work in [`quick-todo.md`](quick-todo.md) over the broader parity directions below. The immediate target is a native samtools-rs path for BioScript VNtyper, not full upstream `test.pl` completion.
+The temporary VNtyper priority pass is complete and folded into the main TODO. The implemented native API surface in `crates/samtools-rs/src/native.rs` now covers the BAM path needed by BioScript VNtyper without shelling out:
 
-Critical MVP order:
-1. `view_region_native` for indexed BAM region slicing (`samtools view -P -b input.bam chr:start-end -o sliced.bam`).
-2. `fastq_native` / `bam_to_fastq_pair` for name-sorted BAM to paired FASTQ outputs.
-3. `depth_native` / `depth_summary` for VNTR coverage QC.
-4. `index` for any produced BAM that needs random access.
+P0 — required for the BioScript VNtyper BAM path:
 
-Next after MVP:
-1. `sort(by_name = true)` and coordinate sort polish.
-2. `merge` for sliced + unmapped read workflows.
-3. `quickcheck` API exposure.
-4. CRAM/reference support and BED-region slicing.
+- [x] `view_region(input_bam, region, output_bam, threads?, reference_fasta?)`: indexed BAM + BAI region slicing to BAM output for `samtools view -P -b input.bam chr:start-end -o sliced.bam`.
+- [x] `view_bed(input_bam, bed_file, output_bam, threads?, reference_fasta?)`: BED `-L` slicing to BAM output for `samtools view -P -b input.bam -L regions.bed -o sliced.bam`.
+- [x] `index(input_bam, output_bai?)`: BAM index wrapper with implicit and explicit `.bai` output paths.
+- [x] `bam_to_fastq_pair(...)` / `fastq_native(...)`: optional integrated name-sort plus paired FASTQ output to `-1`, `-2`, `-0`, and `-s` paths, including `.fastq.gz` output support.
+- [x] `depth(input_bam, region, include_zero, threads?)`: structured per-base depth values for a region.
+- [x] `depth_summary(input_bam, region, include_zero, threads?)`: mean, median, min, max, and uncovered count for VNTR coverage QC.
+
+P1 — needed for faithful upstream behavior:
+
+- [x] `merge(output_bam, input_bams, force, threads?)`: in-memory BAM merge wrapper with `-f` overwrite semantics for sliced + unmapped read workflows.
+- [x] `sort(input_bam, output_bam, by_name, threads?)`: in-memory coordinate sort and name sort wrappers. Coordinate-sorted output remains indexable.
+- [x] `quickcheck(input_alignment, verbose)`: BAM/CRAM validation wrapper returning structured errors.
+
+P2 — CRAM and edge compatibility:
+
+- [x] CRAM `view_region` with required `reference_fasta`, associated CRAI/CSI index use, and BAM output compatible with `index`, `sort`, `merge`, and `fastq`.
+- [x] `extract_unmapped_pairs(input_alignment, output_bam, flag = 12, threads?, reference_fasta?)`: BAM and reference-backed CRAM flag-filter extraction without shell pipes.
+- [x] Tests cover BAM/CRAM region slicing, CRAM reference-backed `flag = 12` unmapped-pair extraction, FASTQ conversion, depth summaries, sort/merge/index, and quickcheck.
+
+Follow-up polish after the MVP:
+
+- [ ] Propagate `threads` into BGZF/noodles worker pools instead of accepting it as an API-compatible no-op in several wrappers.
+- [ ] Replace in-memory `sort`/`merge` implementations with streaming/external algorithms for large BAMs.
+- [ ] Deepen `@PG` parity for native-generated BAM headers.
+- [ ] Add broader real-world CRAM fixtures when available from VNtyper/BioScript workflows.
 
 Three roughly orthogonal directions, each substantial:
 
