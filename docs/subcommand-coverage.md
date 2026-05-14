@@ -161,7 +161,7 @@ samtools-rs status legend:
 - **C source:** `bam_mate.c` (~43k LOC)
 - **HTSlib APIs used:** record iteration, mate-flag/pos rewriting, MC/MQ tag updates
 - **htslib-rs coverage:** ⚠️ — basic mutable record rewriting works through `RecordBuf`; direct `bam_aux_*` parity is still useful for deeper aux-tag behavior.
-- **samtools-rs status:** 🟡 — basic adjacent name-sorted mate flag/reference/position fixup works for BAM and SAM inputs, including default MC/MQ mate tags and `-r`; `-c`/`-m`, mate rescore, and CRAM remain.
+- **samtools-rs status:** 🟡 — basic adjacent name-sorted mate flag/reference/position fixup works for BAM and SAM inputs, including default MC/MQ mate tags, `-m` mate-score tags, and `-r`; `-c`, mate rescore, and CRAM remain.
 
 ### markdup
 

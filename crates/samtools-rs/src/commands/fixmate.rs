@@ -6,7 +6,7 @@
 //! + `mate_alignment_start` are made consistent.
 //!
 //! **Not yet supported:** record-level sanitizer mutation, `-c` (calculate CT),
-//! `-m` (add ms score), CRAM input/output.
+//! CRAM input/output.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -74,6 +74,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         opts.output_fmt,
         pg_argv,
         opts.remove_reads,
+        opts.mate_score,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -94,6 +95,8 @@ struct Opts {
     /// clear `PROPER_PAIR` / `MATE_REVERSE` on a pair where one mate is
     /// unmapped (mirrors upstream's `remove_reads`).
     remove_reads: bool,
+    /// `-m`: add `ms:i` mate score tags for duplicate marking.
+    mate_score: bool,
 }
 
 impl Default for Opts {
@@ -105,6 +108,7 @@ impl Default for Opts {
             sanitize_flags: None,
             no_pg: false,
             remove_reads: false,
+            mate_score: false,
         }
     }
 }
@@ -143,7 +147,10 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
             "-r" => {
                 opts.remove_reads = true;
             }
-            "-c" | "-m" | "-p" => {
+            "-m" => {
+                opts.mate_score = true;
+            }
+            "-c" | "-p" => {
                 // Accepted but not yet implemented.
             }
             "--help" => return Err(ParseError::Usage),
@@ -184,11 +191,12 @@ fn run_fixmate(
     fmt: OutFmt,
     pg_argv: Option<&[OsString]>,
     remove_reads: bool,
+    mate_score: bool,
 ) -> io::Result<()> {
     let format = sam_io::sam_open_format(input)?;
     match format.exact {
-        Exact::Sam => run_fixmate_sam(input, output, fmt, pg_argv, remove_reads),
-        Exact::Bam => run_fixmate_bam(input, output, fmt, pg_argv, remove_reads),
+        Exact::Sam => run_fixmate_sam(input, output, fmt, pg_argv, remove_reads, mate_score),
+        Exact::Bam => run_fixmate_bam(input, output, fmt, pg_argv, remove_reads, mate_score),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "only SAM and BAM input are currently supported (CRAM TODO)",
@@ -202,6 +210,7 @@ fn run_fixmate_bam(
     fmt: OutFmt,
     pg_argv: Option<&[OsString]>,
     remove_reads: bool,
+    mate_score: bool,
 ) -> io::Result<()> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let mut header = reader.read_header()?;
@@ -222,6 +231,7 @@ fn run_fixmate_bam(
             &mut pending,
             next.clone(),
             remove_reads,
+            mate_score,
         )?;
     }
     if let Some(rec) = pending
@@ -238,6 +248,7 @@ fn run_fixmate_sam(
     fmt: OutFmt,
     pg_argv: Option<&[OsString]>,
     remove_reads: bool,
+    mate_score: bool,
 ) -> io::Result<()> {
     let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
     let mut header = reader.read_header()?;
@@ -258,6 +269,7 @@ fn run_fixmate_sam(
             &mut pending,
             next.clone(),
             remove_reads,
+            mate_score,
         )?;
     }
     if let Some(rec) = pending
@@ -283,6 +295,7 @@ fn write_fixed_record(
     pending: &mut Option<RecordBuf>,
     next: RecordBuf,
     remove_reads: bool,
+    mate_score: bool,
 ) -> io::Result<()> {
     match pending.take() {
         None => *pending = Some(next),
@@ -290,7 +303,7 @@ fn write_fixed_record(
             let prev_name = prev.name().map(|n| n.to_vec());
             let next_name = next.name().map(|n| n.to_vec());
             if prev_name == next_name && next_name.is_some() {
-                let (a, b) = pair_fixmate(prev, next, remove_reads);
+                let (a, b) = pair_fixmate(prev, next, remove_reads, mate_score);
                 if !skip_for_remove_reads(&a, remove_reads) {
                     sink.write_record(header, &a)?;
                 }
@@ -309,7 +322,12 @@ fn write_fixed_record(
     Ok(())
 }
 
-fn pair_fixmate(mut a: RecordBuf, mut b: RecordBuf, remove_reads: bool) -> (RecordBuf, RecordBuf) {
+fn pair_fixmate(
+    mut a: RecordBuf,
+    mut b: RecordBuf,
+    remove_reads: bool,
+    mate_score: bool,
+) -> (RecordBuf, RecordBuf) {
     let a_tid = a.reference_sequence_id();
     let b_tid = b.reference_sequence_id();
     let a_pos = a.alignment_start();
@@ -318,6 +336,10 @@ fn pair_fixmate(mut a: RecordBuf, mut b: RecordBuf, remove_reads: bool) -> (Reco
     apply_mate_flags(&mut b, &a);
     update_mate_aux_tags(&mut a, &b);
     update_mate_aux_tags(&mut b, &a);
+    if mate_score {
+        update_mate_score_tag(&mut a, &b);
+        update_mate_score_tag(&mut b, &a);
+    }
     *a.mate_reference_sequence_id_mut() = b_tid;
     *b.mate_reference_sequence_id_mut() = a_tid;
     *a.mate_alignment_start_mut() = b_pos;
@@ -357,6 +379,21 @@ fn apply_mate_flags(target: &mut RecordBuf, mate: &RecordBuf) {
         flags.remove(Flags::MATE_REVERSE_COMPLEMENTED);
     }
     *target.flags_mut() = flags;
+}
+
+fn update_mate_score_tag(target: &mut RecordBuf, mate: &RecordBuf) {
+    target
+        .data_mut()
+        .insert(Tag::from([b'm', b's']), Value::from(mate_score(mate)));
+}
+
+fn mate_score(record: &RecordBuf) -> u32 {
+    record
+        .quality_scores()
+        .iter()
+        .filter(|&quality| quality >= 15)
+        .map(u32::from)
+        .sum()
 }
 
 fn update_mate_aux_tags(target: &mut RecordBuf, mate: &RecordBuf) {
@@ -469,6 +506,7 @@ fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
     writeln!(w, "Usage: samtools fixmate [options] <in.bam> [<out.bam>]")?;
     writeln!(w, "  -O sam|bam   output format (default: bam)")?;
+    writeln!(w, "  -m           add mate score tags")?;
     writeln!(w, "  -z, --sanitize FLAG[,FLAG]")?;
     Ok(())
 }

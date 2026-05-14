@@ -2000,6 +2000,49 @@ fn fixmate_sam_input_fills_mate_fields_to_sam_output() {
 }
 
 #[test]
+fn fixmate_m_adds_mate_score_tags() {
+    let tmp = tmp_dir("fixmate-ms");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("fixed.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:queryname\n",
+            "@SQ\tSN:chr1\tLN:16\n",
+            "pair\t65\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\tIIII\tms:i:1\n",
+            "pair\t129\tchr1\t5\t60\t4M\t*\t0\t0\tTGCA\t5555\tms:i:2\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fixmate::main(&argv(
+            "fixmate",
+            &[
+                "-m",
+                "--output-fmt",
+                "sam",
+                sam.to_str().unwrap(),
+                out.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let records: Vec<Vec<_>> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').collect())
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert!(records[0].contains(&"ms:i:80"));
+    assert!(records[1].contains(&"ms:i:160"));
+    assert!(!records[0].contains(&"ms:i:1"));
+    assert!(!records[1].contains(&"ms:i:2"));
+}
+
+#[test]
 fn faidx_builds_index() {
     let tmp = tmp_dir("fai");
     let src = fixtures_dir().join("dat").join("dict.fa");
