@@ -295,6 +295,7 @@ pub(crate) fn run_merge(
     for path in &inputs[1..] {
         let (input_header, mut input_records) = read_records(path, filter.as_ref())?;
         let reference_id_map = merge_reference_sequences(&mut header, &input_header)?;
+        merge_header_metadata(&mut header, &input_header);
         merge_read_groups(&mut header, &input_header)?;
         merge_programs(&mut header, &input_header)?;
         merge_comments(&mut header, &input_header);
@@ -480,6 +481,14 @@ fn merge_reference_sequences(
     }
 
     Ok(reference_id_map)
+}
+
+fn merge_header_metadata(output_header: &mut sam::Header, input_header: &sam::Header) {
+    if output_header.header().is_none()
+        && let Some(input_hd) = input_header.header()
+    {
+        *output_header.header_mut() = Some(input_hd.clone());
+    }
 }
 
 fn remap_records(records: &mut [RecordBuf], reference_id_map: &[usize]) -> io::Result<()> {
