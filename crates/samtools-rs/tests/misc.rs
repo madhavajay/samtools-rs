@@ -1628,6 +1628,92 @@ fn fastq_umi_appends_aux_tag_to_read_names() {
 }
 
 #[test]
+fn fastq_i_adds_casava_fields_from_barcode_tags() {
+    let tmp = tmp_dir("fastq-casava");
+    let sam = tmp.join("in.sam");
+    let bam = tmp.join("in.bam");
+    let sam_out = tmp.join("sam.fq");
+    let bam_out = tmp.join("bam.fq");
+    let custom_out = tmp.join("custom.fq");
+    let fasta_out = tmp.join("reads.fa");
+    let text = concat!(
+        "@HD\tVN:1.6\n",
+        "@SQ\tSN:chr1\tLN:8\n",
+        "read1\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\tBC:Z:AAAA\n",
+        "read2\t641\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\tBC:Z:CCCC\n",
+        "missing\t0\tchr1\t1\t60\t4M\t*\t0\t0\tNNNN\t$$$$\n",
+        "custom\t0\tchr1\t1\t60\t4M\t*\t0\t0\tGGGG\t%%%%\tXB:Z:GGGG\tBC:Z:TTTT\n",
+    );
+    std::fs::write(&sam, text).unwrap();
+    write_bam_from_sam_text(&bam, text);
+
+    for (input, output) in [(&sam, &sam_out), (&bam, &bam_out)] {
+        assert_eq!(
+            exit_to_u8(fastq::main(&argv(
+                "fastq",
+                &[
+                    "-i",
+                    "-n",
+                    "-o",
+                    output.to_str().unwrap(),
+                    input.to_str().unwrap(),
+                ]
+            ))),
+            0
+        );
+    }
+
+    let expected = concat!(
+        "@read1 1:N:0:AAAA\nACGT\n+\n!!!!\n",
+        "@read2 2:Y:0:CCCC\nTGCA\n+\n####\n",
+        "@missing 1:N:0:0\nNNNN\n+\n$$$$\n",
+        "@custom 1:N:0:TTTT\nGGGG\n+\n%%%%\n",
+    );
+    assert_eq!(std::fs::read_to_string(sam_out).unwrap(), expected);
+    assert_eq!(std::fs::read_to_string(bam_out).unwrap(), expected);
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-i",
+                "--barcode-tag",
+                "XB",
+                "-n",
+                "-o",
+                custom_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert!(
+        std::fs::read_to_string(custom_out)
+            .unwrap()
+            .contains("@custom 1:N:0:GGGG\nGGGG\n+\n%%%%\n")
+    );
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fasta",
+            &[
+                "-i",
+                "-n",
+                "-o",
+                fasta_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert!(
+        std::fs::read_to_string(fasta_out)
+            .unwrap()
+            .starts_with(">read1 1:N:0:AAAA\nACGT\n")
+    );
+}
+
+#[test]
 fn fastq_single_sam_path_filters_by_aux_tag_value() {
     let tmp = tmp_dir("fastq-aux-filter-value");
     let sam = tmp.join("in.sam");

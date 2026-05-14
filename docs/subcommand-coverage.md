@@ -146,7 +146,7 @@ samtools-rs status legend:
 - **C source:** `bam_fastq.c` (~48k LOC)
 - **HTSlib APIs used:** record iteration, aux tag access for barcodes/QT/RX/QX
 - **htslib-rs coverage:** ⚠️ — `view_sam_as_fastq_text_from_path_with_limit` exists; full feature set (paired/single, barcode-aware) needs more
-- **samtools-rs status:** 🟡 — SAM/BAM FASTQ/FASTA conversion supports basic single-output and split-output paths, flag filters, read-name suffix controls, selected/all aux comments, aux-tag filtering, `-t`, FASTQ `-O` original-quality `OQ` tags, `-v INT` missing-quality defaults, and `-U`/`--UMI-tag` UMI read-name suffixes; barcode/index files, exact name-grouped routing, and CRAM remain.
+- **samtools-rs status:** 🟡 — SAM/BAM FASTQ/FASTA conversion supports basic single-output and split-output paths, flag filters, read-name suffix controls, selected/all aux comments, aux-tag filtering, `-t`, FASTQ `-O` original-quality `OQ` tags, `-v INT` missing-quality defaults, `-U`/`--UMI-tag` UMI read-name suffixes, and `-i`/`--barcode-tag` CASAVA barcode fields; index FASTQ files, exact name-grouped routing, and CRAM remain.
 
 ### import
 

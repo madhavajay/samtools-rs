@@ -6,7 +6,7 @@
 //! basic paired-output split (`-1`/`-2`/`-s`).
 //!
 //! **Not yet supported:** exact name-grouped singleton/other routing, barcode
-//! index handling (`-i`), index files (`--i1`/`--i2`).
+//! index file extraction (`--i1`/`--i2`).
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -40,6 +40,8 @@ struct FastqRenderOptions<'a> {
     use_original_quality: bool,
     default_quality: Option<u8>,
     umi_tags: Option<&'a [[u8; 2]]>,
+    casava: bool,
+    barcode_tag: [u8; 2],
     aux_selection: &'a AuxSelection,
 }
 
@@ -85,6 +87,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut default_quality: Option<u8> = None;
     let mut umi_enabled = false;
     let mut umi_tags = vec![*b"OX", *b"RX"];
+    let mut casava = false;
+    let mut barcode_tag = *b"BC";
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
         let s = arg.to_str().unwrap_or("");
@@ -182,6 +186,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-O" => {
                 use_original_quality = true;
             }
+            "-i" => {
+                casava = true;
+            }
             "-U" | "--UMI" | "--umi" => {
                 umi_enabled = true;
             }
@@ -194,6 +201,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     Ok(tags) => tags,
                     Err(e) => {
                         print_error(sub_name, format!("invalid --UMI-tag value \"{raw}\": {e}"));
+                        return ExitCode::from(1);
+                    }
+                };
+            }
+            "--barcode-tag" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error(sub_name, "missing value for --barcode-tag");
+                    return ExitCode::from(1);
+                };
+                barcode_tag = match parse_filter_tag(raw) {
+                    Ok(tag) => tag,
+                    Err(e) => {
+                        print_error(sub_name, e);
                         return ExitCode::from(1);
                     }
                 };
@@ -273,6 +293,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
         use_original_quality,
         default_quality,
         umi_tags: umi_tags.as_deref(),
+        casava,
+        barcode_tag,
         aux_selection: &aux_selection,
     };
 
@@ -288,12 +310,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
         let split = if stdin_input {
             let stdin = io::stdin().lock();
             let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(stdin));
-            if fasta_mode && (flag_filters.include_any != 0 || umi_tags.is_some()) {
+            if fasta_mode && (flag_filters.include_any != 0 || umi_tags.is_some() || casava) {
                 view_sam_reader_as_fasta_split(
                     &mut reader,
                     flag_filters,
                     append_read_number,
                     umi_tags.as_deref(),
+                    casava,
+                    barcode_tag,
                 )
             } else if fasta_mode {
                 htslib_rs::alignment_compat::view_sam_as_fasta_split_text_from_reader_with_flag_filter_and_suffix(
@@ -318,12 +342,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     view_sam_path_as_fastq_split(input, flag_filters, render_options, &tag_filters)
                 }
                 (Exact::Sam, true) => {
-                    if flag_filters.include_any != 0 || umi_tags.is_some() {
+                    if flag_filters.include_any != 0 || umi_tags.is_some() || casava {
                         view_sam_path_as_fasta_split(
                             input,
                             flag_filters,
                             append_read_number,
                             umi_tags.as_deref(),
+                            casava,
+                            barcode_tag,
                         )
                     } else {
                         htslib_rs::alignment_compat::view_sam_as_fasta_split_text_from_path_with_flag_filter_and_suffix(
@@ -342,12 +368,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     &tag_filters,
                 ),
                 (Exact::Bam, true) => {
-                    if flag_filters.include_any != 0 || umi_tags.is_some() {
+                    if flag_filters.include_any != 0 || umi_tags.is_some() || casava {
                         view_bam_path_as_fasta_split(
                             input,
                             flag_filters,
                             append_read_number,
                             umi_tags.as_deref(),
+                            casava,
+                            barcode_tag,
                         )
                     } else {
                         htslib_rs::alignment_compat::view_bam_as_fasta_split_text_from_path_with_flag_filter_and_suffix(
@@ -440,6 +468,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             && (use_original_quality
                 || default_quality.is_some()
                 || umi_tags.is_some()
+                || casava
                 || aux_selection.is_enabled()
                 || !tag_filters.is_empty())
         {
@@ -449,12 +478,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 render_options,
                 &tag_filters,
             )
-        } else if fasta_mode && (flag_filters.include_any != 0 || umi_tags.is_some()) {
+        } else if fasta_mode && (flag_filters.include_any != 0 || umi_tags.is_some() || casava) {
             view_sam_reader_as_fasta_text(
                 &mut reader,
                 flag_filters,
                 append_read_number,
                 umi_tags.as_deref(),
+                casava,
+                barcode_tag,
             )
         } else if fasta_mode {
             htslib_rs::alignment_compat::view_sam_as_fasta_text_from_reader_with_flag_filter_and_suffix(
@@ -482,6 +513,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             use_original_quality
                 || default_quality.is_some()
                 || umi_tags.is_some()
+                || casava
                 || aux_selection.is_enabled()
                 || !tag_filters.is_empty()
                 || (!fasta_mode && flag_filters.include_any != 0),
@@ -493,7 +525,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             &tag_filters,
         ),
         (Exact::Sam, true, _, true)
-            if umi_tags.is_some()
+            if (umi_tags.is_some() || casava)
                 && !use_original_quality
                 && default_quality.is_none()
                 && !aux_selection.is_enabled()
@@ -504,10 +536,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 flag_filters,
                 append_read_number,
                 umi_tags.as_deref(),
+                casava,
+                barcode_tag,
             )
         }
         (Exact::Bam, true, _, true)
-            if umi_tags.is_some()
+            if (umi_tags.is_some() || casava)
                 && !use_original_quality
                 && default_quality.is_none()
                 && !aux_selection.is_enabled()
@@ -518,6 +552,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 flag_filters,
                 append_read_number,
                 umi_tags.as_deref(),
+                casava,
+                barcode_tag,
             )
         }
         (Exact::Sam, true, _, true) | (Exact::Bam, true, _, true) => {
@@ -552,7 +588,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
         (Exact::Sam, true, true, _) => {
             if flag_filters.include_any != 0 {
-                view_sam_path_as_fasta_text(input, flag_filters, append_read_number, None)
+                view_sam_path_as_fasta_text(
+                    input,
+                    flag_filters,
+                    append_read_number,
+                    None,
+                    false,
+                    *b"BC",
+                )
             } else {
                 htslib_rs::alignment_compat::view_sam_as_fasta_text_from_path_with_flag_filter_and_suffix(
                 input,
@@ -594,7 +637,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
         (Exact::Bam, true, true, _) => {
             if flag_filters.include_any != 0 {
-                view_bam_path_as_fasta_text(input, flag_filters, append_read_number, None)
+                view_bam_path_as_fasta_text(
+                    input,
+                    flag_filters,
+                    append_read_number,
+                    None,
+                    false,
+                    *b"BC",
+                )
             } else {
                 htslib_rs::alignment_compat::view_bam_as_fasta_text_from_path_with_flag_filter_and_suffix(
                 input,
@@ -689,10 +739,19 @@ fn view_sam_path_as_fasta_split(
     flag_filters: FlagFilters,
     append_read_number: bool,
     umi_tags: Option<&[[u8; 2]]>,
+    casava: bool,
+    barcode_tag: [u8; 2],
 ) -> io::Result<htslib_rs::alignment_compat::FastxSplitText> {
     let file = File::open(input)?;
     let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(file));
-    view_sam_reader_as_fasta_split(&mut reader, flag_filters, append_read_number, umi_tags)
+    view_sam_reader_as_fasta_split(
+        &mut reader,
+        flag_filters,
+        append_read_number,
+        umi_tags,
+        casava,
+        barcode_tag,
+    )
 }
 
 fn view_sam_path_as_fasta_text(
@@ -700,10 +759,19 @@ fn view_sam_path_as_fasta_text(
     flag_filters: FlagFilters,
     append_read_number: bool,
     umi_tags: Option<&[[u8; 2]]>,
+    casava: bool,
+    barcode_tag: [u8; 2],
 ) -> io::Result<String> {
     let file = File::open(input)?;
     let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(file));
-    view_sam_reader_as_fasta_text(&mut reader, flag_filters, append_read_number, umi_tags)
+    view_sam_reader_as_fasta_text(
+        &mut reader,
+        flag_filters,
+        append_read_number,
+        umi_tags,
+        casava,
+        barcode_tag,
+    )
 }
 
 fn view_bam_path_as_fastq_text_with_aux(
@@ -738,6 +806,8 @@ fn view_bam_path_as_fasta_text(
     flag_filters: FlagFilters,
     append_read_number: bool,
     umi_tags: Option<&[[u8; 2]]>,
+    casava: bool,
+    barcode_tag: [u8; 2],
 ) -> io::Result<String> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let header = reader.read_header()?;
@@ -751,7 +821,14 @@ fn view_bam_path_as_fasta_text(
         }
 
         if record_passes_flag_filter(&record, flag_filters)? {
-            write_fasta_record(&mut writer, &record, append_read_number, umi_tags)?;
+            write_fasta_record(
+                &mut writer,
+                &record,
+                append_read_number,
+                umi_tags,
+                casava,
+                barcode_tag,
+            )?;
         }
     }
 
@@ -790,6 +867,8 @@ fn view_bam_path_as_fasta_split(
     flag_filters: FlagFilters,
     append_read_number: bool,
     umi_tags: Option<&[[u8; 2]]>,
+    casava: bool,
+    barcode_tag: [u8; 2],
 ) -> io::Result<htslib_rs::alignment_compat::FastxSplitText> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let header = reader.read_header()?;
@@ -803,7 +882,14 @@ fn view_bam_path_as_fasta_split(
         }
 
         if record_passes_flag_filter(&record, flag_filters)? {
-            write_fasta_record_to_split(&mut split, &record, append_read_number, umi_tags)?;
+            write_fasta_record_to_split(
+                &mut split,
+                &record,
+                append_read_number,
+                umi_tags,
+                casava,
+                barcode_tag,
+            )?;
         }
     }
 
@@ -839,6 +925,8 @@ fn view_sam_reader_as_fasta_text<R>(
     flag_filters: FlagFilters,
     append_read_number: bool,
     umi_tags: Option<&[[u8; 2]]>,
+    casava: bool,
+    barcode_tag: [u8; 2],
 ) -> io::Result<String>
 where
     R: io::BufRead,
@@ -849,7 +937,14 @@ where
     for result in reader.records() {
         let record = result?;
         if record_passes_flag_filter(&record, flag_filters)? {
-            write_fasta_record(&mut writer, &record, append_read_number, umi_tags)?;
+            write_fasta_record(
+                &mut writer,
+                &record,
+                append_read_number,
+                umi_tags,
+                casava,
+                barcode_tag,
+            )?;
         }
     }
 
@@ -885,6 +980,8 @@ fn view_sam_reader_as_fasta_split<R>(
     flag_filters: FlagFilters,
     append_read_number: bool,
     umi_tags: Option<&[[u8; 2]]>,
+    casava: bool,
+    barcode_tag: [u8; 2],
 ) -> io::Result<htslib_rs::alignment_compat::FastxSplitText>
 where
     R: io::BufRead,
@@ -895,7 +992,14 @@ where
     for result in reader.records() {
         let record = result?;
         if record_passes_flag_filter(&record, flag_filters)? {
-            write_fasta_record_to_split(&mut split, &record, append_read_number, umi_tags)?;
+            write_fasta_record_to_split(
+                &mut split,
+                &record,
+                append_read_number,
+                umi_tags,
+                casava,
+                barcode_tag,
+            )?;
         }
     }
 
@@ -947,6 +1051,8 @@ fn write_fasta_record_to_split<R>(
     record: &R,
     append_read_number: bool,
     umi_tags: Option<&[[u8; 2]]>,
+    casava: bool,
+    barcode_tag: [u8; 2],
 ) -> io::Result<()>
 where
     R: htslib_rs::sam::alignment::Record + ?Sized,
@@ -960,7 +1066,14 @@ where
         &mut split.singleton
     };
 
-    write_fasta_record(writer, record, append_read_number, umi_tags)
+    write_fasta_record(
+        writer,
+        record,
+        append_read_number,
+        umi_tags,
+        casava,
+        barcode_tag,
+    )
 }
 
 fn record_passes_tag_filters<R>(record: &R, filters: &[TagFilter]) -> io::Result<bool>
@@ -1041,8 +1154,16 @@ where
     }
 
     write!(writer, "@{name}")?;
-    for field in fastq_aux_fields(record, options.aux_selection)? {
-        write!(writer, "\t{field}")?;
+    if options.casava {
+        write!(
+            writer,
+            " {}",
+            fastq_casava_comment(record, options.barcode_tag)?
+        )?;
+    } else {
+        for field in fastq_aux_fields(record, options.aux_selection)? {
+            write!(writer, "\t{field}")?;
+        }
     }
     writeln!(writer)?;
     writeln!(writer, "{sequence}")?;
@@ -1057,6 +1178,8 @@ fn write_fasta_record<W, R>(
     record: &R,
     append_read_number: bool,
     umi_tags: Option<&[[u8; 2]]>,
+    casava: bool,
+    barcode_tag: [u8; 2],
 ) -> io::Result<()>
 where
     W: Write,
@@ -1067,7 +1190,11 @@ where
     let name = append_fastq_read_number(name, record, append_read_number)?;
     let sequence = fastq_sequence_string(record);
 
-    writeln!(writer, ">{name}")?;
+    write!(writer, ">{name}")?;
+    if casava {
+        write!(writer, " {}", fastq_casava_comment(record, barcode_tag)?)?;
+    }
+    writeln!(writer)?;
     writeln!(writer, "{sequence}")?;
 
     Ok(())
@@ -1150,6 +1277,35 @@ where
     }
 
     Ok(None)
+}
+
+fn fastq_casava_comment<R>(record: &R, barcode_tag: [u8; 2]) -> io::Result<String>
+where
+    R: htslib_rs::sam::alignment::Record + ?Sized,
+{
+    let flags = record.flags()?;
+    let read_number = if flags.is_last_segment() { 2 } else { 1 };
+    let filter = if flags.is_qc_fail() { "Y" } else { "N" };
+    let barcode = fastq_string_tag(record, barcode_tag)?.unwrap_or_else(|| "0".to_string());
+
+    Ok(format!("{read_number}:{filter}:0:{barcode}"))
+}
+
+fn fastq_string_tag<R>(record: &R, tag: [u8; 2]) -> io::Result<Option<String>>
+where
+    R: htslib_rs::sam::alignment::Record + ?Sized,
+{
+    use htslib_rs::sam::alignment::record::data::field::{Tag, Value};
+
+    let data = record.data();
+    let Some(value) = data.get(&Tag::from(tag)).transpose()? else {
+        return Ok(None);
+    };
+
+    match value {
+        Value::String(s) => Ok(Some(String::from_utf8_lossy(s).into_owned())),
+        _ => Ok(None),
+    }
 }
 
 fn fastq_sequence_string<R>(record: &R) -> String
@@ -1490,6 +1646,9 @@ fn print_usage(sub: &str) -> io::Result<()> {
     writeln!(w, "  -n           do not append /1 or /2 to read names")?;
     writeln!(w, "  -N           append /1 or /2 to read names")?;
     writeln!(w, "  -O           use OQ tag qualities when present")?;
+    writeln!(w, "  -i           add Illumina CASAVA 1.8 fields")?;
+    writeln!(w, "  --barcode-tag TAG")?;
+    writeln!(w, "               aux tag to use for CASAVA barcodes [BC]")?;
     writeln!(
         w,
         "  -v INT       default quality score for missing qualities"
