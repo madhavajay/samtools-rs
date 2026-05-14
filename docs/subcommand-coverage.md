@@ -226,7 +226,7 @@ samtools-rs status legend:
 
 - **C source:** `stats.c` (~123k LOC) + `stats_isize.c`
 - **HTSlib APIs used:** record iteration, CIGAR analysis, base/qual histograms, GC bias, insert-size distribution
-- **samtools-rs status:** 🟡 — `SN` summary numbers, `-f`/`--required-flag`, `-F`/`--filtering-flag`, record-backed `-l`/`--read-length`, FFQ/LFQ quality histograms, GCF/GCL GC histograms, and approximate CIGAR-walk COV coverage histograms with `-c`/`--coverage` bin ranges and `-g`/`--cov-threshold` target percentage lines are implemented for SAM, BAM, reference-backed CRAM, SAM/indexed BAM/reference-backed CRAM positional regions, and SAM/indexed BAM/reference-backed CRAM `-t` target files, with overlapping BAM/CRAM regions de-duplicated. `-d` / `--remove-dups` filters duplicate-marked primary records from the summary and record-level histograms; exact pileup-backed COV parity, per-cycle metrics, and CRAM without explicit reference remain.
+- **samtools-rs status:** 🟡 — `SN` summary numbers, `-f`/`--required-flag`, `-F`/`--filtering-flag`, record-backed `-l`/`--read-length`, `-q`/`--trim-quality` BWA trim counting, FFQ/LFQ quality histograms, GCF/GCL GC histograms, and approximate CIGAR-walk COV coverage histograms with `-c`/`--coverage` bin ranges and `-g`/`--cov-threshold` target percentage lines are implemented for SAM, BAM, reference-backed CRAM, SAM/indexed BAM/reference-backed CRAM positional regions, and SAM/indexed BAM/reference-backed CRAM `-t` target files, with overlapping BAM/CRAM regions de-duplicated. `-d` / `--remove-dups` filters duplicate-marked primary records from the summary and record-level histograms; exact pileup-backed COV parity, per-cycle metrics, and CRAM without explicit reference remain.
 
 ### mpileup
 

@@ -2217,6 +2217,40 @@ long\t0\tchr1\t5\t60\t5M\t*\t0\t0\tCCCCC\tIIIII
 }
 
 #[test]
+fn stats_trim_quality_reports_bwa_trimmed_bases() {
+    let tmp = tmp_dir("stats-trim-quality");
+    let sam = tmp.join("trim.sam");
+    let out = tmp.join("trim.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:100
+trimmed\t0\tchr1\t1\t60\t40M\t*\t0\t0\tAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\tIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII!!!!!
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-q",
+                "20",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("SN\tsequences:\t1\n"));
+    assert!(text.contains("SN\tbases trimmed:\t4\n"));
+}
+
+#[test]
 fn stats_emits_bases_mapped_and_error_rate_sn_lines() {
     let tmp = tmp_dir("stats-error-rate");
     let sam = tmp.join("nm.sam");

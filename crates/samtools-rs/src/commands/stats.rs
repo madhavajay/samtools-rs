@@ -36,6 +36,7 @@ struct StatsConfig {
     required_flags: u32,
     filter_flags: u32,
     read_length_filter: Option<usize>,
+    trim_quality: u8,
     coverage_min: u32,
     coverage_max: u32,
     coverage_step: u32,
@@ -49,6 +50,7 @@ impl Default for StatsConfig {
             required_flags: 0,
             filter_flags: 0,
             read_length_filter: None,
+            trim_quality: 0,
             coverage_min: 1,
             coverage_max: 1000,
             coverage_step: 1,
@@ -124,6 +126,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     Ok(len) => config.read_length_filter = Some(len),
                     Err(e) => {
                         print_error("stats", format!("invalid read length \"{raw}\": {e}"));
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            "-q" | "--trim-quality" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("stats", "option -q requires an argument");
+                    return ExitCode::from(1);
+                };
+                match raw.parse::<u8>() {
+                    Ok(trim_quality) => config.trim_quality = trim_quality,
+                    Err(e) => {
+                        print_error("stats", format!("invalid trim quality \"{raw}\": {e}"));
                         return ExitCode::from(1);
                     }
                 }
@@ -736,6 +751,7 @@ struct StatsCounts {
     nmismatches: u64,
     // Sum of sequence lengths for records carrying the duplicate flag.
     bases_dup: u64,
+    bases_trimmed: u64,
 }
 
 struct StatsRecordFields {
@@ -825,6 +841,14 @@ impl StatsCounts {
                 if flag & BAM_FREAD2 != 0 {
                     increment_quality_hist(&mut self.last_qual_hist, cycle, q);
                 }
+            }
+            if config.trim_quality > 0 {
+                let reverse = flag & BAM_FREVERSE != 0;
+                self.bases_trimmed += u64::from(bwa_trim_read(
+                    config.trim_quality,
+                    rec.quality_scores().iter().flatten(),
+                    reverse,
+                ));
             }
 
             if flag & BAM_FDUP != 0 {
@@ -1043,6 +1067,35 @@ fn increment_quality_hist(hist: &mut Vec<[u64; 256]>, cycle: usize, quality: u8)
     hist[cycle][usize::from(quality)] += 1;
 }
 
+fn bwa_trim_read(trim_quality: u8, qualities: impl IntoIterator<Item = u8>, reverse: bool) -> u32 {
+    const BWA_MIN_READ_LEN: usize = 35;
+    let qualities: Vec<_> = qualities.into_iter().collect();
+    if qualities.len() < BWA_MIN_READ_LEN {
+        return 0;
+    }
+
+    let max_trimmed = qualities.len() - BWA_MIN_READ_LEN + 1;
+    let mut sum = 0i32;
+    let mut max_sum = 0i32;
+    let mut max_l = 0u32;
+    for l in 0..max_trimmed {
+        let q = if reverse {
+            qualities[l]
+        } else {
+            qualities[qualities.len() - 1 - l]
+        };
+        sum += i32::from(trim_quality) - i32::from(q);
+        if sum < 0 {
+            break;
+        }
+        if sum > max_sum {
+            max_sum = sum;
+            max_l = l as u32;
+        }
+    }
+    max_l
+}
+
 fn gc_percent_hundredths(bases: impl IntoIterator<Item = u8>) -> u16 {
     let mut len = 0u64;
     let mut gc = 0u64;
@@ -1125,7 +1178,7 @@ fn write_stats_counts(
         "SN\tbases mapped (cigar):\t{}",
         counts.bases_mapped_cigar
     )?;
-    writeln!(out, "SN\tbases trimmed:\t0")?;
+    writeln!(out, "SN\tbases trimmed:\t{}", counts.bases_trimmed)?;
     writeln!(out, "SN\tbases duplicated:\t{}", counts.bases_dup)?;
     writeln!(out, "SN\tmismatches:\t{}", counts.nmismatches)?;
     let error_rate = if counts.bases_mapped_cigar > 0 {
@@ -1367,6 +1420,10 @@ fn print_usage() -> io::Result<()> {
     writeln!(
         w,
         "  -l, --read-length LEN         include only records with sequence length LEN"
+    )?;
+    writeln!(
+        w,
+        "  -q, --trim-quality QUAL       BWA trim quality parameter"
     )?;
     writeln!(
         w,
