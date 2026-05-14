@@ -1269,6 +1269,7 @@ fn stats_emits_insert_size_and_supplementary_sn_lines() {
     let tmp = tmp_dir("stats-insert-size");
     let sam = tmp.join("paired.sam");
     let out = tmp.join("paired.stats");
+    let capped_out = tmp.join("paired-capped.stats");
     // Three records:
     //  - r1 first/forward, r1 mate/reverse: classic FR pair with TLEN 100
     //  - supp: a supplementary alignment of r1 that must NOT contribute to
@@ -1308,6 +1309,22 @@ r1\t2147\tchr1\t1\t60\t10M\t*\t0\t0\tACGTACGTAC\t!!!!!!!!!!
         stats_sn_text(&text, "percentage of properly paired reads (%)"),
         "100.0"
     );
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-i",
+                "50",
+                "-o",
+                capped_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    let capped_text = std::fs::read_to_string(capped_out).unwrap();
+    assert_eq!(stats_sn_text(&capped_text, "insert size average"), "50.0");
 }
 
 #[test]

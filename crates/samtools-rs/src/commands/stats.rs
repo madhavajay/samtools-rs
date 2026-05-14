@@ -36,6 +36,7 @@ struct StatsConfig {
     required_flags: u32,
     filter_flags: u32,
     id_filter: Option<String>,
+    insert_size_max: u32,
     read_length_filter: Option<usize>,
     trim_quality: u8,
     coverage_min: u32,
@@ -51,6 +52,7 @@ impl Default for StatsConfig {
             required_flags: 0,
             filter_flags: 0,
             id_filter: None,
+            insert_size_max: 8000,
             read_length_filter: None,
             trim_quality: 0,
             coverage_min: 1,
@@ -125,6 +127,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     return ExitCode::from(1);
                 };
                 config.id_filter = Some(raw.to_owned());
+            }
+            "-i" | "--insert-size" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("stats", "option -i requires an argument");
+                    return ExitCode::from(1);
+                };
+                match raw.parse::<u32>() {
+                    Ok(max) => config.insert_size_max = max,
+                    Err(e) => {
+                        print_error("stats", format!("invalid insert size \"{raw}\": {e}"));
+                        return ExitCode::from(1);
+                    }
+                }
             }
             "-l" | "--read-length" => {
                 let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
@@ -1116,7 +1131,7 @@ impl StatsCounts {
                 if rec.reference_sequence_id == rec.mate_reference_sequence_id
                     && rec.reference_sequence_id.is_some()
                 {
-                    self.update_isize_bin(flag, rec.template_length);
+                    self.update_isize_bin(flag, rec.template_length, config.insert_size_max);
                 }
             }
             if flag & BAM_FMUNMAP != 0 && flag & BAM_FUNMAP == 0 {
@@ -1140,10 +1155,13 @@ impl StatsCounts {
     /// with opposite strands is FR (inward) when the leftmost read is
     /// forward, and RF (outward) otherwise. Same-direction pairs are
     /// classified as "other".
-    fn update_isize_bin(&mut self, flag: u32, template_length: i32) {
+    fn update_isize_bin(&mut self, flag: u32, template_length: i32, insert_size_max: u32) {
         let read_reverse = flag & BAM_FREVERSE != 0;
         let mate_reverse = flag & 0x20 /* BAM_FMREVERSE */ != 0;
-        let isize = template_length.unsigned_abs() as u64;
+        let mut isize = template_length.unsigned_abs() as u64;
+        if insert_size_max > 0 {
+            isize = isize.min(u64::from(insert_size_max));
+        }
         self.isize_count += 1;
         self.isize_sum = self.isize_sum.saturating_add(isize);
         self.isize_sum_sq += (isize as f64) * (isize as f64);
@@ -1529,6 +1547,10 @@ fn print_usage() -> io::Result<()> {
     writeln!(
         w,
         "  -I, --id ID                   include only read group ID or sample"
+    )?;
+    writeln!(
+        w,
+        "  -i, --insert-size INT         maximum insert size for summaries"
     )?;
     writeln!(
         w,
