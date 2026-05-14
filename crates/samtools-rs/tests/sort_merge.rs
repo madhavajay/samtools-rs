@@ -475,6 +475,43 @@ fn collate_sam_input_groups_by_name_to_sam_output() {
 }
 
 #[test]
+fn collate_cram_input_uses_top_level_reference() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("collate-cram");
+    let out_prefix = tmp.join("collated");
+    let out = tmp.join("collated.sam");
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+
+    let argv: Vec<OsString> = [
+        "samtools",
+        "--reference",
+        reference.to_str().unwrap(),
+        "collate",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out_prefix.to_str().unwrap(),
+        cram.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(samtools_run(argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.starts_with("@HD\t"));
+    let names: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').next().unwrap())
+        .collect();
+    assert!(!names.is_empty());
+    assert!(names.windows(2).all(|w| w[0] <= w[1]));
+}
+
+#[test]
 fn collate_rejects_invalid_output_format() {
     let argv: Vec<OsString> = [
         "collate",

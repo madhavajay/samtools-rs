@@ -3,13 +3,13 @@
 //!
 //! Mirrors `main_bamshuf` in `bamshuf.c`. The upstream implementation uses
 //! name-hash bucketing with on-disk temp files for memory bounding. This
-//! initial Rust port performs an in-memory name sort for BAM/SAM inputs, which
-//! gives the same per-name grouping result but does not scale to inputs larger
-//! than memory.
+//! initial Rust port performs an in-memory name sort for BAM/SAM/reference-backed
+//! CRAM inputs, which gives the same per-name grouping result but does not scale
+//! to inputs larger than memory.
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -20,6 +20,7 @@ use htslib_rs::sam::{self, alignment::RecordBuf};
 
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
 /// Entry point for `samtools collate` (alias `bamshuf`).
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -89,10 +90,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if !matches!(format.exact, Exact::Sam | Exact::Bam) {
+    if !matches!(format.exact, Exact::Sam | Exact::Bam | Exact::Cram) {
         print_error(
             "collate",
-            "only SAM and BAM input are currently supported (CRAM TODO)",
+            "only SAM, BAM, and reference-backed CRAM input are currently supported",
         );
         return ExitCode::from(1);
     }
@@ -156,10 +157,11 @@ fn run_collate(
     let (mut header, mut records) = match format.exact {
         Exact::Sam => read_sam_records(input)?,
         Exact::Bam => read_bam_records(input)?,
+        Exact::Cram => read_cram_records(input)?,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "only SAM and BAM input are currently supported (CRAM TODO)",
+                "only SAM, BAM, and reference-backed CRAM input are currently supported",
             ));
         }
     };
@@ -197,6 +199,30 @@ fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
 
 fn read_sam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
     let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
+    read_sam_records_from_reader(&mut reader)
+}
+
+fn read_cram_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+    let reference = current_global_args().reference.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CRAM input requires top-level --reference FILE",
+        )
+    })?;
+    let text =
+        htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+            input, reference, None,
+        )?;
+    let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(text)));
+    read_sam_records_from_reader(&mut reader)
+}
+
+fn read_sam_records_from_reader<R>(
+    reader: &mut sam::io::Reader<R>,
+) -> io::Result<(sam::Header, Vec<RecordBuf>)>
+where
+    R: BufRead,
+{
     let header = reader.read_header()?;
     let mut records = Vec::new();
     loop {
@@ -278,7 +304,7 @@ fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
     writeln!(
         w,
-        "Usage: samtools collate [options] <in.bam|in.sam> [<out.prefix>]"
+        "Usage: samtools collate [options] <in.bam|in.sam|in.cram> [<out.prefix>]"
     )?;
     writeln!(w, "  -o PREFIX   output prefix or path")?;
     writeln!(w, "  -O          write to stdout")?;
