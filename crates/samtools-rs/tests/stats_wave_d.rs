@@ -186,6 +186,152 @@ fn depth_sam_input_supports_region_restriction() {
 }
 
 #[test]
+fn depth_flag_filters_match_default_exclusion_controls() {
+    let tmp = tmp_dir("depth-flag-filters");
+    let sam = tmp.join("in.sam");
+    let default_out = tmp.join("default.tsv");
+    let include_dup_out = tmp.join("include-dup.tsv");
+    let only_dup_out = tmp.join("only-dup.tsv");
+    let require_dup_out = tmp.join("require-dup.tsv");
+    let exclude_reverse_out = tmp.join("exclude-reverse.tsv");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:6\n",
+            "normal\t0\tchr1\t1\t60\t2M\t*\t0\t0\tAA\t!!\n",
+            "dup\t1024\tchr1\t2\t60\t2M\t*\t0\t0\tCC\t!!\n",
+            "rev\t16\tchr1\t4\t60\t2M\t*\t0\t0\tGG\t!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(depth::main(&argv(
+            "depth",
+            &["-o", default_out.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(&default_out).unwrap(),
+        "chr1\t1\t1\nchr1\t2\t1\nchr1\t4\t1\nchr1\t5\t1\n"
+    );
+
+    assert_eq!(
+        exit_to_u8(depth::main(&argv(
+            "depth",
+            &[
+                "-g",
+                "DUP",
+                "-o",
+                include_dup_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(&include_dup_out).unwrap(),
+        "chr1\t1\t1\nchr1\t2\t2\nchr1\t3\t1\nchr1\t4\t1\nchr1\t5\t1\n"
+    );
+
+    assert_eq!(
+        exit_to_u8(depth::main(&argv(
+            "depth",
+            &[
+                "-g",
+                "DUP",
+                "--incl-flags",
+                "DUP",
+                "-o",
+                only_dup_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(&only_dup_out).unwrap(),
+        "chr1\t2\t1\nchr1\t3\t1\n"
+    );
+
+    assert_eq!(
+        exit_to_u8(depth::main(&argv(
+            "depth",
+            &[
+                "-g",
+                "DUP",
+                "--require-flags",
+                "DUP",
+                "-o",
+                require_dup_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(&require_dup_out).unwrap(),
+        "chr1\t2\t1\nchr1\t3\t1\n"
+    );
+
+    assert_eq!(
+        exit_to_u8(depth::main(&argv(
+            "depth",
+            &[
+                "-G",
+                "REVERSE",
+                "-o",
+                exclude_reverse_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(exclude_reverse_out).unwrap(),
+        "chr1\t1\t1\nchr1\t2\t1\n"
+    );
+}
+
+#[test]
+fn depth_min_read_len_filters_short_alignments() {
+    let tmp = tmp_dir("depth-min-read-len");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("depth.tsv");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "short\t0\tchr1\t1\t60\t2M\t*\t0\t0\tAA\t!!\n",
+            "long\t0\tchr1\t4\t60\t2M1I2M\t*\t0\t0\tCCGTT\t!!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(depth::main(&argv(
+            "depth",
+            &[
+                "-l",
+                "5",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        "chr1\t4\t1\nchr1\t5\t1\nchr1\t6\t1\nchr1\t7\t1\n"
+    );
+}
+
+#[test]
 fn depth_multi_input_outputs_one_column_per_input() {
     let p = indexed_bam();
     let tmp = tmp_dir("depth-multi");
@@ -208,6 +354,74 @@ fn depth_multi_input_outputs_one_column_per_input() {
     let text = std::fs::read_to_string(out).unwrap();
     assert!(!text.is_empty());
     for line in text.lines() {
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields[0], "17");
+        assert_eq!(fields[2], fields[3]);
+    }
+}
+
+#[test]
+fn depth_header_lists_input_columns() {
+    let p = indexed_bam();
+    let tmp = tmp_dir("depth-header");
+    let out = tmp.join("depth.tsv");
+    assert_eq!(
+        exit_to_u8(depth::main(&argv(
+            "depth",
+            &[
+                "-H",
+                "-r",
+                "17:1-10000",
+                "-o",
+                out.to_str().unwrap(),
+                p.to_str().unwrap(),
+                p.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let mut lines = text.lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        format!("#CHROM\tPOS\t{}\t{}", p.display(), p.display())
+    );
+    assert!(lines.next().unwrap().starts_with("17\t"));
+}
+
+#[test]
+fn depth_reads_input_paths_from_file_list() {
+    let p = indexed_bam();
+    let tmp = tmp_dir("depth-file-list");
+    let list = tmp.join("inputs.txt");
+    let out = tmp.join("depth.tsv");
+    std::fs::write(&list, format!("{}\n{}\n", p.display(), p.display())).unwrap();
+
+    assert_eq!(
+        exit_to_u8(depth::main(&argv(
+            "depth",
+            &[
+                "-H",
+                "-f",
+                list.to_str().unwrap(),
+                "-r",
+                "17:1-10000",
+                "-o",
+                out.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let mut lines = text.lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        format!("#CHROM\tPOS\t{}\t{}", p.display(), p.display())
+    );
+    for line in lines {
         let fields: Vec<_> = line.split('\t').collect();
         assert_eq!(fields.len(), 4);
         assert_eq!(fields[0], "17");
@@ -395,6 +609,233 @@ fn coverage_sam_input_supports_region_restriction() {
     assert_eq!(
         rows,
         ["chr1\t3\t5\t2\t3\t100.000000\t1.666667\t24.000000\t45.000000"]
+    );
+}
+
+#[test]
+fn coverage_flag_filters_match_default_exclusion_controls() {
+    let tmp = tmp_dir("coverage-flag-filters");
+    let sam = tmp.join("in.sam");
+    let default_out = tmp.join("default.tsv");
+    let include_dup_out = tmp.join("include-dup.tsv");
+    let only_dup_out = tmp.join("only-dup.tsv");
+    let exclude_reverse_out = tmp.join("exclude-reverse.tsv");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "normal\t0\tchr1\t1\t60\t2M\t*\t0\t0\tAA\tII\n",
+            "dup\t1024\tchr1\t2\t60\t2M\t*\t0\t0\tCC\tII\n",
+            "rev\t16\tchr1\t4\t60\t2M\t*\t0\t0\tGG\tII\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-H",
+                "-o",
+                default_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(&default_out).unwrap(),
+        "chr1\t1\t8\t2\t4\t50.000000\t0.500000\t40.000000\t60.000000\n"
+    );
+
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-H",
+                "--ff",
+                "0",
+                "-o",
+                include_dup_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(&include_dup_out).unwrap(),
+        "chr1\t1\t8\t3\t5\t62.500000\t0.750000\t40.000000\t60.000000\n"
+    );
+
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-H",
+                "--ff",
+                "0",
+                "--rf",
+                "DUP",
+                "-o",
+                only_dup_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(&only_dup_out).unwrap(),
+        "chr1\t1\t8\t1\t2\t25.000000\t0.250000\t40.000000\t60.000000\n"
+    );
+
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-H",
+                "--ff",
+                "REVERSE",
+                "-o",
+                exclude_reverse_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(exclude_reverse_out).unwrap(),
+        "chr1\t1\t8\t2\t3\t37.500000\t0.500000\t40.000000\t60.000000\n"
+    );
+}
+
+#[test]
+fn coverage_reads_input_paths_from_bam_list() {
+    let tmp = tmp_dir("coverage-bam-list");
+    let sam = tmp.join("in.sam");
+    let list = tmp.join("inputs.txt");
+    let out = tmp.join("coverage.tsv");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "normal\t0\tchr1\t1\t60\t2M\t*\t0\t0\tAA\tII\n",
+            "rev\t16\tchr1\t4\t60\t2M\t*\t0\t0\tGG\tII\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(&list, format!("{}\n{}\n", sam.display(), sam.display())).unwrap();
+
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-H",
+                "-b",
+                list.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        "chr1\t1\t8\t4\t4\t50.000000\t1.000000\t40.000000\t60.000000\n"
+    );
+}
+
+#[test]
+fn coverage_min_read_len_filters_short_alignments() {
+    let tmp = tmp_dir("coverage-min-read-len");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("coverage.tsv");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "short\t0\tchr1\t1\t60\t2M\t*\t0\t0\tAA\tII\n",
+            "long\t0\tchr1\t4\t60\t2M1I2M\t*\t0\t0\tCCGTT\tIIIII\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-H",
+                "-l",
+                "5",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        "chr1\t1\t8\t1\t4\t50.000000\t0.500000\t40.000000\t60.000000\n"
+    );
+}
+
+#[test]
+fn coverage_max_depth_caps_reported_depth_metrics() {
+    let tmp = tmp_dir("coverage-max-depth");
+    let sam = tmp.join("in.sam");
+    let default_out = tmp.join("default.tsv");
+    let capped_out = tmp.join("capped.tsv");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:4\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\tIIII\n",
+            "r2\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\tIIII\n",
+            "r3\t0\tchr1\t1\t60\t4M\t*\t0\t0\tGGGG\tIIII\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-H",
+                "-o",
+                default_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-H",
+                "-d",
+                "1",
+                "-o",
+                capped_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(default_out).unwrap(),
+        "chr1\t1\t4\t3\t4\t100.000000\t3.000000\t40.000000\t60.000000\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(capped_out).unwrap(),
+        "chr1\t1\t4\t3\t4\t100.000000\t1.000000\t40.000000\t60.000000\n"
     );
 }
 
@@ -785,10 +1226,123 @@ fn stats_sn_value(text: &str, key: &str) -> u64 {
     text.lines()
         .find_map(|line| {
             let fields: Vec<_> = line.split('\t').collect();
-            (fields.len() == 3 && fields[0] == "SN" && fields[1] == format!("{key}:"))
+            (fields.len() >= 3 && fields[0] == "SN" && fields[1] == format!("{key}:"))
                 .then(|| fields[2].parse().unwrap())
         })
         .unwrap()
+}
+
+fn stats_sn_text<'a>(text: &'a str, key: &str) -> &'a str {
+    text.lines()
+        .find_map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            (fields.len() >= 3 && fields[0] == "SN" && fields[1] == format!("{key}:"))
+                .then(|| fields[2])
+        })
+        .unwrap_or("")
+}
+
+fn quality_hist_value(text: &str, label: &str, cycle: usize, quality: usize) -> u64 {
+    text.lines()
+        .find_map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            (fields.len() >= quality + 3
+                && fields[0] == label
+                && fields[1].parse::<usize>().unwrap() == cycle)
+                .then(|| fields[quality + 2].parse().unwrap())
+        })
+        .unwrap()
+}
+
+fn gc_hist_value(text: &str, label: &str, percent: &str) -> u64 {
+    text.lines()
+        .find_map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            (fields.len() >= 3 && fields[0] == label && fields[1] == percent)
+                .then(|| fields[2].parse().unwrap())
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn stats_emits_insert_size_and_supplementary_sn_lines() {
+    let tmp = tmp_dir("stats-insert-size");
+    let sam = tmp.join("paired.sam");
+    let out = tmp.join("paired.stats");
+    // Three records:
+    //  - r1 first/forward, r1 mate/reverse: classic FR pair with TLEN 100
+    //  - supp: a supplementary alignment of r1 that must NOT contribute to
+    //          the IS bins or to raw totals
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:1000
+r1\t99\tchr1\t1\t60\t10M\t=\t91\t100\tACGTACGTAC\t!!!!!!!!!!
+r1\t147\tchr1\t91\t60\t10M\t=\t1\t-100\tACGTACGTAC\t!!!!!!!!!!
+r1\t2147\tchr1\t1\t60\t10M\t*\t0\t0\tACGTACGTAC\t!!!!!!!!!!
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &["-o", out.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert_eq!(stats_sn_value(&text, "raw total sequences"), 2);
+    assert_eq!(stats_sn_value(&text, "supplementary alignments"), 1);
+    assert_eq!(stats_sn_value(&text, "inward oriented pairs"), 1);
+    assert_eq!(stats_sn_value(&text, "outward oriented pairs"), 0);
+    assert_eq!(stats_sn_value(&text, "pairs with other orientation"), 0);
+    assert_eq!(stats_sn_text(&text, "insert size average"), "100.0");
+    assert_eq!(
+        stats_sn_text(&text, "insert size standard deviation"),
+        "0.0"
+    );
+    assert_eq!(
+        stats_sn_text(&text, "percentage of properly paired reads (%)"),
+        "100.0"
+    );
+}
+
+#[test]
+fn stats_classifies_outward_and_other_orientation() {
+    let tmp = tmp_dir("stats-orientation");
+    let sam = tmp.join("oriented.sam");
+    let out = tmp.join("oriented.stats");
+    // Two pairs on the same chromosome, both mapped:
+    //   pair A: outward — read1 is reverse (5'-most reverse), read2 forward
+    //   pair B: same-direction FF — both forward → "other"
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:1000
+a\t83\tchr1\t1\t60\t10M\t=\t91\t100\tACGTACGTAC\t!!!!!!!!!!
+a\t163\tchr1\t91\t60\t10M\t=\t1\t-100\tACGTACGTAC\t!!!!!!!!!!
+b\t65\tchr1\t1\t60\t10M\t=\t91\t100\tACGTACGTAC\t!!!!!!!!!!
+b\t129\tchr1\t91\t60\t10M\t=\t1\t-100\tACGTACGTAC\t!!!!!!!!!!
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &["-o", out.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert_eq!(stats_sn_value(&text, "inward oriented pairs"), 0);
+    assert_eq!(stats_sn_value(&text, "outward oriented pairs"), 1);
+    assert_eq!(stats_sn_value(&text, "pairs with other orientation"), 1);
 }
 
 #[test]
@@ -1240,4 +1794,324 @@ fn view_filter_expr_for_sam() {
         ))),
         0
     );
+}
+
+#[test]
+fn stats_is_sorted_reflects_header_sort_order() {
+    let tmp = tmp_dir("stats-is-sorted");
+    let sam_sorted = tmp.join("sorted.sam");
+    let sam_unsorted = tmp.join("unsorted.sam");
+    let out_sorted = tmp.join("sorted.stats");
+    let out_unsorted = tmp.join("unsorted.stats");
+    std::fs::write(
+        &sam_sorted,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:100
+r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_unsorted,
+        "\
+@HD\tVN:1.6\tSO:queryname
+@SQ\tSN:chr1\tLN:100
+r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-o",
+                out_sorted.to_str().unwrap(),
+                sam_sorted.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-o",
+                out_unsorted.to_str().unwrap(),
+                sam_unsorted.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let sorted_text = std::fs::read_to_string(&out_sorted).unwrap();
+    let unsorted_text = std::fs::read_to_string(&out_unsorted).unwrap();
+    assert_eq!(stats_sn_value(&sorted_text, "is sorted"), 1);
+    assert_eq!(stats_sn_value(&unsorted_text, "is sorted"), 0);
+}
+
+#[test]
+fn coverage_histogram_emits_ascii_plot() {
+    let tmp = tmp_dir("coverage-hist");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("hist.txt");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:80
+r1\t0\tchr1\t1\t60\t40M\t*\t0\t0\tACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\t!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+r2\t0\tchr1\t1\t60\t40M\t*\t0\t0\tACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\t!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-m",
+                "-w",
+                "20",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("chr1"));
+    // Histogram rows begin with `>` and a percentage. The bottom row is the
+    // 0.00% threshold; ensure it's present and contains at least one filled
+    // glyph (`:` or `.`).
+    let bottom = text
+        .lines()
+        .find(|l| l.contains("0.00%"))
+        .expect("histogram has a 0% row");
+    assert!(bottom.contains(':') || bottom.contains('.'));
+}
+
+#[test]
+fn stats_emits_sequence_length_sn_lines() {
+    let tmp = tmp_dir("stats-seq-len");
+    let sam = tmp.join("len.sam");
+    let out = tmp.join("len.stats");
+    // Two paired reads with sequence length 10; average quality is the
+    // mean of `!` (ASCII 33 → Phred 0) values.
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:1000
+r1\t99\tchr1\t1\t60\t10M\t=\t91\t100\tACGTACGTAC\tIIIIIIIIII
+r1\t147\tchr1\t91\t60\t10M\t=\t1\t-100\tACGTACGTAC\tIIIIIIIIII
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &["-o", out.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert_eq!(stats_sn_value(&text, "total length"), 20);
+    assert_eq!(stats_sn_value(&text, "total first fragment length"), 10);
+    assert_eq!(stats_sn_value(&text, "total last fragment length"), 10);
+    assert_eq!(stats_sn_value(&text, "maximum length"), 10);
+    assert_eq!(stats_sn_text(&text, "average length"), "10");
+    // Quality 'I' is ASCII 73 → Phred 73-33=40.
+    assert_eq!(stats_sn_text(&text, "average quality"), "40.0");
+}
+
+#[test]
+fn stats_emits_first_and_last_fragment_quality_histograms() {
+    let tmp = tmp_dir("stats-quality-hist");
+    let sam = tmp.join("qual.sam");
+    let out = tmp.join("qual.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:1000
+r1\t99\tchr1\t1\t60\t10M\t=\t91\t100\tACGTACGTAC\tIIIIIIIIII
+r1\t147\tchr1\t91\t60\t10M\t=\t1\t-100\tTGCATGCATG\t!!!!!!!!!!
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &["-o", out.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert_eq!(quality_hist_value(&text, "FFQ", 1, 40), 1);
+    assert_eq!(quality_hist_value(&text, "FFQ", 10, 40), 1);
+    assert_eq!(quality_hist_value(&text, "LFQ", 1, 0), 1);
+    assert_eq!(quality_hist_value(&text, "LFQ", 10, 0), 1);
+}
+
+#[test]
+fn stats_emits_first_and_last_fragment_gc_histograms() {
+    let tmp = tmp_dir("stats-gc-hist");
+    let sam = tmp.join("gc.sam");
+    let all_out = tmp.join("all.stats");
+    let dedup_out = tmp.join("dedup.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:1000
+r1\t99\tchr1\t1\t60\t10M\t=\t91\t100\tGGGGGAAAAA\tIIIIIIIIII
+r1\t147\tchr1\t91\t60\t10M\t=\t1\t-100\tCCCCAAAAAA\tIIIIIIIIII
+dup\t1123\tchr1\t201\t60\t10M\t=\t291\t100\tGGGGGGGGGG\tIIIIIIIIII
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &["-o", all_out.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-d",
+                "-o",
+                dedup_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let all_text = std::fs::read_to_string(all_out).unwrap();
+    assert_eq!(gc_hist_value(&all_text, "GCF", "50.00"), 1);
+    assert_eq!(gc_hist_value(&all_text, "GCF", "100.00"), 1);
+    assert_eq!(gc_hist_value(&all_text, "GCL", "40.00"), 1);
+
+    let dedup_text = std::fs::read_to_string(dedup_out).unwrap();
+    assert_eq!(gc_hist_value(&dedup_text, "GCF", "50.00"), 1);
+    assert_eq!(gc_hist_value(&dedup_text, "GCF", "100.00"), 0);
+    assert_eq!(gc_hist_value(&dedup_text, "GCL", "40.00"), 1);
+}
+
+#[test]
+fn stats_emits_cigar_walk_coverage_histogram() {
+    let tmp = tmp_dir("stats-cov");
+    let sam = tmp.join("cov.sam");
+    let out = tmp.join("cov.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:10
+r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\tIIII
+r2\t0\tchr1\t3\t60\t4M\t*\t0\t0\tCCCC\tIIII
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &["-o", out.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("# Coverage distribution."));
+    assert!(text.contains("COV\t[1-1]\t1\t4\n"));
+    assert!(text.contains("COV\t[2-2]\t2\t2\n"));
+}
+
+#[test]
+fn stats_coverage_option_groups_cov_bins() {
+    let tmp = tmp_dir("stats-cov-bins");
+    let sam = tmp.join("cov.sam");
+    let out = tmp.join("cov.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:10
+r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\tIIII
+r2\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\tIIII
+r3\t0\tchr1\t3\t60\t4M\t*\t0\t0\tGGGG\tIIII
+r4\t0\tchr1\t5\t60\t2M\t*\t0\t0\tTT\tII
+r5\t0\tchr1\t5\t60\t2M\t*\t0\t0\tAA\tII
+r6\t0\tchr1\t5\t60\t2M\t*\t0\t0\tCC\tII
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-c",
+                "2,4,2",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(!text.contains("COV\t[1-1]"));
+    assert!(text.contains("COV\t[2-3]\t2\t4\n"));
+    assert!(text.contains("COV\t[4-4]\t4\t2\n"));
+}
+
+#[test]
+fn stats_emits_bases_mapped_and_error_rate_sn_lines() {
+    let tmp = tmp_dir("stats-error-rate");
+    let sam = tmp.join("nm.sam");
+    let out = tmp.join("nm.stats");
+    // Two mapped reads with NM:i:1 and NM:i:0 → 1 mismatch over 20
+    // CIGAR-derived mapped bases gives error rate 0.05.
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:100
+r1\t0\tchr1\t1\t60\t10M\t*\t0\t0\tACGTACGTAC\tIIIIIIIIII\tNM:i:1
+r2\t0\tchr1\t11\t60\t10M\t*\t0\t0\tACGTACGTAC\tIIIIIIIIII\tNM:i:0
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &["-o", out.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert_eq!(stats_sn_value(&text, "bases mapped"), 20);
+    assert_eq!(stats_sn_value(&text, "bases mapped (cigar)"), 20);
+    assert_eq!(stats_sn_value(&text, "mismatches"), 1);
+    let error_rate = stats_sn_text(&text, "error rate");
+    // 1/20 = 0.05 → upstream prints `5.000000e-02`.
+    assert!(error_rate.starts_with("5.0"));
+    assert!(error_rate.contains('e'));
 }

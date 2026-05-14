@@ -63,6 +63,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         .is_none_or(|path| path == Path::new("-"));
 
     let mut opts = opts;
+    opts.argv = Some(args.to_vec());
     if let Some(bed) = opts.bed_path.clone() {
         match load_bed_regions(&bed) {
             Ok(more) => opts.regions.extend(more),
@@ -133,6 +134,9 @@ struct Opts {
     header: HeaderMode,
     count: bool,
     no_pg: bool,
+    /// Argv captured for `@PG` insertion when `--no-PG` is not set.
+    /// `None` means the caller didn't supply an argv (e.g. internal tests).
+    argv: Option<Vec<OsString>>,
     unmap_unselected: bool,
     reference: Option<PathBuf>,
     /// `-f INT` — require ALL these flag bits to be set on the record.
@@ -478,7 +482,8 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
 
     // Header-only mode.
     if opts.header == HeaderMode::HeaderOnly {
-        let header_text = read_raw_header_text_with_format(input, input_exact)?;
+        let header_text =
+            apply_pg_to_header(&read_raw_header_text_with_format(input, input_exact)?, opts)?;
         let mut out = open_text_output(opts)?;
         out.write_all(header_text.as_bytes())?;
         sam_io::check_sam_close(&mut out)?;
@@ -498,7 +503,8 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
             HeaderMode::HeaderOnly => true, // handled above
         };
         if include_header {
-            let header_text = read_raw_header_text_with_format(input, input_exact)?;
+            let header_text =
+                apply_pg_to_header(&read_raw_header_text_with_format(input, input_exact)?, opts)?;
             out.write_all(header_text.as_bytes())?;
             if let Some(unselected) = unselected.as_mut() {
                 unselected.write_all(header_text.as_bytes())?;
@@ -514,12 +520,33 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
 
     // BAM output.
     if effective_out_fmt == OutputFmt::Bam {
-        reject_unselected_binary_output(opts)?;
+        if input_exact != Exact::Sam {
+            reject_unselected_binary_output(opts)?;
+        }
         let filter = combined_filter_expr(opts);
         let dst_file = open_binary_output(opts)?;
         match input_exact {
             Exact::Sam => {
-                if let Some(expr) = filter.as_deref() {
+                let needs_split = opts.unselected_output.is_some() || opts.unmap_unselected;
+                if needs_split {
+                    // Build SAM text with `-p`/`-U` semantics applied, then
+                    // pipe each side into a BAM writer. This avoids
+                    // touching binary records directly while still
+                    // honoring the splitting modes for SAM input.
+                    let raw = read_sam_path_bytes(input)?;
+                    let (selected, unselected) = build_split_sam_text(&raw, opts)?;
+                    htslib_rs::alignment_compat::write_bam_from_sam_reader(
+                        BufReader::new(io::Cursor::new(selected)),
+                        dst_file,
+                    )?;
+                    if let Some(unselected_path) = opts.unselected_output.as_deref() {
+                        let unselected_dst = File::create(unselected_path)?;
+                        htslib_rs::alignment_compat::write_bam_from_sam_reader(
+                            BufReader::new(io::Cursor::new(unselected)),
+                            unselected_dst,
+                        )?;
+                    }
+                } else if let Some(expr) = filter.as_deref() {
                     if has_tag_filter(opts) {
                         let text =
                             htslib_rs::alignment_compat::view_sam_text_matching_filter_from_path(
@@ -603,7 +630,9 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
     }
 
     if effective_out_fmt == OutputFmt::Cram {
-        reject_unselected_binary_output(opts)?;
+        if input_exact != Exact::Sam {
+            reject_unselected_binary_output(opts)?;
+        }
         let filter = combined_filter_expr(opts);
         let dst = opts
             .output
@@ -613,7 +642,29 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
         let dst_file = File::create(&dst)?;
         match input_exact {
             Exact::Sam => {
-                if let Some(expr) = filter.as_deref() {
+                let needs_split = opts.unselected_output.is_some() || opts.unmap_unselected;
+                if needs_split {
+                    let raw = read_sam_path_bytes(input)?;
+                    let (selected, unselected) = build_split_sam_text(&raw, opts)?;
+                    let mut selected_reader =
+                        htslib_rs::sam::io::Reader::new(BufReader::new(io::Cursor::new(selected)));
+                    htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
+                        &mut selected_reader,
+                        &reference,
+                        dst_file,
+                    )?;
+                    if let Some(unselected_path) = opts.unselected_output.as_deref() {
+                        let mut unselected_reader = htslib_rs::sam::io::Reader::new(
+                            BufReader::new(io::Cursor::new(unselected)),
+                        );
+                        let unselected_dst = File::create(unselected_path)?;
+                        htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
+                            &mut unselected_reader,
+                            &reference,
+                            unselected_dst,
+                        )?;
+                    }
+                } else if let Some(expr) = filter.as_deref() {
                     if has_tag_filter(opts) {
                         let text =
                             htslib_rs::alignment_compat::view_sam_text_matching_filter_from_path(
@@ -753,7 +804,11 @@ fn run_sam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
 
     if opts.header == HeaderMode::HeaderOnly {
         let mut out = open_text_output(opts)?;
-        out.write_all(sam_header_lines(input))?;
+        let header_text = apply_pg_to_header(
+            std::str::from_utf8(sam_header_lines(input)).unwrap_or(""),
+            opts,
+        )?;
+        out.write_all(header_text.as_bytes())?;
         sam_io::check_sam_close(&mut out)?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -763,9 +818,13 @@ fn run_sam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
         let mut out = open_text_output(opts)?;
         let mut unselected = open_unselected_text_output(opts)?;
         if opts.header == HeaderMode::Include {
-            out.write_all(sam_header_lines(input))?;
+            let header_text = apply_pg_to_header(
+                std::str::from_utf8(sam_header_lines(input)).unwrap_or(""),
+                opts,
+            )?;
+            out.write_all(header_text.as_bytes())?;
             if let Some(unselected) = unselected.as_mut() {
-                unselected.write_all(sam_header_lines(input))?;
+                unselected.write_all(header_text.as_bytes())?;
             }
         }
         let filter = prefilter_expr_for_sam_output(opts);
@@ -908,8 +967,10 @@ fn run_bam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
     if opts.header == HeaderMode::HeaderOnly {
         let text =
             htslib_rs::alignment_compat::view_bam_as_sam_text(io::Cursor::new(input), Some(0))?;
+        let header_text =
+            apply_pg_to_header(std::str::from_utf8(text.as_bytes()).unwrap_or(""), opts)?;
         let mut out = open_text_output(opts)?;
-        out.write_all(text.as_bytes())?;
+        out.write_all(header_text.as_bytes())?;
         sam_io::check_sam_close(&mut out)?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -928,9 +989,13 @@ fn run_bam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
         let mut out = open_text_output(opts)?;
         let mut unselected = open_unselected_text_output(opts)?;
         if opts.header == HeaderMode::Include {
-            out.write_all(sam_header_lines(text.as_bytes()))?;
+            let header_text = apply_pg_to_header(
+                std::str::from_utf8(sam_header_lines(text.as_bytes())).unwrap_or(""),
+                opts,
+            )?;
+            out.write_all(header_text.as_bytes())?;
             if let Some(unselected) = unselected.as_mut() {
-                unselected.write_all(sam_header_lines(text.as_bytes()))?;
+                unselected.write_all(header_text.as_bytes())?;
             }
         }
         write_sam_text_records_split(&mut out, &mut unselected, text.as_bytes(), opts)?;
@@ -1026,8 +1091,10 @@ fn run_cram_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
             &reference,
             Some(0),
         )?;
+        let header_text =
+            apply_pg_to_header(std::str::from_utf8(text.as_bytes()).unwrap_or(""), opts)?;
         let mut out = open_text_output(opts)?;
-        out.write_all(text.as_bytes())?;
+        out.write_all(header_text.as_bytes())?;
         sam_io::check_sam_close(&mut out)?;
         return Ok(ExitCode::SUCCESS);
     }
@@ -1051,9 +1118,13 @@ fn run_cram_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
         let mut out = open_text_output(opts)?;
         let mut unselected = open_unselected_text_output(opts)?;
         if opts.header == HeaderMode::Include {
-            out.write_all(sam_header_lines(text.as_bytes()))?;
+            let header_text = apply_pg_to_header(
+                std::str::from_utf8(sam_header_lines(text.as_bytes())).unwrap_or(""),
+                opts,
+            )?;
+            out.write_all(header_text.as_bytes())?;
             if let Some(unselected) = unselected.as_mut() {
-                unselected.write_all(sam_header_lines(text.as_bytes()))?;
+                unselected.write_all(header_text.as_bytes())?;
             }
         }
         write_sam_text_records_split(&mut out, &mut unselected, text.as_bytes(), opts)?;
@@ -1133,6 +1204,19 @@ fn resolved_output_fmt(opts: &Opts) -> io::Result<OutputFmt> {
     }
 }
 
+/// Applies samtools' standard `@PG` chain entry to a SAM header text,
+/// unless `--no-PG` was passed or the caller hasn't supplied argv.
+fn apply_pg_to_header(header_text: &str, opts: &Opts) -> io::Result<String> {
+    if opts.no_pg {
+        return Ok(header_text.to_owned());
+    }
+    let Some(argv) = opts.argv.as_deref() else {
+        return Ok(header_text.to_owned());
+    };
+    crate::pg::add_samtools_pg(header_text, argv)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 fn open_text_output(opts: &Opts) -> io::Result<Box<dyn Write>> {
     sam_io::open_text_output(opts.output.as_deref())
 }
@@ -1178,10 +1262,63 @@ fn reject_unselected_binary_output(opts: &Opts) -> io::Result<()> {
     if opts.unselected_output.is_some() || opts.unmap_unselected {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "`-U/--output-unselected` and `-p/--unmap` are only wired up for SAM output so far",
+            "`-U/--output-unselected` and `-p/--unmap` for binary output are only supported for SAM input so far",
         ));
     }
     Ok(())
+}
+
+/// Builds two SAM text buffers — selected records and unselected records —
+/// from a raw SAM byte buffer using the same filtering / `-p` / `-U`
+/// logic as the SAM-output path. Returns `(selected, unselected)`.
+/// `unselected` is empty when the caller did not pass `-U`.
+///
+/// Used by the SAM-input binary output paths to support `-p`/`-U` via a
+/// text → BAM/CRAM roundtrip without needing to touch the binary record
+/// representation directly.
+fn build_split_sam_text(bytes: &[u8], opts: &Opts) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    let mut selected = Vec::with_capacity(bytes.len());
+    let mut unselected = Vec::new();
+    let header = sam_header_lines(bytes);
+    selected.extend_from_slice(header);
+    let want_unselected = opts.unselected_output.is_some();
+    if want_unselected {
+        unselected.extend_from_slice(header);
+    }
+    let tail = strip_header_lines(bytes);
+    let expr_filter = opts
+        .filter_expr
+        .as_deref()
+        .map(htslib_rs::expr::Filter::new);
+    for line in tail.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if !line_selected(line, opts, expr_filter.as_ref())? {
+            if want_unselected {
+                write_sam_record_line(&mut unselected, line, opts)?;
+            } else if opts.unmap_unselected {
+                write_sam_unmapped_record_line(&mut selected, line, opts)?;
+            }
+            continue;
+        }
+        write_sam_record_line(&mut selected, line, opts)?;
+    }
+    Ok((selected, unselected))
+}
+
+/// Returns the raw bytes of `path`, transparently decompressing BGZF input
+/// the same way `filtered_sam_text_from_path` does. Used by binary output
+/// paths that need a textual view of a SAM input for `-p`/`-U` handling.
+fn read_sam_path_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let mut bytes = Vec::new();
+    if is_bgzf_path(path)? {
+        MultiGzDecoder::new(file).read_to_end(&mut bytes)?;
+    } else {
+        BufReader::new(file).read_to_end(&mut bytes)?;
+    }
+    Ok(bytes)
 }
 
 fn load_bed_regions(path: &Path) -> io::Result<Vec<String>> {

@@ -1654,3 +1654,175 @@ fn view_cram_records_without_reference_fail_cleanly() {
         0
     );
 }
+
+#[test]
+fn view_header_only_appends_pg_line_by_default() {
+    let tmp = tmp_dir("view-pg-header-only");
+    let sam = tmp.join("input.sam");
+    let out = tmp.join("hdr.sam");
+    std::fs::write(
+        &sam,
+        b"@HD\tVN:1.6\n@SQ\tSN:ref\tLN:100\n@PG\tID:upstream\tPN:upstream\nr1\t0\tref\t1\t20\t2M\t*\t0\t0\tAC\t!!\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        run(&["-H", "-o", out.to_str().unwrap(), sam.to_str().unwrap()]),
+        0
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("@PG\tID:upstream"));
+    assert!(text.contains("PN:samtools"));
+    assert!(text.contains("PP:upstream"));
+}
+
+#[test]
+fn view_no_pg_suppresses_pg_line_in_header_only() {
+    let tmp = tmp_dir("view-no-pg-header-only");
+    let sam = tmp.join("input.sam");
+    let out = tmp.join("hdr.sam");
+    std::fs::write(
+        &sam,
+        b"@HD\tVN:1.6\n@SQ\tSN:ref\tLN:100\n@PG\tID:upstream\tPN:upstream\nr1\t0\tref\t1\t20\t2M\t*\t0\t0\tAC\t!!\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        run(&[
+            "-H",
+            "--no-PG",
+            "-o",
+            out.to_str().unwrap(),
+            sam.to_str().unwrap()
+        ]),
+        0
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("@PG\tID:upstream"));
+    assert!(!text.contains("PN:samtools"));
+}
+
+#[test]
+fn view_h_flag_sam_output_appends_pg_line() {
+    let tmp = tmp_dir("view-pg-sam-output");
+    let sam = tmp.join("input.sam");
+    let out = tmp.join("full.sam");
+    std::fs::write(
+        &sam,
+        b"@HD\tVN:1.6\n@SQ\tSN:ref\tLN:100\nr1\t0\tref\t1\t20\t2M\t*\t0\t0\tAC\t!!\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        run(&["-h", "-o", out.to_str().unwrap(), sam.to_str().unwrap()]),
+        0
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("PN:samtools"));
+    assert!(text.contains("\nr1\t"));
+}
+
+#[test]
+fn view_p_unmap_unselected_routes_into_bam_output_for_sam_input() {
+    let tmp = tmp_dir("view-unmap-bam");
+    let input = tmp.join("input.sam");
+    let bam_out = tmp.join("out.bam");
+    let sam_out = tmp.join("out.sam");
+
+    std::fs::write(
+        &input,
+        b"@HD\tVN:1.6\n@SQ\tSN:ref\tLN:100\nr1\t0\tref\t1\t20\t2M\t*\t0\t0\tAC\t!!\nr2\t0\tref\t2\t0\t2M\t*\t0\t0\tTG\t##\n",
+    )
+    .unwrap();
+
+    // -p with binary output: records below MAPQ threshold should be marked
+    // unmapped in the resulting BAM. Round-trip BAM -> SAM via view.
+    assert_eq!(
+        run(&[
+            "-b",
+            "-p",
+            "-h",
+            "-q",
+            "10",
+            "-o",
+            bam_out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert_eq!(
+        run(&[
+            "-h",
+            "-o",
+            sam_out.to_str().unwrap(),
+            bam_out.to_str().unwrap()
+        ]),
+        0
+    );
+    let text = std::fs::read_to_string(&sam_out).unwrap();
+    let bodies: Vec<&str> = text.lines().filter(|l| !l.starts_with('@')).collect();
+    assert_eq!(bodies.len(), 2);
+    // r2 (mapq=0) gets unmapped flag set (4) and CIGAR/MAPQ cleared.
+    let r1 = bodies.iter().find(|l| l.starts_with("r1\t")).unwrap();
+    let r2 = bodies.iter().find(|l| l.starts_with("r2\t")).unwrap();
+    let r1_flags: u32 = r1.split('\t').nth(1).unwrap().parse().unwrap();
+    let r2_flags: u32 = r2.split('\t').nth(1).unwrap().parse().unwrap();
+    assert_eq!(r1_flags & 4, 0);
+    assert_eq!(r2_flags & 4, 4);
+}
+
+#[test]
+fn view_u_unselected_routes_into_bam_output_for_sam_input() {
+    let tmp = tmp_dir("view-unselected-bam");
+    let input = tmp.join("input.sam");
+    let sel_bam = tmp.join("sel.bam");
+    let unsel_bam = tmp.join("unsel.bam");
+    let sel_sam = tmp.join("sel.sam");
+    let unsel_sam = tmp.join("unsel.sam");
+
+    std::fs::write(
+        &input,
+        b"@HD\tVN:1.6\n@SQ\tSN:ref\tLN:100\nr1\t0\tref\t1\t20\t2M\t*\t0\t0\tAC\t!!\nr2\t0\tref\t2\t0\t2M\t*\t0\t0\tTG\t##\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        run(&[
+            "-b",
+            "-h",
+            "-q",
+            "10",
+            "-U",
+            unsel_bam.to_str().unwrap(),
+            "-o",
+            sel_bam.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert_eq!(
+        run(&[
+            "-h",
+            "-o",
+            sel_sam.to_str().unwrap(),
+            sel_bam.to_str().unwrap()
+        ]),
+        0
+    );
+    assert_eq!(
+        run(&[
+            "-h",
+            "-o",
+            unsel_sam.to_str().unwrap(),
+            unsel_bam.to_str().unwrap()
+        ]),
+        0
+    );
+
+    let sel_text = std::fs::read_to_string(&sel_sam).unwrap();
+    let unsel_text = std::fs::read_to_string(&unsel_sam).unwrap();
+    assert!(sel_text.contains("\nr1\t"));
+    assert!(!sel_text.contains("\nr2\t"));
+    assert!(unsel_text.contains("\nr2\t"));
+    assert!(!unsel_text.contains("\nr1\t"));
+}

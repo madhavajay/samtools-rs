@@ -3,9 +3,10 @@
 //! Mirrors `bam_merge` in `bam_sort.c`. This initial Rust port loads all
 //! records from BAM/SAM inputs into memory and sorts by coordinate (or name
 //! with `-n`) before writing the merged output. K-way streaming merge
-//! and CRAM are TODO. Coordinate-sorted BAM outputs can also write a BAI via
-//! `--write-index`.
+//! and CRAM are TODO. `-R` and `-L` restrict indexed BAM inputs by region/BED.
+//! Coordinate-sorted BAM outputs can also write a BAI via `--write-index`.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufReader, Write};
@@ -29,6 +30,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut positional: Vec<PathBuf> = Vec::new();
     let mut force = false;
     let mut local_write_index = false;
+    let mut no_pg = false;
+    let mut region: Option<String> = None;
+    let mut bed: Option<PathBuf> = None;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -52,11 +56,20 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     }
                 };
             }
-            "-@" | "--threads" | "-l" | "--compression-level" | "-R" => {
+            "-R" => {
+                region = iter.next().and_then(|a| a.to_str().map(str::to_owned));
+            }
+            "-L" => {
+                bed = iter.next().map(PathBuf::from);
+            }
+            "-@" | "--threads" | "-l" | "--compression-level" => {
                 let _ = iter.next();
             }
             "--write-index" => local_write_index = true,
-            "--no-PG" | "-c" | "-p" | "-u" => {}
+            "--no-PG" => {
+                no_pg = true;
+            }
+            "-c" | "-p" | "-u" => {}
             "--help" => {
                 let _ = print_usage();
                 return ExitCode::SUCCESS;
@@ -143,12 +156,26 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     }
 
+    if region.is_some() && bed.is_some() {
+        print_error(
+            "merge",
+            "-R and -L are mutually exclusive in samtools-rs merge",
+        );
+        return ExitCode::from(1);
+    }
+
     match run_merge(
         &inputs,
         out_path.as_deref(),
         name_sort,
         output_fmt,
         write_index,
+        if no_pg { None } else { Some(args) },
+        match (region.as_deref(), bed.as_deref()) {
+            (Some(r), None) => MergeRestriction::Region(r),
+            (None, Some(path)) => MergeRestriction::Bed(path),
+            _ => MergeRestriction::None,
+        },
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -172,17 +199,41 @@ pub(crate) enum OutFmt {
     Bam,
 }
 
+pub(crate) enum MergeRestriction<'a> {
+    None,
+    Region(&'a str),
+    Bed(&'a Path),
+}
+
 pub(crate) fn run_merge(
     inputs: &[PathBuf],
     output: Option<&Path>,
     name_sort: bool,
     fmt: OutFmt,
     write_index: bool,
+    pg_argv: Option<&[OsString]>,
+    restriction: MergeRestriction<'_>,
 ) -> io::Result<()> {
-    let (mut header, mut records) = read_records(&inputs[0])?;
+    let filter = match restriction {
+        MergeRestriction::Region(r) => Some(RegionFilter::Regions(vec![
+            r.parse::<htslib_rs::core::Region>().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("invalid -R region \"{r}\": {e}"),
+                )
+            })?,
+        ])),
+        MergeRestriction::Bed(path) => {
+            let bed = crate::bedidx::load_bed_index(path)?;
+            Some(RegionFilter::Regions(bed.to_htslib_regions()?))
+        }
+        MergeRestriction::None => None,
+    };
+
+    let (mut header, mut records) = read_records(&inputs[0], filter.as_ref())?;
 
     for path in &inputs[1..] {
-        let (_h, mut input_records) = read_records(path)?;
+        let (_h, mut input_records) = read_records(path, filter.as_ref())?;
         records.append(&mut input_records);
     }
 
@@ -211,6 +262,10 @@ pub(crate) fn run_merge(
         if name_sort { "queryname" } else { "coordinate" },
     );
 
+    if let Some(argv) = pg_argv {
+        header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
+    }
+
     {
         let mut writer = open_output(output, fmt, &header)?;
         for rec in &records {
@@ -230,11 +285,25 @@ pub(crate) fn run_merge(
     Ok(())
 }
 
-fn read_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+enum RegionFilter {
+    Regions(Vec<htslib_rs::core::Region>),
+}
+
+fn read_records(
+    input: &Path,
+    filter: Option<&RegionFilter>,
+) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
     let format = sam_io::sam_open_format(input)?;
-    match format.exact {
-        Exact::Sam => read_sam_records(input),
-        Exact::Bam => read_bam_records(input),
+    match (format.exact, filter) {
+        (Exact::Sam, None) => read_sam_records(input),
+        (Exact::Sam, Some(_)) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "samtools merge region filters require indexed BAM input (SAM is not supported)",
+        )),
+        (Exact::Bam, None) => read_bam_records(input),
+        (Exact::Bam, Some(RegionFilter::Regions(regions))) => {
+            read_bam_records_in_regions(input, regions)
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "only SAM and BAM input are currently supported (CRAM TODO)",
@@ -254,6 +323,38 @@ fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
         records.push(record);
     }
     Ok((header, records))
+}
+
+/// Reads BAM records overlapping `regions` using the input's BAI index.
+/// Returns the records as `RecordBuf` for downstream sorting and writing.
+fn read_bam_records_in_regions(
+    input: &Path,
+    regions: &[htslib_rs::core::Region],
+) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+    let header = htslib_rs::alignment_compat::read_bam_header_from_path(input)?;
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    for region in regions {
+        let bam_records = htslib_rs::alignment_compat::query_bam_records_from_path(input, region)?;
+        for bam_record in bam_records {
+            let buf = sam::alignment::RecordBuf::try_from_alignment_record(&header, &bam_record)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            if seen.insert(record_key(&buf)) {
+                records.push(buf);
+            }
+        }
+    }
+    Ok((header, records))
+}
+
+fn record_key(record: &RecordBuf) -> (Vec<u8>, u16, Option<usize>, Option<usize>, String) {
+    (
+        record.name().map(|n| n.to_vec()).unwrap_or_default(),
+        record.flags().bits(),
+        record.reference_sequence_id(),
+        record.alignment_start().map(usize::from),
+        format!("{:?}", record.cigar().as_ref()),
+    )
 }
 
 fn read_sam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
@@ -370,6 +471,11 @@ fn print_usage() -> io::Result<()> {
     writeln!(w, "Options:")?;
     writeln!(w, "  -n              name sort")?;
     writeln!(w, "  -f              force overwrite output")?;
+    writeln!(w, "  -R REGION       restrict indexed BAM inputs to REGION")?;
+    writeln!(
+        w,
+        "  -L BED          restrict indexed BAM inputs to BED intervals"
+    )?;
     writeln!(w, "  -o FILE         output to FILE")?;
     writeln!(w, "  --output-fmt sam|bam")?;
     writeln!(w, "  --write-index   write BAI index for BAM file output")?;

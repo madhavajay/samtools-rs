@@ -27,6 +27,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut to_stdout = false;
     let mut output_fmt = OutFmt::Bam;
     let mut input: Option<PathBuf> = None;
+    let mut no_pg = false;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -51,7 +52,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     }
                 };
             }
-            "--no-PG" => {}
+            "--no-PG" => {
+                no_pg = true;
+            }
             "-@" | "--threads" => {
                 let _ = iter.next();
             }
@@ -110,7 +113,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
         OutputTarget::File(path)
     };
 
-    match run_collate(&input, output, output_fmt) {
+    match run_collate(
+        &input,
+        output,
+        output_fmt,
+        if no_pg { None } else { Some(args) },
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             print_error_errno("collate", "collate failed", &e);
@@ -138,9 +146,14 @@ fn parse_output_format(raw: &str) -> Result<OutFmt, String> {
     }
 }
 
-fn run_collate(input: &Path, output: OutputTarget, fmt: OutFmt) -> io::Result<()> {
+fn run_collate(
+    input: &Path,
+    output: OutputTarget,
+    fmt: OutFmt,
+    pg_argv: Option<&[OsString]>,
+) -> io::Result<()> {
     let format = sam_io::sam_open_format(input)?;
-    let (header, mut records) = match format.exact {
+    let (mut header, mut records) = match format.exact {
         Exact::Sam => read_sam_records(input)?,
         Exact::Bam => read_bam_records(input)?,
         _ => {
@@ -156,6 +169,10 @@ fn run_collate(input: &Path, output: OutputTarget, fmt: OutFmt) -> io::Result<()
         let bn = b.name().map(|s| s.to_vec()).unwrap_or_default();
         an.cmp(&bn)
     });
+
+    if let Some(argv) = pg_argv {
+        header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
+    }
 
     let mut writer = open_output(&output, fmt, &header)?;
     for rec in &records {

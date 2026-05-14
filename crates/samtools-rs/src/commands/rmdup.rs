@@ -3,10 +3,11 @@
 //! Mirrors `bam_rmdup` / `bam_rmdupse` in upstream samtools. Upstream's
 //! implementation is paired-aware and works on coordinate-sorted BAMs.
 //!
-//! This Rust port implements a single-end variant: for each
-//! `(reference_sequence_id, alignment_start, reverse-flag)` group, keep
-//! the record with the highest mapping quality and drop the rest.
-//! Requires coordinate-sorted BAM input.
+//! This Rust port implements single-end and adjacent paired-end duplicate
+//! removal: SE records are keyed by `(reference_sequence_id, alignment_start,
+//! reverse-flag)`, while PE records are paired by qname and keyed by the
+//! canonical pair of end coordinates. The record or pair with the highest
+//! mapping quality score is retained.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -20,7 +21,7 @@ use htslib_rs::bgzf;
 use htslib_rs::format::Exact;
 use htslib_rs::sam::{self, alignment::RecordBuf, alignment::io::Write as _};
 
-use crate::bam_flag::{BAM_FREVERSE, BAM_FUNMAP};
+use crate::bam_flag::{BAM_FMUNMAP, BAM_FPAIRED, BAM_FREVERSE, BAM_FUNMAP};
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
 
@@ -28,13 +29,17 @@ use crate::io as sam_io;
 pub fn main(args: &[OsString]) -> ExitCode {
     let mut output: Option<PathBuf> = None;
     let mut input: Option<PathBuf> = None;
+    let mut no_pg = false;
+    let mut single_end = false;
     let iter = args.iter().skip(1);
     for arg in iter {
         let s = arg.to_str().unwrap_or("");
         match s {
             "-S" | "-s" => {
-                // upstream: -s treats paired-end as single-end; here single-end
-                // is the only mode.
+                single_end = true;
+            }
+            "--no-PG" => {
+                no_pg = true;
             }
             "--help" => {
                 let _ = print_usage();
@@ -74,9 +79,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    let pg_argv = if no_pg { None } else { Some(args) };
     let result = match format.exact {
-        Exact::Sam => run_sam_rmdup(&input, output.as_deref()),
-        Exact::Bam => run_bam_rmdup(&input, output.as_deref()),
+        Exact::Sam => run_sam_rmdup(&input, output.as_deref(), pg_argv, single_end),
+        Exact::Bam => run_bam_rmdup(&input, output.as_deref(), pg_argv, single_end),
         _ => unreachable!("format checked above"),
     };
 
@@ -89,59 +95,29 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 }
 
-fn run_bam_rmdup(input: &Path, output: Option<&Path>) -> io::Result<()> {
+fn run_bam_rmdup(
+    input: &Path,
+    output: Option<&Path>,
+    pg_argv: Option<&[OsString]>,
+    single_end: bool,
+) -> io::Result<()> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
-    let header = reader.read_header()?;
+    let mut header = reader.read_header()?;
+    if let Some(argv) = pg_argv {
+        header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
+    }
 
-    let mut records: Vec<bam::Record> = Vec::new();
-    let mut record = bam::Record::default();
+    let mut records: Vec<RecordBuf> = Vec::new();
+    let mut record = RecordBuf::default();
     loop {
-        let n = reader.read_record(&mut record)?;
+        let n = reader.read_record_buf(&header, &mut record)?;
         if n == 0 {
             break;
         }
         records.push(record.clone());
     }
 
-    // Group by (tid, pos, reverse-flag) and keep the record with the
-    // highest MAPQ in each group. Unmapped records pass through.
-    let mut best_per_group: HashMap<(i32, i64, bool), usize> = HashMap::new();
-    let mut keep = vec![false; records.len()];
-    for (i, rec) in records.iter().enumerate() {
-        let flag = u16::from(rec.flags()) as u32;
-        if flag & BAM_FUNMAP != 0 {
-            keep[i] = true;
-            continue;
-        }
-        let tid = rec
-            .reference_sequence_id()
-            .and_then(|res| res.ok())
-            .map(|t| t as i32)
-            .unwrap_or(-1);
-        let pos = rec
-            .alignment_start()
-            .and_then(|res| res.ok())
-            .map(|p| usize::from(p) as i64)
-            .unwrap_or(0);
-        let rev = flag & BAM_FREVERSE != 0;
-        let mapq = rec.mapping_quality().map(u8::from).unwrap_or(0);
-        let key = (tid, pos, rev);
-        match best_per_group.get(&key) {
-            Some(&idx) => {
-                let prev_mapq = records[idx].mapping_quality().map(u8::from).unwrap_or(0);
-                if mapq > prev_mapq {
-                    keep[idx] = false;
-                    keep[i] = true;
-                    best_per_group.insert(key, i);
-                }
-            }
-            None => {
-                keep[i] = true;
-                best_per_group.insert(key, i);
-            }
-        }
-    }
-
+    let keep = duplicate_keep_mask_for_records(&records, single_end);
     let mut writer = open_bam_output(output, &header)?;
     for (i, rec) in records.iter().enumerate() {
         if keep[i] {
@@ -151,9 +127,17 @@ fn run_bam_rmdup(input: &Path, output: Option<&Path>) -> io::Result<()> {
     Ok(())
 }
 
-fn run_sam_rmdup(input: &Path, output: Option<&Path>) -> io::Result<()> {
+fn run_sam_rmdup(
+    input: &Path,
+    output: Option<&Path>,
+    pg_argv: Option<&[OsString]>,
+    single_end: bool,
+) -> io::Result<()> {
     let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
-    let header = reader.read_header()?;
+    let mut header = reader.read_header()?;
+    if let Some(argv) = pg_argv {
+        header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
+    }
 
     let mut records: Vec<RecordBuf> = Vec::new();
     loop {
@@ -164,7 +148,7 @@ fn run_sam_rmdup(input: &Path, output: Option<&Path>) -> io::Result<()> {
         records.push(record);
     }
 
-    let keep = duplicate_keep_mask_for_sam_records(&records);
+    let keep = duplicate_keep_mask_for_records(&records, single_end);
     let mut writer = open_sam_output(output, &header)?;
     for (i, rec) in records.iter().enumerate() {
         if keep[i] {
@@ -174,8 +158,13 @@ fn run_sam_rmdup(input: &Path, output: Option<&Path>) -> io::Result<()> {
     Ok(())
 }
 
-fn duplicate_keep_mask_for_sam_records(records: &[RecordBuf]) -> Vec<bool> {
-    let mut best_per_group: HashMap<(i32, i64, bool), usize> = HashMap::new();
+fn duplicate_keep_mask_for_records(records: &[RecordBuf], single_end: bool) -> Vec<bool> {
+    type PosKey = (i32, i64, bool);
+    type PairKey = (PosKey, PosKey);
+    type PairIdx = (usize, usize);
+    let mut se_best: HashMap<PosKey, usize> = HashMap::new();
+    let mut pair_pending: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut pair_best: HashMap<PairKey, PairIdx> = HashMap::new();
     let mut keep = vec![false; records.len()];
     for (i, rec) in records.iter().enumerate() {
         let flag = rec.flags().bits() as u32;
@@ -187,40 +176,82 @@ fn duplicate_keep_mask_for_sam_records(records: &[RecordBuf]) -> Vec<bool> {
         let pos = rec.alignment_start().map(usize::from).unwrap_or(0) as i64;
         let rev = flag & BAM_FREVERSE != 0;
         let mapq = rec.mapping_quality().map(u8::from).unwrap_or(0);
-        let key = (tid, pos, rev);
-        match best_per_group.get(&key) {
+        let me = (tid, pos, rev);
+
+        let paired_both_mapped = !single_end && flag & BAM_FPAIRED != 0 && flag & BAM_FMUNMAP == 0;
+        if paired_both_mapped {
+            let name = rec.name().map(|n| n.to_vec()).unwrap_or_default();
+            match pair_pending.remove(&name) {
+                None => {
+                    pair_pending.insert(name, i);
+                }
+                Some(first_idx) => {
+                    let first = pos_key(&records[first_idx]);
+                    let key = if first <= me {
+                        (first, me)
+                    } else {
+                        (me, first)
+                    };
+                    let score = pair_score(records, first_idx, i);
+                    match pair_best.get(&key).copied() {
+                        Some((prev_first, prev_second)) => {
+                            let prev_score = pair_score(records, prev_first, prev_second);
+                            if score > prev_score {
+                                keep[prev_first] = false;
+                                keep[prev_second] = false;
+                                keep[first_idx] = true;
+                                keep[i] = true;
+                                pair_best.insert(key, (first_idx, i));
+                            }
+                        }
+                        None => {
+                            keep[first_idx] = true;
+                            keep[i] = true;
+                            pair_best.insert(key, (first_idx, i));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        match se_best.get(&me) {
             Some(&idx) => {
                 let prev_mapq = records[idx].mapping_quality().map(u8::from).unwrap_or(0);
                 if mapq > prev_mapq {
                     keep[idx] = false;
                     keep[i] = true;
-                    best_per_group.insert(key, i);
+                    se_best.insert(me, i);
                 }
             }
             None => {
                 keep[i] = true;
-                best_per_group.insert(key, i);
+                se_best.insert(me, i);
             }
         }
+    }
+
+    for idx in pair_pending.into_values() {
+        keep[idx] = true;
     }
     keep
 }
 
 trait BamLike {
-    fn write_record(&mut self, header: &sam::Header, record: &bam::Record) -> io::Result<()>;
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()>;
 }
 
 struct BamFile(bam::io::Writer<bgzf::io::Writer<File>>);
 struct BamStdout(bam::io::Writer<bgzf::io::Writer<io::Stdout>>);
 
 impl BamLike for BamFile {
-    fn write_record(&mut self, header: &sam::Header, record: &bam::Record) -> io::Result<()> {
-        self.0.write_record(header, record)
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        self.0.write_alignment_record(header, record)
     }
 }
 impl BamLike for BamStdout {
-    fn write_record(&mut self, header: &sam::Header, record: &bam::Record) -> io::Result<()> {
-        self.0.write_record(header, record)
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        self.0.write_alignment_record(header, record)
     }
 }
 
@@ -283,4 +314,21 @@ fn print_usage() -> io::Result<()> {
     writeln!(w)?;
     writeln!(w, "NOTE: rmdup is deprecated; prefer `samtools markdup`.")?;
     Ok(())
+}
+
+fn pos_key(record: &RecordBuf) -> (i32, i64, bool) {
+    let flag = record.flags().bits() as u32;
+    (
+        record
+            .reference_sequence_id()
+            .map(|t| t as i32)
+            .unwrap_or(-1),
+        record.alignment_start().map(usize::from).unwrap_or(0) as i64,
+        flag & BAM_FREVERSE != 0,
+    )
+}
+
+fn pair_score(records: &[RecordBuf], first: usize, second: usize) -> u32 {
+    u32::from(records[first].mapping_quality().map(u8::from).unwrap_or(0))
+        + u32::from(records[second].mapping_quality().map(u8::from).unwrap_or(0))
 }

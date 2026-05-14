@@ -1,21 +1,21 @@
 //! `samtools addreplacerg` — add or replace `@RG` lines and `RG:Z:` aux tags.
 //!
 //! Mirrors `main_addreplacerg` in `bam_addrprg.c`. Initial Rust port works on
-//! **SAM input → SAM output** by streaming lines and rewriting them as text:
+//! **SAM/BAM input → SAM/BAM output**:
 //!  - `-r '@RG\tID:foo\tSM:bar'` — full `@RG` line spec; merged into header.
 //!  - `-r 'ID:foo'` — incremental tag form (one tag per `-r`); combined into
 //!    a single `@RG` line.
 //!  - `-R ID` — set every record's `RG:Z` to this existing ID.
-//!  - `-m overwrite_all|orphan_only|orphan_first` — how to handle existing
-//!    `RG:Z` tags. `orphan_only` is the default; `overwrite_all` always
-//!    replaces.
-//!  - `-O sam` — only SAM output is currently supported.
+//!  - `-m overwrite_all|orphan_only` — how to handle existing `RG:Z` tags.
+//!    Matches upstream's two modes; `overwrite_all` is the default.
+//!  - `-O sam|bam` — output format (default: sam).
 //!  - `--no-PG` — silently accepted (no `@PG` is added by this port).
 //!  - `-w` — accepted but currently a no-op (editing-only mode).
 //!
-//! **Pending:** BAM/CRAM input/output, paired-end mate update, full
-//! `orphan_first` semantics.
+//! **Pending:** CRAM input/output, paired-end mate update, full `orphan_first`
+//! semantics.
 
+use bstr::BString;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -23,7 +23,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use flate2::read::MultiGzDecoder;
+use htslib_rs::bam;
+use htslib_rs::bgzf;
 use htslib_rs::format::Exact;
+use htslib_rs::sam::{self, alignment::RecordBuf};
 
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
@@ -38,10 +41,11 @@ enum Mode {
 pub fn main(args: &[OsString]) -> ExitCode {
     let mut tag_pieces: Vec<String> = Vec::new();
     let mut replace_id: Option<String> = None;
-    let mut mode = Mode::OrphanOnly;
+    let mut mode = Mode::OverwriteAll;
     let mut output: Option<PathBuf> = None;
     let mut input: Option<PathBuf> = None;
-    let mut output_fmt = "sam".to_string();
+    let mut output_fmt = OutFmt::Sam;
+    let mut no_pg = false;
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
         let s = arg.to_str().unwrap_or("");
@@ -57,20 +61,36 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 let v = iter.next().and_then(|a| a.to_str()).unwrap_or("");
                 mode = match v {
                     "overwrite_all" => Mode::OverwriteAll,
-                    _ => Mode::OrphanOnly,
+                    "orphan_only" => Mode::OrphanOnly,
+                    _ => {
+                        print_error(
+                            "addreplacerg",
+                            format!(
+                                "unknown -m value \"{}\" (expected overwrite_all or orphan_only)",
+                                v
+                            ),
+                        );
+                        return ExitCode::from(1);
+                    }
                 };
             }
             "-o" | "--output" => {
                 output = iter.next().map(PathBuf::from);
             }
             "-O" => {
-                output_fmt = iter
-                    .next()
-                    .and_then(|a| a.to_str())
-                    .unwrap_or("sam")
-                    .to_lowercase();
+                let value = iter.next().and_then(|a| a.to_str()).unwrap_or("sam");
+                output_fmt = match parse_output_format(value) {
+                    Ok(fmt) => fmt,
+                    Err(e) => {
+                        print_error("addreplacerg", e);
+                        return ExitCode::from(1);
+                    }
+                };
             }
-            "-w" | "--no-PG" | "-@" | "--threads" => {
+            "--no-PG" => {
+                no_pg = true;
+            }
+            "-w" | "-@" | "--threads" => {
                 if matches!(s, "-@" | "--threads") {
                     let _ = iter.next();
                 }
@@ -91,14 +111,6 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     }
 
-    if output_fmt != "sam" {
-        print_error(
-            "addreplacerg",
-            "only -O sam is currently supported in samtools-rs",
-        );
-        return ExitCode::from(1);
-    }
-
     let Some(input) = input else {
         let _ = print_usage();
         return ExitCode::from(1);
@@ -111,10 +123,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if format.exact != Exact::Sam {
+    if !matches!(format.exact, Exact::Sam | Exact::Bam) {
         print_error(
             "addreplacerg",
-            "only SAM input is currently supported (BAM/CRAM TODO)",
+            "only SAM and BAM input are currently supported (CRAM TODO)",
         );
         return ExitCode::from(1);
     }
@@ -141,28 +153,58 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
-    let mut writer = match sam_io::open_text_output(output.as_deref()) {
-        Ok(writer) => writer,
-        Err(e) => {
-            print_error_errno("addreplacerg", "open -o output", &e);
-            return ExitCode::from(1);
+    let pg_argv = if no_pg { None } else { Some(args) };
+    let result = match (format.exact, output_fmt) {
+        (Exact::Sam, OutFmt::Sam) => {
+            let mut writer = match sam_io::open_text_output(output.as_deref()) {
+                Ok(writer) => writer,
+                Err(e) => {
+                    print_error_errno("addreplacerg", "open -o output", &e);
+                    return ExitCode::from(1);
+                }
+            };
+            let result = rewrite_sam(
+                &input,
+                &mut writer,
+                rg_line.as_deref(),
+                &rg_id,
+                mode,
+                pg_argv,
+            );
+            result.and_then(|()| sam_io::check_sam_close(&mut writer))
         }
+        _ => rewrite_records(
+            &input,
+            output.as_deref(),
+            output_fmt,
+            rg_line.as_deref(),
+            &rg_id,
+            mode,
+            pg_argv,
+        ),
     };
 
-    if let Err(e) = rewrite_sam(&input, &mut writer, rg_line.as_deref(), &rg_id, mode) {
+    if let Err(e) = result {
         if e.kind() == io::ErrorKind::BrokenPipe {
             return ExitCode::SUCCESS;
         }
         print_error_errno("addreplacerg", "rewrite failed", &e);
         return ExitCode::from(1);
     }
-    match sam_io::check_sam_close(&mut writer) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
-        Err(e) => {
-            print_error_errno("addreplacerg", "close output", &e);
-            ExitCode::from(1)
-        }
+    ExitCode::SUCCESS
+}
+
+#[derive(Clone, Copy)]
+enum OutFmt {
+    Sam,
+    Bam,
+}
+
+fn parse_output_format(raw: &str) -> Result<OutFmt, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "sam" => Ok(OutFmt::Sam),
+        "bam" => Ok(OutFmt::Bam),
+        _ => Err(format!("unsupported output format \"{}\"", raw)),
     }
 }
 
@@ -206,6 +248,7 @@ fn rewrite_sam(
     rg_line: Option<&str>,
     rg_id: &str,
     mode: Mode,
+    pg_argv: Option<&[OsString]>,
 ) -> io::Result<()> {
     let file = File::open(path)?;
     let mut probe = File::open(path)?;
@@ -219,47 +262,73 @@ fn rewrite_sam(
     };
 
     let mut reader = reader;
-    let mut header_emitted = false;
-    let mut wrote_rg_line = false;
     let rg_tag = format!("RG:Z:{}", rg_id);
 
+    // Buffer header lines so we can inject the @RG and (optional) @PG
+    // entries via shared helpers before emitting any record bytes.
+    let mut header = String::new();
+    let mut first_record: Option<String> = None;
     let mut line = String::new();
     loop {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
             break;
         }
         if line.starts_with('@') {
-            // Suppress duplicate @RG lines with the same ID; otherwise pass through.
+            // Suppress duplicate @RG lines with the same ID; otherwise keep.
             if line.starts_with("@RG")
                 && let Some(existing_id) = extract_id(line.trim_end())
                 && existing_id == rg_id
             {
                 continue;
             }
-            out.write_all(line.as_bytes())?;
-            header_emitted = true;
+            header.push_str(&line);
         } else {
-            // First record line — flush our new @RG line ahead of it if needed.
-            if !wrote_rg_line {
-                if let Some(rg) = rg_line {
-                    if !header_emitted {
-                        // Nothing was emitted yet; add a minimal HD line so
-                        // downstream SAM parsers are happy.
-                        out.write_all(b"@HD\tVN:1.6\n")?;
-                    }
-                    out.write_all(rg.as_bytes())?;
-                    if !rg.ends_with('\n') {
-                        out.write_all(b"\n")?;
-                    }
-                }
-                wrote_rg_line = true;
-            }
-            let stripped = line.trim_end_matches(&['\r', '\n'][..]);
-            let new = rewrite_record(stripped, &rg_tag, mode);
-            out.write_all(new.as_bytes())?;
-            out.write_all(b"\n")?;
+            first_record = Some(line.clone());
+            break;
         }
+    }
+
+    // Ensure the header has a trailing newline before we append our entries.
+    if !header.is_empty() && !header.ends_with('\n') {
+        header.push('\n');
+    }
+
+    if let Some(rg) = rg_line {
+        if header.is_empty() {
+            header.push_str("@HD\tVN:1.6\n");
+        }
+        header.push_str(rg);
+        if !rg.ends_with('\n') {
+            header.push('\n');
+        }
+    }
+
+    if let Some(argv) = pg_argv {
+        header = crate::pg::add_samtools_pg(&header, argv)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    }
+
+    out.write_all(header.as_bytes())?;
+
+    if let Some(first) = first_record {
+        let stripped = first.trim_end_matches(&['\r', '\n'][..]);
+        let new = rewrite_record(stripped, &rg_tag, mode);
+        out.write_all(new.as_bytes())?;
+        out.write_all(b"\n")?;
+    }
+
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+        let stripped = line.trim_end_matches(&['\r', '\n'][..]);
+        let new = rewrite_record(stripped, &rg_tag, mode);
+        out.write_all(new.as_bytes())?;
+        out.write_all(b"\n")?;
     }
     Ok(())
 }
@@ -287,11 +356,181 @@ fn rewrite_record(line: &str, new_rg: &str, mode: Mode) -> String {
     fields.join("\t")
 }
 
+fn rewrite_records(
+    input: &Path,
+    output: Option<&Path>,
+    output_fmt: OutFmt,
+    rg_line: Option<&str>,
+    rg_id: &str,
+    mode: Mode,
+    pg_argv: Option<&[OsString]>,
+) -> io::Result<()> {
+    let format = sam_io::sam_open_format(input)?;
+    let (mut header, mut records) = match format.exact {
+        Exact::Sam => read_sam_records(input)?,
+        Exact::Bam => read_bam_records(input)?,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only SAM and BAM input are currently supported (CRAM TODO)",
+            ));
+        }
+    };
+
+    header = update_header(header, rg_line, pg_argv)?;
+    for record in &mut records {
+        rewrite_record_buf(record, rg_id, mode);
+    }
+
+    let mut writer = open_record_output(output, output_fmt, &header)?;
+    for record in &records {
+        writer.write_record(&header, record)?;
+    }
+    Ok(())
+}
+
+fn read_sam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+    let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
+    let header = reader.read_header()?;
+    let mut records = Vec::new();
+    loop {
+        let mut record = RecordBuf::default();
+        if reader.read_record_buf(&header, &mut record)? == 0 {
+            break;
+        }
+        records.push(record);
+    }
+    Ok((header, records))
+}
+
+fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+    let mut reader = bam::io::Reader::new(File::open(input)?);
+    let header = reader.read_header()?;
+    let mut records = Vec::new();
+    loop {
+        let mut record = RecordBuf::default();
+        if reader.read_record_buf(&header, &mut record)? == 0 {
+            break;
+        }
+        records.push(record);
+    }
+    Ok((header, records))
+}
+
+fn update_header(
+    mut header: sam::Header,
+    rg_line: Option<&str>,
+    pg_argv: Option<&[OsString]>,
+) -> io::Result<sam::Header> {
+    if let Some(rg) = rg_line {
+        let mut parser = sam::header::Parser::default();
+        parser
+            .parse_partial(rg.as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let parsed = parser.finish();
+        for (id, read_group) in parsed.read_groups() {
+            header
+                .read_groups_mut()
+                .insert(id.clone(), read_group.clone());
+        }
+    }
+
+    if let Some(argv) = pg_argv {
+        header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
+    }
+
+    Ok(header)
+}
+
+fn rewrite_record_buf(record: &mut RecordBuf, rg_id: &str, mode: Mode) {
+    use sam::alignment::record::data::field::Tag;
+    use sam::alignment::record_buf::data::field::Value;
+
+    let tag = Tag::from([b'R', b'G']);
+    let has_rg = record.data().get(&tag).is_some();
+    match (has_rg, mode) {
+        (true, Mode::OrphanOnly) => {}
+        _ => {
+            record
+                .data_mut()
+                .insert(tag, Value::String(BString::from(rg_id)));
+        }
+    }
+}
+
+trait RecordSink {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()>;
+}
+
+struct BamFile(bam::io::Writer<bgzf::io::Writer<File>>);
+struct BamStdout(bam::io::Writer<bgzf::io::Writer<io::Stdout>>);
+struct SamFile(sam::io::Writer<File>);
+struct SamStdout(sam::io::Writer<io::Stdout>);
+
+impl RecordSink for BamFile {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        use sam::alignment::io::Write as _;
+        self.0.write_alignment_record(header, record)
+    }
+}
+
+impl RecordSink for BamStdout {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        use sam::alignment::io::Write as _;
+        self.0.write_alignment_record(header, record)
+    }
+}
+
+impl RecordSink for SamFile {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        use sam::alignment::io::Write as _;
+        self.0.write_alignment_record(header, record)
+    }
+}
+
+impl RecordSink for SamStdout {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        use sam::alignment::io::Write as _;
+        self.0.write_alignment_record(header, record)
+    }
+}
+
+fn open_record_output(
+    output: Option<&Path>,
+    fmt: OutFmt,
+    header: &sam::Header,
+) -> io::Result<Box<dyn RecordSink>> {
+    match (output, fmt) {
+        (Some(path), OutFmt::Sam) => {
+            let file = File::create(path)?;
+            let mut writer = sam::io::Writer::new(file);
+            writer.write_header(header)?;
+            Ok(Box::new(SamFile(writer)))
+        }
+        (Some(path), OutFmt::Bam) => {
+            let file = File::create(path)?;
+            let mut writer = bam::io::Writer::new(file);
+            writer.write_header(header)?;
+            Ok(Box::new(BamFile(writer)))
+        }
+        (None, OutFmt::Sam) => {
+            let mut writer = sam::io::Writer::new(io::stdout());
+            writer.write_header(header)?;
+            Ok(Box::new(SamStdout(writer)))
+        }
+        (None, OutFmt::Bam) => {
+            let mut writer = bam::io::Writer::new(io::stdout());
+            writer.write_header(header)?;
+            Ok(Box::new(BamStdout(writer)))
+        }
+    }
+}
+
 fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
     writeln!(
         w,
-        "Usage: samtools addreplacerg [options] -r 'tag-spec' <in.sam>"
+        "Usage: samtools addreplacerg [options] -r 'tag-spec' <in.sam|in.bam>"
     )?;
     writeln!(
         w,
@@ -300,9 +539,9 @@ fn print_usage() -> io::Result<()> {
     writeln!(w, "  -R ID         existing @RG ID to apply")?;
     writeln!(
         w,
-        "  -m MODE       overwrite_all | orphan_only [orphan_only]"
+        "  -m MODE       overwrite_all | orphan_only [overwrite_all]"
     )?;
     writeln!(w, "  -o FILE       output FILE (default stdout)")?;
-    writeln!(w, "  -O FMT        output format (only 'sam' supported)")?;
+    writeln!(w, "  -O FMT        output format: sam|bam")?;
     Ok(())
 }

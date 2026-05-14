@@ -11,7 +11,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -20,7 +20,7 @@ use htslib_rs::core::Region;
 use htslib_rs::format::Exact;
 use htslib_rs::sam;
 
-use crate::bam_flag::{BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FUNMAP};
+use crate::bam_flag::{BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FUNMAP, str_to_flag};
 use crate::bedidx::load_bed_index;
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
@@ -40,7 +40,12 @@ pub(crate) enum AMode {
 pub(crate) struct DepthRunConfig<'a> {
     pub(crate) min_mapq: u8,
     pub(crate) min_depth: u32,
+    pub(crate) min_read_len: usize,
     pub(crate) a_mode: AMode,
+    pub(crate) show_header: bool,
+    pub(crate) exclude_flags: u32,
+    pub(crate) include_any_flags: u32,
+    pub(crate) require_flags: u32,
     pub(crate) region: Option<&'a str>,
     pub(crate) bed: Option<&'a Path>,
     pub(crate) reference: Option<&'a Path>,
@@ -49,7 +54,10 @@ pub(crate) struct DepthRunConfig<'a> {
 #[derive(Clone, Copy)]
 struct DepthWalkConfig {
     exclude_flags: u32,
+    include_any_flags: u32,
+    require_flags: u32,
     min_mapq: u8,
+    min_read_len: usize,
     min_depth: u32,
     a_mode: AMode,
 }
@@ -58,10 +66,15 @@ struct DepthWalkConfig {
 pub fn main(args: &[OsString]) -> ExitCode {
     let mut min_mapq: u8 = 0;
     let mut min_depth: u32 = 1;
+    let mut min_read_len: usize = 0;
     let mut a_mode = AMode::None;
     let mut output: Option<PathBuf> = None;
     let mut region: Option<String> = None;
     let mut bed: Option<PathBuf> = None;
+    let mut show_header = false;
+    let mut exclude_flags = default_exclude_flags();
+    let mut include_any_flags = 0;
+    let mut require_flags = 0;
     let mut inputs: Vec<PathBuf> = Vec::new();
 
     let mut iter = args.iter().skip(1).peekable();
@@ -91,6 +104,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(1);
             }
+            "-l" | "--min-read-len" => {
+                min_read_len = iter
+                    .next()
+                    .and_then(|a| a.to_str())
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            }
             "-o" | "--output" => {
                 output = iter.next().map(PathBuf::from);
             }
@@ -100,12 +120,43 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-b" => {
                 bed = iter.next().map(PathBuf::from);
             }
-            "-l" | "--min-read-len" | "-Q" | "--min-BQ" | "--rf" | "--ff" | "-m"
-            | "--max-depth" | "-G" | "-g" | "-f" => {
+            "-g" => match parse_flag_value(iter.next(), "-g") {
+                Ok(flags) => exclude_flags &= !flags,
+                Err(()) => return ExitCode::from(1),
+            },
+            "-G" | "--excl-flags" => match parse_flag_value(iter.next(), s) {
+                Ok(flags) => exclude_flags |= flags,
+                Err(()) => return ExitCode::from(1),
+            },
+            "--incl-flags" => match parse_flag_value(iter.next(), s) {
+                Ok(flags) => include_any_flags |= flags,
+                Err(()) => return ExitCode::from(1),
+            },
+            "--require-flags" => match parse_flag_value(iter.next(), s) {
+                Ok(flags) => require_flags |= flags,
+                Err(()) => return ExitCode::from(1),
+            },
+            "-f" => {
+                let Some(path) = iter.next().map(PathBuf::from) else {
+                    print_error("depth", "option -f requires an argument");
+                    return ExitCode::from(1);
+                };
+                match read_input_list(&path) {
+                    Ok(listed_inputs) => inputs.extend(listed_inputs),
+                    Err(e) => {
+                        print_error_errno("depth", "read -f input list", &e);
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            "-Q" | "--min-BQ" | "--rf" | "--ff" | "-m" | "--max-depth" => {
                 let _ = iter.next();
             }
-            "-H" | "-J" | "-s" | "-x" | "-X" => {
-                // Header / scientific / strip / index variations not yet supported.
+            "-H" => {
+                show_header = true;
+            }
+            "-J" | "-s" | "-x" | "-X" => {
+                // Deletions / overlap-removal / scientific / custom-index variations not yet supported.
             }
             "--help" => {
                 let _ = print_usage();
@@ -180,7 +231,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
         DepthRunConfig {
             min_mapq,
             min_depth,
+            min_read_len,
             a_mode,
+            show_header,
+            exclude_flags,
+            include_any_flags,
+            require_flags,
             region: region.as_deref(),
             bed: bed.as_deref(),
             reference: reference.as_deref(),
@@ -202,6 +258,36 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 }
 
+pub(crate) fn default_exclude_flags() -> u32 {
+    BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP
+}
+
+fn parse_flag_value(value: Option<&OsString>, option: &str) -> Result<u32, ()> {
+    let Some(raw) = value.and_then(|a| a.to_str()) else {
+        print_error("depth", format!("option {option} requires an argument"));
+        return Err(());
+    };
+    let Some(flags) = str_to_flag(raw) else {
+        print_error("depth", format!("unknown flag '{}'", raw));
+        return Err(());
+    };
+    Ok(flags as u32)
+}
+
+fn read_input_list(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut inputs = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim_end_matches('\r').trim();
+        if !trimmed.is_empty() {
+            inputs.push(PathBuf::from(trimmed));
+        }
+    }
+    Ok(inputs)
+}
+
 fn regions_need_index(region: Option<&str>, bed: Option<&Path>) -> io::Result<()> {
     if let Some(region) = region {
         parse_region(region)?;
@@ -217,10 +303,12 @@ pub(crate) fn run_depth(
     out: &mut dyn Write,
     config: DepthRunConfig<'_>,
 ) -> io::Result<()> {
-    let exclude_flags = BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP;
     let walk = DepthWalkConfig {
-        exclude_flags,
+        exclude_flags: config.exclude_flags,
+        include_any_flags: config.include_any_flags,
+        require_flags: config.require_flags,
         min_mapq: config.min_mapq,
+        min_read_len: config.min_read_len,
         min_depth: config.min_depth,
         a_mode: config.a_mode,
     };
@@ -259,7 +347,14 @@ pub(crate) fn run_depth(
         per_input_targets.push(targets);
     }
 
-    emit_depths(out, &per_input_targets, walk.min_depth, walk.a_mode)
+    emit_depths(
+        out,
+        inputs,
+        &per_input_targets,
+        walk.min_depth,
+        walk.a_mode,
+        config.show_header,
+    )
 }
 
 fn collect_sam_depth(
@@ -273,13 +368,7 @@ fn collect_sam_depth(
 
     for result in reader.records() {
         let record = result?;
-        update_targets(
-            &header,
-            &mut targets,
-            &record,
-            config.exclude_flags,
-            config.min_mapq,
-        );
+        update_targets(&header, &mut targets, &record, config);
     }
 
     Ok(targets)
@@ -301,24 +390,12 @@ fn collect_bam_depth(
             if n == 0 {
                 break;
             }
-            update_targets(
-                &header,
-                &mut targets,
-                &record,
-                config.exclude_flags,
-                config.min_mapq,
-            );
+            update_targets(&header, &mut targets, &record, config);
         }
     } else {
         for (i, region) in regions.iter().enumerate() {
             for record in htslib_rs::alignment_compat::query_bam_records_from_path(path, region)? {
-                update_target(
-                    &header,
-                    &mut targets[i],
-                    &record,
-                    config.exclude_flags,
-                    config.min_mapq,
-                );
+                update_target(&header, &mut targets[i], &record, config);
             }
         }
     }
@@ -341,13 +418,7 @@ fn collect_cram_depth(
             for record in htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
                 path, &region, reference,
             )? {
-                update_target(
-                    &header,
-                    target,
-                    &record,
-                    config.exclude_flags,
-                    config.min_mapq,
-                );
+                update_target(&header, target, &record, config);
             }
         }
     } else {
@@ -355,13 +426,7 @@ fn collect_cram_depth(
             for record in htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
                 path, region, reference,
             )? {
-                update_target(
-                    &header,
-                    &mut targets[i],
-                    &record,
-                    config.exclude_flags,
-                    config.min_mapq,
-                );
+                update_target(&header, &mut targets[i], &record, config);
             }
         }
     }
@@ -398,9 +463,11 @@ fn load_bed_regions(path: &Path) -> io::Result<Vec<Region>> {
 
 fn emit_depths(
     out: &mut dyn Write,
+    inputs: &[PathBuf],
     per_input_targets: &[Vec<DepthTarget>],
     min_depth: u32,
     a_mode: AMode,
+    show_header: bool,
 ) -> io::Result<()> {
     let Some(first_targets) = per_input_targets.first() else {
         return Ok(());
@@ -408,6 +475,14 @@ fn emit_depths(
 
     for targets in &per_input_targets[1..] {
         ensure_compatible_targets(first_targets, targets)?;
+    }
+
+    if show_header {
+        write!(out, "#CHROM\tPOS")?;
+        for input in inputs {
+            write!(out, "\t{}", input.display())?;
+        }
+        writeln!(out)?;
     }
 
     for (target_index, target) in first_targets.iter().enumerate() {
@@ -547,14 +622,13 @@ fn update_targets(
     header: &sam::Header,
     targets: &mut [DepthTarget],
     record: &(impl sam::alignment::Record + ?Sized),
-    exclude_flags: u32,
-    min_mapq: u8,
+    config: DepthWalkConfig,
 ) {
     let flag = match record.flags() {
         Ok(flags) => u16::from(flags) as u32,
         Err(_) => return,
     };
-    if flag & exclude_flags != 0 {
+    if !flag_passes(flag, config) {
         return;
     }
     let mapq = match record.mapping_quality() {
@@ -562,7 +636,12 @@ fn update_targets(
         Some(Err(_)) => return,
         None => 0,
     };
-    if mapq < min_mapq {
+    if mapq < config.min_mapq {
+        return;
+    }
+    if config.min_read_len != 0
+        && read_length_used(record.cigar().iter()).unwrap_or_default() < config.min_read_len
+    {
         return;
     }
     let tid = match record.reference_sequence_id(header).transpose() {
@@ -582,14 +661,13 @@ fn update_target(
     header: &sam::Header,
     target: &mut DepthTarget,
     record: &(impl sam::alignment::Record + ?Sized),
-    exclude_flags: u32,
-    min_mapq: u8,
+    config: DepthWalkConfig,
 ) {
     let flag = match record.flags() {
         Ok(flags) => u16::from(flags) as u32,
         Err(_) => return,
     };
-    if flag & exclude_flags != 0 {
+    if !flag_passes(flag, config) {
         return;
     }
     let mapq = match record.mapping_quality() {
@@ -597,7 +675,12 @@ fn update_target(
         Some(Err(_)) => return,
         None => 0,
     };
-    if mapq < min_mapq {
+    if mapq < config.min_mapq {
+        return;
+    }
+    if config.min_read_len != 0
+        && read_length_used(record.cigar().iter()).unwrap_or_default() < config.min_read_len
+    {
         return;
     }
     if record
@@ -613,6 +696,37 @@ fn update_target(
         _ => return,
     };
     update_target_cigar(target, record, start);
+}
+
+fn flag_passes(flag: u32, config: DepthWalkConfig) -> bool {
+    if flag & config.exclude_flags != 0 {
+        return false;
+    }
+    if config.include_any_flags != 0 && flag & config.include_any_flags == 0 {
+        return false;
+    }
+    if config.require_flags != 0 && flag & config.require_flags != config.require_flags {
+        return false;
+    }
+    true
+}
+
+fn read_length_used(
+    cigar: impl Iterator<Item = io::Result<htslib_rs::sam::alignment::record::cigar::Op>>,
+) -> io::Result<usize> {
+    use htslib_rs::sam::alignment::record::cigar::op::Kind;
+
+    let mut len = 0usize;
+    for op in cigar {
+        let op = op?;
+        match op.kind() {
+            Kind::Match | Kind::Insertion | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                len = len.saturating_add(op.len());
+            }
+            Kind::Deletion | Kind::Skip | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
+        }
+    }
+    Ok(len)
 }
 
 fn update_target_cigar(
@@ -661,5 +775,10 @@ fn print_usage() -> io::Result<()> {
     writeln!(w, "  -o FILE     output FILE")?;
     writeln!(w, "  -r REGION   restrict to REGION")?;
     writeln!(w, "  -b FILE     restrict to BED regions")?;
+    writeln!(
+        w,
+        "  -g FLAGS    remove FLAGS from the default filter-out set"
+    )?;
+    writeln!(w, "  -G FLAGS    add FLAGS to the filter-out set")?;
     Ok(())
 }

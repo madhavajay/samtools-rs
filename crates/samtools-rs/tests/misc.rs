@@ -7,9 +7,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Mutex;
 
+use htslib_rs::bam;
+use htslib_rs::sam;
 use samtools_rs::commands::{
-    bedcov, cat, faidx, fastq, fixmate, flagstat, fqidx, idxstats, import, index, reheader, reset,
-    rmdup, samples, split,
+    addreplacerg, bedcov, calmd, cat, checksum, faidx, fastq, fixmate, flagstat, fqidx, idxstats,
+    import, index, reference, reheader, reset, rmdup, samples, split, view,
 };
 use samtools_rs::header_text;
 use samtools_rs::run as samtools_run;
@@ -64,6 +66,23 @@ fn sample_bam() -> PathBuf {
     fixtures_dir().join("checksum").join("chk1.bam")
 }
 
+fn normalize_checksum_file_line(text: &str) -> String {
+    let mut lines = text.lines();
+    let mut out = String::from("# Checksum 1.0 for file:\n");
+    for line in lines.by_ref().skip(1) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+fn checksum_all_row(text: &str) -> String {
+    text.lines()
+        .find(|line| line.starts_with("all        all"))
+        .unwrap()
+        .to_string()
+}
+
 fn write_bam_from_sam_text(path: &std::path::Path, text: &str) {
     let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(Cursor::new(text.as_bytes())));
     let header = reader.read_header().unwrap();
@@ -84,6 +103,647 @@ fn flagstat_succeeds() {
         exit_to_u8(flagstat::main(&argv("flagstat", &[p.to_str().unwrap()]))),
         0
     );
+}
+
+#[test]
+fn checksum_bam_matches_upstream_default_fixture() {
+    let tmp = tmp_dir("checksum-default");
+    let output = tmp.join("chk1.out");
+    let input = sample_bam();
+
+    assert_eq!(
+        exit_to_u8(checksum::main(&argv(
+            "checksum",
+            &[input.to_str().unwrap(), "-o", output.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let actual = normalize_checksum_file_line(&std::fs::read_to_string(output).unwrap());
+    let expected =
+        std::fs::read_to_string(fixtures_dir().join("checksum").join("chk1.1.expected")).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn checksum_bam_qv_matches_upstream_fixture() {
+    let tmp = tmp_dir("checksum-qv");
+    let output = tmp.join("chk1-qv.out");
+    let input = sample_bam();
+
+    assert_eq!(
+        exit_to_u8(checksum::main(&argv(
+            "checksum",
+            &[
+                "-qv",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let actual = normalize_checksum_file_line(&std::fs::read_to_string(output).unwrap());
+    let expected =
+        std::fs::read_to_string(fixtures_dir().join("checksum").join("chk1.3.expected")).unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn checksum_merge_matches_direct_checksum_for_default_reports() {
+    let tmp = tmp_dir("checksum-merge");
+    let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:100\n";
+    let one = tmp.join("one.sam");
+    let two = tmp.join("two.sam");
+    let both = tmp.join("both.sam");
+    std::fs::write(
+        &one,
+        format!("{header}r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGTT\t!!!!!\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        &two,
+        format!("{header}r2\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCAT\t#####\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        &both,
+        format!(
+            "{header}r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGTT\t!!!!!\nr2\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCAT\t#####\n"
+        ),
+    )
+    .unwrap();
+
+    let one_chk = tmp.join("one.chk");
+    let two_chk = tmp.join("two.chk");
+    let merged = tmp.join("merged.chk");
+    let direct = tmp.join("direct.chk");
+    for (input, output) in [(&one, &one_chk), (&two, &two_chk), (&both, &direct)] {
+        assert_eq!(
+            exit_to_u8(checksum::main(&argv(
+                "checksum",
+                &[input.to_str().unwrap(), "-o", output.to_str().unwrap()]
+            ))),
+            0
+        );
+    }
+    assert_eq!(
+        exit_to_u8(checksum::main(&argv(
+            "checksum",
+            &[
+                "-m",
+                one_chk.to_str().unwrap(),
+                two_chk.to_str().unwrap(),
+                "-o",
+                merged.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        normalize_checksum_file_line(&std::fs::read_to_string(merged).unwrap()),
+        normalize_checksum_file_line(&std::fs::read_to_string(direct).unwrap())
+    );
+}
+
+#[test]
+fn checksum_tabs_formats_report_as_tsv_and_merge_preserves_tsv_shape() {
+    let tmp = tmp_dir("checksum-tabs");
+    let input = sample_bam();
+    let direct = tmp.join("direct.tsv");
+    let merged = tmp.join("merged.tsv");
+
+    assert_eq!(
+        exit_to_u8(checksum::main(&argv(
+            "checksum",
+            &[
+                "-T",
+                input.to_str().unwrap(),
+                "-o",
+                direct.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(checksum::main(&argv(
+            "checksum",
+            &[
+                "-m",
+                "-T",
+                direct.to_str().unwrap(),
+                "-o",
+                merged.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let direct_text = std::fs::read_to_string(&direct).unwrap();
+    assert!(direct_text.contains("# Checksum 1.0 for file:\t"));
+    assert!(direct_text.contains("# Group\tQC\tcount\tflag+seq\t+name\t+qual\t+aux\tcombined"));
+    assert!(direct_text.lines().any(|line| {
+        line.starts_with("all\tall\t144\t") && line.split('\t').count() == 8 && !line.contains("  ")
+    }));
+
+    assert_eq!(
+        normalize_checksum_file_line(&std::fs::read_to_string(merged).unwrap()),
+        normalize_checksum_file_line(&direct_text)
+    );
+}
+
+#[test]
+fn checksum_in_order_distinguishes_record_order() {
+    let tmp = tmp_dir("checksum-order");
+    let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:100\n";
+    let rec_a = "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n";
+    let rec_b = "b\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\n";
+    let ab = tmp.join("ab.sam");
+    let ba = tmp.join("ba.sam");
+    std::fs::write(&ab, format!("{header}{rec_a}{rec_b}")).unwrap();
+    std::fs::write(&ba, format!("{header}{rec_b}{rec_a}")).unwrap();
+
+    let ab_default = tmp.join("ab.default.chk");
+    let ba_default = tmp.join("ba.default.chk");
+    let ab_ordered = tmp.join("ab.ordered.chk");
+    let ba_ordered = tmp.join("ba.ordered.chk");
+    for (input, output, extra) in [
+        (&ab, &ab_default, &[][..]),
+        (&ba, &ba_default, &[][..]),
+        (&ab, &ab_ordered, &["-O"][..]),
+        (&ba, &ba_ordered, &["-O"][..]),
+    ] {
+        let mut args = vec![input.to_str().unwrap(), "-o", output.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        assert_eq!(exit_to_u8(checksum::main(&argv("checksum", &args))), 0);
+    }
+
+    assert_eq!(
+        normalize_checksum_file_line(&std::fs::read_to_string(ab_default).unwrap()),
+        normalize_checksum_file_line(&std::fs::read_to_string(ba_default).unwrap())
+    );
+    assert_ne!(
+        normalize_checksum_file_line(&std::fs::read_to_string(ab_ordered).unwrap()),
+        normalize_checksum_file_line(&std::fs::read_to_string(ba_ordered).unwrap())
+    );
+}
+
+#[test]
+fn checksum_check_pos_distinguishes_coordinates_and_merges() {
+    let tmp = tmp_dir("checksum-check-pos");
+    let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:100\n";
+    let rec_at_1 = "same\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n";
+    let rec_at_7 = "same\t0\tchr1\t7\t60\t4M\t*\t0\t0\tACGT\t!!!!\n";
+    let one = tmp.join("one.sam");
+    let two = tmp.join("two.sam");
+    let both = tmp.join("both.sam");
+    let shifted = tmp.join("shifted.sam");
+    std::fs::write(&one, format!("{header}{rec_at_1}")).unwrap();
+    std::fs::write(&two, format!("{header}{rec_at_7}")).unwrap();
+    std::fs::write(&both, format!("{header}{rec_at_1}{rec_at_7}")).unwrap();
+    std::fs::write(&shifted, format!("{header}{rec_at_1}{rec_at_1}")).unwrap();
+
+    let both_default = tmp.join("both.default.chk");
+    let shifted_default = tmp.join("shifted.default.chk");
+    let both_pos = tmp.join("both.pos.chk");
+    let shifted_pos = tmp.join("shifted.pos.chk");
+    for (input, output, extra) in [
+        (&both, &both_default, &[][..]),
+        (&shifted, &shifted_default, &[][..]),
+        (&both, &both_pos, &["-P"][..]),
+        (&shifted, &shifted_pos, &["-P"][..]),
+    ] {
+        let mut args = vec![input.to_str().unwrap(), "-o", output.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        assert_eq!(exit_to_u8(checksum::main(&argv("checksum", &args))), 0);
+    }
+
+    assert_eq!(
+        normalize_checksum_file_line(&std::fs::read_to_string(&both_default).unwrap()),
+        normalize_checksum_file_line(&std::fs::read_to_string(&shifted_default).unwrap())
+    );
+    assert_ne!(
+        normalize_checksum_file_line(&std::fs::read_to_string(&both_pos).unwrap()),
+        normalize_checksum_file_line(&std::fs::read_to_string(&shifted_pos).unwrap())
+    );
+    assert!(
+        std::fs::read_to_string(&both_pos)
+            .unwrap()
+            .contains("+chr/pos  combined")
+    );
+
+    let one_pos = tmp.join("one.pos.chk");
+    let two_pos = tmp.join("two.pos.chk");
+    let merged_pos = tmp.join("merged.pos.chk");
+    for (input, output) in [(&one, &one_pos), (&two, &two_pos)] {
+        assert_eq!(
+            exit_to_u8(checksum::main(&argv(
+                "checksum",
+                &[
+                    "-P",
+                    input.to_str().unwrap(),
+                    "-o",
+                    output.to_str().unwrap()
+                ]
+            ))),
+            0
+        );
+    }
+    assert_eq!(
+        exit_to_u8(checksum::main(&argv(
+            "checksum",
+            &[
+                "-m",
+                one_pos.to_str().unwrap(),
+                two_pos.to_str().unwrap(),
+                "-o",
+                merged_pos.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        normalize_checksum_file_line(&std::fs::read_to_string(merged_pos).unwrap()),
+        normalize_checksum_file_line(&std::fs::read_to_string(both_pos).unwrap())
+    );
+}
+
+#[test]
+fn checksum_check_cigar_distinguishes_cigar_and_merges() {
+    let tmp = tmp_dir("checksum-check-cigar");
+    let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:100\n";
+    let rec_4m = "same\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n";
+    let rec_2m2m = "same\t0\tchr1\t1\t60\t2M2M\t*\t0\t0\tACGT\t!!!!\n";
+    let one = tmp.join("one.sam");
+    let two = tmp.join("two.sam");
+    let both = tmp.join("both.sam");
+    let merged_cigar_shape = tmp.join("merged-cigar-shape.sam");
+    std::fs::write(&one, format!("{header}{rec_4m}")).unwrap();
+    std::fs::write(&two, format!("{header}{rec_2m2m}")).unwrap();
+    std::fs::write(&both, format!("{header}{rec_4m}{rec_2m2m}")).unwrap();
+    std::fs::write(&merged_cigar_shape, format!("{header}{rec_4m}{rec_4m}")).unwrap();
+
+    let both_default = tmp.join("both.default.chk");
+    let merged_default = tmp.join("merged.default.chk");
+    let both_cigar = tmp.join("both.cigar.chk");
+    let merged_cigar = tmp.join("merged.cigar.chk");
+    for (input, output, extra) in [
+        (&both, &both_default, &[][..]),
+        (&merged_cigar_shape, &merged_default, &[][..]),
+        (&both, &both_cigar, &["-C"][..]),
+        (&merged_cigar_shape, &merged_cigar, &["-C"][..]),
+    ] {
+        let mut args = vec![input.to_str().unwrap(), "-o", output.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        assert_eq!(exit_to_u8(checksum::main(&argv("checksum", &args))), 0);
+    }
+
+    assert_eq!(
+        normalize_checksum_file_line(&std::fs::read_to_string(&both_default).unwrap()),
+        normalize_checksum_file_line(&std::fs::read_to_string(&merged_default).unwrap())
+    );
+    assert_ne!(
+        normalize_checksum_file_line(&std::fs::read_to_string(&both_cigar).unwrap()),
+        normalize_checksum_file_line(&std::fs::read_to_string(&merged_cigar).unwrap())
+    );
+    assert!(
+        std::fs::read_to_string(&both_cigar)
+            .unwrap()
+            .contains("+cigar    combined")
+    );
+
+    let one_cigar = tmp.join("one.cigar.chk");
+    let two_cigar = tmp.join("two.cigar.chk");
+    let merged_report = tmp.join("merged-report.cigar.chk");
+    for (input, output) in [(&one, &one_cigar), (&two, &two_cigar)] {
+        assert_eq!(
+            exit_to_u8(checksum::main(&argv(
+                "checksum",
+                &[
+                    "-C",
+                    input.to_str().unwrap(),
+                    "-o",
+                    output.to_str().unwrap(),
+                ]
+            ))),
+            0
+        );
+    }
+    assert_eq!(
+        exit_to_u8(checksum::main(&argv(
+            "checksum",
+            &[
+                "-m",
+                one_cigar.to_str().unwrap(),
+                two_cigar.to_str().unwrap(),
+                "-o",
+                merged_report.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        normalize_checksum_file_line(&std::fs::read_to_string(merged_report).unwrap()),
+        normalize_checksum_file_line(&std::fs::read_to_string(both_cigar).unwrap())
+    );
+}
+
+#[test]
+fn checksum_check_mate_distinguishes_mate_position_and_merges() {
+    let tmp = tmp_dir("checksum-check-mate");
+    let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:100\n";
+    let mate_at_5 = "same\t1\tchr1\t1\t60\t4M\t=\t5\t4\tACGT\t!!!!\n";
+    let mate_at_9 = "same\t1\tchr1\t1\t60\t4M\t=\t9\t8\tACGT\t!!!!\n";
+    let one = tmp.join("one.sam");
+    let two = tmp.join("two.sam");
+    let both = tmp.join("both.sam");
+    let shifted = tmp.join("shifted.sam");
+    std::fs::write(&one, format!("{header}{mate_at_5}")).unwrap();
+    std::fs::write(&two, format!("{header}{mate_at_9}")).unwrap();
+    std::fs::write(&both, format!("{header}{mate_at_5}{mate_at_9}")).unwrap();
+    std::fs::write(&shifted, format!("{header}{mate_at_5}{mate_at_5}")).unwrap();
+
+    let both_default = tmp.join("both.default.chk");
+    let shifted_default = tmp.join("shifted.default.chk");
+    let both_mate = tmp.join("both.mate.chk");
+    let shifted_mate = tmp.join("shifted.mate.chk");
+    for (input, output, extra) in [
+        (&both, &both_default, &[][..]),
+        (&shifted, &shifted_default, &[][..]),
+        (&both, &both_mate, &["-M"][..]),
+        (&shifted, &shifted_mate, &["-M"][..]),
+    ] {
+        let mut args = vec![input.to_str().unwrap(), "-o", output.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        assert_eq!(exit_to_u8(checksum::main(&argv("checksum", &args))), 0);
+    }
+
+    assert_eq!(
+        normalize_checksum_file_line(&std::fs::read_to_string(&both_default).unwrap()),
+        normalize_checksum_file_line(&std::fs::read_to_string(&shifted_default).unwrap())
+    );
+    assert_ne!(
+        normalize_checksum_file_line(&std::fs::read_to_string(&both_mate).unwrap()),
+        normalize_checksum_file_line(&std::fs::read_to_string(&shifted_mate).unwrap())
+    );
+    assert!(
+        std::fs::read_to_string(&both_mate)
+            .unwrap()
+            .contains("+mate     combined")
+    );
+
+    let one_mate = tmp.join("one.mate.chk");
+    let two_mate = tmp.join("two.mate.chk");
+    let merged_report = tmp.join("merged-report.mate.chk");
+    for (input, output) in [(&one, &one_mate), (&two, &two_mate)] {
+        assert_eq!(
+            exit_to_u8(checksum::main(&argv(
+                "checksum",
+                &[
+                    "-M",
+                    input.to_str().unwrap(),
+                    "-o",
+                    output.to_str().unwrap(),
+                ]
+            ))),
+            0
+        );
+    }
+    assert_eq!(
+        exit_to_u8(checksum::main(&argv(
+            "checksum",
+            &[
+                "-m",
+                one_mate.to_str().unwrap(),
+                two_mate.to_str().unwrap(),
+                "-o",
+                merged_report.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        normalize_checksum_file_line(&std::fs::read_to_string(merged_report).unwrap()),
+        normalize_checksum_file_line(&std::fs::read_to_string(both_mate).unwrap())
+    );
+}
+
+#[test]
+fn checksum_bamseqchksum_format_outputs_compat_rows() {
+    let tmp = tmp_dir("checksum-bamseqchksum");
+    let output = tmp.join("compat.chk");
+    let input = sample_bam();
+
+    assert_eq!(
+        exit_to_u8(checksum::main(&argv(
+            "checksum",
+            &[
+                "-B",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(output).unwrap();
+    let lines = text.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines[0],
+        "###\tset\tcount\t\tb_seq\tname_b_seq\tb_seq_qual\tb_seq_tags(BC,FI,QT,RT,TC)"
+    );
+    assert!(
+        lines.iter().any(|line| {
+            line.starts_with("all\tall\t144\t12eebb31\t7e82e134\t156fc353\t12eebb31")
+        })
+    );
+    assert!(lines.iter().any(|line| {
+        line.starts_with("ERR013140\tpass\t71\t2259e00a\t338c6a3\t7621d262\t2259e00a")
+    }));
+    assert!(!text.contains("\tfail\t"));
+    assert!(!text.contains("combined"));
+}
+
+#[test]
+fn checksum_all_expands_to_full_field_options_for_sam_and_bam() {
+    let tmp = tmp_dir("checksum-all");
+    let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:100\n";
+    let sam = tmp.join("input.sam");
+    let bam = tmp.join("input.bam");
+    std::fs::write(
+        &sam,
+        format!(
+            "{header}r1\t99\tchr1\t1\t60\t4M\t=\t10\t13\tACGT\t!!!!\tRG:Z:g1\tBC:Z:b\tNM:i:0\n"
+        ),
+    )
+    .unwrap();
+    write_bam_from_sam_text(&bam, &std::fs::read_to_string(&sam).unwrap());
+
+    for input in [&sam, &bam] {
+        let shorthand = tmp.join(format!(
+            "{}.all.chk",
+            input.file_stem().unwrap().to_string_lossy()
+        ));
+        let explicit = tmp.join(format!(
+            "{}.explicit.chk",
+            input.file_stem().unwrap().to_string_lossy()
+        ));
+
+        assert_eq!(
+            exit_to_u8(checksum::main(&argv(
+                "checksum",
+                &[
+                    "-a",
+                    input.to_str().unwrap(),
+                    "-o",
+                    shorthand.to_str().unwrap()
+                ]
+            ))),
+            0
+        );
+        assert_eq!(
+            exit_to_u8(checksum::main(&argv(
+                "checksum",
+                &[
+                    "-P",
+                    "-C",
+                    "-M",
+                    "-O",
+                    "-c",
+                    "-b",
+                    "0xfff",
+                    "-f",
+                    "0",
+                    "-F",
+                    "0",
+                    "-t",
+                    "*,cF,MD,NM",
+                    input.to_str().unwrap(),
+                    "-o",
+                    explicit.to_str().unwrap(),
+                ]
+            ))),
+            0
+        );
+
+        assert_eq!(
+            normalize_checksum_file_line(&std::fs::read_to_string(shorthand).unwrap()),
+            normalize_checksum_file_line(&std::fs::read_to_string(explicit).unwrap())
+        );
+    }
+}
+
+#[test]
+fn checksum_aux_wildcard_includes_sorted_tags() {
+    let tmp = tmp_dir("checksum-aux-wildcard");
+    let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:100\n";
+    let input = tmp.join("input.sam");
+    std::fs::write(
+        &input,
+        format!("{header}r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tZZ:Z:z\tBC:Z:b\tXA:B:C,1,2\tAA:i:1\n"),
+    )
+    .unwrap();
+
+    let all_tags = tmp.join("all-tags.chk");
+    let explicit_sorted = tmp.join("explicit-sorted.chk");
+    let without_bc = tmp.join("without-bc.chk");
+    let explicit_without_bc = tmp.join("explicit-without-bc.chk");
+    for (tags, output) in [
+        ("*", &all_tags),
+        ("AA,BC,XA,ZZ", &explicit_sorted),
+        ("*,BC", &without_bc),
+        ("AA,XA,ZZ", &explicit_without_bc),
+    ] {
+        assert_eq!(
+            exit_to_u8(checksum::main(&argv(
+                "checksum",
+                &[
+                    "-t",
+                    tags,
+                    input.to_str().unwrap(),
+                    "-o",
+                    output.to_str().unwrap(),
+                ]
+            ))),
+            0
+        );
+    }
+
+    let all_row = checksum_all_row(&std::fs::read_to_string(all_tags).unwrap());
+    let explicit_row = checksum_all_row(&std::fs::read_to_string(explicit_sorted).unwrap());
+    let without_bc_row = checksum_all_row(&std::fs::read_to_string(without_bc).unwrap());
+    let explicit_without_bc_row =
+        checksum_all_row(&std::fs::read_to_string(explicit_without_bc).unwrap());
+
+    assert_eq!(all_row, explicit_row);
+    assert_eq!(without_bc_row, explicit_without_bc_row);
+    assert_ne!(all_row, without_bc_row);
+}
+
+#[test]
+fn reference_reconstructs_from_sam_md_tags() {
+    let tmp = tmp_dir("reference-sam-md");
+    let input = tmp.join("input.sam");
+    let output = tmp.join("ref.fa");
+    std::fs::write(
+        &input,
+        "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:12\nr1\t0\tchr1\t1\t60\t4M1D4M\t*\t0\t0\tACGTTGCA\t!!!!!!!!\tMD:Z:4^A4\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(reference::main(&argv(
+            "reference",
+            &[
+                "-q",
+                input.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(output).unwrap(),
+        ">chr1\nACGTATGCANNN\n"
+    );
+}
+
+#[test]
+fn reference_region_outputs_requested_slice_and_bam_input() {
+    let tmp = tmp_dir("reference-region-bam");
+    let sam = tmp.join("input.sam");
+    let bam = tmp.join("input.bam");
+    let sam_out = tmp.join("sam-region.fa");
+    let bam_out = tmp.join("bam-region.fa");
+    let text = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:12\nr1\t0\tchr1\t1\t60\t4M1D4M\t*\t0\t0\tACGTTGCA\t!!!!!!!!\tMD:Z:4^A4\n";
+    std::fs::write(&sam, text).unwrap();
+    write_bam_from_sam_text(&bam, text);
+
+    for (input, output) in [(&sam, &sam_out), (&bam, &bam_out)] {
+        assert_eq!(
+            exit_to_u8(reference::main(&argv(
+                "reference",
+                &[
+                    "-q",
+                    "-r",
+                    "chr1:3-7",
+                    input.to_str().unwrap(),
+                    "-o",
+                    output.to_str().unwrap()
+                ]
+            ))),
+            0
+        );
+    }
+
+    let expected = ">chr1:3-7 length: 5\nGTATG\n";
+    assert_eq!(std::fs::read_to_string(sam_out).unwrap(), expected);
+    assert_eq!(std::fs::read_to_string(bam_out).unwrap(), expected);
 }
 
 #[test]
@@ -405,6 +1065,45 @@ fn cat_no_pg_suppresses_pg() {
 
     let header = header_text::read_raw_header_text(&out).unwrap();
     assert!(!header.contains("\tCL:cat "));
+}
+
+#[test]
+fn cat_sam_inputs_write_sam_output_with_single_header() {
+    let tmp = tmp_dir("cat-sam");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("cat.sam");
+    let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:100\n";
+    std::fs::write(
+        &sam_a,
+        format!("{header}a1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        format!("{header}b1\t0\tchr1\t5\t60\t4M\t*\t0\t0\tTGCA\t####\n"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(cat::main(&argv(
+            "cat",
+            &[
+                "--no-PG",
+                sam_a.to_str().unwrap(),
+                sam_b.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert_eq!(text.matches("@SQ\tSN:chr1").count(), 1);
+    assert!(text.lines().any(|line| line.starts_with("a1\t")));
+    assert!(text.lines().any(|line| line.starts_with("b1\t")));
+    assert!(!text.contains("\tCL:cat "));
 }
 
 #[test]
@@ -1291,9 +1990,13 @@ fn fixmate_sam_input_fills_mate_fields_to_sam_output() {
     assert_eq!(records[0][1], "65");
     assert_eq!(records[0][6], "=");
     assert_eq!(records[0][7], "5");
+    assert!(records[0].contains(&"MC:Z:4M"));
+    assert!(records[0].contains(&"MQ:i:60"));
     assert_eq!(records[1][1], "129");
     assert_eq!(records[1][6], "=");
     assert_eq!(records[1][7], "1");
+    assert!(records[1].contains(&"MC:Z:4M"));
+    assert!(records[1].contains(&"MQ:i:60"));
 }
 
 #[test]
@@ -2561,6 +3264,42 @@ fn rmdup_sam_input_keeps_best_single_end_duplicate() {
 }
 
 #[test]
+fn rmdup_sam_input_removes_lower_scoring_paired_duplicate() {
+    let tmp = tmp_dir("rmdup-pe-sam");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:200\n",
+            "pair_a\t99\tchr1\t1\t60\t10M\t=\t91\t100\tAAAAAAAAAA\t!!!!!!!!!!\n",
+            "pair_a\t147\tchr1\t91\t60\t10M\t=\t1\t-100\tTTTTTTTTTT\t!!!!!!!!!!\n",
+            "pair_b\t99\tchr1\t1\t10\t10M\t=\t91\t100\tCCCCCCCCCC\t!!!!!!!!!!\n",
+            "pair_b\t147\tchr1\t91\t10\t10M\t=\t1\t-100\tGGGGGGGGGG\t!!!!!!!!!!\n",
+            "pair_c\t99\tchr1\t2\t10\t10M\t=\t91\t100\tACACACACAC\t!!!!!!!!!!\n",
+            "pair_c\t147\tchr1\t91\t10\t10M\t=\t2\t-100\tTGTGTGTGTG\t!!!!!!!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(rmdup::main(&argv(
+            "rmdup",
+            &[sam.to_str().unwrap(), out.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("\npair_a\t99\t"));
+    assert!(text.contains("\npair_a\t147\t"));
+    assert!(!text.contains("\npair_b\t"));
+    assert!(text.contains("\npair_c\t99\t"));
+    assert!(text.contains("\npair_c\t147\t"));
+}
+
+#[test]
 fn reset_sam_input_clears_alignment_fields_and_default_tags() {
     let tmp = tmp_dir("reset-sam");
     let sam = tmp.join("in.sam");
@@ -2680,10 +3419,11 @@ fn reset_no_rg_removes_read_group_headers_and_tags() {
 }
 
 #[test]
-fn reset_no_pg_removes_program_headers() {
+fn reset_no_pg_skips_adding_reset_program_entry() {
     let tmp = tmp_dir("reset-no-pg");
     let sam = tmp.join("in.sam");
-    let out = tmp.join("reset.sam");
+    let no_pg_out = tmp.join("reset.no-pg.sam");
+    let default_out = tmp.join("reset.default.sam");
     std::fs::write(
         &sam,
         concat!(
@@ -2696,6 +3436,9 @@ fn reset_no_pg_removes_program_headers() {
     )
     .unwrap();
 
+    // --no-PG: existing @PG records are preserved, but no new samtools
+    // @PG entry is added. This matches upstream `samtools reset` behavior
+    // (`reset.c`'s `noPGentry` flag).
     assert_eq!(
         exit_to_u8(reset::main(&argv(
             "reset",
@@ -2704,15 +3447,37 @@ fn reset_no_pg_removes_program_headers() {
                 "-O",
                 "sam",
                 "-o",
-                out.to_str().unwrap(),
+                no_pg_out.to_str().unwrap(),
                 sam.to_str().unwrap(),
             ]
         ))),
         0
     );
+    let no_pg_text = std::fs::read_to_string(&no_pg_out).unwrap();
+    assert!(no_pg_text.contains("@PG\tID:aligner"));
+    assert!(no_pg_text.contains("@PG\tID:post"));
+    assert!(!no_pg_text.contains("PN:samtools"));
 
-    let text = std::fs::read_to_string(out).unwrap();
-    assert!(!text.contains("\n@PG\t"));
+    // Default: existing @PGs are preserved AND a new samtools @PG line is
+    // chained onto the terminal program.
+    assert_eq!(
+        exit_to_u8(reset::main(&argv(
+            "reset",
+            &[
+                "-O",
+                "sam",
+                "-o",
+                default_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let default_text = std::fs::read_to_string(default_out).unwrap();
+    assert!(default_text.contains("@PG\tID:aligner"));
+    assert!(default_text.contains("@PG\tID:post"));
+    assert!(default_text.contains("PN:samtools"));
+    assert!(default_text.contains("PP:post"));
 }
 
 #[test]
@@ -3109,4 +3874,801 @@ fn split_accepts_no_pg_option() {
     let g1 = std::fs::read_to_string(tmp.join("out.g1.sam")).unwrap();
     assert!(!g1.contains("@PG\tID:samtools"));
     assert!(g1.lines().any(|line| line.starts_with("r1\t")));
+}
+
+#[test]
+fn fixmate_adds_pg_line_by_default() {
+    let tmp = tmp_dir("fixmate-pg");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("fixed.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:queryname\n",
+            "@SQ\tSN:chr1\tLN:100\n",
+            "r1\t99\tchr1\t1\t60\t10M\t=\t91\t100\tACGTACGTAC\t!!!!!!!!!!\n",
+            "r1\t147\tchr1\t91\t60\t10M\t=\t1\t-100\tACGTACGTAC\t!!!!!!!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fixmate::main(&argv(
+            "fixmate",
+            &["-O", "sam", sam.to_str().unwrap(), out.to_str().unwrap(),]
+        ))),
+        0
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("PN:samtools"));
+}
+
+#[test]
+fn fixmate_no_pg_omits_pg_line() {
+    let tmp = tmp_dir("fixmate-no-pg");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("fixed.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:queryname\n",
+            "@SQ\tSN:chr1\tLN:100\n",
+            "r1\t99\tchr1\t1\t60\t10M\t=\t91\t100\tACGTACGTAC\t!!!!!!!!!!\n",
+            "r1\t147\tchr1\t91\t60\t10M\t=\t1\t-100\tACGTACGTAC\t!!!!!!!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fixmate::main(&argv(
+            "fixmate",
+            &[
+                "--no-PG",
+                "-O",
+                "sam",
+                sam.to_str().unwrap(),
+                out.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(!text.contains("PN:samtools"));
+}
+
+#[test]
+fn rmdup_adds_pg_line_by_default() {
+    let tmp = tmp_dir("rmdup-pg");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("dedup.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(rmdup::main(&argv(
+            "rmdup",
+            &[sam.to_str().unwrap(), out.to_str().unwrap()]
+        ))),
+        0
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("PN:samtools"));
+}
+
+#[test]
+fn rmdup_no_pg_omits_pg_line() {
+    let tmp = tmp_dir("rmdup-no-pg");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("dedup.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(rmdup::main(&argv(
+            "rmdup",
+            &["--no-PG", sam.to_str().unwrap(), out.to_str().unwrap()]
+        ))),
+        0
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(!text.contains("PN:samtools"));
+}
+
+#[test]
+fn addreplacerg_adds_pg_line_by_default_and_omits_with_no_pg() {
+    let tmp = tmp_dir("addreplacerg-pg");
+    let sam = tmp.join("in.sam");
+    let default_out = tmp.join("default.sam");
+    let no_pg_out = tmp.join("no_pg.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(addreplacerg::main(&argv(
+            "addreplacerg",
+            &[
+                "-r",
+                "ID:g1",
+                "-r",
+                "SM:s1",
+                "-O",
+                "sam",
+                "-o",
+                default_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let default_text = std::fs::read_to_string(&default_out).unwrap();
+    assert!(default_text.contains("PN:samtools"));
+
+    assert_eq!(
+        exit_to_u8(addreplacerg::main(&argv(
+            "addreplacerg",
+            &[
+                "--no-PG",
+                "-r",
+                "ID:g1",
+                "-r",
+                "SM:s1",
+                "-O",
+                "sam",
+                "-o",
+                no_pg_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let no_pg_text = std::fs::read_to_string(&no_pg_out).unwrap();
+    assert!(!no_pg_text.contains("PN:samtools"));
+}
+
+#[test]
+fn addreplacerg_writes_bam_output_with_rg_header_and_tag() {
+    let tmp = tmp_dir("addreplacerg-bam-output");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.bam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(addreplacerg::main(&argv(
+            "addreplacerg",
+            &[
+                "--no-PG",
+                "-r",
+                "ID:g1",
+                "-r",
+                "SM:s1",
+                "-O",
+                "bam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let mut reader = bam::io::Reader::new(std::fs::File::open(&out).unwrap());
+    let header = reader.read_header().unwrap();
+    assert!(header.read_groups().contains_key("g1".as_bytes()));
+
+    let mut record = sam::alignment::RecordBuf::default();
+    assert_ne!(reader.read_record_buf(&header, &mut record).unwrap(), 0);
+    let tag = sam::alignment::record::data::field::Tag::from([b'R', b'G']);
+    let value = record.data().get(&tag).unwrap();
+    assert_eq!(
+        value,
+        &sam::alignment::record_buf::data::field::Value::String("g1".into())
+    );
+}
+
+#[test]
+fn addreplacerg_bam_input_to_sam_honors_orphan_only_mode() {
+    let tmp = tmp_dir("addreplacerg-bam-input");
+    let sam = tmp.join("in.sam");
+    let bam = tmp.join("with_rg.bam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:old\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(addreplacerg::main(&argv(
+            "addreplacerg",
+            &[
+                "--no-PG",
+                "-r",
+                "ID:old",
+                "-O",
+                "bam",
+                "-o",
+                bam.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(addreplacerg::main(&argv(
+            "addreplacerg",
+            &[
+                "--no-PG",
+                "-R",
+                "new",
+                "-m",
+                "orphan_only",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                bam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("RG:Z:old"));
+    assert!(!text.contains("RG:Z:new"));
+}
+
+#[test]
+fn fixmate_r_removes_unmapped_and_secondary_records() {
+    let tmp = tmp_dir("fixmate-r");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("fixed.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:queryname\n",
+            "@SQ\tSN:chr1\tLN:100\n",
+            // Pair where second mate is unmapped (FUNMAP=0x4 → flag 77 for read1 / 141 for read2)
+            "r1\t77\t*\t0\t0\t*\t*\t0\t0\tACGTACGTAC\t!!!!!!!!!!\n",
+            "r1\t141\t*\t0\t0\t*\t*\t0\t0\tACGTACGTAC\t!!!!!!!!!!\n",
+            // Secondary alignment (FSECONDARY=0x100)
+            "r2\t256\tchr1\t1\t60\t10M\t*\t0\t0\tACGTACGTAC\t!!!!!!!!!!\n",
+            // Primary mapped pair
+            "r3\t99\tchr1\t1\t60\t10M\t=\t91\t100\tACGTACGTAC\t!!!!!!!!!!\n",
+            "r3\t147\tchr1\t91\t60\t10M\t=\t1\t-100\tACGTACGTAC\t!!!!!!!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fixmate::main(&argv(
+            "fixmate",
+            &[
+                "-r",
+                "-O",
+                "sam",
+                sam.to_str().unwrap(),
+                out.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(!text.contains("\nr1\t"), "unmapped pair must be removed");
+    assert!(
+        !text.contains("\nr2\t"),
+        "secondary alignment must be removed"
+    );
+    assert!(text.contains("\nr3\t"), "primary pair must be retained");
+}
+
+#[test]
+fn cat_r_region_restricts_to_indexed_bam_records() {
+    use samtools_rs::commands::view;
+
+    let tmp = tmp_dir("cat-region");
+    let bam = sample_bam();
+    let indexed = tmp.join("indexed.bam");
+    std::fs::copy(&bam, &indexed).unwrap();
+    assert_eq!(
+        exit_to_u8(index::main(&argv("index", &[indexed.to_str().unwrap()]))),
+        0
+    );
+
+    let full_out = tmp.join("full.bam");
+    let region_out = tmp.join("region.bam");
+    assert_eq!(
+        exit_to_u8(cat::main(&argv(
+            "cat",
+            &["-o", full_out.to_str().unwrap(), indexed.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(cat::main(&argv(
+            "cat",
+            &[
+                "-r",
+                "17:1-2000",
+                "-o",
+                region_out.to_str().unwrap(),
+                indexed.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let full_count = tmp.join("full.count.txt");
+    let region_count = tmp.join("region.count.txt");
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &[
+                "-c",
+                "-o",
+                full_count.to_str().unwrap(),
+                full_out.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &[
+                "-c",
+                "-o",
+                region_count.to_str().unwrap(),
+                region_out.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    let full: u64 = std::fs::read_to_string(&full_count)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let restricted: u64 = std::fs::read_to_string(&region_count)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(restricted > 0);
+    assert!(restricted < full);
+}
+
+#[test]
+fn calmd_sam_input_recomputes_md_and_nm_tags() {
+    let tmp = tmp_dir("calmd-md-nm");
+    let sam = tmp.join("in.sam");
+    let reference = tmp.join("ref.fa");
+    let out = tmp.join("out.sam");
+    std::fs::write(&reference, ">chr1\nACGTACGTACGT\n").unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:12\n",
+            "r1\t0\tchr1\t1\t60\t4M1I2M1D2M\t*\t0\t0\tACGTTCGAC\t!!!!!!!!!\tNM:i:99\tMD:Z:0A0\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(calmd::main(&argv(
+            "calmd",
+            &[
+                "--no-PG",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+                reference.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let record = text.lines().find(|line| line.starts_with("r1\t")).unwrap();
+    assert!(record.contains("\tNM:i:6"));
+    assert!(record.contains("\tMD:Z:4A0C0^G0T0A0"));
+    assert!(!record.contains("NM:i:99"));
+    assert!(!record.contains("MD:Z:0A0"));
+}
+
+#[test]
+fn calmd_bam_input_recomputes_md_and_nm_tags_to_sam_output() {
+    let tmp = tmp_dir("calmd-bam-md-nm");
+    let sam = tmp.join("in.sam");
+    let bam = tmp.join("in.bam");
+    let reference = tmp.join("ref.fa");
+    let out = tmp.join("out.sam");
+    std::fs::write(&reference, ">chr1\nACGTACGTACGT\n").unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:12\n",
+            "r1\t0\tchr1\t1\t60\t4M1I2M1D2M\t*\t0\t0\tACGTTCGAC\t!!!!!!!!!\tNM:i:99\tMD:Z:0A0\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &["-b", "-o", bam.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(calmd::main(&argv(
+            "calmd",
+            &[
+                "--no-PG",
+                "-o",
+                out.to_str().unwrap(),
+                bam.to_str().unwrap(),
+                reference.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let record = text.lines().find(|line| line.starts_with("r1\t")).unwrap();
+    assert!(record.contains("\tNM:i:6"));
+    assert!(record.contains("\tMD:Z:4A0C0^G0T0A0"));
+    assert!(!record.contains("NM:i:99"));
+    assert!(!record.contains("MD:Z:0A0"));
+}
+
+#[test]
+fn calmd_drop_baq_removes_bq_tags() {
+    let tmp = tmp_dir("calmd-drop-bq");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:12\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tBQ:Z:abcd\tNM:i:0\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(calmd::main(&argv(
+            "calmd",
+            &[
+                "--no-PG",
+                "-d",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let record = text.lines().find(|line| line.starts_with("r1\t")).unwrap();
+    assert!(!record.contains("\tBQ:Z:"));
+    assert!(record.contains("\tNM:i:0"));
+}
+
+#[test]
+fn markdup_sam_input_flags_duplicates_keeping_highest_mapq() {
+    use samtools_rs::commands::markdup;
+    let tmp = tmp_dir("markdup-sam");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:100\n",
+            "low\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "reverse\t16\tchr1\t1\t30\t4M\t*\t0\t0\tCCCC\t$$$$\n",
+            "unique\t0\tchr1\t2\t30\t4M\t*\t0\t0\tGGGG\t....\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let high = text.lines().find(|l| l.starts_with("high\t")).unwrap();
+    let low = text.lines().find(|l| l.starts_with("low\t")).unwrap();
+    let reverse = text.lines().find(|l| l.starts_with("reverse\t")).unwrap();
+    let unique = text.lines().find(|l| l.starts_with("unique\t")).unwrap();
+
+    let flag_of = |line: &str| line.split('\t').nth(1).unwrap().parse::<u32>().unwrap();
+    // 0x400 == BAM_FDUP
+    assert_eq!(
+        flag_of(high) & 0x400,
+        0,
+        "highest MAPQ in group keeps primary"
+    );
+    assert_eq!(flag_of(low) & 0x400, 0x400, "low MAPQ duplicate flagged");
+    assert_eq!(
+        flag_of(reverse) & 0x400,
+        0,
+        "different strand is not a duplicate"
+    );
+    assert_eq!(
+        flag_of(unique) & 0x400,
+        0,
+        "different position is not a duplicate"
+    );
+}
+
+#[test]
+fn markdup_barcode_tag_separates_duplicate_groups() {
+    use samtools_rs::commands::markdup;
+    let tmp = tmp_dir("markdup-barcode");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:100\n",
+            "aa_low\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\tBC:Z:AA\n",
+            "aa_high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\tBC:Z:AA\n",
+            "bb\t0\tchr1\t1\t20\t4M\t*\t0\t0\tCCCC\t$$$$\tBC:Z:BB\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "-O",
+                "sam",
+                "-b",
+                "BC",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let aa_high = text.lines().find(|l| l.starts_with("aa_high\t")).unwrap();
+    let aa_low = text.lines().find(|l| l.starts_with("aa_low\t")).unwrap();
+    let bb = text.lines().find(|l| l.starts_with("bb\t")).unwrap();
+
+    let flag_of = |line: &str| line.split('\t').nth(1).unwrap().parse::<u32>().unwrap();
+    assert_eq!(flag_of(aa_high) & 0x400, 0);
+    assert_eq!(flag_of(aa_low) & 0x400, 0x400);
+    assert_eq!(flag_of(bb) & 0x400, 0);
+}
+
+#[test]
+fn markdup_r_removes_duplicates_from_output() {
+    use samtools_rs::commands::markdup;
+    let tmp = tmp_dir("markdup-remove");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:100\n",
+            "high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "low\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "-r",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.lines().any(|l| l.starts_with("high\t")));
+    assert!(!text.lines().any(|l| l.starts_with("low\t")));
+}
+
+#[test]
+fn markdup_propagates_duplicate_flag_to_supplementary_records() {
+    use samtools_rs::commands::markdup;
+    let tmp = tmp_dir("markdup-supplementary");
+    let sam = tmp.join("in.sam");
+    let flagged_out = tmp.join("flagged.sam");
+    let removed_out = tmp.join("removed.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:1000\n",
+            "keep\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "dup\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "dup\t2048\tchr1\t20\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "keep\t2048\tchr1\t30\t10\t4M\t*\t0\t0\tTGCA\t####\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "-O",
+                "sam",
+                "-o",
+                flagged_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let flagged_text = std::fs::read_to_string(&flagged_out).unwrap();
+    let flag_of = |text: &str, name: &str, original_flag: u32| -> u32 {
+        text.lines()
+            .find_map(|line| {
+                let mut fields = line.split('\t');
+                let qname = fields.next()?;
+                let flag = fields.next()?.parse::<u32>().ok()?;
+                (qname == name && flag & !0x400 == original_flag).then_some(flag)
+            })
+            .expect("record present")
+    };
+
+    assert_eq!(flag_of(&flagged_text, "dup", 0) & 0x400, 0x400);
+    assert_eq!(flag_of(&flagged_text, "dup", 2048) & 0x400, 0x400);
+    assert_eq!(flag_of(&flagged_text, "keep", 0) & 0x400, 0);
+    assert_eq!(flag_of(&flagged_text, "keep", 2048) & 0x400, 0);
+
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "-r",
+                "-O",
+                "sam",
+                "-o",
+                removed_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let removed_text = std::fs::read_to_string(&removed_out).unwrap();
+    assert!(!removed_text.lines().any(|line| line.starts_with("dup\t")));
+    assert!(
+        removed_text
+            .lines()
+            .any(|line| line.starts_with("keep\t0\t"))
+    );
+    assert!(
+        removed_text
+            .lines()
+            .any(|line| line.starts_with("keep\t2048\t"))
+    );
+}
+
+#[test]
+fn markdup_paired_end_groups_pairs_and_flags_duplicates() {
+    use samtools_rs::commands::markdup;
+    let tmp = tmp_dir("markdup-pe");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    // Two FR pairs at the same coordinates (positions 1 and 91). pair_a has
+    // higher combined MAPQ; pair_b should be flagged as duplicate. A third
+    // pair at different positions is unique.
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:1000\n",
+            "pair_a\t99\tchr1\t1\t60\t10M\t=\t91\t100\tACGTACGTAC\tIIIIIIIIII\n",
+            "pair_a\t147\tchr1\t91\t60\t10M\t=\t1\t-100\tACGTACGTAC\tIIIIIIIIII\n",
+            "pair_b\t99\tchr1\t1\t10\t10M\t=\t91\t100\tACGTACGTAC\tIIIIIIIIII\n",
+            "pair_b\t147\tchr1\t91\t10\t10M\t=\t1\t-100\tACGTACGTAC\tIIIIIIIIII\n",
+            "pair_c\t99\tchr1\t200\t60\t10M\t=\t291\t100\tACGTACGTAC\tIIIIIIIIII\n",
+            "pair_c\t147\tchr1\t291\t60\t10M\t=\t200\t-100\tACGTACGTAC\tIIIIIIIIII\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let flag_of = |name: &str, flag_value: u32| -> u32 {
+        let line = text
+            .lines()
+            .find(|l| {
+                l.starts_with(name) && {
+                    let f: u32 = l.split('\t').nth(1).unwrap().parse().unwrap();
+                    f == flag_value
+                }
+            })
+            .expect("record present");
+        line.split('\t').nth(1).unwrap().parse().unwrap()
+    };
+
+    // pair_a: NOT a duplicate (highest combined MAPQ)
+    assert_eq!(flag_of("pair_a\t", 99) & 0x400, 0);
+    assert_eq!(flag_of("pair_a\t", 147) & 0x400, 0);
+    // pair_b: BOTH reads marked as duplicates
+    assert_eq!(flag_of("pair_b\t", 99 | 0x400) & 0x400, 0x400);
+    assert_eq!(flag_of("pair_b\t", 147 | 0x400) & 0x400, 0x400);
+    // pair_c: NOT a duplicate (different coordinates)
+    assert_eq!(flag_of("pair_c\t", 99) & 0x400, 0);
+    assert_eq!(flag_of("pair_c\t", 147) & 0x400, 0);
 }

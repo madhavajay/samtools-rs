@@ -118,8 +118,10 @@ where
             input_bam,
             Some(sorted_bam.path()),
             true,
+            None,
             sort_command::OutFmt::Bam,
             false,
+            None,
         )?;
         Some(sorted_bam)
     } else {
@@ -185,7 +187,12 @@ where
         depth_command::DepthRunConfig {
             min_mapq: 0,
             min_depth: 1,
+            min_read_len: 0,
             a_mode,
+            show_header: false,
+            exclude_flags: depth_command::default_exclude_flags(),
+            include_any_flags: 0,
+            require_flags: 0,
             region: Some(region.as_ref()),
             bed: None,
             reference: None,
@@ -238,8 +245,10 @@ where
         input_bam.as_ref(),
         Some(output_bam.as_ref()),
         by_name,
+        None,
         sort_command::OutFmt::Bam,
         false,
+        None,
     )
 }
 
@@ -288,6 +297,8 @@ where
         false,
         merge_command::OutFmt::Bam,
         false,
+        None,
+        merge_command::MergeRestriction::None,
     )
 }
 
