@@ -2133,6 +2133,7 @@ fn stats_filters_required_and_filtering_flags() {
 read1\t65\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\tIIII
 read2\t0\tchr1\t5\t60\t4M\t*\t0\t0\tCCCC\tIIII
 read3\t4\t*\t0\t0\t*\t*\t0\t0\tGGGG\tIIII
+secondary\t256\tchr1\t9\t60\t4M\t*\t0\t0\tTTTT\tIIII
 ",
     )
     .unwrap();
@@ -2151,10 +2152,11 @@ read3\t4\t*\t0\t0\t*\t*\t0\t0\tGGGG\tIIII
         0
     );
     let required_text = std::fs::read_to_string(required_out).unwrap();
-    assert!(required_text.contains("SN\traw total sequences:\t3\n"));
-    assert!(required_text.contains("SN\tfiltered sequences:\t2\n"));
+    assert!(required_text.contains("SN\traw total sequences:\t4\n"));
+    assert!(required_text.contains("SN\tfiltered sequences:\t3\n"));
     assert!(required_text.contains("SN\tsequences:\t1\n"));
     assert!(required_text.contains("SN\t1st fragments:\t1\n"));
+    assert!(required_text.contains("SN\tnon-primary alignments:\t0\n"));
 
     assert_eq!(
         exit_to_u8(stats::main(&argv(
@@ -2207,8 +2209,8 @@ long\t0\tchr1\t5\t60\t5M\t*\t0\t0\tCCCCC\tIIIII
     );
 
     let text = std::fs::read_to_string(out).unwrap();
-    assert!(text.contains("SN\traw total sequences:\t2\n"));
-    assert!(text.contains("SN\tfiltered sequences:\t1\n"));
+    assert!(text.contains("SN\traw total sequences:\t1\n"));
+    assert!(text.contains("SN\tfiltered sequences:\t0\n"));
     assert!(text.contains("SN\tsequences:\t1\n"));
     assert!(text.contains("SN\ttotal length:\t5\n"));
     assert!(text.contains("SN\tmaximum length:\t5\n"));

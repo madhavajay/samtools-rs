@@ -921,6 +921,27 @@ impl StatsCounts {
 
     fn update(&mut self, rec: StatsRecordFields, config: StatsConfig) {
         let flag = rec.flag;
+        if config.required_flags != 0 && flag & config.required_flags != config.required_flags {
+            self.raw_total += 1;
+            self.filtered += 1;
+            return;
+        }
+        if config.filter_flags != 0 && flag & config.filter_flags != 0 {
+            self.raw_total += 1;
+            self.filtered += 1;
+            return;
+        }
+        if config.remove_dups && flag & BAM_FDUP != 0 {
+            self.raw_total += 1;
+            self.filtered += 1;
+            return;
+        }
+        if config
+            .read_length_filter
+            .is_some_and(|required_len| rec.read_len != Some(required_len))
+        {
+            return;
+        }
         if flag & BAM_FSECONDARY != 0 {
             self.secondary += 1;
             return;
@@ -930,25 +951,6 @@ impl StatsCounts {
             return;
         }
         self.raw_total += 1;
-        if config.required_flags != 0 && flag & config.required_flags != config.required_flags {
-            self.filtered += 1;
-            return;
-        }
-        if config.filter_flags != 0 && flag & config.filter_flags != 0 {
-            self.filtered += 1;
-            return;
-        }
-        if config
-            .read_length_filter
-            .is_some_and(|required_len| rec.read_len != Some(required_len))
-        {
-            self.filtered += 1;
-            return;
-        }
-        if config.remove_dups && flag & BAM_FDUP != 0 {
-            self.filtered += 1;
-            return;
-        }
         self.total += 1;
 
         if flag & BAM_FUNMAP == 0 {
