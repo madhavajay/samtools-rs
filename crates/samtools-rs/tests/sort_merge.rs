@@ -475,6 +475,54 @@ fn collate_sam_input_groups_by_name_to_sam_output() {
 }
 
 #[test]
+fn collate_fast_mode_pairs_primary_reads_and_drops_supplementary() {
+    let tmp = tmp_dir("collate-fast");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("fast.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:20\n",
+            "pair\t147\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\n",
+            "supp\t2113\tchr1\t6\t60\t4M\t*\t0\t0\tCCCC\t$$$$\n",
+            "solo\t65\tchr1\t9\t60\t4M\t*\t0\t0\tGGGG\t%%%%\n",
+            "pair\t99\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "collate",
+        "--output-fmt=sam",
+        "-f",
+        "-r",
+        "2",
+        "-o",
+        out.to_str().unwrap(),
+        sam.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(collate::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.starts_with("@HD\tVN:1.6\tSO:unsorted\tGO:query\n"));
+    let records: Vec<(&str, u16)> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let name = fields.next().unwrap();
+            let flag = fields.next().unwrap().parse::<u16>().unwrap();
+            (name, flag)
+        })
+        .collect();
+    assert_eq!(records, [("pair", 99), ("pair", 147), ("solo", 65)]);
+}
+
+#[test]
 fn collate_cram_input_uses_top_level_reference() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let tmp = tmp_dir("collate-cram");

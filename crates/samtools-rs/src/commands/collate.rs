@@ -7,17 +7,20 @@
 //! CRAM inputs, which gives the same per-name grouping result but does not scale
 //! to inputs larger than memory.
 
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use bstr::BString;
 use htslib_rs::bam;
 use htslib_rs::bgzf;
 use htslib_rs::format::Exact;
 use htslib_rs::sam::{self, alignment::RecordBuf};
 
+use crate::bam_flag::{BAM_FREAD1, BAM_FREAD2, BAM_FSECONDARY, BAM_FSUPPLEMENTARY};
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
 use crate::sam_global::current_global_args;
@@ -29,10 +32,22 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut output_fmt = OutFmt::Bam;
     let mut input: Option<PathBuf> = None;
     let mut no_pg = false;
+    let mut fast = false;
+    let mut reads_store = 10_000usize;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
         let s = arg.to_str().unwrap_or("");
+        if let Some(v) = s.strip_prefix("--output-fmt=") {
+            output_fmt = match parse_output_format(v) {
+                Ok(fmt) => fmt,
+                Err(e) => {
+                    print_error("collate", e);
+                    return ExitCode::from(1);
+                }
+            };
+            continue;
+        }
         match s {
             "-o" => {
                 output_prefix = iter.next().and_then(|a| a.to_str()).map(|s| s.to_string());
@@ -55,6 +70,22 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
             "--no-PG" => {
                 no_pg = true;
+            }
+            "-f" => {
+                fast = true;
+            }
+            "-r" => {
+                let Some(v) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("collate", "missing value for -r");
+                    return ExitCode::from(1);
+                };
+                reads_store = match v.parse::<usize>() {
+                    Ok(n) => n.max(2),
+                    Err(_) => {
+                        print_error("collate", format!("invalid -r value \"{}\"", v));
+                        return ExitCode::from(1);
+                    }
+                };
             }
             "-@" | "--threads" => {
                 let _ = iter.next();
@@ -118,6 +149,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
         &input,
         output,
         output_fmt,
+        fast,
+        reads_store,
         if no_pg { None } else { Some(args) },
     ) {
         Ok(()) => ExitCode::SUCCESS,
@@ -151,10 +184,12 @@ fn run_collate(
     input: &Path,
     output: OutputTarget,
     fmt: OutFmt,
+    fast: bool,
+    reads_store: usize,
     pg_argv: Option<&[OsString]>,
 ) -> io::Result<()> {
     let format = sam_io::sam_open_format(input)?;
-    let (mut header, mut records) = match format.exact {
+    let (mut header, records) = match format.exact {
         Exact::Sam => read_sam_records(input)?,
         Exact::Bam => read_bam_records(input)?,
         Exact::Cram => read_cram_records(input)?,
@@ -166,11 +201,13 @@ fn run_collate(
         }
     };
 
-    records.sort_by(|a, b| {
-        let an = a.name().map(|s| s.to_vec()).unwrap_or_default();
-        let bn = b.name().map(|s| s.to_vec()).unwrap_or_default();
-        an.cmp(&bn)
-    });
+    set_collate_header(&mut header);
+
+    let records = if fast {
+        fast_collate_records(records, reads_store)
+    } else {
+        sort_records_by_name(records)
+    };
 
     if let Some(argv) = pg_argv {
         header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
@@ -181,6 +218,95 @@ fn run_collate(
         writer.write_record(&header, rec)?;
     }
     Ok(())
+}
+
+fn sort_records_by_name(mut records: Vec<RecordBuf>) -> Vec<RecordBuf> {
+    records.sort_by_key(name_key);
+    records
+}
+
+fn fast_collate_records(records: Vec<RecordBuf>, reads_store: usize) -> Vec<RecordBuf> {
+    let reads_store = reads_store.max(2);
+    let mut paired = Vec::new();
+    let mut deferred = Vec::new();
+    let mut stored: HashMap<Vec<u8>, RecordBuf> = HashMap::new();
+    let mut order = VecDeque::new();
+
+    for record in records {
+        if !is_fast_collate_candidate(&record) {
+            continue;
+        }
+
+        let name = name_key(&record);
+        if let Some(mate) = stored.remove(&name) {
+            let (r1, r2) = order_pair(record, mate);
+            paired.push(r1);
+            paired.push(r2);
+        } else {
+            if stored.len() >= reads_store {
+                flush_oldest_stored_record(&mut stored, &mut order, &mut deferred);
+            }
+            order.push_back(name.clone());
+            stored.insert(name, record);
+        }
+    }
+
+    while !stored.is_empty() {
+        flush_oldest_stored_record(&mut stored, &mut order, &mut deferred);
+    }
+
+    paired.extend(sort_records_by_name(deferred));
+    paired
+}
+
+fn flush_oldest_stored_record(
+    stored: &mut HashMap<Vec<u8>, RecordBuf>,
+    order: &mut VecDeque<Vec<u8>>,
+    deferred: &mut Vec<RecordBuf>,
+) {
+    while let Some(name) = order.pop_front() {
+        if let Some(record) = stored.remove(&name) {
+            deferred.push(record);
+            break;
+        }
+    }
+}
+
+fn is_fast_collate_candidate(record: &RecordBuf) -> bool {
+    let flags = record.flags().bits() as u32;
+    let read_flag = flags & (BAM_FREAD1 | BAM_FREAD2);
+    flags & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY) == 0
+        && matches!(read_flag, BAM_FREAD1 | BAM_FREAD2)
+}
+
+fn order_pair(a: RecordBuf, b: RecordBuf) -> (RecordBuf, RecordBuf) {
+    if a.flags().is_first_segment() {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+fn name_key(record: &RecordBuf) -> Vec<u8> {
+    record.name().map(|s| s.to_vec()).unwrap_or_default()
+}
+
+fn set_collate_header(header: &mut sam::Header) {
+    use sam::header::record::value::map::{self, Map};
+
+    if let Some(hd) = header.header_mut() {
+        hd.other_fields_mut()
+            .insert(map::header::tag::SORT_ORDER, BString::from("unsorted"));
+        hd.other_fields_mut()
+            .insert(map::header::tag::GROUP_ORDER, BString::from("query"));
+    } else {
+        let mut hd: Map<map::Header> = Map::default();
+        hd.other_fields_mut()
+            .insert(map::header::tag::SORT_ORDER, BString::from("unsorted"));
+        hd.other_fields_mut()
+            .insert(map::header::tag::GROUP_ORDER, BString::from("query"));
+        *header.header_mut() = Some(hd);
+    }
 }
 
 fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
@@ -308,6 +434,11 @@ fn print_usage() -> io::Result<()> {
     )?;
     writeln!(w, "  -o PREFIX   output prefix or path")?;
     writeln!(w, "  -O          write to stdout")?;
+    writeln!(
+        w,
+        "  -f          fast mode: output primary read pairs early"
+    )?;
+    writeln!(w, "  -r INT      working reads stored with -f")?;
     writeln!(w, "  --output-fmt sam|bam")?;
     Ok(())
 }
