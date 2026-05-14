@@ -2120,6 +2120,63 @@ r2\t0\tchr1\t3\t60\t4M\t*\t0\t0\tCCCC\tIIII
 }
 
 #[test]
+fn stats_filters_required_and_filtering_flags() {
+    let tmp = tmp_dir("stats-flag-filters");
+    let sam = tmp.join("flags.sam");
+    let required_out = tmp.join("required.stats");
+    let filtered_out = tmp.join("filtered.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:100
+read1\t65\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\tIIII
+read2\t0\tchr1\t5\t60\t4M\t*\t0\t0\tCCCC\tIIII
+read3\t4\t*\t0\t0\t*\t*\t0\t0\tGGGG\tIIII
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-f",
+                "READ1",
+                "-o",
+                required_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    let required_text = std::fs::read_to_string(required_out).unwrap();
+    assert!(required_text.contains("SN\traw total sequences:\t3\n"));
+    assert!(required_text.contains("SN\tfiltered sequences:\t2\n"));
+    assert!(required_text.contains("SN\tsequences:\t1\n"));
+    assert!(required_text.contains("SN\t1st fragments:\t1\n"));
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-F",
+                "UNMAP",
+                "-o",
+                filtered_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    let filtered_text = std::fs::read_to_string(filtered_out).unwrap();
+    assert!(filtered_text.contains("SN\traw total sequences:\t3\n"));
+    assert!(filtered_text.contains("SN\tfiltered sequences:\t1\n"));
+    assert!(filtered_text.contains("SN\tsequences:\t2\n"));
+    assert!(filtered_text.contains("SN\treads mapped:\t2\n"));
+}
+
+#[test]
 fn stats_emits_bases_mapped_and_error_rate_sn_lines() {
     let tmp = tmp_dir("stats-error-rate");
     let sam = tmp.join("nm.sam");

@@ -23,7 +23,7 @@ use htslib_rs::sam;
 
 use crate::bam_flag::{
     BAM_FDUP, BAM_FMUNMAP, BAM_FPAIRED, BAM_FPROPER_PAIR, BAM_FQCFAIL, BAM_FREAD1, BAM_FREAD2,
-    BAM_FREVERSE, BAM_FSECONDARY, BAM_FSUPPLEMENTARY, BAM_FUNMAP,
+    BAM_FREVERSE, BAM_FSECONDARY, BAM_FSUPPLEMENTARY, BAM_FUNMAP, str_to_flag,
 };
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
@@ -33,6 +33,8 @@ use crate::version::SAMTOOLS_VERSION;
 #[derive(Clone, Copy, Debug)]
 struct StatsConfig {
     remove_dups: bool,
+    required_flags: u32,
+    filter_flags: u32,
     coverage_min: u32,
     coverage_max: u32,
     coverage_step: u32,
@@ -43,6 +45,8 @@ impl Default for StatsConfig {
     fn default() -> Self {
         Self {
             remove_dups: false,
+            required_flags: 0,
+            filter_flags: 0,
             coverage_min: 1,
             coverage_max: 1000,
             coverage_step: 1,
@@ -101,6 +105,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     }
                 }
             }
+            "-f" | "--required-flag" => match parse_flag_value(iter.next(), s) {
+                Ok(flags) => config.required_flags = flags,
+                Err(()) => return ExitCode::from(1),
+            },
+            "-F" | "--filtering-flag" => match parse_flag_value(iter.next(), s) {
+                Ok(flags) => config.filter_flags |= flags,
+                Err(()) => return ExitCode::from(1),
+            },
             "-@" | "--threads" | "-r" | "--reference" | "-l" | "--read-length" | "-I" | "--id"
             | "-S" | "--split" | "-P" | "--split-prefix" | "-G" => {
                 let _ = iter.next();
@@ -337,6 +349,18 @@ fn parse_coverage_range(raw: &str) -> Result<(u32, u32, u32), String> {
         ));
     }
     Ok((min, max, step))
+}
+
+fn parse_flag_value(value: Option<&OsString>, option: &str) -> Result<u32, ()> {
+    let Some(raw) = value.and_then(|a| a.to_str()) else {
+        print_error("stats", format!("option {option} requires an argument"));
+        return Err(());
+    };
+    let Some(flags) = str_to_flag(raw) else {
+        print_error("stats", format!("Unknown flag '{}'", raw));
+        return Err(());
+    };
+    Ok(flags as u32)
 }
 
 fn read_target_regions(path: &std::path::Path) -> io::Result<Vec<Region>> {
@@ -882,6 +906,14 @@ impl StatsCounts {
             return;
         }
         self.raw_total += 1;
+        if config.required_flags != 0 && flag & config.required_flags != config.required_flags {
+            self.filtered += 1;
+            return;
+        }
+        if config.filter_flags != 0 && flag & config.filter_flags != 0 {
+            self.filtered += 1;
+            return;
+        }
         if config.remove_dups && flag & BAM_FDUP != 0 {
             self.filtered += 1;
             return;
