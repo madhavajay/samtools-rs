@@ -112,7 +112,7 @@ samtools-rs status legend:
 
 - **C source:** `bamshuf.c`
 - **HTSlib APIs used:** `sam_open_format`, `sam_read1`, `sam_write1`, BGZF temp file I/O
-- **samtools-rs status:** 🟡 — in-memory name grouping works for BAM, SAM, and reference-backed CRAM inputs, including `-f` fast primary-pair mode, `-r` working-read cap, and upstream-style `@HD SO:unsorted GO:query`; on-disk hash bucketing, `-n` temporary-file count, and CRAM output remain.
+- **samtools-rs status:** 🟡 — in-memory name grouping works for BAM, SAM, and reference-backed CRAM inputs, including `-f` fast primary-pair mode, `-r` working-read cap, legacy positional output prefixes, `-o`/`-O` conflict validation, and upstream-style `@HD SO:unsorted GO:query`; on-disk hash bucketing, `-n` temporary-file count, and CRAM output remain.
 
 ### cat
 

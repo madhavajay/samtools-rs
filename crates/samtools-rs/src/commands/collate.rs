@@ -28,6 +28,7 @@ use crate::sam_global::current_global_args;
 /// Entry point for `samtools collate` (alias `bamshuf`).
 pub fn main(args: &[OsString]) -> ExitCode {
     let mut output_prefix: Option<String> = None;
+    let mut positional_prefix: Option<String> = None;
     let mut to_stdout = false;
     let mut output_fmt = OutFmt::Bam;
     let mut input: Option<PathBuf> = None;
@@ -104,6 +105,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
             _ => {
                 if input.is_none() {
                     input = Some(PathBuf::from(arg));
+                } else if positional_prefix.is_none() {
+                    positional_prefix = arg.to_str().map(|s| s.to_string());
                 }
             }
         }
@@ -113,6 +116,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
         let _ = print_usage();
         return ExitCode::from(1);
     };
+
+    if to_stdout && output_prefix.is_some() {
+        print_error("collate", "-o and -O options cannot be used together");
+        return ExitCode::from(1);
+    }
 
     let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,
@@ -132,7 +140,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let output = if to_stdout {
         OutputTarget::Stdout
     } else {
-        let prefix = output_prefix.unwrap_or_else(|| "collated".to_string());
+        let prefix = output_prefix
+            .or(positional_prefix)
+            .unwrap_or_else(|| "collated".to_string());
         let ext = match output_fmt {
             OutFmt::Sam => "sam",
             OutFmt::Bam => "bam",

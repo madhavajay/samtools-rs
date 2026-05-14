@@ -475,6 +475,60 @@ fn collate_sam_input_groups_by_name_to_sam_output() {
 }
 
 #[test]
+fn collate_positional_prefix_writes_format_extension() {
+    let tmp = tmp_dir("collate-prefix");
+    let sam = tmp.join("in.sam");
+    let out_prefix = tmp.join("legacy");
+    let out = tmp.join("legacy.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "b\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "collate",
+        "--output-fmt=sam",
+        sam.to_str().unwrap(),
+        out_prefix.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(collate::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.starts_with("@HD\tVN:1.6\tSO:unsorted\tGO:query\n"));
+    let names: Vec<_> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').next().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+}
+
+#[test]
+fn collate_rejects_output_file_with_stdout() {
+    let argv: Vec<OsString> = [
+        "collate",
+        "-O",
+        "-o",
+        "out.sam",
+        sample_bam().to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+
+    assert_eq!(exit_to_u8(collate::main(&argv)), 1);
+}
+
+#[test]
 fn collate_fast_mode_pairs_primary_reads_and_drops_supplementary() {
     let tmp = tmp_dir("collate-fast");
     let sam = tmp.join("in.sam");
