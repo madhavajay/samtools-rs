@@ -420,6 +420,88 @@ fn merge_short_output_format_consumes_value() {
 }
 
 #[test]
+fn merge_tag_sort_orders_by_aux_tag_and_accepts_s_option() {
+    let tmp = tmp_dir("merge-tag");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:8\n";
+    std::fs::write(
+        &sam_a,
+        format!(
+            "{header}missing\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n\
+             high\t0\tchr1\t2\t60\t4M\t*\t0\t0\tCCCC\t####\tZZ:i:7\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        format!("{header}low\t0\tchr1\t3\t60\t4M\t*\t0\t0\tGGGG\t$$$$\tZZ:i:3\n"),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "-s",
+        "1",
+        "-t",
+        "ZZ",
+        "--output-fmt=sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.starts_with("@HD\tVN:1.6\tSO:unsorted\tSS:unsorted:ZZ:coordinate\n"));
+    let names: Vec<_> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').next().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["missing", "low", "high"]);
+}
+
+#[test]
+fn merge_dash_output_writes_sam_to_stdout() {
+    let tmp = tmp_dir("merge-dash-output");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:8\n";
+    std::fs::write(
+        &sam_a,
+        format!("{header}b\t0\tchr1\t4\t60\t4M\t*\t0\t0\tTGCA\t####\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        format!("{header}a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n"),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "-O",
+        "SAM",
+        "-",
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+    assert!(!tmp.join("-").exists());
+}
+
+#[test]
 fn collate_stdout_succeeds() {
     let argv: Vec<OsString> = [
         "collate",

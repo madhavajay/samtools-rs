@@ -6,6 +6,7 @@
 //! and CRAM are TODO. `-R` and `-L` restrict indexed BAM inputs by region/BED.
 //! Coordinate-sorted BAM outputs can also write a BAI via `--write-index`.
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::File;
@@ -33,10 +34,21 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut no_pg = false;
     let mut region: Option<String> = None;
     let mut bed: Option<PathBuf> = None;
+    let mut tag_sort: Option<[u8; 2]> = None;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
         let s = arg.to_str().unwrap_or("");
+        if let Some(v) = s.strip_prefix("--output-fmt=") {
+            output_fmt = match parse_output_format(v) {
+                Ok(fmt) => fmt,
+                Err(e) => {
+                    print_error("merge", e);
+                    return ExitCode::from(1);
+                }
+            };
+            continue;
+        }
         match s {
             "-n" => name_sort = true,
             "-f" => force = true,
@@ -56,6 +68,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     }
                 };
             }
+            "-t" => {
+                let Some(v) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("merge", "missing value for -t");
+                    return ExitCode::from(1);
+                };
+                tag_sort = match parse_tag(v) {
+                    Ok(tag) => Some(tag),
+                    Err(e) => {
+                        print_error("merge", e);
+                        return ExitCode::from(1);
+                    }
+                };
+            }
             "-R" => {
                 region = iter.next().and_then(|a| a.to_str().map(str::to_owned));
             }
@@ -68,6 +93,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "--write-index" => local_write_index = true,
             "--no-PG" => {
                 no_pg = true;
+            }
+            "-s" => {
+                let _ = iter.next();
             }
             "-c" | "-p" | "-u" => {}
             "--help" => {
@@ -105,6 +133,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    let out_path = out_path.filter(|p| p.as_os_str() != "-");
+
     if let Some(p) = out_path.as_ref()
         && p.exists()
         && !force
@@ -141,12 +171,21 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     let write_index = local_write_index || current_global_args().write_index;
+    let order = match tag_sort {
+        Some(tag) => MergeOrder::Tag {
+            tag,
+            name_secondary: name_sort,
+        },
+        None if name_sort => MergeOrder::Name,
+        None => MergeOrder::Coordinate,
+    };
+
     if write_index {
         if out_path.is_none() {
             print_error("merge", "--write-index requires output file");
             return ExitCode::from(1);
         }
-        if name_sort {
+        if !matches!(order, MergeOrder::Coordinate) {
             print_error("merge", "--write-index requires coordinate sort output");
             return ExitCode::from(1);
         }
@@ -167,7 +206,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     match run_merge(
         &inputs,
         out_path.as_deref(),
-        name_sort,
+        order,
         output_fmt,
         write_index,
         if no_pg { None } else { Some(args) },
@@ -193,6 +232,18 @@ fn parse_output_format(raw: &str) -> Result<OutFmt, String> {
     }
 }
 
+fn parse_tag(raw: &str) -> Result<[u8; 2], String> {
+    let bytes = raw.as_bytes();
+    if bytes.len() == 2 {
+        Ok([bytes[0], bytes[1]])
+    } else {
+        Err(format!(
+            "merge tag must be exactly two bytes, got {:?}",
+            raw
+        ))
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum OutFmt {
     Sam,
@@ -205,10 +256,17 @@ pub(crate) enum MergeRestriction<'a> {
     Bed(&'a Path),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum MergeOrder {
+    Coordinate,
+    Name,
+    Tag { tag: [u8; 2], name_secondary: bool },
+}
+
 pub(crate) fn run_merge(
     inputs: &[PathBuf],
     output: Option<&Path>,
-    name_sort: bool,
+    order: MergeOrder,
     fmt: OutFmt,
     write_index: bool,
     pg_argv: Option<&[OsString]>,
@@ -237,30 +295,45 @@ pub(crate) fn run_merge(
         records.append(&mut input_records);
     }
 
-    if name_sort {
-        records.sort_by(|a, b| {
-            let an = a.name().map(|s| s.to_vec()).unwrap_or_default();
-            let bn = b.name().map(|s| s.to_vec()).unwrap_or_default();
-            an.cmp(&bn)
-        });
-    } else {
-        records.sort_by(|a, b| {
-            let key = |r: &RecordBuf| -> (i32, i64) {
-                let tid = r
-                    .reference_sequence_id()
-                    .map(|t| t as i32)
-                    .unwrap_or(i32::MAX);
-                let pos = r.alignment_start().map(usize::from).unwrap_or(0) as i64;
-                (tid, pos)
-            };
-            key(a).cmp(&key(b))
-        });
+    match order {
+        MergeOrder::Tag {
+            tag,
+            name_secondary,
+        } => records.sort_by(|a, b| compare_by_tag(a, b, tag, name_secondary)),
+        MergeOrder::Name => records.sort_by_key(name_key),
+        MergeOrder::Coordinate => records.sort_by_key(coordinate_key),
     }
 
-    set_sort_order(
-        &mut header,
-        if name_sort { "queryname" } else { "coordinate" },
-    );
+    if let MergeOrder::Tag {
+        tag,
+        name_secondary,
+    } = order
+    {
+        set_sort_order(
+            &mut header,
+            "unsorted",
+            Some(&format!(
+                "unsorted:{}{}:{}",
+                tag[0] as char,
+                tag[1] as char,
+                if name_secondary {
+                    "queryname:lexicographical"
+                } else {
+                    "coordinate"
+                }
+            )),
+        );
+    } else {
+        set_sort_order(
+            &mut header,
+            if matches!(order, MergeOrder::Name) {
+                "queryname"
+            } else {
+                "coordinate"
+            },
+            None,
+        );
+    }
 
     if let Some(argv) = pg_argv {
         header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
@@ -357,6 +430,107 @@ fn record_key(record: &RecordBuf) -> (Vec<u8>, u16, Option<usize>, Option<usize>
     )
 }
 
+fn coordinate_key(r: &RecordBuf) -> (i32, i64) {
+    let tid = r
+        .reference_sequence_id()
+        .map(|t| t as i32)
+        .unwrap_or(i32::MAX);
+    let pos = r.alignment_start().map(usize::from).unwrap_or(0) as i64;
+    (tid, pos)
+}
+
+fn name_key(r: &RecordBuf) -> Vec<u8> {
+    r.name().map(|s| s.to_vec()).unwrap_or_default()
+}
+
+fn compare_by_tag(a: &RecordBuf, b: &RecordBuf, tag: [u8; 2], name_sort: bool) -> Ordering {
+    tag_sort_value(a, tag)
+        .cmp(&tag_sort_value(b, tag))
+        .then_with(|| {
+            if name_sort {
+                name_key(a).cmp(&name_key(b))
+            } else {
+                coordinate_key(a).cmp(&coordinate_key(b))
+            }
+        })
+        .then_with(|| name_key(a).cmp(&name_key(b)))
+}
+
+#[derive(Clone, Debug)]
+enum TagSortValue {
+    Missing,
+    Character(u8),
+    Array(String),
+    Text(Vec<u8>),
+    Int(i64),
+    Float(f32),
+}
+
+impl TagSortValue {
+    fn rank(&self) -> u8 {
+        match self {
+            Self::Missing => 0,
+            Self::Character(_) => b'A',
+            Self::Array(_) => b'B',
+            Self::Text(_) => b'H',
+            Self::Int(_) => b'c',
+            Self::Float(_) => b'f',
+        }
+    }
+}
+
+impl PartialEq for TagSortValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for TagSortValue {}
+
+impl PartialOrd for TagSortValue {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TagSortValue {
+    fn cmp(&self, other: &Self) -> Ordering {
+        use TagSortValue::*;
+
+        match (self, other) {
+            (Missing, Missing) => Ordering::Equal,
+            (Missing, _) => Ordering::Less,
+            (_, Missing) => Ordering::Greater,
+            (Int(a), Int(b)) => a.cmp(b),
+            (Float(a), Float(b)) => a.total_cmp(b),
+            (Int(a), Float(b)) => (*a as f32).total_cmp(b),
+            (Float(a), Int(b)) => a.total_cmp(&(*b as f32)),
+            (Character(a), Character(b)) => a.cmp(b),
+            (Text(a), Text(b)) => a.cmp(b),
+            (Array(a), Array(b)) => a.cmp(b),
+            _ => self.rank().cmp(&other.rank()),
+        }
+    }
+}
+
+fn tag_sort_value(record: &RecordBuf, tag: [u8; 2]) -> TagSortValue {
+    use sam::alignment::record_buf::data::field::Value;
+
+    match record.data().get(&tag) {
+        None => TagSortValue::Missing,
+        Some(Value::Character(c)) => TagSortValue::Character(*c),
+        Some(Value::Int8(n)) => TagSortValue::Int(i64::from(*n)),
+        Some(Value::UInt8(n)) => TagSortValue::Int(i64::from(*n)),
+        Some(Value::Int16(n)) => TagSortValue::Int(i64::from(*n)),
+        Some(Value::UInt16(n)) => TagSortValue::Int(i64::from(*n)),
+        Some(Value::Int32(n)) => TagSortValue::Int(i64::from(*n)),
+        Some(Value::UInt32(n)) => TagSortValue::Int(i64::from(*n)),
+        Some(Value::Float(n)) => TagSortValue::Float(*n),
+        Some(Value::String(s)) | Some(Value::Hex(s)) => TagSortValue::Text(s.to_vec()),
+        Some(Value::Array(array)) => TagSortValue::Array(format!("{:?}", array)),
+    }
+}
+
 fn read_sam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
     let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
     let header = reader.read_header()?;
@@ -371,16 +545,30 @@ fn read_sam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
     Ok((header, records))
 }
 
-fn set_sort_order(header: &mut sam::Header, so: &str) {
+fn set_sort_order(header: &mut sam::Header, so: &str, ss: Option<&str>) {
     use bstr::BString;
     use sam::header::record::value::map::{self, Map};
     if let Some(hd) = header.header_mut() {
         hd.other_fields_mut()
             .insert(map::header::tag::SORT_ORDER, BString::from(so));
+        match ss {
+            Some(ss) => {
+                hd.other_fields_mut()
+                    .insert(map::header::tag::SUBSORT_ORDER, BString::from(ss));
+            }
+            None => {
+                hd.other_fields_mut()
+                    .shift_remove(&map::header::tag::SUBSORT_ORDER);
+            }
+        }
     } else {
         let mut hd: Map<map::Header> = Map::default();
         hd.other_fields_mut()
             .insert(map::header::tag::SORT_ORDER, BString::from(so));
+        if let Some(ss) = ss {
+            hd.other_fields_mut()
+                .insert(map::header::tag::SUBSORT_ORDER, BString::from(ss));
+        }
         *header.header_mut() = Some(hd);
     }
 }
