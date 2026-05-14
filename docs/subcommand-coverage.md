@@ -100,7 +100,7 @@ samtools-rs status legend:
   - Streaming write — ✅
   - Custom per-record sort key extraction — ✅ partial for coordinate, query-name, and aux-tag keys
   - Multi-way merge — ❌
-- **samtools-rs status:** 🟡 — in-memory coordinate, query-name, and aux-tag sort works for BAM and SAM inputs; external merge, template/minimiser sorts, write-index, thread/memory caps, and CRAM remain.
+- **samtools-rs status:** 🟡 — in-memory coordinate, query-name, and aux-tag sort works for BAM, SAM, and reference-backed CRAM inputs; external merge, template/minimiser sorts, write-index, thread/memory caps, and CRAM output remain.
 
 ### merge
 

@@ -4,8 +4,12 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Mutex;
 
 use samtools_rs::commands::{collate, merge, sort};
+use samtools_rs::run as samtools_run;
+
+static GLOBAL_ARGS_LOCK: Mutex<()> = Mutex::new(());
 
 fn fixtures_dir() -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -35,6 +39,18 @@ fn tmp_dir(name: &str) -> PathBuf {
 
 fn sample_bam() -> PathBuf {
     fixtures_dir().join("checksum").join("chk1.bam")
+}
+
+fn htslib_fixtures_dir() -> PathBuf {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    PathBuf::from(manifest)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("htslib-rs")
+        .join("htslib")
+        .join("test")
 }
 
 #[test]
@@ -84,6 +100,44 @@ fn sort_name_succeeds() {
         ])
         .collect();
     assert_eq!(exit_to_u8(sort::main(&argv)), 0);
+}
+
+#[test]
+fn sort_cram_input_uses_top_level_reference() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("sort-cram");
+    let out = tmp.join("sorted.sam");
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+
+    let argv: Vec<OsString> = [
+        "samtools",
+        "--reference",
+        reference.to_str().unwrap(),
+        "sort",
+        "-n",
+        "-O",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        cram.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(samtools_run(argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.starts_with("@HD\t"));
+    assert!(text.contains("SO:queryname"));
+    let names: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').next().unwrap())
+        .collect();
+    assert!(!names.is_empty());
+    assert!(names.windows(2).all(|w| w[0] <= w[1]));
 }
 
 #[test]
