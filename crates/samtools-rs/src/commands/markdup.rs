@@ -15,6 +15,7 @@
 //!  - `-s` — emit upstream-shaped summary counts to stderr.
 //!  - `-S` — accepted; supplementary propagation is always performed.
 //!  - `-c` — clear existing duplicate flags before marking.
+//!  - `-t` — add `do:Z:<original>` duplicate-origin tags for duplicates.
 //!  - `-b TAG` / `--barcode-tag TAG` — include a string aux tag in the
 //!    duplicate key.
 //!  - `-O sam|bam` / `--output-fmt sam|bam` — output format (default `bam`).
@@ -31,6 +32,7 @@ use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use bstr::BString;
 use htslib_rs::bam;
 use htslib_rs::bgzf;
 use htslib_rs::format::Exact;
@@ -59,6 +61,7 @@ struct MarkdupOptions {
     remove_dups: bool,
     emit_stats: bool,
     clear_existing_dups: bool,
+    duplicate_origin_tag: bool,
     barcode_tag: Option<Tag>,
 }
 
@@ -70,6 +73,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut remove_dups = false;
     let mut emit_stats = false;
     let mut clear_existing_dups = false;
+    let mut duplicate_origin_tag = false;
     let mut no_pg = false;
     let mut barcode_tag: Option<Tag> = None;
 
@@ -83,6 +87,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 // Supplementary duplicate propagation is always performed.
             }
             "-c" => clear_existing_dups = true,
+            "-t" => duplicate_origin_tag = true,
             "-O" | "--output-fmt" => {
                 let Some(v) = iter.next().and_then(|a| a.to_str()) else {
                     print_error("markdup", format!("missing value for {}", s));
@@ -117,9 +122,6 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-@" | "--threads" | "-l" | "-m" | "-d" | "-T" => {
                 // Accepted-but-ignored for compatibility.
                 let _ = iter.next();
-            }
-            "-t" => {
-                // Accepted-but-ignored for compatibility.
             }
             "--help" => {
                 let _ = print_usage();
@@ -167,6 +169,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         remove_dups,
         emit_stats,
         clear_existing_dups,
+        duplicate_origin_tag,
         barcode_tag,
     };
     let result = match format.exact {
@@ -222,7 +225,7 @@ fn run_bam_markdup(
     if options.clear_existing_dups {
         clear_duplicate_flags(&mut records);
     }
-    let mut stats = mark_duplicates(&mut records, options.barcode_tag);
+    let mut stats = mark_duplicates(&mut records, options);
     stats.written = output_record_count(&records, options.remove_dups);
     let mut sink = open_output(output, fmt, &header)?;
     for rec in &records {
@@ -260,7 +263,7 @@ fn run_sam_markdup(
     if options.clear_existing_dups {
         clear_duplicate_flags(&mut records);
     }
-    let mut stats = mark_duplicates(&mut records, options.barcode_tag);
+    let mut stats = mark_duplicates(&mut records, options);
     stats.written = output_record_count(&records, options.remove_dups);
     let mut sink = open_output(output, fmt, &header)?;
     for rec in &records {
@@ -292,7 +295,7 @@ fn run_sam_markdup(
 /// (Upstream's full algorithm matches this with extra qname-based linkage;
 /// here we approximate by carrying the dup flag forward across records
 /// with the same qname when at least one primary in that qname is dup.)
-fn mark_duplicates(records: &mut [RecordBuf], barcode_tag: Option<Tag>) -> MarkdupStats {
+fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> MarkdupStats {
     type BarcodeKey = Option<Vec<u8>>;
     type PosKey = (i32, i64, bool);
     type SeKey = (PosKey, BarcodeKey);
@@ -302,6 +305,7 @@ fn mark_duplicates(records: &mut [RecordBuf], barcode_tag: Option<Tag>) -> Markd
     let mut se_best: HashMap<SeKey, usize> = HashMap::new();
     let mut pair_pending: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut pair_best: HashMap<PairKey, PairIdx> = HashMap::new();
+    let mut duplicate_primary_origins: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let mut stats = MarkdupStats {
         read: records.len() as u64,
         written: records.len() as u64,
@@ -359,8 +363,8 @@ fn mark_duplicates(records: &mut [RecordBuf], barcode_tag: Option<Tag>) -> Markd
                         .mapping_quality()
                         .map(u8::from)
                         .unwrap_or(0);
-                    let first_barcode = barcode_value(&records[first_idx], barcode_tag);
-                    let barcode = barcode_value(&records[i], barcode_tag);
+                    let first_barcode = barcode_value(&records[first_idx], options.barcode_tag);
+                    let barcode = barcode_value(&records[i], options.barcode_tag);
 
                     let first = (first_tid, first_pos, first_rev);
                     let key = if first <= me {
@@ -381,12 +385,56 @@ fn mark_duplicates(records: &mut [RecordBuf], barcode_tag: Option<Tag>) -> Markd
                                     .map(u8::from)
                                     .unwrap_or(0) as u32;
                             if score > prev_score {
-                                set_dup(&mut records[prev_first]);
-                                set_dup(&mut records[prev_second]);
+                                let origin = records[first_idx]
+                                    .name()
+                                    .map(|name| name.to_vec())
+                                    .unwrap_or_default();
+                                mark_duplicate(
+                                    &mut records[prev_first],
+                                    Some(&origin),
+                                    options.duplicate_origin_tag,
+                                );
+                                mark_duplicate(
+                                    &mut records[prev_second],
+                                    Some(&origin),
+                                    options.duplicate_origin_tag,
+                                );
+                                remember_duplicate_origin(
+                                    &mut duplicate_primary_origins,
+                                    &records[prev_first],
+                                    &origin,
+                                );
+                                remember_duplicate_origin(
+                                    &mut duplicate_primary_origins,
+                                    &records[prev_second],
+                                    &origin,
+                                );
                                 pair_best.insert(key, (first_idx, i));
                             } else {
-                                set_dup(&mut records[first_idx]);
-                                set_dup(&mut records[i]);
+                                let origin = records[prev_first]
+                                    .name()
+                                    .map(|name| name.to_vec())
+                                    .unwrap_or_default();
+                                mark_duplicate(
+                                    &mut records[first_idx],
+                                    Some(&origin),
+                                    options.duplicate_origin_tag,
+                                );
+                                mark_duplicate(
+                                    &mut records[i],
+                                    Some(&origin),
+                                    options.duplicate_origin_tag,
+                                );
+                                remember_duplicate_origin(
+                                    &mut duplicate_primary_origins,
+                                    &records[first_idx],
+                                    &origin,
+                                );
+                                remember_duplicate_origin(
+                                    &mut duplicate_primary_origins,
+                                    &records[i],
+                                    &origin,
+                                );
                             }
                             stats.duplicate_pair += 2;
                         }
@@ -401,15 +449,33 @@ fn mark_duplicates(records: &mut [RecordBuf], barcode_tag: Option<Tag>) -> Markd
 
         // SE path: mate not mapped (singleton) or unpaired primary.
         stats.single += 1;
-        let se_key = (me, barcode_value(&records[i], barcode_tag));
+        let se_key = (me, barcode_value(&records[i], options.barcode_tag));
         match se_best.get(&se_key).copied() {
             Some(idx) => {
                 let prev_mapq = records[idx].mapping_quality().map(u8::from).unwrap_or(0);
                 if mapq > prev_mapq {
-                    set_dup(&mut records[idx]);
+                    let origin = records[i]
+                        .name()
+                        .map(|name| name.to_vec())
+                        .unwrap_or_default();
+                    mark_duplicate(
+                        &mut records[idx],
+                        Some(&origin),
+                        options.duplicate_origin_tag,
+                    );
+                    remember_duplicate_origin(
+                        &mut duplicate_primary_origins,
+                        &records[idx],
+                        &origin,
+                    );
                     se_best.insert(se_key, i);
                 } else {
-                    set_dup(&mut records[i]);
+                    let origin = records[idx]
+                        .name()
+                        .map(|name| name.to_vec())
+                        .unwrap_or_default();
+                    mark_duplicate(&mut records[i], Some(&origin), options.duplicate_origin_tag);
+                    remember_duplicate_origin(&mut duplicate_primary_origins, &records[i], &origin);
                 }
                 stats.duplicate_single += 1;
             }
@@ -439,8 +505,15 @@ fn mark_duplicates(records: &mut [RecordBuf], barcode_tag: Option<Tag>) -> Markd
         let Some(name) = record.name() else {
             continue;
         };
-        if duplicate_primary_names.contains(name) && set_dup(record) {
-            stats.duplicate_non_primary += 1;
+        if duplicate_primary_names.contains(name) {
+            let origin = duplicate_primary_origins.get(name);
+            if mark_duplicate(
+                record,
+                origin.map(Vec::as_slice),
+                options.duplicate_origin_tag,
+            ) {
+                stats.duplicate_non_primary += 1;
+            }
         }
     }
 
@@ -460,6 +533,27 @@ fn clear_duplicate_flags(records: &mut [RecordBuf]) {
         flags.remove(sam::alignment::record::Flags::DUPLICATE);
         *record.flags_mut() = flags;
     }
+}
+
+fn remember_duplicate_origin(
+    origins: &mut HashMap<Vec<u8>, Vec<u8>>,
+    record: &RecordBuf,
+    origin: &[u8],
+) {
+    if let Some(name) = record.name() {
+        origins.insert(name.to_vec(), origin.to_vec());
+    }
+}
+
+fn mark_duplicate(record: &mut RecordBuf, origin: Option<&[u8]>, add_origin_tag: bool) -> bool {
+    let was_new = set_dup(record);
+    if add_origin_tag && let Some(origin) = origin {
+        record.data_mut().insert(
+            Tag::from([b'd', b'o']),
+            Value::String(BString::from(origin.to_vec())),
+        );
+    }
+    was_new
 }
 
 fn set_dup(record: &mut RecordBuf) -> bool {
@@ -587,6 +681,7 @@ fn print_usage() -> io::Result<()> {
     writeln!(w, "  -s            emit summary counts to stderr")?;
     writeln!(w, "  -S            mark supplementary duplicates (default)")?;
     writeln!(w, "  -c            clear existing duplicate flags first")?;
+    writeln!(w, "  -t            add duplicate-origin do tags")?;
     writeln!(
         w,
         "  -b TAG        include barcode aux tag in duplicate key"

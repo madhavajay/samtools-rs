@@ -4575,6 +4575,48 @@ fn markdup_c_clears_existing_duplicate_flags_and_s_accepts_supplementary_mode() 
 }
 
 #[test]
+fn markdup_t_adds_duplicate_origin_tag() {
+    use samtools_rs::commands::markdup;
+    let tmp = tmp_dir("markdup-origin-tag");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:100\n",
+            "high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "low\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "-t",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let high = text
+        .lines()
+        .find(|line| line.starts_with("high\t"))
+        .unwrap();
+    let low = text.lines().find(|line| line.starts_with("low\t")).unwrap();
+    assert!(!high.contains("\tdo:Z:"));
+    assert!(low.contains("\tdo:Z:high"));
+}
+
+#[test]
 fn markdup_propagates_duplicate_flag_to_supplementary_records() {
     use samtools_rs::commands::markdup;
     let tmp = tmp_dir("markdup-supplementary");
