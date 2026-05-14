@@ -747,6 +747,41 @@ fn reference_region_outputs_requested_slice_and_bam_input() {
 }
 
 #[test]
+fn reference_region_uses_indexed_bam_query_path() {
+    let tmp = tmp_dir("reference-indexed-bam-region");
+    let sam = tmp.join("input.sam");
+    let bam = tmp.join("input.bam");
+    let output = tmp.join("region.fa");
+    let text = "@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:12\nr1\t0\tchr1\t1\t60\t4M1D4M\t*\t0\t0\tACGTTGCA\t!!!!!!!!\tMD:Z:4^A4\n";
+    std::fs::write(&sam, text).unwrap();
+    write_bam_from_sam_text(&bam, text);
+    assert_eq!(
+        exit_to_u8(index::main(&argv("index", &[bam.to_str().unwrap()]))),
+        0
+    );
+
+    assert_eq!(
+        exit_to_u8(reference::main(&argv(
+            "reference",
+            &[
+                "-q",
+                "-r",
+                "chr1:3-7",
+                bam.to_str().unwrap(),
+                "-o",
+                output.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(output).unwrap(),
+        ">chr1:3-7 length: 5\nGTATG\n"
+    );
+}
+
+#[test]
 fn flagstat_cram_uses_top_level_reference() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let fixtures = htslib_fixtures_dir();

@@ -183,25 +183,7 @@ fn reference_path(input: &Path, opts: &ReferenceOptions, writer: &mut dyn Write)
             }
             dump_refs(writer, &refs, target.as_ref(), opts.quiet)
         }
-        Exact::Bam => {
-            let mut reader = htslib_rs::bam::io::Reader::new(File::open(input)?);
-            let header = reader.read_header()?;
-            let mut refs = init_refs(&header);
-            let target = opts
-                .region
-                .as_ref()
-                .map(|region| region_target(&header, region))
-                .transpose()?;
-            let mut record = sam::alignment::RecordBuf::default();
-            loop {
-                let n = reader.read_record_buf(&header, &mut record)?;
-                if n == 0 {
-                    break;
-                }
-                update_refs(&header, &mut refs, &record, target.as_ref())?;
-            }
-            dump_refs(writer, &refs, target.as_ref(), opts.quiet)
-        }
+        Exact::Bam => reference_bam_path(input, opts, writer),
         Exact::Cram => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "CRAM reference reconstruction is blocked on CRAM all-record/container APIs",
@@ -211,6 +193,51 @@ fn reference_path(input: &Path, opts: &ReferenceOptions, writer: &mut dyn Write)
             "only SAM and BAM input are currently supported",
         )),
     }
+}
+
+fn reference_bam_path(
+    input: &Path,
+    opts: &ReferenceOptions,
+    writer: &mut dyn Write,
+) -> io::Result<()> {
+    let header = htslib_rs::alignment_compat::read_bam_header_from_path(input)?;
+    let mut refs = init_refs(&header);
+    let target = opts
+        .region
+        .as_ref()
+        .map(|region| region_target(&header, region))
+        .transpose()?;
+
+    if let Some(region) = opts.region.as_ref() {
+        match htslib_rs::alignment_compat::query_bam_records_from_path(input, region) {
+            Ok(records) => {
+                for record in records {
+                    update_refs(&header, &mut refs, &record, target.as_ref())?;
+                }
+                return dump_refs(writer, &refs, target.as_ref(), opts.quiet);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    let mut reader = htslib_rs::bam::io::Reader::new(File::open(input)?);
+    let header = reader.read_header()?;
+    let mut refs = init_refs(&header);
+    let target = opts
+        .region
+        .as_ref()
+        .map(|region| region_target(&header, region))
+        .transpose()?;
+    let mut record = sam::alignment::RecordBuf::default();
+    loop {
+        let n = reader.read_record_buf(&header, &mut record)?;
+        if n == 0 {
+            break;
+        }
+        update_refs(&header, &mut refs, &record, target.as_ref())?;
+    }
+    dump_refs(writer, &refs, target.as_ref(), opts.quiet)
 }
 
 fn init_refs(header: &sam::Header) -> Vec<RefBuf> {

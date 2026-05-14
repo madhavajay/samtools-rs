@@ -279,7 +279,7 @@ samtools-rs status legend:
 ### reference
 
 - **C source:** `reference.c`
-- **samtools-rs status:** 🟡 — SAM/BAM MD-tag reconstruction to FASTA works with `-o`, `-q`, and basic `-r` region output; CRAM input, embedded-reference extraction (`-e`), indexed region iteration, and full upstream parity remain.
+- **samtools-rs status:** 🟡 — SAM/BAM MD-tag reconstruction to FASTA works with `-o`, `-q`, basic `-r` region output, and indexed BAM region iteration when an associated BAI/CSI is present; CRAM input, embedded-reference extraction (`-e`), and full upstream parity remain.
 
 ### flags
 
