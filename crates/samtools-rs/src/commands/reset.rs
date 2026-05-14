@@ -11,14 +11,16 @@
 //!  - drops common aligner-added aux tags (NM, MD, AS, XS, SA, MC, MQ,
 //!    NH, HI) by default
 //!
-//! Reverse-strand sequence/quality re-reversal is **not yet implemented**.
-//! `--no-RG`, `--reject-PG`, `--no-PG`, and `--dupflag` are accepted but
-//! ignored for now. `-x`/`--keep-tag` aux-tag filtering is honored.
+//! `--dupflag` preserves duplicate flags, SAM stdin input works, reverse-strand
+//! sequence/quality re-reversal is implemented, legacy SAM `@HD VN:1` input is
+//! accepted, `--no-RG` removes read-group headers and tags, and `--reject-PG` /
+//! `--no-PG` remove program header chains. `-x`/`--keep-tag` aux-tag filtering
+//! is honored.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -27,7 +29,10 @@ use htslib_rs::bgzf;
 use htslib_rs::format::Exact;
 use htslib_rs::sam::{
     self,
-    alignment::{RecordBuf, record::Flags},
+    alignment::{
+        RecordBuf,
+        record::{Flags, MappingQuality},
+    },
 };
 
 use crate::aux_list::{AuxTag, parse_aux_list};
@@ -45,6 +50,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut output_fmt = OutFmt::Bam;
     let mut extra_drop: Vec<AuxTag> = Vec::new();
     let mut keep_only: Option<HashSet<AuxTag>> = None;
+    let mut preserve_duplicate = false;
+    let mut remove_read_groups = false;
+    let mut remove_programs = false;
+    let mut reject_programs = Vec::new();
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -93,8 +102,22 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     }
                 }
             }
-            "--no-RG" | "--reject-PG" | "--no-PG" | "--dupflag" | "-T" => {
-                if matches!(s, "--reject-PG" | "-T") {
+            "--dupflag" => {
+                preserve_duplicate = true;
+            }
+            "--no-RG" => {
+                remove_read_groups = true;
+            }
+            "--reject-PG" => {
+                if let Some(v) = iter.next().and_then(|a| a.to_str()) {
+                    reject_programs.push(v.to_string());
+                }
+            }
+            "--no-PG" => {
+                remove_programs = true;
+            }
+            "-T" => {
+                if matches!(s, "-T") {
                     let _ = iter.next();
                 }
             }
@@ -117,34 +140,44 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     }
 
-    let Some(input) = input else {
-        let _ = print_usage();
-        return ExitCode::from(1);
+    let settings = ResetSettings {
+        extra_drop: &extra_drop,
+        keep_only: keep_only.as_ref(),
+        preserve_duplicate,
+        remove_read_groups,
+        remove_programs,
+        reject_programs: &reject_programs,
     };
 
-    let format = match sam_io::sam_open_format(&input) {
-        Ok(f) => f,
-        Err(e) => {
-            print_error("reset", e.to_string());
-            return ExitCode::from(1);
+    let result = match input {
+        Some(input) if input != Path::new("-") => {
+            let format = match sam_io::sam_open_format(&input) {
+                Ok(f) => f,
+                Err(e) => {
+                    print_error("reset", e.to_string());
+                    return ExitCode::from(1);
+                }
+            };
+            if !matches!(format.exact, Exact::Sam | Exact::Bam) {
+                print_error(
+                    "reset",
+                    "only SAM and BAM input are currently supported (CRAM TODO)",
+                );
+                return ExitCode::from(1);
+            }
+
+            run_reset(
+                &input,
+                format.exact,
+                output.as_deref(),
+                output_fmt,
+                &settings,
+            )
         }
+        _ => run_reset_stdin(output.as_deref(), output_fmt, &settings),
     };
-    if !matches!(format.exact, Exact::Sam | Exact::Bam) {
-        print_error(
-            "reset",
-            "only SAM and BAM input are currently supported (CRAM TODO)",
-        );
-        return ExitCode::from(1);
-    }
 
-    match run_reset(
-        &input,
-        format.exact,
-        output.as_deref(),
-        output_fmt,
-        &extra_drop,
-        keep_only.as_ref(),
-    ) {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             print_error_errno("reset", "reset failed", &e);
@@ -159,17 +192,25 @@ enum OutFmt {
     Bam,
 }
 
+struct ResetSettings<'a> {
+    extra_drop: &'a [[u8; 2]],
+    keep_only: Option<&'a HashSet<[u8; 2]>>,
+    preserve_duplicate: bool,
+    remove_read_groups: bool,
+    remove_programs: bool,
+    reject_programs: &'a [String],
+}
+
 fn run_reset(
     input: &Path,
     input_format: Exact,
     output: Option<&Path>,
     fmt: OutFmt,
-    extra_drop: &[[u8; 2]],
-    keep_only: Option<&HashSet<[u8; 2]>>,
+    settings: &ResetSettings<'_>,
 ) -> io::Result<()> {
     match input_format {
-        Exact::Sam => run_reset_sam(input, output, fmt, extra_drop, keep_only),
-        Exact::Bam => run_reset_bam(input, output, fmt, extra_drop, keep_only),
+        Exact::Sam => run_reset_sam(input, output, fmt, settings),
+        Exact::Bam => run_reset_bam(input, output, fmt, settings),
         _ => unreachable!("input format checked by caller"),
     }
 }
@@ -178,11 +219,23 @@ fn run_reset_bam(
     input: &Path,
     output: Option<&Path>,
     fmt: OutFmt,
-    extra_drop: &[[u8; 2]],
-    keep_only: Option<&HashSet<[u8; 2]>>,
+    settings: &ResetSettings<'_>,
 ) -> io::Result<()> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
-    let header = reader.read_header()?;
+    run_reset_bam_reader(&mut reader, output, fmt, settings)
+}
+
+fn run_reset_bam_reader<R>(
+    reader: &mut bam::io::Reader<R>,
+    output: Option<&Path>,
+    fmt: OutFmt,
+    settings: &ResetSettings<'_>,
+) -> io::Result<()>
+where
+    R: Read,
+{
+    let mut header = reader.read_header()?;
+    reset_header(&mut header, settings);
     let mut sink = open_output(output, fmt, &header)?;
 
     let mut record = RecordBuf::default();
@@ -191,7 +244,7 @@ fn run_reset_bam(
         if n == 0 {
             break;
         }
-        reset_record(&mut record, extra_drop, keep_only);
+        reset_record(&mut record, settings);
         sink.write_record(&header, &record)?;
     }
     Ok(())
@@ -201,11 +254,51 @@ fn run_reset_sam(
     input: &Path,
     output: Option<&Path>,
     fmt: OutFmt,
-    extra_drop: &[[u8; 2]],
-    keep_only: Option<&HashSet<[u8; 2]>>,
+    settings: &ResetSettings<'_>,
 ) -> io::Result<()> {
-    let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
-    let header = reader.read_header()?;
+    let input = normalize_legacy_sam_header_version(std::fs::read(input)?);
+    let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(input)));
+    run_reset_sam_reader(&mut reader, output, fmt, settings)
+}
+
+fn run_reset_stdin(
+    output: Option<&Path>,
+    fmt: OutFmt,
+    settings: &ResetSettings<'_>,
+) -> io::Result<()> {
+    let stdin = io::stdin();
+    let mut input = Vec::new();
+    stdin.lock().read_to_end(&mut input)?;
+
+    if !looks_like_sam(&input) {
+        let mut reader = bam::io::Reader::new(Cursor::new(input));
+        return run_reset_bam_reader(&mut reader, output, fmt, settings);
+    }
+
+    let input = normalize_legacy_sam_header_version(input);
+    let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(input)));
+    run_reset_sam_reader(&mut reader, output, fmt, settings)
+}
+
+fn looks_like_sam(input: &[u8]) -> bool {
+    input
+        .iter()
+        .copied()
+        .find(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+        == Some(b'@')
+}
+
+fn run_reset_sam_reader<R>(
+    reader: &mut sam::io::Reader<R>,
+    output: Option<&Path>,
+    fmt: OutFmt,
+    settings: &ResetSettings<'_>,
+) -> io::Result<()>
+where
+    R: BufRead,
+{
+    let mut header = reader.read_header()?;
+    reset_header(&mut header, settings);
     let mut sink = open_output(output, fmt, &header)?;
 
     loop {
@@ -213,22 +306,93 @@ fn run_reset_sam(
         if reader.read_record_buf(&header, &mut record)? == 0 {
             break;
         }
-        reset_record(&mut record, extra_drop, keep_only);
+        reset_record(&mut record, settings);
         sink.write_record(&header, &record)?;
     }
     Ok(())
 }
 
-fn reset_record(
-    record: &mut RecordBuf,
-    extra_drop: &[[u8; 2]],
-    keep_only: Option<&HashSet<[u8; 2]>>,
-) {
+fn reset_header(header: &mut sam::Header, settings: &ResetSettings<'_>) {
+    if settings.remove_read_groups {
+        header.read_groups_mut().clear();
+    }
+
+    if settings.remove_programs {
+        header.programs_mut().as_mut().clear();
+    } else if !settings.reject_programs.is_empty() {
+        reject_header_programs(header, settings.reject_programs);
+    }
+}
+
+fn reject_header_programs(header: &mut sam::Header, rejected_ids: &[String]) {
+    use htslib_rs::sam::header::record::value::map::program::tag;
+
+    let mut rejected: HashSet<Vec<u8>> = rejected_ids
+        .iter()
+        .map(|id| id.as_bytes().to_vec())
+        .collect();
+
+    loop {
+        let mut changed = false;
+        for (id, program) in header.programs().as_ref() {
+            let id_bytes: &[u8] = id.as_ref();
+            if rejected.contains(id_bytes) {
+                continue;
+            }
+
+            if let Some(previous_id) = program.other_fields().get(&tag::PREVIOUS_PROGRAM_ID) {
+                let previous_id: &[u8] = previous_id.as_ref();
+                if rejected.contains(previous_id) {
+                    rejected.insert(id_bytes.to_vec());
+                    changed = true;
+                }
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    header
+        .programs_mut()
+        .as_mut()
+        .retain(|id, _| !rejected.contains(id.as_ref() as &[u8]));
+}
+
+fn normalize_legacy_sam_header_version(mut input: Vec<u8>) -> Vec<u8> {
+    let line_end = input
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(input.len());
+
+    if !input[..line_end].starts_with(b"@HD\t") {
+        return input;
+    }
+
+    for i in 0..line_end.saturating_sub(5) {
+        if !input[i..].starts_with(b"\tVN:1") {
+            continue;
+        }
+
+        if matches!(input.get(i + 5), None | Some(b'\t' | b'\r' | b'\n')) {
+            input.splice(i + 5..i + 5, b".0".iter().copied());
+            break;
+        }
+    }
+
+    input
+}
+
+fn reset_record(record: &mut RecordBuf, settings: &ResetSettings<'_>) {
+    let was_reverse = record.flags().is_reverse_complemented();
+
     // Reset alignment fields.
     *record.reference_sequence_id_mut() = None;
     *record.alignment_start_mut() = None;
     *record.cigar_mut() = sam::alignment::record_buf::Cigar::default();
-    *record.mapping_quality_mut() = None;
+    *record.mapping_quality_mut() = Some(MappingQuality::MIN);
     *record.mate_reference_sequence_id_mut() = None;
     *record.mate_alignment_start_mut() = None;
     *record.template_length_mut() = 0;
@@ -238,12 +402,23 @@ fn reset_record(
     flags.remove(Flags::PROPERLY_SEGMENTED);
     flags.remove(Flags::SECONDARY);
     flags.remove(Flags::SUPPLEMENTARY);
-    flags.remove(Flags::DUPLICATE);
-    flags.remove(Flags::MATE_UNMAPPED);
+    if !settings.preserve_duplicate {
+        flags.remove(Flags::DUPLICATE);
+    }
     flags.remove(Flags::REVERSE_COMPLEMENTED);
     flags.remove(Flags::MATE_REVERSE_COMPLEMENTED);
     flags.insert(Flags::UNMAPPED);
+    if flags.is_segmented() {
+        flags.insert(Flags::MATE_UNMAPPED);
+    } else {
+        flags.remove(Flags::MATE_UNMAPPED);
+    }
     *record.flags_mut() = flags;
+
+    if was_reverse {
+        reverse_complement_record_sequence(record);
+        record.quality_scores_mut().as_mut().reverse();
+    }
 
     // Drop aligner-added aux tags.
     let data = record.data_mut();
@@ -251,20 +426,68 @@ fn reset_record(
     for tag in DEFAULT_DROP_TAGS {
         to_drop.insert(**tag);
     }
-    for tag in extra_drop {
+    for tag in settings.extra_drop {
         to_drop.insert(*tag);
+    }
+    if settings.remove_read_groups {
+        to_drop.insert(*b"RG");
     }
     let mut keys: Vec<sam::alignment::record::data::field::Tag> =
         data.iter().map(|(t, _)| t).collect();
     for k in keys.drain(..) {
         let bytes: [u8; 2] = k.into();
-        let should_drop = match keep_only {
-            Some(keep) => !keep.contains(&bytes),
-            None => to_drop.contains(&bytes),
-        };
+        let should_drop = (settings.remove_read_groups && bytes == *b"RG")
+            || match settings.keep_only {
+                Some(keep) => !keep.contains(&bytes),
+                None => to_drop.contains(&bytes),
+            };
         if should_drop {
             data.remove(&k);
         }
+    }
+}
+
+fn reverse_complement_record_sequence(record: &mut RecordBuf) {
+    let sequence = record.sequence_mut().as_mut();
+    sequence.reverse();
+    for base in sequence {
+        *base = complement_base(*base);
+    }
+}
+
+fn complement_base(base: u8) -> u8 {
+    match base {
+        b'A' => b'T',
+        b'C' => b'G',
+        b'G' => b'C',
+        b'T' => b'A',
+        b'M' => b'K',
+        b'R' => b'Y',
+        b'W' => b'W',
+        b'S' => b'S',
+        b'Y' => b'R',
+        b'K' => b'M',
+        b'V' => b'B',
+        b'H' => b'D',
+        b'D' => b'H',
+        b'B' => b'V',
+        b'N' => b'N',
+        b'a' => b't',
+        b'c' => b'g',
+        b'g' => b'c',
+        b't' => b'a',
+        b'm' => b'k',
+        b'r' => b'y',
+        b'w' => b'w',
+        b's' => b's',
+        b'y' => b'r',
+        b'k' => b'm',
+        b'v' => b'b',
+        b'h' => b'd',
+        b'd' => b'h',
+        b'b' => b'v',
+        b'n' => b'n',
+        _ => base,
     }
 }
 
@@ -329,7 +552,7 @@ fn open_output(out: Option<&Path>, fmt: OutFmt, header: &sam::Header) -> io::Res
 
 fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
-    writeln!(w, "Usage: samtools reset [options] <in.bam|in.sam>")?;
+    writeln!(w, "Usage: samtools reset [options] [in.bam|in.sam|-]")?;
     writeln!(w, "  -o FILE                 output FILE")?;
     writeln!(w, "  -O sam|bam              output format")?;
     writeln!(
@@ -337,5 +560,110 @@ fn print_usage() -> io::Result<()> {
         "  -x/--remove-tag TAG     drop the listed aux tags (comma-separated, ^ for keep)"
     )?;
     writeln!(w, "  --keep-tag TAG          only keep the listed aux tags")?;
+    writeln!(
+        w,
+        "  --reject-PG ID          remove program header chain from ID"
+    )?;
+    writeln!(
+        w,
+        "  --no-PG                 remove all program header records"
+    )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufReader, Cursor};
+
+    use super::*;
+
+    #[test]
+    fn reset_sam_reader_supports_stdin_style_input() {
+        let input = concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t99\tchr1\t2\t60\t4M\t=\t6\t8\tACGT\t!!!!\tNM:i:1\tMD:Z:3A\tRG:Z:g1\n",
+        );
+        let tmp = std::env::temp_dir().join(format!(
+            "samtools-rs-reset-stdin-{}-{}.sam",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let extra_drop = Vec::new();
+        let settings = ResetSettings {
+            extra_drop: &extra_drop,
+            keep_only: None,
+            preserve_duplicate: false,
+            remove_read_groups: false,
+            remove_programs: false,
+            reject_programs: &[],
+        };
+        let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(input.as_bytes())));
+
+        run_reset_sam_reader(&mut reader, Some(&tmp), OutFmt::Sam, &settings).unwrap();
+
+        let text = std::fs::read_to_string(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let record = text.lines().find(|line| !line.starts_with('@')).unwrap();
+        let fields: Vec<_> = record.split('\t').collect();
+        assert_eq!(fields[1], "77");
+        assert_eq!(fields[2], "*");
+        assert_eq!(fields[3], "0");
+        assert_eq!(fields[4], "0");
+        assert_eq!(fields[5], "*");
+        assert!(!record.contains("\tNM:i:"));
+        assert!(!record.contains("\tMD:Z:"));
+        assert!(record.contains("\tRG:Z:g1"));
+    }
+
+    #[test]
+    fn reset_bam_reader_supports_stdin_style_input() {
+        let input = concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t99\tchr1\t2\t60\t4M\t=\t6\t8\tACGT\t!!!!\tNM:i:1\tMD:Z:3A\n",
+        );
+        let mut sam_reader = sam::io::Reader::new(BufReader::new(Cursor::new(input.as_bytes())));
+        let header = sam_reader.read_header().unwrap();
+        let mut bam_bytes = Vec::new();
+        {
+            let mut writer = bam::io::Writer::new(&mut bam_bytes);
+            writer.write_header(&header).unwrap();
+            for result in sam_reader.records() {
+                let record = result.unwrap();
+                use sam::alignment::io::Write as _;
+                writer.write_alignment_record(&header, &record).unwrap();
+            }
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "samtools-rs-reset-bam-stdin-{}-{}.sam",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let extra_drop = Vec::new();
+        let settings = ResetSettings {
+            extra_drop: &extra_drop,
+            keep_only: None,
+            preserve_duplicate: false,
+            remove_read_groups: false,
+            remove_programs: false,
+            reject_programs: &[],
+        };
+        let mut reader = bam::io::Reader::new(Cursor::new(bam_bytes));
+
+        run_reset_bam_reader(&mut reader, Some(&tmp), OutFmt::Sam, &settings).unwrap();
+
+        let text = std::fs::read_to_string(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let record = text.lines().find(|line| !line.starts_with('@')).unwrap();
+        let fields: Vec<_> = record.split('\t').collect();
+        assert_eq!(fields[1], "77");
+        assert_eq!(fields[2], "*");
+        assert_eq!(fields[3], "0");
+        assert_eq!(fields[4], "0");
+        assert_eq!(fields[5], "*");
+        assert!(!record.contains("\tNM:i:"));
+        assert!(!record.contains("\tMD:Z:"));
+    }
 }

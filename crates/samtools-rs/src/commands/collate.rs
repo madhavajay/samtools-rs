@@ -39,11 +39,16 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 to_stdout = true;
             }
             "--output-fmt" => {
-                let v = iter.next().and_then(|a| a.to_str()).unwrap_or("bam");
-                output_fmt = match v.to_lowercase().as_str() {
-                    "sam" => OutFmt::Sam,
-                    "bam" => OutFmt::Bam,
-                    _ => OutFmt::Bam,
+                let Some(v) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("collate", "missing value for --output-fmt");
+                    return ExitCode::from(1);
+                };
+                output_fmt = match parse_output_format(v) {
+                    Ok(fmt) => fmt,
+                    Err(e) => {
+                        print_error("collate", e);
+                        return ExitCode::from(1);
+                    }
                 };
             }
             "--no-PG" => {}
@@ -123,6 +128,14 @@ enum OutFmt {
 enum OutputTarget {
     Stdout,
     File(PathBuf),
+}
+
+fn parse_output_format(raw: &str) -> Result<OutFmt, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "sam" => Ok(OutFmt::Sam),
+        "bam" => Ok(OutFmt::Bam),
+        _ => Err(format!("unsupported output format \"{}\"", raw)),
+    }
 }
 
 fn run_collate(input: &Path, output: OutputTarget, fmt: OutFmt) -> io::Result<()> {

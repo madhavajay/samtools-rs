@@ -17,7 +17,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -106,12 +106,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
         };
         match format.exact {
-            Exact::Bam => {}
+            Exact::Sam | Exact::Bam => {}
             Exact::Cram => has_cram = true,
             _ => {
                 print_error(
                     "coverage",
-                    "only BAM and reference-backed CRAM input are currently supported (SAM TODO)",
+                    "only SAM, BAM, and reference-backed CRAM input are currently supported",
                 );
                 return ExitCode::from(1);
             }
@@ -192,6 +192,7 @@ fn run_coverage(
     let mut merged_refs: Option<Vec<RefStats>> = None;
     for path in inputs {
         let refs = match sam_io::sam_open_format(path)?.exact {
+            Exact::Sam => collect_sam_coverage(path, exclude_flags, config, region.as_ref())?,
             Exact::Bam => collect_bam_coverage(path, exclude_flags, config, region.as_ref())?,
             Exact::Cram => collect_cram_coverage(
                 path,
@@ -208,7 +209,7 @@ fn run_coverage(
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "only BAM and reference-backed CRAM input are currently supported",
+                    "only SAM, BAM, and reference-backed CRAM input are currently supported",
                 ));
             }
         };
@@ -257,6 +258,24 @@ fn collect_bam_coverage(
             }
             update_targets(&header, &mut refs, &record, exclude_flags, config);
         }
+    }
+
+    Ok(refs)
+}
+
+fn collect_sam_coverage(
+    path: &Path,
+    exclude_flags: u32,
+    config: CoverageConfig,
+    region: Option<&Region>,
+) -> io::Result<Vec<RefStats>> {
+    let mut reader = sam::io::Reader::new(BufReader::new(File::open(path)?));
+    let header = reader.read_header()?;
+    let mut refs = coverage_targets(&header, region)?;
+
+    for result in reader.records() {
+        let record = result?;
+        update_targets(&header, &mut refs, &record, exclude_flags, config);
     }
 
     Ok(refs)

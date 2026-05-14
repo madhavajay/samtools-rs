@@ -3,7 +3,8 @@
 //! Mirrors `bam_merge` in `bam_sort.c`. This initial Rust port loads all
 //! records from BAM/SAM inputs into memory and sorts by coordinate (or name
 //! with `-n`) before writing the merged output. K-way streaming merge
-//! and CRAM are TODO.
+//! and CRAM are TODO. Coordinate-sorted BAM outputs can also write a BAI via
+//! `--write-index`.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -18,6 +19,7 @@ use htslib_rs::sam::{self, alignment::RecordBuf};
 
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
 /// Entry point for `samtools merge`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -26,6 +28,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut output_fmt = OutFmt::Bam;
     let mut positional: Vec<PathBuf> = Vec::new();
     let mut force = false;
+    let mut local_write_index = false;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -37,17 +40,23 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 output = iter.next().map(PathBuf::from);
             }
             "--output-fmt" | "-O" => {
-                let v = iter.next().and_then(|a| a.to_str()).unwrap_or("bam");
-                output_fmt = match v.to_lowercase().as_str() {
-                    "sam" => OutFmt::Sam,
-                    "bam" => OutFmt::Bam,
-                    _ => OutFmt::Bam,
+                let Some(v) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("merge", format!("missing value for {}", s));
+                    return ExitCode::from(1);
+                };
+                output_fmt = match parse_output_format(v) {
+                    Ok(fmt) => fmt,
+                    Err(e) => {
+                        print_error("merge", e);
+                        return ExitCode::from(1);
+                    }
                 };
             }
             "-@" | "--threads" | "-l" | "--compression-level" | "-R" => {
                 let _ = iter.next();
             }
-            "--no-PG" | "--write-index" | "-c" | "-p" | "-u" => {}
+            "--write-index" => local_write_index = true,
+            "--no-PG" | "-c" | "-p" | "-u" => {}
             "--help" => {
                 let _ = print_usage();
                 return ExitCode::SUCCESS;
@@ -118,12 +127,42 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     }
 
-    match run_merge(&inputs, out_path.as_deref(), name_sort, output_fmt) {
+    let write_index = local_write_index || current_global_args().write_index;
+    if write_index {
+        if out_path.is_none() {
+            print_error("merge", "--write-index requires output file");
+            return ExitCode::from(1);
+        }
+        if name_sort {
+            print_error("merge", "--write-index requires coordinate sort output");
+            return ExitCode::from(1);
+        }
+        if !matches!(output_fmt, OutFmt::Bam) {
+            print_error("merge", "--write-index is only supported for BAM output");
+            return ExitCode::from(1);
+        }
+    }
+
+    match run_merge(
+        &inputs,
+        out_path.as_deref(),
+        name_sort,
+        output_fmt,
+        write_index,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             print_error_errno("merge", "merge failed", &e);
             ExitCode::from(1)
         }
+    }
+}
+
+fn parse_output_format(raw: &str) -> Result<OutFmt, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "sam" => Ok(OutFmt::Sam),
+        "bam" => Ok(OutFmt::Bam),
+        _ => Err(format!("unsupported output format \"{}\"", raw)),
     }
 }
 
@@ -138,6 +177,7 @@ pub(crate) fn run_merge(
     output: Option<&Path>,
     name_sort: bool,
     fmt: OutFmt,
+    write_index: bool,
 ) -> io::Result<()> {
     let (mut header, mut records) = read_records(&inputs[0])?;
 
@@ -171,9 +211,21 @@ pub(crate) fn run_merge(
         if name_sort { "queryname" } else { "coordinate" },
     );
 
-    let mut writer = open_output(output, fmt, &header)?;
-    for rec in &records {
-        writer.write_record(&header, rec)?;
+    {
+        let mut writer = open_output(output, fmt, &header)?;
+        for rec in &records {
+            writer.write_record(&header, rec)?;
+        }
+    }
+
+    if write_index {
+        let Some(path) = output else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--write-index requires output file",
+            ));
+        };
+        write_bam_index(path)?;
     }
     Ok(())
 }
@@ -297,6 +349,18 @@ fn open_output(
     }
 }
 
+fn write_bam_index(path: &Path) -> io::Result<()> {
+    let index = htslib_rs::index_compat::build_bai(path)?;
+    htslib_rs::index_compat::write_bai(append_extension(path, "bai"), &index)
+}
+
+fn append_extension(path: &Path, ext: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".");
+    s.push(ext);
+    PathBuf::from(s)
+}
+
 fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
     writeln!(
@@ -308,5 +372,6 @@ fn print_usage() -> io::Result<()> {
     writeln!(w, "  -f              force overwrite output")?;
     writeln!(w, "  -o FILE         output to FILE")?;
     writeln!(w, "  --output-fmt sam|bam")?;
+    writeln!(w, "  --write-index   write BAI index for BAM file output")?;
     Ok(())
 }

@@ -2,6 +2,7 @@
 //! `flagstat`, `index`, `faidx`, `import`, `bedcov`, `rmdup`, `split`.
 
 use std::ffi::OsString;
+use std::io::{BufReader, Cursor};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Mutex;
@@ -61,6 +62,19 @@ fn argv(name: &str, rest: &[&str]) -> Vec<OsString> {
 
 fn sample_bam() -> PathBuf {
     fixtures_dir().join("checksum").join("chk1.bam")
+}
+
+fn write_bam_from_sam_text(path: &std::path::Path, text: &str) {
+    let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(Cursor::new(text.as_bytes())));
+    let header = reader.read_header().unwrap();
+    let mut writer = htslib_rs::bam::io::Writer::new(std::fs::File::create(path).unwrap());
+    writer.write_header(&header).unwrap();
+
+    for result in reader.records() {
+        let record = result.unwrap();
+        use htslib_rs::sam::alignment::io::Write as _;
+        writer.write_alignment_record(&header, &record).unwrap();
+    }
 }
 
 #[test]
@@ -455,6 +469,305 @@ fn fastq_filters_by_required_flags() {
 }
 
 #[test]
+fn fastq_filters_by_include_any_long_flag_alias() {
+    let tmp = tmp_dir("fastq-include-any");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("reads.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "read1\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\n",
+            "read2\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\n",
+            "unpaired\t0\tchr1\t1\t60\t4M\t*\t0\t0\tNNNN\t$$$$\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "--include-flags",
+                "64",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        "@read1/1\nACGT\n+\n!!!!\n"
+    );
+}
+
+#[test]
+fn fasta_filters_by_include_any_long_flag_alias() {
+    let tmp = tmp_dir("fasta-include-any");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("reads.fa");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "read1\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\n",
+            "read2\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\n",
+            "unpaired\t0\tchr1\t1\t60\t4M\t*\t0\t0\tNNNN\t$$$$\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fasta",
+            &[
+                "--include-flags",
+                "64",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(std::fs::read_to_string(out).unwrap(), ">read1/1\nACGT\n");
+}
+
+#[test]
+fn fastq_excludes_secondary_and_supplementary_by_default() {
+    let tmp = tmp_dir("fastq-default-exclude");
+    let sam = tmp.join("in.sam");
+    let default_out = tmp.join("default.fq");
+    let include_out = tmp.join("include.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "primary\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "secondary\t256\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "supplementary\t2048\tchr1\t1\t60\t4M\t*\t0\t0\tNNNN\t$$$$\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &["-o", default_out.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-F",
+                "0",
+                "-o",
+                include_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(default_out).unwrap(),
+        "@primary\nACGT\n+\n!!!!\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(include_out).unwrap(),
+        "@primary\nACGT\n+\n!!!!\n@secondary\nTGCA\n+\n####\n@supplementary\nNNNN\n+\n$$$$\n"
+    );
+}
+
+#[test]
+fn fastq_single_sam_path_filters_by_aux_tag_value() {
+    let tmp = tmp_dir("fastq-aux-filter-value");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "keep\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tNM:i:0\tMD:Z:4\n",
+            "drop\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\tNM:i:1\tMD:Z:3A\n",
+            "missing\t0\tchr1\t1\t60\t4M\t*\t0\t0\tNNNN\t$$$$\tMD:Z:4\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-d",
+                "NM:0",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("@keep\n"));
+    assert!(!text.contains("@drop\n"));
+    assert!(!text.contains("@missing\n"));
+}
+
+#[test]
+fn fastq_single_sam_path_filters_by_aux_tag_presence() {
+    let tmp = tmp_dir("fastq-aux-filter-presence");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "has\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tBC:Z:AAAA\n",
+            "missing\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-d",
+                "BC",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("@has\n"));
+    assert!(!text.contains("@missing\n"));
+}
+
+#[test]
+fn fastq_single_sam_path_filters_aux_values_from_file() {
+    let tmp = tmp_dir("fastq-aux-filter-file");
+    let sam = tmp.join("in.sam");
+    let values = tmp.join("values.txt");
+    let out = tmp.join("out.fq");
+    std::fs::write(&values, "AAAA\nCCCC\n").unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "keep1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tBC:Z:AAAA\n",
+            "drop\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\tBC:Z:GGGG\n",
+            "keep2\t0\tchr1\t1\t60\t4M\t*\t0\t0\tNNNN\t$$$$\tBC:Z:CCCC\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-D",
+                &format!("BC:{}", values.display()),
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("@keep1\n"));
+    assert!(text.contains("@keep2\n"));
+    assert!(!text.contains("@drop\n"));
+}
+
+#[test]
+fn fastq_single_bam_path_preserves_selected_aux_tags() {
+    let tmp = tmp_dir("fastq-bam-aux");
+    let bam = tmp.join("in.bam");
+    let out = tmp.join("out.fq");
+    write_bam_from_sam_text(
+        &bam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:rg1\tBC:Z:ACTG\tNM:i:1\n",
+        ),
+    );
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-T",
+                "RG,BC,NM",
+                "-o",
+                out.to_str().unwrap(),
+                bam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        "@r1\tRG:Z:rg1\tBC:Z:ACTG\tNM:i:1\nACGT\n+\n!!!!\n"
+    );
+}
+
+#[test]
+fn fastq_single_bam_path_filters_by_aux_tag_value() {
+    let tmp = tmp_dir("fastq-bam-aux-filter");
+    let bam = tmp.join("in.bam");
+    let out = tmp.join("out.fq");
+    write_bam_from_sam_text(
+        &bam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "keep\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tNM:i:0\n",
+            "drop\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\tNM:i:1\n",
+        ),
+    );
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-d",
+                "NM:0",
+                "-o",
+                out.to_str().unwrap(),
+                bam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("@keep\n"));
+    assert!(!text.contains("@drop\n"));
+}
+
+#[test]
 fn fastq_zero_output_writes_single_stream_file() {
     let tmp = tmp_dir("fastq-zero");
     let sam = tmp.join("in.sam");
@@ -629,6 +942,316 @@ fn fastq_zero_routes_unpaired_reads_in_split_mode() {
 }
 
 #[test]
+fn fastq_split_sam_path_preserves_selected_aux_tags() {
+    let tmp = tmp_dir("fastq-split-aux");
+    let sam = tmp.join("in.sam");
+    let r1 = tmp.join("r1.fq");
+    let r2 = tmp.join("r2.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "pair\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\tRG:Z:rg1\tBC:Z:ACTG\tQT:Z:!!!!\tNM:i:1\n",
+            "pair\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\tRG:Z:rg1\tBC:Z:TGCA\tQT:Z:####\tNM:i:2\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-N",
+                "-T",
+                "RG,BC,QT",
+                "-1",
+                r1.to_str().unwrap(),
+                "-2",
+                r2.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(r1).unwrap(),
+        "@pair/1\tRG:Z:rg1\tBC:Z:ACTG\tQT:Z:!!!!\nACGT\n+\n!!!!\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(r2).unwrap(),
+        "@pair/2\tRG:Z:rg1\tBC:Z:TGCA\tQT:Z:####\nTGCA\n+\n####\n"
+    );
+}
+
+#[test]
+fn fastq_split_sam_path_t_copies_default_aux_tags() {
+    let tmp = tmp_dir("fastq-split-t");
+    let sam = tmp.join("in.sam");
+    let r1 = tmp.join("r1.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "pair\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\tRG:Z:rg1\tBC:Z:ACTG\tQT:Z:!!!!\tNM:i:1\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-N",
+                "-t",
+                "-1",
+                r1.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(r1).unwrap(),
+        "@pair/1\tRG:Z:rg1\tBC:Z:ACTG\tQT:Z:!!!!\nACGT\n+\n!!!!\n"
+    );
+}
+
+#[test]
+fn fastq_split_bam_path_preserves_selected_aux_tags() {
+    let tmp = tmp_dir("fastq-split-bam-aux");
+    let bam = tmp.join("in.bam");
+    let r1 = tmp.join("r1.fq");
+    let r2 = tmp.join("r2.fq");
+    write_bam_from_sam_text(
+        &bam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "pair\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\tRG:Z:rg1\tBC:Z:ACTG\tQT:Z:!!!!\tNM:i:1\n",
+            "pair\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\tRG:Z:rg1\tBC:Z:TGCA\tQT:Z:####\tNM:i:2\n",
+        ),
+    );
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-N",
+                "-T",
+                "RG,BC,NM",
+                "-1",
+                r1.to_str().unwrap(),
+                "-2",
+                r2.to_str().unwrap(),
+                bam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(r1).unwrap(),
+        "@pair/1\tRG:Z:rg1\tBC:Z:ACTG\tNM:i:1\nACGT\n+\n!!!!\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(r2).unwrap(),
+        "@pair/2\tRG:Z:rg1\tBC:Z:TGCA\tNM:i:2\nTGCA\n+\n####\n"
+    );
+}
+
+#[test]
+fn fastq_split_bam_path_filters_by_aux_tag_value() {
+    let tmp = tmp_dir("fastq-split-bam-filter");
+    let bam = tmp.join("in.bam");
+    let r1 = tmp.join("r1.fq");
+    let r2 = tmp.join("r2.fq");
+    let singleton = tmp.join("single.fq");
+    write_bam_from_sam_text(
+        &bam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "keep\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\tBC:Z:KEEP\n",
+            "keep\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\tBC:Z:KEEP\n",
+            "drop\t65\tchr1\t1\t60\t4M\t=\t5\t8\tAAAA\t!!!!\tBC:Z:DROP\n",
+            "drop\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTTTT\t####\tBC:Z:DROP\n",
+            "solo\t4\t*\t0\t0\t*\t*\t0\t0\tNNNN\t$$$$\tBC:Z:KEEP\n",
+        ),
+    );
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-d",
+                "BC:KEEP",
+                "-1",
+                r1.to_str().unwrap(),
+                "-2",
+                r2.to_str().unwrap(),
+                "-s",
+                singleton.to_str().unwrap(),
+                bam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(r1).unwrap(),
+        "@keep\nACGT\n+\n!!!!\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(r2).unwrap(),
+        "@keep\nTGCA\n+\n####\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(singleton).unwrap(),
+        "@solo\nNNNN\n+\n$$$$\n"
+    );
+}
+
+#[test]
+fn fastq_single_sam_path_preserves_selected_aux_tags() {
+    let tmp = tmp_dir("fastq-single-aux");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tba:A:x\tbb:i:7\tbc:Z:text\tNM:i:1\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-T",
+                "ba,bb,bc",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        "@r1\tba:A:x\tbb:i:7\tbc:Z:text\nACGT\n+\n!!!!\n"
+    );
+}
+
+#[test]
+fn fastq_single_sam_path_empty_t_copies_all_aux_tags() {
+    let tmp = tmp_dir("fastq-single-all-aux-empty");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tMD:Z:4\tNM:i:0\tRG:Z:rg1\tBC:Z:ACTG\tba:B:c,-1,0,1\tbb:B:C,0,127,255\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &["-T", "", "-o", out.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        "@r1\tMD:Z:4\tNM:i:0\tRG:Z:rg1\tBC:Z:ACTG\tba:B:c,-1,0,1\tbb:B:C,0,127,255\nACGT\n+\n!!!!\n"
+    );
+}
+
+#[test]
+fn fastq_single_sam_path_star_t_copies_all_aux_tags_after_t() {
+    let tmp = tmp_dir("fastq-single-all-aux-star");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:rg1\tBC:Z:ACTG\tQT:Z:!!!!\tMD:Z:4\tia:i:40000\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-t",
+                "-T",
+                "*",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        "@r1\tRG:Z:rg1\tBC:Z:ACTG\tQT:Z:!!!!\tMD:Z:4\tia:i:40000\nACGT\n+\n!!!!\n"
+    );
+}
+
+#[test]
+fn fastq_single_sam_aux_path_reverse_complements_reverse_reads() {
+    let tmp = tmp_dir("fastq-single-aux-reverse");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t16\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!#$%\tNM:i:0\n",
+            "r2\t16\tchr1\t1\t60\t15M\t*\t0\t0\tACGTMRWSYKVHDBN\t0123456789abcd!\tNM:i:1\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-T",
+                "*",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        "@r1\tNM:i:0\nACGT\n+\n%$#!\n@r2\tNM:i:1\nNVHDBMRSWYKACGT\n+\n!dcba9876543210\n"
+    );
+}
+
+#[test]
 fn fixmate_sam_input_fills_mate_fields_to_sam_output() {
     let tmp = tmp_dir("fixmate-sam");
     let sam = tmp.join("in.sam");
@@ -687,6 +1310,95 @@ fn faidx_builds_index() {
 }
 
 #[test]
+fn faidx_builds_index_for_bgzf_input_and_writes_gzi() {
+    let tmp = tmp_dir("fai-bgzf");
+    let plain = b">chr1\nACGTACGT\n>chr2\nTTTTCCCC\n";
+    let encoded = htslib_rs::bgzf_compat::write_all_with_kind(
+        plain,
+        htslib_rs::bgzf_compat::CompressionKind::Bgzf,
+    )
+    .unwrap();
+    let fa = tmp.join("ref.fa.gz");
+    std::fs::write(&fa, encoded).unwrap();
+
+    assert_eq!(
+        exit_to_u8(faidx::main(&argv("faidx", &[fa.to_str().unwrap()]))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(tmp.join("ref.fa.gz.fai")).unwrap(),
+        "chr1\t8\t6\t8\t9\nchr2\t8\t21\t8\t9\n"
+    );
+    assert!(tmp.join("ref.fa.gz.gzi").exists());
+}
+
+#[test]
+fn faidx_extracts_from_bgzf_input_and_writes_bgzf_output() {
+    let tmp = tmp_dir("fai-bgzf-region");
+    let plain = b">chr1\nACGTACGTACGT\n>chr2\nTTTTCCCC\n";
+    let encoded = htslib_rs::bgzf_compat::write_all_with_kind(
+        plain,
+        htslib_rs::bgzf_compat::CompressionKind::Bgzf,
+    )
+    .unwrap();
+    let fa = tmp.join("ref.fa.gz");
+    let out = tmp.join("out.fa.gz");
+    std::fs::write(&fa, encoded).unwrap();
+
+    assert_eq!(
+        exit_to_u8(faidx::main(&argv(
+            "faidx",
+            &[
+                "--length",
+                "4",
+                "-o",
+                out.to_str().unwrap(),
+                fa.to_str().unwrap(),
+                "chr1:3-10",
+            ]
+        ))),
+        0
+    );
+
+    let decoded = htslib_rs::bgzf_compat::read_auto(&std::fs::read(out).unwrap()).unwrap();
+    assert_eq!(
+        String::from_utf8(decoded).unwrap(),
+        ">chr1:3-10 length: 8\nGTAC\nGTAC\n"
+    );
+}
+
+#[test]
+fn faidx_accepts_equals_output_format_option_for_bgzf_output() {
+    let tmp = tmp_dir("fai-output-fmt-opt");
+    let fa = tmp.join("ref.fa");
+    let out = tmp.join("out.fa.gz");
+    std::fs::write(&fa, ">chr1\nACGTACGTACGT\n").unwrap();
+
+    assert_eq!(
+        exit_to_u8(faidx::main(&argv(
+            "faidx",
+            &[
+                "--length",
+                "4",
+                "-o",
+                out.to_str().unwrap(),
+                fa.to_str().unwrap(),
+                "chr1:3-10",
+                "--output-fmt-opt=level=4",
+            ]
+        ))),
+        0
+    );
+
+    let decoded = htslib_rs::bgzf_compat::read_auto(&std::fs::read(out).unwrap()).unwrap();
+    assert_eq!(
+        String::from_utf8(decoded).unwrap(),
+        ">chr1:3-10 length: 8\nGTAC\nGTAC\n"
+    );
+}
+
+#[test]
 fn faidx_extracts_region_to_file() {
     let tmp = tmp_dir("fai-region");
     let fa = tmp.join("ref.fa");
@@ -740,6 +1452,90 @@ fn faidx_extracts_regions_from_file() {
 }
 
 #[test]
+fn faidx_write_index_uses_default_sixty_base_output_lines() {
+    let tmp = tmp_dir("fai-write-index");
+    let fa = tmp.join("ref.fa");
+    let regions = tmp.join("regions.txt");
+    let out = tmp.join("out.fa");
+    let seq = "A".repeat(61);
+    std::fs::write(&fa, format!(">chr1\n{seq}\n")).unwrap();
+    std::fs::write(&regions, "chr1\n").unwrap();
+
+    assert_eq!(
+        exit_to_u8(faidx::main(&argv(
+            "faidx",
+            &[
+                "--write-index",
+                "-r",
+                regions.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                fa.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        format!(">chr1\n{}\nA\n", "A".repeat(60))
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.join("out.fa.fai")).unwrap(),
+        "chr1\t61\t6\t60\t61\n"
+    );
+}
+
+#[test]
+fn faidx_out_of_range_region_exits_successfully_with_empty_output() {
+    let tmp = tmp_dir("fai-zero-region");
+    let fa = tmp.join("ref.fa");
+    let out = tmp.join("out.fa");
+    std::fs::write(&fa, ">chr1\nACGTACGT\n").unwrap();
+
+    assert_eq!(
+        exit_to_u8(faidx::main(&argv(
+            "faidx",
+            &[
+                "-o",
+                out.to_str().unwrap(),
+                fa.to_str().unwrap(),
+                "chr1:100-105",
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(std::fs::read_to_string(out).unwrap(), "");
+}
+
+#[test]
+fn faidx_truncated_region_exits_successfully_with_clamped_output() {
+    let tmp = tmp_dir("fai-truncated-region");
+    let fa = tmp.join("ref.fa");
+    let out = tmp.join("out.fa");
+    std::fs::write(&fa, ">chr1\nACGTACGT\n").unwrap();
+
+    assert_eq!(
+        exit_to_u8(faidx::main(&argv(
+            "faidx",
+            &[
+                "-o",
+                out.to_str().unwrap(),
+                fa.to_str().unwrap(),
+                "chr1:6-12",
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        ">chr1:6-12 length: 3\nCGT\n"
+    );
+}
+
+#[test]
 fn fqidx_extracts_region_to_file() {
     let tmp = tmp_dir("fqi-region");
     let fq = tmp.join("reads.fq");
@@ -761,6 +1557,65 @@ fn fqidx_extracts_region_to_file() {
     );
     assert_eq!(
         std::fs::read_to_string(out).unwrap(),
+        "@r1:2-7 length: 6\nCGTA\nCG\n+\nbcde\nfg\n"
+    );
+}
+
+#[test]
+fn fqidx_builds_index_for_bgzf_input_and_writes_gzi() {
+    let tmp = tmp_dir("fqi-bgzf");
+    let plain = b"@r1\nACGTACGT\n+\nabcdefgh\n";
+    let encoded = htslib_rs::bgzf_compat::write_all_with_kind(
+        plain,
+        htslib_rs::bgzf_compat::CompressionKind::Bgzf,
+    )
+    .unwrap();
+    let fq = tmp.join("reads.fq.gz");
+    std::fs::write(&fq, encoded).unwrap();
+
+    assert_eq!(
+        exit_to_u8(fqidx::main(&argv("fqidx", &[fq.to_str().unwrap()]))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(tmp.join("reads.fq.gz.fai")).unwrap(),
+        "r1\t8\t4\t8\t9\t15\n"
+    );
+    assert!(tmp.join("reads.fq.gz.gzi").exists());
+}
+
+#[test]
+fn fqidx_extracts_from_bgzf_input_and_writes_bgzf_output() {
+    let tmp = tmp_dir("fqi-bgzf-region");
+    let plain = b"@r1\nACGTACGT\n+\nabcdefgh\n";
+    let encoded = htslib_rs::bgzf_compat::write_all_with_kind(
+        plain,
+        htslib_rs::bgzf_compat::CompressionKind::Bgzf,
+    )
+    .unwrap();
+    let fq = tmp.join("reads.fq.gz");
+    let out = tmp.join("out.fq.gz");
+    std::fs::write(&fq, encoded).unwrap();
+
+    assert_eq!(
+        exit_to_u8(fqidx::main(&argv(
+            "fqidx",
+            &[
+                "--length",
+                "4",
+                "-o",
+                out.to_str().unwrap(),
+                fq.to_str().unwrap(),
+                "r1:2-7",
+            ]
+        ))),
+        0
+    );
+
+    let decoded = htslib_rs::bgzf_compat::read_auto(&std::fs::read(out).unwrap()).unwrap();
+    assert_eq!(
+        String::from_utf8(decoded).unwrap(),
         "@r1:2-7 length: 6\nCGTA\nCG\n+\nbcde\nfg\n"
     );
 }
@@ -1737,10 +2592,10 @@ fn reset_sam_input_clears_alignment_fields_and_default_tags() {
     let text = std::fs::read_to_string(out).unwrap();
     let record = text.lines().find(|line| !line.starts_with('@')).unwrap();
     let fields: Vec<_> = record.split('\t').collect();
-    assert_eq!(fields[1], "69");
+    assert_eq!(fields[1], "77");
     assert_eq!(fields[2], "*");
     assert_eq!(fields[3], "0");
-    assert_eq!(fields[4], "255");
+    assert_eq!(fields[4], "0");
     assert_eq!(fields[5], "*");
     assert_eq!(fields[6], "*");
     assert_eq!(fields[7], "0");
@@ -1748,6 +2603,156 @@ fn reset_sam_input_clears_alignment_fields_and_default_tags() {
     assert!(!record.contains("\tNM:i:"));
     assert!(!record.contains("\tMD:Z:"));
     assert!(record.contains("\tRG:Z:g1"));
+}
+
+#[test]
+fn reset_dupflag_preserves_duplicate_and_restores_reverse_sequence() {
+    let tmp = tmp_dir("reset-dupflag-reverse");
+    let sam = fixtures_dir().join("reset").join("seq.sam");
+    let out = tmp.join("reset.sam");
+
+    assert_eq!(
+        exit_to_u8(reset::main(&argv(
+            "reset",
+            &[
+                "--dupflag",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let actual = std::fs::read_to_string(out)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let expected =
+        std::fs::read_to_string(fixtures_dir().join("reset").join("output.flg.1.expected"))
+            .unwrap();
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn reset_no_rg_removes_read_group_headers_and_tags() {
+    let tmp = tmp_dir("reset-no-rg");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("reset.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:g1\tSM:s1\n",
+            "@RG\tID:g2\tSM:s2\n",
+            "r1\t99\tchr1\t2\t60\t4M\t=\t6\t8\tACGT\t!!!!\tRG:Z:g1\tNM:i:1\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(reset::main(&argv(
+            "reset",
+            &[
+                "--no-RG",
+                "--keep-tag",
+                "RG",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(!text.contains("\n@RG\t"));
+    assert!(!text.contains("\tRG:Z:"));
+}
+
+#[test]
+fn reset_no_pg_removes_program_headers() {
+    let tmp = tmp_dir("reset-no-pg");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("reset.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@PG\tID:aligner\tPN:aligner\n",
+            "@PG\tID:post\tPN:post\tPP:aligner\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(reset::main(&argv(
+            "reset",
+            &[
+                "--no-PG",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(!text.contains("\n@PG\t"));
+}
+
+#[test]
+fn reset_reject_pg_removes_program_chain_from_id() {
+    let tmp = tmp_dir("reset-reject-pg");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("reset.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@PG\tID:bwa_index\tPN:bwa\n",
+            "@PG\tID:bwa_aln\tPN:bwa\tPP:bwa_index\n",
+            "@PG\tID:qc\tPN:qc\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(reset::main(&argv(
+            "reset",
+            &[
+                "--reject-PG",
+                "bwa_index",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(!text.contains("@PG\tID:bwa_index"));
+    assert!(!text.contains("@PG\tID:bwa_aln"));
+    assert!(text.contains("@PG\tID:qc"));
 }
 
 #[test]

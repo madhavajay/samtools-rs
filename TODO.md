@@ -1,6 +1,16 @@
 # TODO: Port samtools to Pure Rust
 
-Goal: build a pure Rust replacement for the `samtools` C program with full subcommand parity, then port and pass the upstream `test/test.pl` suite plus add Rust-native unit/integration tests. Implementation routes through `htslib-rs` (sibling submodule); when a needed HTSlib API is not yet exposed there, extend `htslib-rs` first.
+Goal: build a pure Rust replacement for the `samtools` C program with full subcommand parity, then port and pass the upstream `test/test.pl` suite plus add Rust-native unit/integration tests. Implementation routes through `htslib-rs` (sibling submodule); long-term, when a needed HTSlib API is not yet exposed there, extend `htslib-rs` first.
+
+## Active Goal
+
+For the current pass, keep working only in `samtools-rs`. Do not change the
+`htslib-rs` or noodles submodules. If a TODO item requires an underlying-library
+change, move or keep it at the end of this file under **htslib-rs Extensions
+Needed** or **noodles Extensions Needed**, skip it for now, and continue with the
+next samtools-only item. Stop once the only remaining actionable work requires
+`htslib-rs` or noodles changes, and report those blockers instead of modifying
+the underlying libraries.
 
 ## Progress Snapshot
 
@@ -9,7 +19,7 @@ Goal: build a pure Rust replacement for the `samtools` C program with full subco
 Subcommands shipped (27 of ~40):
 - ✅ byte-parity verified: `flags`, `quickcheck`, `dict`
 - ✅ functional with partial-feature notes: `head`, `index`, `idxstats`, `samples` (incl. `-i`, `-f`, `-X`, stdin path lists), `flagstat`, `faidx`/`fqidx`
-- 🟡 partial implementation: `view` (SAM↔SAM, SAM→BAM/CRAM, count/header, region queries, `-f/-F/-G/-q` filters, `-L` BED, `-e` for SAM, `-x/--keep-tag` aux strip), `cat`, `reheader`, `fastq`/`fasta`/`bam2fq`, `split`, `sort` (in-memory), `merge` (in-memory), `collate` (in-memory), `import`, `rmdup` (single-end), `bedcov` (CIGAR-walk), `coverage`, `depth`, `addreplacerg` (SAM text mode), `fixmate` (name-sorted BAM/SAM), `reset` (alignment field clear + default aux strip), `stats` (SN summary numbers), `calmd`/`fillmd` (BAQ paths)
+- 🟡 partial implementation: `view` (SAM↔SAM, SAM→BAM/CRAM including BAM stdout/redirection, count/header, region queries, `-f/-F/-G/-q` filters, `-L` BED, `-e` for SAM, `-x/--keep-tag` aux strip), `cat`, `reheader`, `fastq`/`fasta`/`bam2fq`, `split`, `sort` (in-memory), `merge` (in-memory), `collate` (in-memory), `import`, `rmdup` (single-end), `bedcov` (CIGAR-walk), `coverage`, `depth`, `addreplacerg` (SAM text mode), `fixmate` (name-sorted BAM/SAM), `reset` (alignment field clear + default aux strip), `stats` (SN summary numbers), `calmd`/`fillmd` (BAQ paths)
 
 Remaining subcommands and their blockers:
 - **BAM aux-tag mutation is reachable** via `bam::io::Reader::read_record_buf` → `RecordBuf` (mutable) → `bam::io::Writer::write_alignment_record`. This unblocks BAM forms of `addreplacerg`, `fixmate`, `reset`, `markdup`, `calmd`, `ampliconclip`. The work is still substantial per-subcommand.
@@ -26,7 +36,7 @@ htslib-rs extensions landed during this work:
 - BAM to CRAM writer: `write_cram_from_bam_path_with_reference`
 - FASTQ import helpers: paired FASTQ input, index FASTQ input, aux-tag allow-listing, barcode quality tags, and read group tag insertion.
 
-Rust tests: 248 currently passing (quickcheck:6, flags:3, dict:1, view:46, head:5, sort_merge:7, misc:69, stats_wave_d:36, test_status:1, library/command unit tests:74) — `cargo test -p samtools-rs` green; `cargo fmt --check` and `cargo clippy -p samtools-rs --all-targets -- -D warnings` also clean as of the latest full run.
+Rust tests: 286 currently passing (quickcheck:6, flags:3, dict:1, view:46, head:5, sort_merge:12, misc:97, stats_wave_d:39, test_status:1, library/command unit tests:76). `cargo fmt --all --check`, `cargo clippy -p samtools-rs --all-targets -- -D warnings`, and `cargo test -p samtools-rs` are green after the latest `faidx`/`fqidx`, `view -b` stdout, `sort -O`/`--write-index`, `merge -O`/`--write-index`, `collate --output-fmt` validation, `fastq`/`fasta -T/-t`/`-d`/`-D` SAM/BAM single and split-output paths, FASTQ/FASTA long flag aliases/`--include-flags`, SAM-input `depth`/`coverage`/`bedcov`, and `reset --dupflag`/`--no-RG`/`--no-PG`/`--reject-PG`/SAM+BAM stdin/legacy-`@HD VN:1`/reverse-restoration work.
 
 Progress snapshot PR chain:
 - noodles: https://github.com/madhavajay/noodles/pull/1
@@ -34,6 +44,12 @@ Progress snapshot PR chain:
 - samtools-rs: https://github.com/madhavajay/samtools-rs/pull/3
 
 ## What's Next — Decision Points
+
+### Current Goal Constraint
+
+See **Active Goal** above: this pass is samtools-rs-only. Underlying-library
+blockers belong at the end of this file, and the pass stops when those are the
+only actionable tasks left.
 
 ### BioScript VNtyper Native API Status
 
@@ -88,7 +104,7 @@ The following are decided up front and shape every phase below:
 - **Layout**: workspace mirroring `htslib-rs`:
   - `crates/samtools-rs` — library, one module per subcommand
   - `crates/samtools-rs-cli` — the `samtools` binary (dispatch + main)
-- **HTSlib API gaps**: when samtools-rs needs an HTSlib-shaped API that `htslib-rs` does not yet expose, add it to `htslib-rs` first and route through it. Do not bypass `htslib-rs` for HTSlib-shaped APIs. (Direct `noodles` use from samtools-rs is acceptable only for code that has no HTSlib analogue.)
+- **HTSlib API gaps**: long-term, when samtools-rs needs an HTSlib-shaped API that `htslib-rs` does not yet expose, add it to `htslib-rs` first and route through it. During the current samtools-only pass, defer these gaps to the end of this file and keep working on items that do not require underlying-library changes. Do not bypass `htslib-rs` for HTSlib-shaped APIs. (Direct `noodles` use from samtools-rs is acceptable only for code that has no HTSlib analogue.)
 - **Tests — two gates**:
   1. **Parity gate**: upstream `samtools/test/test.pl` run against the Rust binary. Expected outputs are the checked-in files under `samtools/test/`. Used as a regression gate in CI.
   2. **Rust unit/integration tests**: per-subcommand `tests/` under each crate using `cargo test`. Used for fine-grained development feedback and Rust-native edge cases.
@@ -111,7 +127,7 @@ The following are decided up front and shape every phase below:
 ## Porting Principles
 
 - Stay pure Rust. No `bindgen`, no `cc` crate, no linking to HTSlib C.
-- Default to `htslib-rs` for HTSlib-shaped helpers (header manipulation, aux tags, pileup, region parsing, format detection, BGZF, index I/O). When `htslib-rs` lacks the API, file a task in `htslib-rs/TODO.md` and add it there before consuming from samtools-rs.
+- Default to `htslib-rs` for HTSlib-shaped helpers (header manipulation, aux tags, pileup, region parsing, format detection, BGZF, index I/O). For the current samtools-only pass, when `htslib-rs` lacks the API, add the blocker to the end of this `TODO.md` and continue with other samtools-rs work instead of editing the underlying library.
 - Preserve observable behavior under the parity rules above. Treat each `test.pl` test case as an acceptance test; do not mark a subcommand complete until both its `test.pl` cases and its Rust integration tests pass.
 - Each subcommand is one module under `crates/samtools-rs/src/commands/<name>.rs`, exposing `pub fn main(args: &[OsString]) -> ExitCode` (or similar). The CLI crate dispatches on `argv[1]` exactly like `bamtk.c:246`.
 - Use `clap` for arg parsing but configure it to accept upstream's flag forms (short flags, long flags, value layout). Aliases and synonyms (`stat`/`stats`, `flag`/`flags`, `fastq`/`fasta`/`bam2fq`, `idxstat`/`idxstats`, `pad2unpad`/`depad`, `bamshuf`/`collate`) must be preserved.
@@ -178,20 +194,20 @@ The waves are ordered to land foundational machinery first (read/write/index) an
 - [x] `quickcheck` (`bam_quickcheck.c`) — passes byte-for-byte against `quickcheck/all.expected`.
 - [x] `index` (`bam_index.c`) — BAI/CSI/CRAI build, `-c` CSI mode, `--min-shift`, `-M`, `-o`, legacy `<in> <out.idx>` synopsis. **Pending:** `-@` threads not yet propagated to noodles workers.
 - [x] `idxstats` (`bam_stat.c`) — index-based per-reference counts for BAM, with streaming slow-path counts for SAM, reference-backed CRAM, and unindexed BAM; tests cover both successful reference-backed CRAM and clean missing-reference failure. **Pending:** index-derived CRAM counting path for CRAM inputs without a reference.
-- [~] `faidx` / `fqidx` (`faidx.c`) — index-build mode works (`samtools faidx file.fa` produces `file.fa.fai`); local uncompressed region extraction works for positional regions, `-r` region files, `-o`, `--length`, FASTQ mode via `fqidx` and `faidx -f`, reverse-complement `-i` with mark-strand modes, and `--continue`-style missing-region tolerance. **Pending:** BGZI support, compressed output, output indexing, and full warning text parity.
+- [~] `faidx` / `fqidx` (`faidx.c`) — index-build mode works (`samtools faidx file.fa` produces `file.fa.fai`); BGZF FASTA/FASTQ input now writes `.gzi` and can be indexed/retrieved; local region extraction works for positional regions, `-r` region files, `-o`, `.gz`/`.bgz`/`.bgzf` BGZF output, `--length`, `--write-index` for file outputs, FASTQ mode via `fqidx` and `faidx -f`, reverse-complement `-i` with mark-strand modes, `--continue`-style missing-region tolerance, and upstream-style zero/truncated region warning keywords. The upstream `test_faidx`/`test_fqidx` section now progresses through its checked commands in the local parity harness. **Pending:** exact warning text parity, compression-level/thread option effects, and broader BGZI edge cases.
 - [x] `dict` (`dict.c`) — sequence dictionary builder. Passes byte-for-byte against `dict.out`, `dict.alias.out`, `dict.alt.out` (run via test.pl-style stdin/file invocations).
 - [x] `flagstat` / `flagstats` (`bam_stat.c`) — SAM, BAM, and reference-backed CRAM input. Default + `-O json` + `-O tsv` output modes. Tests cover both successful reference-backed CRAM and clean missing-reference failure. Required extending `htslib-rs::alignment_compat::AlignmentRecordSummary` with `flags_u16` / `reference_sequence_id` / `mate_reference_sequence_id` / `mapping_quality` accessors, plus BAM and reference-backed CRAM summary paths. **Pending:** CRAM input without an explicit reference remains unsupported.
 
 ### Wave B — File Ops
 
-- [~] `sort` (`bam_sort.c`, 138k — the largest single file) — basic in-memory coordinate sort and `-n` name sort for BAM and SAM inputs. Sets `@HD SO` correctly. **Pending:** on-disk external merge for large inputs, tag sort (`-t`), template-coordinate sort (`-M`), minimiser sort (`-N`), thread/memory caps, write-index, CRAM.
-- [~] `merge` (`bam_sort.c` shared) — basic in-memory multi-input merge for BAM and SAM inputs with coordinate or name sort. `-f` overwrite, `-o`/`--output-fmt`. **Pending:** k-way streaming merge, header merging for inputs with differing `@SQ`, region restriction, CRAM.
-- [~] `collate` / `bamshuf` (`bamshuf.c`) — basic in-memory name-sort grouping for BAM and SAM inputs. `-o PREFIX`, `-O` stdout, `--output-fmt sam|bam`. **Pending:** on-disk hash-bucket implementation for inputs larger than memory, `-r` random seed, `-n` in-memory record cap, CRAM.
+- [~] `sort` (`bam_sort.c`, 138k — the largest single file) — basic in-memory coordinate sort and `-n` name sort for BAM and SAM inputs. Supports `-o`, `-O sam|bam`, `--output-fmt sam|bam`, coordinate-sort BAM `--write-index`, and sets `@HD SO` correctly. **Pending:** on-disk external merge for large inputs, tag sort (`-t`), template-coordinate sort (`-M`), minimiser sort (`-N`), thread/memory caps, CRAM.
+- [~] `merge` (`bam_sort.c` shared) — basic in-memory multi-input merge for BAM and SAM inputs with coordinate or name sort. `-f` overwrite, `-o`, `-O sam|bam`, `--output-fmt sam|bam`, and coordinate-sort BAM `--write-index` are supported. **Pending:** k-way streaming merge, header merging for inputs with differing `@SQ`, region restriction, CRAM.
+- [~] `collate` / `bamshuf` (`bamshuf.c`) — basic in-memory name-sort grouping for BAM and SAM inputs. `-o PREFIX`, `-O` stdout, and validated `--output-fmt sam|bam` are supported. **Pending:** on-disk hash-bucket implementation for inputs larger than memory, `-r` random seed, `-n` in-memory record cap, CRAM.
 - [~] `cat` (`bam_cat.c`) — basic BAM concatenation works (record-level decompress + re-encode). Supports `-o`, `-h` (header replacement), default `@PG` insertion, and `--no-PG`. **Pending:** BGZF block-level fast path, CRAM, `-p N/M`, and `-r`.
 - [~] `split` (`bam_split.c`) — basic BAM/SAM-by-`@RG` splitting with per-output `@RG` header filtering and default `@PG` insertion; explicit `-d TAG` string/integer aux-tag splitting with on-demand outputs; explicit `-d RG` unknown-read-group header insertion; `-M`/`--max-split`, `-f` template (`%*`, `%!`, `%#`, `%.`), `-u` unaccounted, `-h` unaccounted SAM header override, `--output-fmt sam|bam`, `--no-PG`, `--write-index` BAI generation for BAM outputs, and `-p N` padding. **Pending:** CRAM, sorted-by-tag streaming mode, and deeper upstream `@PG` byte-parity for complex chains.
 - [~] `reheader` (`bam_reheader.c`) — basic BAM header replacement (record-level rewrite) with default `@PG` insertion, `--no-PG` suppression, and BAM `-c <command>` external header filtering. **Pending:** BGZF block-level fast path and CRAM `--in-place`.
 - [~] `addreplacerg` (`bam_addrprg.c`) — SAM→SAM text-level add/replace for `@RG` header line and `RG:Z` aux tag. `-r SPEC`, `-R ID`, `-m overwrite_all|orphan_only`, `-O sam`, `-o FILE`. **Pending:** BAM/CRAM input/output (blocked on aux mutation), `orphan_first` semantics, mate-aware updates.
-- [~] `fastq` / `fasta` / `bam2fq` (`bam_fastq.c`) — basic single-stream output works for SAM and BAM (records written to stdout, `-o FILE`, or `-0 FILE`), with `-f`/`-F`/`-G` flag filters, read-name suffix controls (`-n`/`-N`), and basic flag-driven paired split outputs (`-1`/`-2`/`-s`/`-0`). **Pending:** barcode/index/tag handling and exact name-grouped paired/singleton/other semantics.
+- [~] `fastq` / `fasta` / `bam2fq` (`bam_fastq.c`) — basic single-stream output works for SAM and BAM (records written to stdout, `-o FILE`, or `-0 FILE`), with `-f`/`--require-flags`, `--rf`/`--include-flags`, `-F`/`--exclude-flags`, `-G`, the upstream default `0x900` secondary/supplementary exclusion, read-name suffix controls (`-n`/`-N`), basic flag-driven paired split outputs (`-1`/`-2`/`-s`/`-0`), SAM/BAM selected aux comments via `-T` in single and split output modes, all-tag SAM/BAM comments via `-T ''` / `-T '*'` in single and split-output FASTQ mode, SAM/BAM `B` array aux comment formatting, SAM/BAM single and split-output FASTQ tag filtering via `-d`/`--tag TAG[:VALUE]` and `-D`/`--tag-file TAG:FILE`, and `-t` as the upstream shortcut for `RG,BC,QT`. The upstream SAM-input all-tags fixture `bam2fq/15.fq.expected` now matches for `-T ''` and `-t -T '*'`. **Pending:** barcode/index handling and exact name-grouped paired/singleton/other semantics.
 - [~] `import` (`bam_import.c`) — basic single FASTA/FASTQ and paired FASTQ (`-1`/`-2`, `--r1`/`--r2`, `-s` interleaved, plus two positional inputs) → SAM/BAM (`-O bam` / `--bam`), including positional single input plus `-0` single-read alias, positional interleaved FASTQ detection from `/1`/`/2` read names, no-op `--no-PG`, CASAVA parsing (`-i`) with upstream-style reverse comments, SRA name2 (`-N`), UMI extraction (`-U`/`--UMI-tag`) with reverse comments, CASAVA barcode sequence tags (`--barcode-tag`), FASTQ definition aux tags (`-T`) including upstream-style float exponent spelling, explicit index reads (`--i1`/`--i2`) for `-0`, `-s`, positional interleaved, and paired `-1`/`-2` inputs with barcode sequence/quality tags (`--barcode-tag`/`--quality-tag`) and `-b`, and read-group header/tag support (`-R`/`-r`) with repeated `-r` accumulation, `-r` precedence over `-R`, and `-r` ID validation. Direct comparisons against `test/import/*.expected.sam` for the currently implemented import fixture commands pass. **Pending:** paired singleton/other grouping, full read-group parity, CRAM output.
 
 ### Wave C — Editing / Mate-aware
@@ -201,14 +217,14 @@ The waves are ordered to land foundational machinery first (read/write/index) an
 - [~] `rmdup` (`bam_rmdup.c` + `bam_rmdupse.c`) — single-end duplicate removal for BAM and SAM inputs (by `(tid, pos, reverse-flag)`, keeping highest MAPQ). **Pending:** paired-end mode, CRAM.
 - [~] `calmd` / `fillmd` (`bam_md.c`) — BAQ paths (`-r`, `-r -e`, `-E`) wired through `htslib_rs::alignment_compat::recalculate_baq_*` and `apply_existing_baq_from_sam_path`. SAM input only. **Pending:** MD/NM tag recomputation against the reference (per-base diff), BAM/CRAM I/O, `-A`/`-d`/`-C cap`.
 - [ ] `targetcut` (`cut_target.c`) — fosmid pool target cutting.
-- [~] `reset` (`reset.c`) — strip alignment fields (`tid`/`pos`/`cigar`/`mapq`/`mate_*`/`template_length`) for BAM and SAM inputs, drop a default set of aligner aux tags (NM, MD, AS, XS, SA, MC, MQ, NH, HI, ms), clear `PROPER_PAIR`/`SECONDARY`/`SUPPLEMENTARY`/`DUP`/`MATE_UNMAPPED`/`REVERSE`/`MATE_REVERSE` flag bits, set `UNMAPPED`. `-x`/`--keep-tag` honored. **Pending:** reverse-strand seq/qual re-reversal, `--reject-PG`, `--dupflag`, CRAM I/O.
+- [~] `reset` (`reset.c`) — strip alignment fields (`tid`/`pos`/`cigar`/`mate_*`/`template_length`) for BAM and SAM inputs, set MAPQ to `0`, drop a default set of aligner aux tags (NM, MD, AS, XS, SA, MC, MQ, NH, HI, ms), clear `PROPER_PAIR`/`SECONDARY`/`SUPPLEMENTARY`/`REVERSE`/`MATE_REVERSE`, set `UNMAPPED`, set `MATE_UNMAPPED` for paired reads, reverse-restore reverse-strand sequence/quality, preserve duplicate flags with `--dupflag`, remove read-group headers/tags with `--no-RG`, remove program header records/chains with `--no-PG` and `--reject-PG`, accept SAM/BAM input from stdin/no positional input/`-`, and tolerate legacy SAM `@HD VN:1` headers. `-x`/`--keep-tag` honored, with `--no-RG` taking precedence over keeping `RG`. **Pending:** CRAM I/O, exact samtools `@PG` insertion/chaining parity.
 - [ ] `ampliconclip` (`bam_ampliconclip.c`, 40k) — primer clipping with BED amplicon spec.
 
 ### Wave D — Stats / Pileup
 
-- [~] `depth` (`bam2depth.c`) — per-position depth via CIGAR walks for BAM and reference-backed indexed CRAM. `-a`/`-aa`/`-d`/`-q`/`-o`, `-r` region restriction, `-b` BED restriction, and multi-input columnar output are supported. Tests cover successful CRAM region depth with top-level `--reference`, multi-input BAM columns, and clean missing-reference failure. **Pending:** pileup-based exact handling of overlaps/deletions, CRAM input without an explicit reference.
-- [~] `coverage` (`coverage.c`) — per-reference/`-r` region `numreads`, `covbases`, `coverage`, `meandepth`, `meanbaseq`, and `meanmapq` via CIGAR walks for BAM and reference-backed indexed CRAM. `--min-depth` thresholds covered-base counts, `-Q`/`--min-BQ` filters low-quality bases, `-q`/`--min-MQ` filters reads, and multiple inputs aggregate into one row per reference/region. Tests cover successful CRAM region coverage with top-level `--reference`, non-zero BAM/CRAM mean base quality, base/depth filtering, multi-input BAM aggregation, and clean missing-reference failure. **Pending:** histogram/ASCII-plot output modes, CRAM input without an explicit reference.
-- [~] `bedcov` (`bedcov.c`) — total aligned-base coverage per BED region, walking each record's CIGAR for BAM and reference-backed indexed CRAM. `-Q` mapq filter, `-H` output headers, `-c` read-count columns, and `-d` depth-threshold columns are supported. Tests cover successful CRAM BED coverage with top-level `--reference` and clean missing-reference failure. **Pending:** pileup-based exact coverage for byte parity.
+- [~] `depth` (`bam2depth.c`) — per-position depth via CIGAR walks for SAM, BAM, and reference-backed indexed CRAM. `-a`/`-aa`/`-d`/`-q`/`-o`, `-r` region restriction, `-b` BED restriction, and multi-input columnar output are supported. Tests cover SAM region depth, successful CRAM region depth with top-level `--reference`, multi-input BAM columns, and clean missing-reference failure. **Pending:** pileup-based exact handling of overlaps/deletions, CRAM input without an explicit reference.
+- [~] `coverage` (`coverage.c`) — per-reference/`-r` region `numreads`, `covbases`, `coverage`, `meandepth`, `meanbaseq`, and `meanmapq` via CIGAR walks for SAM, BAM, and reference-backed indexed CRAM. `--min-depth` thresholds covered-base counts, `-Q`/`--min-BQ` filters low-quality bases, `-q`/`--min-MQ` filters reads, and multiple inputs aggregate into one row per reference/region. Tests cover SAM region coverage, successful CRAM region coverage with top-level `--reference`, non-zero BAM/CRAM mean base quality, base/depth filtering, multi-input BAM aggregation, and clean missing-reference failure. **Pending:** histogram/ASCII-plot output modes, CRAM input without an explicit reference.
+- [~] `bedcov` (`bedcov.c`) — total aligned-base coverage per BED region, walking each record's CIGAR for SAM, BAM, and reference-backed indexed CRAM. `-Q` mapq filter, `-H` output headers, `-c` read-count columns, and `-d` depth-threshold columns are supported. Tests cover SAM depth/count columns, successful CRAM BED coverage with top-level `--reference`, and clean missing-reference failure. **Pending:** pileup-based exact coverage for byte parity.
 - [~] `stats` (`stats.c` + `stats_isize.c`, 123k + 8k) — basic `SN` (Summary Numbers) section for SAM, BAM, and reference-backed CRAM: raw total / filtered / 1st & last fragments / mapped / paired / properly paired / unmapped / duplicated / MQ0 / QC-failed / non-primary / singletons / diffchr pairs. SAM, indexed BAM, and reference-backed CRAM positional region arguments and `-t` target files restrict the summary, with overlapping BAM/CRAM regions de-duplicated. `-d` / `--remove-dups` filters duplicate-marked primary records from the basic summary. Missing CRAM references fail cleanly. **Pending:** FFQ/LFQ, IS (insert sizes), GCF, COV histogram, per-cycle, BAQ, CRAM input without an explicit reference.
 - [ ] `mpileup` (`bam_plcmd.c`, 49k) — multi-way pileup with `htslib-rs::alignment_compat` pileup support. Output formats including VCF, depth-aware.
 - [ ] `consensus` (`bam_consensus.c`, 126k, + `consensus_pileup.c`) — consensus FASTA/FASTQ/pileup builder.
@@ -247,9 +263,18 @@ This list is filled in during Phase 2 as the subcommand surface mapping uncovers
 - [ ] **`sam_pileup` / `bam_plp_*` API surface** — multi-input pileup iterator. `htslib-rs::alignment_compat` has fixture-level pileup but the iterator API surface needs auditing before mpileup/consensus land.
 - [ ] **`hts_set_threads`** — wire-up to BGZF worker count for samtools `-@`.
 - [ ] **`auto_index` / index save during write** — write BAI/CSI/CRAI alongside writer.
+- [ ] **Indexing BAMs without `@HD SO:coordinate` metadata** — upstream `samtools index` indexes fixtures such as `test/dat/test_input_1_a.bam` and `test_input_1_b.bam` even when the header has no coordinate sort-order tag. Current `htslib-rs` index creation rejects these with `invalid sort order: expected coordinate, got None`; defer this here rather than changing `htslib-rs` during the current samtools-only pass.
 - [ ] **CRAM internals for `cram-size`** — currently marked out of scope in `htslib-rs/README.md`. Either expose a minimal block/container/codec inventory API in `htslib-rs`, or drop `cram-size` from samtools-rs scope.
 - [ ] **`htslib-rs::region`** — confirm coverage of HTSlib's full region-string grammar including `*` (unmapped) and `.` (everything else).
 - [ ] **`probaln_glocal` and BAQ recalculation** — exposed by `htslib-rs::probaln`; verify wiring for `calmd` and `mpileup`.
+
+## noodles Extensions Needed (rolling list)
+
+Keep these at the end during the current samtools-only pass. Do not modify the
+noodles submodule for these blockers until explicitly switching back to
+underlying-library work.
+
+- [ ] **CSI query robustness for very large references/regions** — the local parity harness now reaches `test_index`, where `samtools view large_chrom.bam ref2` panics inside `noodles-csi/src/binning_index/index/reference_sequence.rs` with `index out of bounds`, and `ref2:1-541556283` reports `invalid end bound`. Defer to noodles/htslib-rs region/index handling rather than patching noodles from this samtools-rs pass.
 
 ## Submodule Pinning
 
