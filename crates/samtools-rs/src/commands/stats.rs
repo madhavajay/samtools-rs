@@ -35,6 +35,7 @@ struct StatsConfig {
     remove_dups: bool,
     required_flags: u32,
     filter_flags: u32,
+    read_length_filter: Option<usize>,
     coverage_min: u32,
     coverage_max: u32,
     coverage_step: u32,
@@ -47,6 +48,7 @@ impl Default for StatsConfig {
             remove_dups: false,
             required_flags: 0,
             filter_flags: 0,
+            read_length_filter: None,
             coverage_min: 1,
             coverage_max: 1000,
             coverage_step: 1,
@@ -113,8 +115,21 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 Ok(flags) => config.filter_flags |= flags,
                 Err(()) => return ExitCode::from(1),
             },
-            "-@" | "--threads" | "-r" | "--reference" | "-l" | "--read-length" | "-I" | "--id"
-            | "-S" | "--split" | "-P" | "--split-prefix" | "-G" => {
+            "-l" | "--read-length" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("stats", "option -l requires an argument");
+                    return ExitCode::from(1);
+                };
+                match raw.parse::<usize>() {
+                    Ok(len) => config.read_length_filter = Some(len),
+                    Err(e) => {
+                        print_error("stats", format!("invalid read length \"{raw}\": {e}"));
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            "-@" | "--threads" | "-r" | "--reference" | "-I" | "--id" | "-S" | "--split" | "-P"
+            | "--split-prefix" | "-G" => {
                 let _ = iter.next();
             }
             "-d" | "--remove-dups" => {
@@ -723,6 +738,15 @@ struct StatsCounts {
     bases_dup: u64,
 }
 
+struct StatsRecordFields {
+    flag: u32,
+    mapq: Option<u8>,
+    reference_sequence_id: Option<usize>,
+    mate_reference_sequence_id: Option<usize>,
+    template_length: i32,
+    read_len: Option<usize>,
+}
+
 impl StatsCounts {
     fn update_record(
         &mut self,
@@ -754,14 +778,18 @@ impl StatsCounts {
             .transpose()
             .unwrap_or_default();
         let template_length = rec.template_length().ok().unwrap_or(0);
+        let seq_len = rec.sequence().len();
 
         let pre_total = self.total;
         self.update(
-            flag,
-            mapq,
-            reference_sequence_id,
-            mate_reference_sequence_id,
-            template_length,
+            StatsRecordFields {
+                flag,
+                mapq,
+                reference_sequence_id,
+                mate_reference_sequence_id,
+                template_length,
+                read_len: Some(seq_len),
+            },
             config,
         );
 
@@ -769,22 +797,22 @@ impl StatsCounts {
         // reads that were not filtered out by `--remove-dups` — i.e. the
         // ones that contributed to `total`.
         if self.total > pre_total {
-            let seq_len = rec.sequence().len() as u32;
-            if seq_len > 0 {
-                self.total_len += u64::from(seq_len);
-                if seq_len > self.max_len {
-                    self.max_len = seq_len;
+            let seq_len_u32 = seq_len as u32;
+            if seq_len_u32 > 0 {
+                self.total_len += u64::from(seq_len_u32);
+                if seq_len_u32 > self.max_len {
+                    self.max_len = seq_len_u32;
                 }
                 if flag & BAM_FREAD1 != 0 {
-                    self.total_len_1st += u64::from(seq_len);
-                    if seq_len > self.max_len_1st {
-                        self.max_len_1st = seq_len;
+                    self.total_len_1st += u64::from(seq_len_u32);
+                    if seq_len_u32 > self.max_len_1st {
+                        self.max_len_1st = seq_len_u32;
                     }
                 }
                 if flag & BAM_FREAD2 != 0 {
-                    self.total_len_2nd += u64::from(seq_len);
-                    if seq_len > self.max_len_2nd {
-                        self.max_len_2nd = seq_len;
+                    self.total_len_2nd += u64::from(seq_len_u32);
+                    if seq_len_u32 > self.max_len_2nd {
+                        self.max_len_2nd = seq_len_u32;
                     }
                 }
             }
@@ -800,10 +828,10 @@ impl StatsCounts {
             }
 
             if flag & BAM_FDUP != 0 {
-                self.bases_dup += u64::from(seq_len);
+                self.bases_dup += u64::from(seq_len_u32);
             }
 
-            if seq_len > 0 {
+            if seq_len_u32 > 0 {
                 let gc_percent = gc_percent_hundredths(rec.sequence().iter());
                 if flag & BAM_FREAD1 != 0 {
                     *self.first_gc_hist.entry(gc_percent).or_default() += 1;
@@ -814,7 +842,7 @@ impl StatsCounts {
             }
 
             if flag & BAM_FUNMAP == 0 {
-                self.bases_mapped += u64::from(seq_len);
+                self.bases_mapped += u64::from(seq_len_u32);
                 use sam::alignment::record::cigar::op::Kind;
                 for op in rec.cigar().iter().flatten() {
                     if matches!(
@@ -879,24 +907,20 @@ impl StatsCounts {
 
     fn update_summary(&mut self, rec: &AlignmentRecordSummary, config: StatsConfig) {
         self.update(
-            rec.flags_u16() as u32,
-            rec.mapping_quality(),
-            rec.reference_sequence_id(),
-            rec.mate_reference_sequence_id(),
-            rec.template_length(),
+            StatsRecordFields {
+                flag: rec.flags_u16() as u32,
+                mapq: rec.mapping_quality(),
+                reference_sequence_id: rec.reference_sequence_id(),
+                mate_reference_sequence_id: rec.mate_reference_sequence_id(),
+                template_length: rec.template_length(),
+                read_len: None,
+            },
             config,
         );
     }
 
-    fn update(
-        &mut self,
-        flag: u32,
-        mapq: Option<u8>,
-        reference_sequence_id: Option<usize>,
-        mate_reference_sequence_id: Option<usize>,
-        template_length: i32,
-        config: StatsConfig,
-    ) {
+    fn update(&mut self, rec: StatsRecordFields, config: StatsConfig) {
+        let flag = rec.flag;
         if flag & BAM_FSECONDARY != 0 {
             self.secondary += 1;
             return;
@@ -914,6 +938,13 @@ impl StatsCounts {
             self.filtered += 1;
             return;
         }
+        if config
+            .read_length_filter
+            .is_some_and(|required_len| rec.read_len != Some(required_len))
+        {
+            self.filtered += 1;
+            return;
+        }
         if config.remove_dups && flag & BAM_FDUP != 0 {
             self.filtered += 1;
             return;
@@ -922,7 +953,7 @@ impl StatsCounts {
 
         if flag & BAM_FUNMAP == 0 {
             self.mapped += 1;
-            if mapq == Some(0) {
+            if rec.mapq == Some(0) {
                 self.mq0 += 1;
             }
         } else {
@@ -941,16 +972,16 @@ impl StatsCounts {
             }
             if flag & BAM_FUNMAP == 0 && flag & BAM_FMUNMAP == 0 {
                 self.mapped_and_paired += 1;
-                if reference_sequence_id != mate_reference_sequence_id
-                    && reference_sequence_id.is_some()
-                    && mate_reference_sequence_id.is_some()
+                if rec.reference_sequence_id != rec.mate_reference_sequence_id
+                    && rec.reference_sequence_id.is_some()
+                    && rec.mate_reference_sequence_id.is_some()
                 {
                     self.diffchr += 1;
                 }
-                if reference_sequence_id == mate_reference_sequence_id
-                    && reference_sequence_id.is_some()
+                if rec.reference_sequence_id == rec.mate_reference_sequence_id
+                    && rec.reference_sequence_id.is_some()
                 {
-                    self.update_isize_bin(flag, template_length);
+                    self.update_isize_bin(flag, rec.template_length);
                 }
             }
             if flag & BAM_FMUNMAP != 0 && flag & BAM_FUNMAP == 0 {

@@ -2177,6 +2177,44 @@ read3\t4\t*\t0\t0\t*\t*\t0\t0\tGGGG\tIIII
 }
 
 #[test]
+fn stats_filters_by_exact_read_length() {
+    let tmp = tmp_dir("stats-read-length-filter");
+    let sam = tmp.join("lengths.sam");
+    let out = tmp.join("lengths.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:100
+short\t0\tchr1\t1\t60\t3M\t*\t0\t0\tAAA\tIII
+long\t0\tchr1\t5\t60\t5M\t*\t0\t0\tCCCCC\tIIIII
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-l",
+                "5",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("SN\traw total sequences:\t2\n"));
+    assert!(text.contains("SN\tfiltered sequences:\t1\n"));
+    assert!(text.contains("SN\tsequences:\t1\n"));
+    assert!(text.contains("SN\ttotal length:\t5\n"));
+    assert!(text.contains("SN\tmaximum length:\t5\n"));
+}
+
+#[test]
 fn stats_emits_bases_mapped_and_error_rate_sn_lines() {
     let tmp = tmp_dir("stats-error-rate");
     let sam = tmp.join("nm.sam");
