@@ -2,6 +2,9 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::io;
+
+use htslib_rs::sam;
 
 use crate::version::SAMTOOLS_VERSION;
 
@@ -24,6 +27,26 @@ pub fn add_samtools_pg(header_text: &str, argv: &[OsString]) -> Result<String, S
             command_line: Some(&command_line),
         },
     )
+}
+
+/// Adds samtools' standard `@PG` line(s) to a typed SAM header.
+pub fn add_samtools_pg_to_header(
+    header: &sam::Header,
+    argv: &[OsString],
+) -> io::Result<sam::Header> {
+    let mut bytes = Vec::new();
+    {
+        let mut writer = sam::io::Writer::new(&mut bytes);
+        writer.write_header(header)?;
+    }
+    let header_text =
+        String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let header_text = add_samtools_pg(&header_text, argv)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    header_text
+        .parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 /// Program-line fields used when adding a `@PG` record.

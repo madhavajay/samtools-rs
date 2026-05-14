@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use flate2::read::MultiGzDecoder;
-use samtools_rs::commands::{bedcov, coverage, depth, index, view};
+use samtools_rs::commands::{bedcov, coverage, depth, index, stats, view};
 use samtools_rs::native;
 use samtools_rs::run as samtools_run;
 
@@ -150,6 +150,36 @@ fn depth_bed_outputs_only_bed_interval() {
 }
 
 #[test]
+fn depth_multi_input_outputs_one_column_per_input() {
+    let p = indexed_bam();
+    let tmp = tmp_dir("depth-multi");
+    let out = tmp.join("depth.tsv");
+    assert_eq!(
+        exit_to_u8(depth::main(&argv(
+            "depth",
+            &[
+                "-r",
+                "17:1-10000",
+                "-o",
+                out.to_str().unwrap(),
+                p.to_str().unwrap(),
+                p.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(!text.is_empty());
+    for line in text.lines() {
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields[0], "17");
+        assert_eq!(fields[2], fields[3]);
+    }
+}
+
+#[test]
 fn depth_cram_region_uses_top_level_reference() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let tmp = tmp_dir("depth-cram");
@@ -210,6 +240,64 @@ fn coverage_outputs_per_ref() {
 }
 
 #[test]
+fn coverage_multi_input_aggregates_per_reference() {
+    let p = indexed_bam();
+    let tmp = tmp_dir("coverage-multi");
+    let single_out = tmp.join("single.tsv");
+    let multi_out = tmp.join("multi.tsv");
+
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-r",
+                "17:1-10000",
+                "-o",
+                single_out.to_str().unwrap(),
+                p.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-r",
+                "17:1-10000",
+                "-o",
+                multi_out.to_str().unwrap(),
+                p.to_str().unwrap(),
+                p.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let single_text = std::fs::read_to_string(single_out).unwrap();
+    let multi_text = std::fs::read_to_string(multi_out).unwrap();
+    let single_rows: Vec<_> = single_text
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+    let multi_rows: Vec<_> = multi_text
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+    assert_eq!(single_rows.len(), 1);
+    assert_eq!(multi_rows.len(), 1);
+
+    let single_fields: Vec<_> = single_rows[0].split('\t').collect();
+    let multi_fields: Vec<_> = multi_rows[0].split('\t').collect();
+    assert_eq!(multi_fields[0], "17");
+    assert_eq!(
+        multi_fields[3].parse::<u64>().unwrap(),
+        single_fields[3].parse::<u64>().unwrap() * 2
+    );
+    assert!(multi_fields[6].parse::<f64>().unwrap() > single_fields[6].parse::<f64>().unwrap());
+}
+
+#[test]
 fn coverage_region_outputs_requested_interval() {
     let p = indexed_bam();
     let tmp = tmp_dir("coverage-region");
@@ -232,6 +320,67 @@ fn coverage_region_outputs_requested_interval() {
     let rows: Vec<_> = text.lines().filter(|line| !line.starts_with('#')).collect();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].starts_with("17\t1\t10000\t"));
+    let fields: Vec<_> = rows[0].split('\t').collect();
+    assert!(fields[7].parse::<f64>().unwrap() > 0.0);
+}
+
+#[test]
+fn coverage_min_depth_and_base_quality_filter_covbases() {
+    let p = indexed_bam();
+    let tmp = tmp_dir("coverage-filters");
+    let default_out = tmp.join("coverage-default.tsv");
+    let filtered_out = tmp.join("coverage-filtered.tsv");
+
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-r",
+                "17:1-10000",
+                "-o",
+                default_out.to_str().unwrap(),
+                p.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-r",
+                "17:1-10000",
+                "--min-depth",
+                "2",
+                "-Q",
+                "30",
+                "-o",
+                filtered_out.to_str().unwrap(),
+                p.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let default_row = std::fs::read_to_string(default_out)
+        .unwrap()
+        .lines()
+        .find(|line| !line.starts_with('#'))
+        .unwrap()
+        .to_owned();
+    let filtered_row = std::fs::read_to_string(filtered_out)
+        .unwrap()
+        .lines()
+        .find(|line| !line.starts_with('#'))
+        .unwrap()
+        .to_owned();
+    let default_fields: Vec<_> = default_row.split('\t').collect();
+    let filtered_fields: Vec<_> = filtered_row.split('\t').collect();
+    let default_covbases = default_fields[4].parse::<usize>().unwrap();
+    let filtered_covbases = filtered_fields[4].parse::<usize>().unwrap();
+
+    assert!(filtered_covbases < default_covbases);
+    assert!(filtered_fields[7].parse::<f64>().unwrap() >= 30.0);
 }
 
 #[test]
@@ -263,7 +412,7 @@ fn coverage_cram_region_uses_top_level_reference() {
     let text = std::fs::read_to_string(out).unwrap();
     assert!(
         text.contains(
-            "CHROMOSOME_II\t2980\t2980\t1\t1\t100.000000\t1.000000\t0.000000\t60.000000\n"
+            "CHROMOSOME_II\t2980\t2980\t1\t1\t100.000000\t1.000000\t35.000000\t60.000000\n"
         )
     );
 }
@@ -320,6 +469,252 @@ fn stats_cram_without_reference_fails_cleanly() {
         ))),
         0
     );
+}
+
+#[test]
+fn stats_cram_region_and_target_file_restrict_summary_counts() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+    let tmp = tmp_dir("stats-cram-region");
+    let targets = tmp.join("targets.txt");
+    let full_out = tmp.join("full.stats");
+    let region_out = tmp.join("region.stats");
+    let target_out = tmp.join("target.stats");
+
+    std::fs::write(&targets, "CHROMOSOME_II 2980 2980\n").unwrap();
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "stats",
+                "-o",
+                full_out.to_str().unwrap(),
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "stats",
+                "-o",
+                region_out.to_str().unwrap(),
+                cram.to_str().unwrap(),
+                "CHROMOSOME_II:2980-2980",
+            ],
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "stats",
+                "-t",
+                targets.to_str().unwrap(),
+                "-o",
+                target_out.to_str().unwrap(),
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+
+    let full_total = stats_sn_value(&std::fs::read_to_string(full_out).unwrap(), "sequences");
+    let region_total = stats_sn_value(&std::fs::read_to_string(region_out).unwrap(), "sequences");
+    let target_total = stats_sn_value(&std::fs::read_to_string(target_out).unwrap(), "sequences");
+
+    assert!(region_total > 0);
+    assert!(region_total < full_total);
+    assert_eq!(target_total, region_total);
+}
+
+#[test]
+fn stats_bam_positional_region_restricts_summary_counts() {
+    let bam = indexed_bam();
+    let tmp = tmp_dir("stats-region");
+    let full_out = tmp.join("full.stats");
+    let region_out = tmp.join("region.stats");
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &["-o", full_out.to_str().unwrap(), bam.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-o",
+                region_out.to_str().unwrap(),
+                bam.to_str().unwrap(),
+                "17:2726-2730"
+            ]
+        ))),
+        0
+    );
+
+    let full_total = stats_sn_value(&std::fs::read_to_string(full_out).unwrap(), "sequences");
+    let region_total = stats_sn_value(&std::fs::read_to_string(region_out).unwrap(), "sequences");
+
+    assert!(region_total > 0);
+    assert!(region_total < full_total);
+}
+
+#[test]
+fn stats_bam_target_file_restricts_summary_counts() {
+    let bam = indexed_bam();
+    let tmp = tmp_dir("stats-targets");
+    let targets = tmp.join("targets.txt");
+    let full_out = tmp.join("full.stats");
+    let target_out = tmp.join("target.stats");
+
+    std::fs::write(&targets, "# comments are ignored\n17 2726 2730\n").unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &["-o", full_out.to_str().unwrap(), bam.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-t",
+                targets.to_str().unwrap(),
+                "-o",
+                target_out.to_str().unwrap(),
+                bam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let full_total = stats_sn_value(&std::fs::read_to_string(full_out).unwrap(), "sequences");
+    let target_total = stats_sn_value(&std::fs::read_to_string(target_out).unwrap(), "sequences");
+
+    assert!(target_total > 0);
+    assert!(target_total < full_total);
+}
+
+#[test]
+fn stats_remove_dups_filters_duplicate_marked_reads() {
+    let tmp = tmp_dir("stats-remove-dups");
+    let sam = tmp.join("dups.sam");
+    let all_out = tmp.join("all.stats");
+    let dedup_out = tmp.join("dedup.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:100
+r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!
+r2\t1024\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &["-o", all_out.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-d",
+                "-o",
+                dedup_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let all_text = std::fs::read_to_string(all_out).unwrap();
+    let dedup_text = std::fs::read_to_string(dedup_out).unwrap();
+
+    assert_eq!(stats_sn_value(&all_text, "raw total sequences"), 2);
+    assert_eq!(stats_sn_value(&all_text, "filtered sequences"), 0);
+    assert_eq!(stats_sn_value(&all_text, "sequences"), 2);
+    assert_eq!(stats_sn_value(&all_text, "reads duplicated"), 1);
+    assert_eq!(stats_sn_value(&dedup_text, "raw total sequences"), 2);
+    assert_eq!(stats_sn_value(&dedup_text, "filtered sequences"), 1);
+    assert_eq!(stats_sn_value(&dedup_text, "sequences"), 1);
+    assert_eq!(stats_sn_value(&dedup_text, "reads duplicated"), 0);
+}
+
+#[test]
+fn stats_target_regions_deduplicate_overlaps_for_sam_and_bam() {
+    let fixtures = fixtures_dir().join("stat");
+    let sam = fixtures.join("11_target.sam");
+    let bam = fixtures.join("11_target.bam");
+    let targets = fixtures.join("11.stats.targets");
+    let tmp = tmp_dir("stats-target-dedup");
+    let sam_out = tmp.join("sam.stats");
+    let bam_out = tmp.join("bam.stats");
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-t",
+                targets.to_str().unwrap(),
+                "-o",
+                sam_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-o",
+                bam_out.to_str().unwrap(),
+                bam.to_str().unwrap(),
+                "ref1:10-24",
+                "ref1:30-46",
+                "ref1:39-56",
+            ]
+        ))),
+        0
+    );
+
+    let sam_total = stats_sn_value(&std::fs::read_to_string(sam_out).unwrap(), "sequences");
+    let bam_total = stats_sn_value(&std::fs::read_to_string(bam_out).unwrap(), "sequences");
+
+    assert_eq!(sam_total, 26);
+    assert_eq!(bam_total, 26);
+}
+
+fn stats_sn_value(text: &str, key: &str) -> u64 {
+    text.lines()
+        .find_map(|line| {
+            let fields: Vec<_> = line.split('\t').collect();
+            (fields.len() == 3 && fields[0] == "SN" && fields[1] == format!("{key}:"))
+                .then(|| fields[2].parse().unwrap())
+        })
+        .unwrap()
 }
 
 #[test]

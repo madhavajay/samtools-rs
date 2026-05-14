@@ -3,19 +3,20 @@
 //!
 //! Mirrors `main_bamshuf` in `bamshuf.c`. The upstream implementation uses
 //! name-hash bucketing with on-disk temp files for memory bounding. This
-//! initial Rust port performs an in-memory name sort, which gives the same
-//! per-name grouping result but does not scale to inputs larger than memory.
+//! initial Rust port performs an in-memory name sort for BAM/SAM inputs, which
+//! gives the same per-name grouping result but does not scale to inputs larger
+//! than memory.
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use htslib_rs::bam;
 use htslib_rs::bgzf;
 use htslib_rs::format::Exact;
-use htslib_rs::sam;
+use htslib_rs::sam::{self, alignment::RecordBuf};
 
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
@@ -80,10 +81,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if format.exact != Exact::Bam {
+    if !matches!(format.exact, Exact::Sam | Exact::Bam) {
         print_error(
             "collate",
-            "only BAM input is currently supported (SAM/CRAM TODO)",
+            "only SAM and BAM input are currently supported (CRAM TODO)",
         );
         return ExitCode::from(1);
     }
@@ -125,18 +126,17 @@ enum OutputTarget {
 }
 
 fn run_collate(input: &Path, output: OutputTarget, fmt: OutFmt) -> io::Result<()> {
-    let mut reader = bam::io::Reader::new(File::open(input)?);
-    let header = reader.read_header()?;
-
-    let mut records: Vec<bam::Record> = Vec::new();
-    let mut record = bam::Record::default();
-    loop {
-        let n = reader.read_record(&mut record)?;
-        if n == 0 {
-            break;
+    let format = sam_io::sam_open_format(input)?;
+    let (header, mut records) = match format.exact {
+        Exact::Sam => read_sam_records(input)?,
+        Exact::Bam => read_bam_records(input)?,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only SAM and BAM input are currently supported (CRAM TODO)",
+            ));
         }
-        records.push(record.clone());
-    }
+    };
 
     records.sort_by(|a, b| {
         let an = a.name().map(|s| s.to_vec()).unwrap_or_default();
@@ -151,8 +151,36 @@ fn run_collate(input: &Path, output: OutputTarget, fmt: OutFmt) -> io::Result<()
     Ok(())
 }
 
-trait BamLike {
-    fn write_record(&mut self, header: &sam::Header, record: &bam::Record) -> io::Result<()>;
+fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+    let mut reader = bam::io::Reader::new(File::open(input)?);
+    let header = reader.read_header()?;
+    let mut records = Vec::new();
+    loop {
+        let mut record = RecordBuf::default();
+        if reader.read_record_buf(&header, &mut record)? == 0 {
+            break;
+        }
+        records.push(record);
+    }
+    Ok((header, records))
+}
+
+fn read_sam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+    let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
+    let header = reader.read_header()?;
+    let mut records = Vec::new();
+    loop {
+        let mut record = RecordBuf::default();
+        if reader.read_record_buf(&header, &mut record)? == 0 {
+            break;
+        }
+        records.push(record);
+    }
+    Ok((header, records))
+}
+
+trait CollateSink {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()>;
 }
 
 struct BamFile(bam::io::Writer<bgzf::io::Writer<File>>);
@@ -160,24 +188,26 @@ struct BamStdout(bam::io::Writer<bgzf::io::Writer<io::Stdout>>);
 struct SamFile(sam::io::Writer<File>);
 struct SamStdout(sam::io::Writer<io::Stdout>);
 
-impl BamLike for BamFile {
-    fn write_record(&mut self, header: &sam::Header, record: &bam::Record) -> io::Result<()> {
-        self.0.write_record(header, record)
-    }
-}
-impl BamLike for BamStdout {
-    fn write_record(&mut self, header: &sam::Header, record: &bam::Record) -> io::Result<()> {
-        self.0.write_record(header, record)
-    }
-}
-impl BamLike for SamFile {
-    fn write_record(&mut self, header: &sam::Header, record: &bam::Record) -> io::Result<()> {
+impl CollateSink for BamFile {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
         use sam::alignment::io::Write as _;
         self.0.write_alignment_record(header, record)
     }
 }
-impl BamLike for SamStdout {
-    fn write_record(&mut self, header: &sam::Header, record: &bam::Record) -> io::Result<()> {
+impl CollateSink for BamStdout {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        use sam::alignment::io::Write as _;
+        self.0.write_alignment_record(header, record)
+    }
+}
+impl CollateSink for SamFile {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        use sam::alignment::io::Write as _;
+        self.0.write_alignment_record(header, record)
+    }
+}
+impl CollateSink for SamStdout {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
         use sam::alignment::io::Write as _;
         self.0.write_alignment_record(header, record)
     }
@@ -187,7 +217,7 @@ fn open_output(
     out: &OutputTarget,
     fmt: OutFmt,
     header: &sam::Header,
-) -> io::Result<Box<dyn BamLike>> {
+) -> io::Result<Box<dyn CollateSink>> {
     match (out, fmt) {
         (OutputTarget::Stdout, OutFmt::Sam) => {
             let mut writer = sam::io::Writer::new(io::stdout());
@@ -218,7 +248,7 @@ fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
     writeln!(
         w,
-        "Usage: samtools collate [options] <in.bam> [<out.prefix>]"
+        "Usage: samtools collate [options] <in.bam|in.sam> [<out.prefix>]"
     )?;
     writeln!(w, "  -o PREFIX   output prefix or path")?;
     writeln!(w, "  -O          write to stdout")?;

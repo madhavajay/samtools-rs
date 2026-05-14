@@ -11,14 +11,14 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use htslib_rs::bam;
 use htslib_rs::bgzf;
 use htslib_rs::format::Exact;
-use htslib_rs::sam;
+use htslib_rs::sam::{self, alignment::RecordBuf, alignment::io::Write as _};
 
 use crate::bam_flag::{BAM_FREVERSE, BAM_FUNMAP};
 use crate::diagnostics::{print_error, print_error_errno};
@@ -66,15 +66,21 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if format.exact != Exact::Bam {
+    if !matches!(format.exact, Exact::Sam | Exact::Bam) {
         print_error(
             "rmdup",
-            "only BAM input is currently supported (SAM/CRAM TODO)",
+            "only SAM and BAM input are currently supported (CRAM TODO)",
         );
         return ExitCode::from(1);
     }
 
-    match run_rmdup(&input, output.as_deref()) {
+    let result = match format.exact {
+        Exact::Sam => run_sam_rmdup(&input, output.as_deref()),
+        Exact::Bam => run_bam_rmdup(&input, output.as_deref()),
+        _ => unreachable!("format checked above"),
+    };
+
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             print_error_errno("rmdup", "rmdup failed", &e);
@@ -83,7 +89,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 }
 
-fn run_rmdup(input: &Path, output: Option<&Path>) -> io::Result<()> {
+fn run_bam_rmdup(input: &Path, output: Option<&Path>) -> io::Result<()> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let header = reader.read_header()?;
 
@@ -136,13 +142,68 @@ fn run_rmdup(input: &Path, output: Option<&Path>) -> io::Result<()> {
         }
     }
 
-    let mut writer = open_output(output, &header)?;
+    let mut writer = open_bam_output(output, &header)?;
     for (i, rec) in records.iter().enumerate() {
         if keep[i] {
             writer.write_record(&header, rec)?;
         }
     }
     Ok(())
+}
+
+fn run_sam_rmdup(input: &Path, output: Option<&Path>) -> io::Result<()> {
+    let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
+    let header = reader.read_header()?;
+
+    let mut records: Vec<RecordBuf> = Vec::new();
+    loop {
+        let mut record = RecordBuf::default();
+        if reader.read_record_buf(&header, &mut record)? == 0 {
+            break;
+        }
+        records.push(record);
+    }
+
+    let keep = duplicate_keep_mask_for_sam_records(&records);
+    let mut writer = open_sam_output(output, &header)?;
+    for (i, rec) in records.iter().enumerate() {
+        if keep[i] {
+            writer.write_record(&header, rec)?;
+        }
+    }
+    Ok(())
+}
+
+fn duplicate_keep_mask_for_sam_records(records: &[RecordBuf]) -> Vec<bool> {
+    let mut best_per_group: HashMap<(i32, i64, bool), usize> = HashMap::new();
+    let mut keep = vec![false; records.len()];
+    for (i, rec) in records.iter().enumerate() {
+        let flag = rec.flags().bits() as u32;
+        if flag & BAM_FUNMAP != 0 {
+            keep[i] = true;
+            continue;
+        }
+        let tid = rec.reference_sequence_id().map(|t| t as i32).unwrap_or(-1);
+        let pos = rec.alignment_start().map(usize::from).unwrap_or(0) as i64;
+        let rev = flag & BAM_FREVERSE != 0;
+        let mapq = rec.mapping_quality().map(u8::from).unwrap_or(0);
+        let key = (tid, pos, rev);
+        match best_per_group.get(&key) {
+            Some(&idx) => {
+                let prev_mapq = records[idx].mapping_quality().map(u8::from).unwrap_or(0);
+                if mapq > prev_mapq {
+                    keep[idx] = false;
+                    keep[i] = true;
+                    best_per_group.insert(key, i);
+                }
+            }
+            None => {
+                keep[i] = true;
+                best_per_group.insert(key, i);
+            }
+        }
+    }
+    keep
 }
 
 trait BamLike {
@@ -163,7 +224,7 @@ impl BamLike for BamStdout {
     }
 }
 
-fn open_output(out: Option<&Path>, header: &sam::Header) -> io::Result<Box<dyn BamLike>> {
+fn open_bam_output(out: Option<&Path>, header: &sam::Header) -> io::Result<Box<dyn BamLike>> {
     match out {
         Some(p) => {
             let mut writer = bam::io::Writer::new(File::create(p)?);
@@ -178,9 +239,42 @@ fn open_output(out: Option<&Path>, header: &sam::Header) -> io::Result<Box<dyn B
     }
 }
 
+trait SamLike {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()>;
+}
+
+struct SamFile(sam::io::Writer<File>);
+struct SamStdout(sam::io::Writer<io::Stdout>);
+
+impl SamLike for SamFile {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        self.0.write_alignment_record(header, record)
+    }
+}
+impl SamLike for SamStdout {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        self.0.write_alignment_record(header, record)
+    }
+}
+
+fn open_sam_output(out: Option<&Path>, header: &sam::Header) -> io::Result<Box<dyn SamLike>> {
+    match out {
+        Some(p) => {
+            let mut writer = sam::io::Writer::new(File::create(p)?);
+            writer.write_header(header)?;
+            Ok(Box::new(SamFile(writer)))
+        }
+        None => {
+            let mut writer = sam::io::Writer::new(io::stdout());
+            writer.write_header(header)?;
+            Ok(Box::new(SamStdout(writer)))
+        }
+    }
+}
+
 fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
-    writeln!(w, "Usage: samtools rmdup [-sS] <in.bam> [<out.bam>]")?;
+    writeln!(w, "Usage: samtools rmdup [-sS] <in.bam|in.sam> [<out>]")?;
     writeln!(
         w,
         "  -s    treat reads as single-end (this port: single-end only)"

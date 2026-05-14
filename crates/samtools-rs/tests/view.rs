@@ -137,6 +137,43 @@ fn view_unselected_sam_output_splits_filter_results() {
 }
 
 #[test]
+fn view_unselected_sam_output_splits_expr_results() {
+    let tmp = tmp_dir("unselected-sam-expr");
+    let input = tmp.join("input.sam");
+    let selected = tmp.join("selected.sam");
+    let unselected = tmp.join("unselected.sam");
+
+    std::fs::write(
+        &input,
+        b"@HD\tVN:1.6\n@SQ\tSN:ref\tLN:100\nr1\t0\tref\t1\t20\t2M\t*\t0\t0\tAC\t!!\trg:Z:a\nr2\t0\tref\t2\t0\t2M\t*\t0\t0\tTG\t##\trg:Z:b\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        run(&[
+            "-h",
+            "-e",
+            "mapq >= 10",
+            "-U",
+            unselected.to_str().unwrap(),
+            "-o",
+            selected.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+
+    let selected_text = std::fs::read_to_string(selected).unwrap();
+    let unselected_text = std::fs::read_to_string(unselected).unwrap();
+    assert!(selected_text.starts_with("@HD\t"));
+    assert!(unselected_text.starts_with("@HD\t"));
+    assert!(selected_text.contains("\nr1\t"));
+    assert!(!selected_text.contains("\nr2\t"));
+    assert!(unselected_text.contains("\nr2\t"));
+    assert!(!unselected_text.contains("\nr1\t"));
+}
+
+#[test]
 fn view_unmap_unselected_sam_output_keeps_failed_records() {
     let tmp = tmp_dir("unmap-unselected-sam");
     let input = tmp.join("input.sam");
@@ -174,6 +211,84 @@ fn view_unmap_unselected_sam_output_keeps_failed_records() {
 }
 
 #[test]
+fn view_unmap_unselected_sam_output_keeps_expr_failed_records() {
+    let tmp = tmp_dir("unmap-unselected-sam-expr");
+    let input = tmp.join("input.sam");
+    let output = tmp.join("output.sam");
+
+    std::fs::write(
+        &input,
+        b"@HD\tVN:1.6\n@SQ\tSN:ref\tLN:100\nr1\t0\tref\t1\t20\t2M\t*\t0\t0\tAC\t!!\nr2\t0\tref\t2\t0\t2M\t*\t0\t99\tTG\t##\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        run(&[
+            "-e",
+            "mapq >= 10",
+            "-p",
+            "-o",
+            output.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+
+    let text = std::fs::read_to_string(output).unwrap();
+    let records: Vec<&str> = text.lines().collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].split('\t').next(), Some("r1"));
+    assert_eq!(records[0].split('\t').nth(1), Some("0"));
+    assert_eq!(records[1].split('\t').next(), Some("r2"));
+    let failed_fields: Vec<&str> = records[1].split('\t').collect();
+    assert_eq!(failed_fields[1], "4");
+    assert_eq!(failed_fields[4], "0");
+    assert_eq!(failed_fields[5], "*");
+    assert_eq!(failed_fields[8], "0");
+}
+
+#[test]
+fn view_bam_sam_unselected_output_splits_expr_results() {
+    let tmp = tmp_dir("bam-unselected-sam-expr");
+    let input = tmp.join("input.sam");
+    let bam = tmp.join("input.bam");
+    let selected = tmp.join("selected.sam");
+    let unselected = tmp.join("unselected.sam");
+
+    std::fs::write(
+        &input,
+        b"@HD\tVN:1.6\n@SQ\tSN:ref\tLN:100\nr1\t0\tref\t1\t20\t2M\t*\t0\t0\tAC\t!!\nr2\t0\tref\t2\t0\t2M\t*\t0\t0\tTG\t##\n",
+    )
+    .unwrap();
+    htslib_rs::alignment_compat::write_bam_from_sam_path(
+        &input,
+        std::fs::File::create(&bam).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        run(&[
+            "-h",
+            "-e",
+            "mapq >= 10",
+            "-U",
+            unselected.to_str().unwrap(),
+            "-o",
+            selected.to_str().unwrap(),
+            bam.to_str().unwrap(),
+        ]),
+        0
+    );
+
+    let selected_text = std::fs::read_to_string(selected).unwrap();
+    let unselected_text = std::fs::read_to_string(unselected).unwrap();
+    assert!(selected_text.contains("\nr1\t"));
+    assert!(!selected_text.contains("\nr2\t"));
+    assert!(unselected_text.contains("\nr2\t"));
+    assert!(!unselected_text.contains("\nr1\t"));
+}
+
+#[test]
 fn view_sam_to_bam_output_honors_mapq_filter() {
     let tmp = tmp_dir("sam-bam-line-filter");
     let out = tmp.join("out.bam");
@@ -200,6 +315,72 @@ fn view_sam_to_bam_output_honors_mapq_filter() {
         .collect();
     assert!(!mapqs.is_empty());
     assert!(mapqs.iter().all(|mapq| *mapq >= 10));
+}
+
+#[test]
+fn view_sam_to_bam_output_strips_tags() {
+    let tmp = tmp_dir("sam-bam-tag-filter");
+    let input = tmp.join("input.sam");
+    let out = tmp.join("out.bam");
+
+    std::fs::write(
+        &input,
+        b"@HD\tVN:1.6\n@SQ\tSN:ref\tLN:100\nr1\t0\tref\t1\t20\t2M\t*\t0\t0\tAC\t!!\trg:Z:a\taa:i:1\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        run(&[
+            "-b",
+            "-x",
+            "rg",
+            "-o",
+            out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+
+    let text =
+        htslib_rs::alignment_compat::view_bam_as_sam_text_from_path_with_limit(&out, None).unwrap();
+    assert!(text.contains("\tr1\t") || text.contains("\nr1\t"));
+    assert!(!text.contains("\trg:Z:a"));
+    assert!(text.contains("\taa:i:1"));
+}
+
+#[test]
+fn view_sam_to_bam_output_strips_tags_with_expr() {
+    let tmp = tmp_dir("sam-bam-tag-filter-expr");
+    let input = tmp.join("input.sam");
+    let out = tmp.join("out.bam");
+
+    std::fs::write(
+        &input,
+        b"@HD\tVN:1.6\n@SQ\tSN:ref1\tLN:56\nr1\t0\tref1\t1\t20\t2M\t*\t0\t0\tAC\t!!\trg:Z:a\taa:i:1\nr2\t0\tref1\t2\t0\t2M\t*\t0\t0\tTG\t##\trg:Z:b\taa:i:2\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        run(&[
+            "-b",
+            "-e",
+            "mapq >= 10",
+            "-x",
+            "rg",
+            "-o",
+            out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+
+    let text =
+        htslib_rs::alignment_compat::view_bam_as_sam_text_from_path_with_limit(&out, None).unwrap();
+    assert!(text.contains("\tr1\t") || text.contains("\nr1\t"));
+    assert!(!text.contains("\nr2\t"));
+    assert!(!text.contains("\trg:Z:a"));
+    assert!(!text.contains("\trg:Z:b"));
+    assert!(text.contains("\taa:i:1"));
 }
 
 #[test]
@@ -238,8 +419,49 @@ fn view_sam_to_cram_output_honors_mapq_filter() {
 }
 
 #[test]
-fn view_bam_to_bam_output_rejects_line_filters_until_supported() {
-    let tmp = tmp_dir("bam-bam-line-filter-reject");
+fn view_sam_to_cram_output_strips_tags_with_expr() {
+    let tmp = tmp_dir("sam-cram-tag-filter-expr");
+    let input = tmp.join("input.sam");
+    let out = tmp.join("out.cram");
+    let reference = fixtures_dir().join("view.001.fa");
+
+    std::fs::write(
+        &input,
+        b"@HD\tVN:1.6\n@SQ\tSN:ref1\tLN:56\nr1\t0\tref1\t1\t20\t2M\t*\t0\t0\tAC\t!!\trg:Z:a\taa:i:1\nr2\t0\tref1\t2\t0\t2M\t*\t0\t0\tTG\t##\trg:Z:b\taa:i:2\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        run(&[
+            "-C",
+            "-T",
+            reference.to_str().unwrap(),
+            "-e",
+            "mapq >= 10",
+            "-x",
+            "rg",
+            "-o",
+            out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+
+    let text =
+        htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+            &out, &reference, None,
+        )
+        .unwrap();
+    assert!(text.contains("\tr1\t") || text.contains("\nr1\t"));
+    assert!(!text.contains("\nr2\t"));
+    assert!(!text.contains("\trg:Z:a"));
+    assert!(!text.contains("\trg:Z:b"));
+    assert!(text.contains("\taa:i:1"));
+}
+
+#[test]
+fn view_bam_to_bam_output_honors_mapq_filter() {
+    let tmp = tmp_dir("bam-bam-line-filter");
     let bam = tmp.join("input.bam");
     let out = tmp.join("out.bam");
     let sam = fixtures_dir().join("view.001.sam");
@@ -250,7 +472,7 @@ fn view_bam_to_bam_output_rejects_line_filters_until_supported() {
     )
     .unwrap();
 
-    assert_ne!(
+    assert_eq!(
         run(&[
             "-b",
             "-q",
@@ -260,6 +482,20 @@ fn view_bam_to_bam_output_rejects_line_filters_until_supported() {
             bam.to_str().unwrap(),
         ]),
         0
+    );
+
+    let text =
+        htslib_rs::alignment_compat::view_bam_as_sam_text_from_path_with_limit(&out, None).unwrap();
+    let mapqs: Vec<u8> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').nth(4).unwrap().parse().unwrap())
+        .collect();
+    assert!(!mapqs.is_empty());
+    assert!(mapqs.iter().all(|mapq| *mapq >= 10));
+    assert!(
+        htslib_rs::alignment_compat::count_bam_records_from_path(&out).unwrap()
+            < htslib_rs::alignment_compat::count_bam_records_from_path(&bam).unwrap()
     );
 }
 
@@ -652,6 +888,67 @@ fn view_cram_expr_sam_output_uses_top_level_reference() {
 }
 
 #[test]
+fn view_cram_sam_unselected_output_splits_expr_results() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("cram-unselected-sam-expr");
+    let selected = tmp.join("selected.sam");
+    let unselected = tmp.join("unselected.sam");
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "view",
+                "-h",
+                "-e",
+                "mapq >= 20",
+                "-U",
+                unselected.to_str().unwrap(),
+                "-o",
+                selected.to_str().unwrap(),
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+
+    let selected_text = std::fs::read_to_string(selected).unwrap();
+    let unselected_text = std::fs::read_to_string(unselected).unwrap();
+    assert!(selected_text.starts_with("@HD\t"));
+    assert!(unselected_text.starts_with("@HD\t"));
+
+    let selected_records: Vec<&str> = selected_text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .collect();
+    let unselected_records: Vec<&str> = unselected_text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .collect();
+    assert!(!selected_records.is_empty());
+    assert!(!unselected_records.is_empty());
+    assert!(
+        selected_records
+            .iter()
+            .all(|line| line.split('\t').nth(4).unwrap().parse::<u8>().unwrap() >= 20)
+    );
+    assert!(
+        unselected_records.iter().any(|line| line
+            .split('\t')
+            .nth(4)
+            .unwrap()
+            .parse::<u8>()
+            .unwrap()
+            < 20)
+    );
+}
+
+#[test]
 fn view_cram_expr_bam_output_uses_top_level_reference() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let tmp = tmp_dir("cram-expr-bam");
@@ -722,6 +1019,41 @@ fn view_bam_region_expr_bam_output_succeeds() {
         .collect();
     assert!(!mapqs.is_empty());
     assert!(mapqs.iter().all(|mapq| *mapq >= 20));
+}
+
+#[test]
+fn view_bam_region_bam_output_honors_mapq_filter() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("bam-region-bam-line-filter");
+    let out = tmp.join("region.bam");
+    let bam = htslib_fixtures_dir().join("range.bam");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "view",
+                "-b",
+                "-q",
+                "20",
+                "-o",
+                out.to_str().unwrap(),
+                bam.to_str().unwrap(),
+                "CHROMOSOME_II:2980-2980",
+            ],
+        ))),
+        0
+    );
+
+    let text =
+        htslib_rs::alignment_compat::view_bam_as_sam_text_from_path_with_limit(&out, None).unwrap();
+    let records: Vec<&str> = text.lines().filter(|line| !line.starts_with('@')).collect();
+    assert!(!records.is_empty());
+    for record in records {
+        let fields: Vec<&str> = record.split('\t').collect();
+        assert_eq!(fields[2], "CHROMOSOME_II");
+        assert!(fields[4].parse::<u8>().unwrap() >= 20);
+    }
 }
 
 #[test]
@@ -1016,6 +1348,44 @@ fn view_cram_to_bam_uses_top_level_reference() {
 }
 
 #[test]
+fn view_cram_to_bam_output_honors_mapq_filter() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("cram-bam-line-filter");
+    let out = tmp.join("view.bam");
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "view",
+                "-b",
+                "-q",
+                "20",
+                "-o",
+                out.to_str().unwrap(),
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+
+    let text =
+        htslib_rs::alignment_compat::view_bam_as_sam_text_from_path_with_limit(&out, None).unwrap();
+    let mapqs: Vec<u8> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').nth(4).unwrap().parse().unwrap())
+        .collect();
+    assert!(!mapqs.is_empty());
+    assert!(mapqs.iter().all(|mapq| *mapq >= 20));
+}
+
+#[test]
 fn view_cram_region_to_bam_uses_local_reference() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let tmp = tmp_dir("cram-region-bam");
@@ -1076,6 +1446,47 @@ fn view_cram_to_cram_uses_top_level_reference() {
 }
 
 #[test]
+fn view_cram_to_cram_output_honors_mapq_filter() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("cram-cram-line-filter");
+    let out = tmp.join("view.cram");
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "view",
+                "-C",
+                "-q",
+                "20",
+                "-o",
+                out.to_str().unwrap(),
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+
+    let text =
+        htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+            &out, &reference, None,
+        )
+        .unwrap();
+    let mapqs: Vec<u8> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').nth(4).unwrap().parse().unwrap())
+        .collect();
+    assert!(!mapqs.is_empty());
+    assert!(mapqs.iter().all(|mapq| *mapq >= 20));
+}
+
+#[test]
 fn view_bam_to_cram_uses_local_reference() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let tmp = tmp_dir("bam-cram");
@@ -1109,6 +1520,54 @@ fn view_bam_to_cram_uses_local_reference() {
     assert!(out.metadata().unwrap().len() > 0);
     let header = htslib_rs::alignment_compat::read_cram_header_from_path(&out).unwrap();
     assert!(!header.reference_sequences().is_empty());
+}
+
+#[test]
+fn view_bam_to_cram_output_honors_mapq_filter() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("bam-cram-line-filter");
+    let bam = tmp.join("input.bam");
+    let out = tmp.join("view.cram");
+    let sam = fixtures_dir().join("view.001.sam");
+    let reference = fixtures_dir().join("view.001.fa");
+
+    htslib_rs::alignment_compat::write_bam_from_sam_path(
+        &sam,
+        std::fs::File::create(&bam).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "view",
+                "-C",
+                "-T",
+                reference.to_str().unwrap(),
+                "-q",
+                "10",
+                "-o",
+                out.to_str().unwrap(),
+                bam.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+
+    let text =
+        htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+            &out, &reference, None,
+        )
+        .unwrap();
+    let mapqs: Vec<u8> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').nth(4).unwrap().parse().unwrap())
+        .collect();
+    assert!(!mapqs.is_empty());
+    assert!(mapqs.iter().all(|mapq| *mapq >= 10));
+    assert!(mapqs.len() < htslib_rs::alignment_compat::count_bam_records_from_path(&bam).unwrap());
 }
 
 #[test]
