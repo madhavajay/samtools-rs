@@ -36,6 +36,7 @@ struct StatsConfig {
     coverage_min: u32,
     coverage_max: u32,
     coverage_step: u32,
+    cov_threshold: u32,
 }
 
 impl Default for StatsConfig {
@@ -45,6 +46,7 @@ impl Default for StatsConfig {
             coverage_min: 1,
             coverage_max: 1000,
             coverage_step: 1,
+            cov_threshold: 0,
         }
     }
 }
@@ -83,8 +85,24 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     }
                 }
             }
+            "-g" | "--cov-threshold" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("stats", "option -g requires an argument");
+                    return ExitCode::from(1);
+                };
+                match raw.parse::<u32>() {
+                    Ok(threshold) => config.cov_threshold = threshold,
+                    Err(e) => {
+                        print_error(
+                            "stats",
+                            format!("invalid coverage threshold \"{raw}\": {e}"),
+                        );
+                        return ExitCode::from(1);
+                    }
+                }
+            }
             "-@" | "--threads" | "-r" | "--reference" | "-l" | "--read-length" | "-I" | "--id"
-            | "-S" | "--split" | "-P" | "--split-prefix" | "-g" | "--cov-threshold" | "-G" => {
+            | "-S" | "--split" | "-P" | "--split-prefix" | "-G" => {
                 let _ = iter.next();
             }
             "-d" | "--remove-dups" => {
@@ -425,6 +443,33 @@ fn region_targets(header: &sam::Header, regions: &[Region]) -> io::Result<Vec<Re
         .collect()
 }
 
+fn target_base_count(targets: &[RegionTarget]) -> u64 {
+    let mut intervals: Vec<_> = targets
+        .iter()
+        .map(|target| (target.tid, target.start, target.end))
+        .collect();
+    intervals.sort_unstable();
+
+    let mut total = 0u64;
+    let mut current: Option<(usize, usize, usize)> = None;
+    for (tid, start, end) in intervals {
+        match current {
+            Some((cur_tid, cur_start, cur_end)) if cur_tid == tid && start <= cur_end + 1 => {
+                current = Some((cur_tid, cur_start, cur_end.max(end)));
+            }
+            Some((_, cur_start, cur_end)) => {
+                total += (cur_end - cur_start + 1) as u64;
+                current = Some((tid, start, end));
+            }
+            None => current = Some((tid, start, end)),
+        }
+    }
+    if let Some((_, start, end)) = current {
+        total += (end - start + 1) as u64;
+    }
+    total
+}
+
 /// Iterates all SAM records to build a `StatsCounts` with sequence-length
 /// and quality accumulators populated (which the `summarize_*` path can
 /// not provide because `AlignmentRecordSummary` discards sequence and
@@ -468,7 +513,10 @@ fn collect_sam_region_stats(
         .map(sam::io::Reader::new)?;
     let header = reader.read_header()?;
     let targets = region_targets(&header, regions)?;
-    let mut counts = StatsCounts::default();
+    let mut counts = StatsCounts {
+        target_bases: target_base_count(&targets),
+        ..Default::default()
+    };
     let mut seen = HashSet::new();
 
     for result in reader.records() {
@@ -490,7 +538,10 @@ fn collect_bam_region_stats(
 ) -> io::Result<StatsCounts> {
     let header = htslib_rs::alignment_compat::read_bam_header_from_path(input)?;
     let targets = region_targets(&header, regions)?;
-    let mut counts = StatsCounts::default();
+    let mut counts = StatsCounts {
+        target_bases: target_base_count(&targets),
+        ..Default::default()
+    };
     let mut seen = HashSet::new();
     for region in regions {
         for record in htslib_rs::alignment_compat::query_bam_records_from_path(input, region)? {
@@ -510,7 +561,10 @@ fn collect_cram_region_stats(
 ) -> io::Result<StatsCounts> {
     let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
     let targets = region_targets(&header, regions)?;
-    let mut counts = StatsCounts::default();
+    let mut counts = StatsCounts {
+        target_bases: target_base_count(&targets),
+        ..Default::default()
+    };
     let mut seen = HashSet::new();
     for region in regions {
         for record in htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
@@ -633,6 +687,7 @@ struct StatsCounts {
     first_gc_hist: BTreeMap<u16, u64>,
     last_gc_hist: BTreeMap<u16, u64>,
     coverage_depths: BTreeMap<(usize, usize), u32>,
+    target_bases: u64,
     // Bases mapped (sum of sequence lengths for mapped reads, ignoring
     // clipping), bases mapped from CIGAR (sum of M/=/X ops), and total
     // NM aux values across reads. Used for the `bases mapped`,
@@ -1099,6 +1154,20 @@ fn write_stats_counts(
         "SN\tpercentage of properly paired reads (%):\t{:.1}",
         proper_pct
     )?;
+    if counts.target_bases > 0 {
+        writeln!(out, "SN\tbases inside the target:\t{}", counts.target_bases)?;
+        let covered_above_threshold = counts
+            .coverage_depths
+            .values()
+            .filter(|&&depth| depth > config.cov_threshold)
+            .count() as u64;
+        let target_pct = 100.0 * covered_above_threshold as f64 / counts.target_bases as f64;
+        writeln!(
+            out,
+            "SN\tpercentage of target genome with coverage > {} (%):\t{:.2}",
+            config.cov_threshold, target_pct
+        )?;
+    }
     write_quality_histograms(out, counts)?;
     write_gc_histograms(out, counts)?;
     write_coverage_histogram(out, counts, config)?;

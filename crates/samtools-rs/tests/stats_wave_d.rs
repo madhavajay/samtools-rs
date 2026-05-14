@@ -2081,6 +2081,45 @@ r6\t0\tchr1\t5\t60\t2M\t*\t0\t0\tCC\tII
 }
 
 #[test]
+fn stats_cov_threshold_reports_target_percentage() {
+    let tmp = tmp_dir("stats-cov-threshold");
+    let sam = tmp.join("cov.sam");
+    let targets = tmp.join("targets.bed");
+    let out = tmp.join("cov.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:10
+r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\tIIII
+r2\t0\tchr1\t3\t60\t4M\t*\t0\t0\tCCCC\tIIII
+",
+    )
+    .unwrap();
+    std::fs::write(&targets, "chr1\t1\t6\n").unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-t",
+                targets.to_str().unwrap(),
+                "-g",
+                "1",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("SN\tbases inside the target:\t6\n"));
+    assert!(text.contains("SN\tpercentage of target genome with coverage > 1 (%):\t33.33\n"));
+}
+
+#[test]
 fn stats_emits_bases_mapped_and_error_rate_sn_lines() {
     let tmp = tmp_dir("stats-error-rate");
     let sam = tmp.join("nm.sam");
