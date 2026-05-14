@@ -296,6 +296,7 @@ pub(crate) fn run_merge(
         let (input_header, mut input_records) = read_records(path, filter.as_ref())?;
         let reference_id_map = merge_reference_sequences(&mut header, &input_header)?;
         merge_read_groups(&mut header, &input_header)?;
+        merge_programs(&mut header, &input_header)?;
         merge_comments(&mut header, &input_header);
         remap_records(&mut input_records, &reference_id_map)?;
         records.append(&mut input_records);
@@ -526,6 +527,29 @@ fn merge_read_groups(
             output_header
                 .read_groups_mut()
                 .insert(id.clone(), input_read_group.clone());
+        }
+    }
+
+    Ok(())
+}
+
+fn merge_programs(output_header: &mut sam::Header, input_header: &sam::Header) -> io::Result<()> {
+    for (id, input_program) in input_header.programs().as_ref() {
+        if let Some(output_program) = output_header.programs().as_ref().get(id) {
+            if output_program != input_program {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "conflicting @PG definition for {}",
+                        String::from_utf8_lossy(id)
+                    ),
+                ));
+            }
+        } else {
+            output_header
+                .programs_mut()
+                .as_mut()
+                .insert(id.clone(), input_program.clone());
         }
     }
 
