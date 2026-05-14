@@ -283,13 +283,18 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let is_sorted = header_sort_order
-        .as_deref()
-        .map(|so| so == "coordinate")
-        .unwrap_or(false);
     let write_result = match stats_input {
-        StatsInput::Summaries(summaries) => write_stats(&mut writer, &summaries, config, is_sorted),
-        StatsInput::Counts(counts) => write_stats_counts(&mut writer, &counts, config, is_sorted),
+        StatsInput::Summaries(summaries) => {
+            let is_sorted = header_sort_order
+                .as_deref()
+                .map(|so| so == "coordinate")
+                .unwrap_or(false);
+            write_stats(&mut writer, &summaries, config, is_sorted)
+        }
+        StatsInput::Counts(counts) => {
+            let is_sorted = counts.is_coordinate_sorted();
+            write_stats_counts(&mut writer, &counts, config, is_sorted)
+        }
     };
     if let Err(e) = write_result {
         if e.kind() == io::ErrorKind::BrokenPipe {
@@ -330,12 +335,8 @@ fn read_nm_aux(rec: &(impl sam::alignment::Record + ?Sized)) -> Option<u64> {
 }
 
 /// Returns the `SO:` value from the input's `@HD` line, lower-cased, or
-/// `None` if the header has no sort-order tag. Mirrors how upstream's
-/// `samtools stats` populates the `is sorted` summary line: a coordinate-
-/// sorted header reports `1`, everything else reports `0`. Without per-
-/// record position tracking we trust the header tag here, which differs
-/// from upstream's runtime check when the header claims coordinate sort
-/// but the records are not actually in order.
+/// `None` if the header has no sort-order tag. This is only used for
+/// summary-only paths that cannot currently inspect full records.
 fn read_input_header_sort_order(
     input: &std::path::Path,
     exact: Exact,
@@ -759,6 +760,8 @@ struct StatsCounts {
     // Sum of sequence lengths for records carrying the duplicate flag.
     bases_dup: u64,
     bases_trimmed: u64,
+    last_sort_position: Option<(usize, usize)>,
+    sort_order_violation: bool,
 }
 
 struct StatsRecordFields {
@@ -820,6 +823,13 @@ impl StatsCounts {
         // reads that were not filtered out by `--remove-dups` — i.e. the
         // ones that contributed to `total`.
         if self.total > pre_total {
+            if flag & BAM_FUNMAP == 0
+                && let Ok(Some(start)) = rec.alignment_start().transpose()
+                && let Some(tid) = reference_sequence_id
+            {
+                self.update_sort_order(tid, usize::from(start));
+            }
+
             let seq_len_u32 = seq_len as u32;
             if seq_len_u32 > 0 {
                 self.total_len += u64::from(seq_len_u32);
@@ -889,6 +899,19 @@ impl StatsCounts {
                 self.update_coverage_depths(header, rec, targets);
             }
         }
+    }
+
+    fn is_coordinate_sorted(&self) -> bool {
+        !self.sort_order_violation
+    }
+
+    fn update_sort_order(&mut self, tid: usize, pos: usize) {
+        if let Some((last_tid, last_pos)) = self.last_sort_position
+            && (tid < last_tid || (tid == last_tid && pos < last_pos))
+        {
+            self.sort_order_violation = true;
+        }
+        self.last_sort_position = Some((tid, pos));
     }
 
     fn update_coverage_depths(

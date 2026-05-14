@@ -1797,11 +1797,13 @@ fn view_filter_expr_for_sam() {
 }
 
 #[test]
-fn stats_is_sorted_reflects_header_sort_order() {
+fn stats_is_sorted_reflects_record_order() {
     let tmp = tmp_dir("stats-is-sorted");
     let sam_sorted = tmp.join("sorted.sam");
-    let sam_unsorted = tmp.join("unsorted.sam");
+    let sam_queryname_header = tmp.join("queryname-header.sam");
+    let sam_unsorted = tmp.join("coordinate-header-unsorted.sam");
     let out_sorted = tmp.join("sorted.stats");
+    let out_queryname_header = tmp.join("queryname-header.stats");
     let out_unsorted = tmp.join("unsorted.stats");
     std::fs::write(
         &sam_sorted,
@@ -1809,14 +1811,26 @@ fn stats_is_sorted_reflects_header_sort_order() {
 @HD\tVN:1.6\tSO:coordinate
 @SQ\tSN:chr1\tLN:100
 r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!
+r2\t0\tchr1\t10\t60\t4M\t*\t0\t0\tACGT\t!!!!
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_queryname_header,
+        "\
+@HD\tVN:1.6\tSO:queryname
+@SQ\tSN:chr1\tLN:100
+r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!
+r2\t0\tchr1\t10\t60\t4M\t*\t0\t0\tACGT\t!!!!
 ",
     )
     .unwrap();
     std::fs::write(
         &sam_unsorted,
         "\
-@HD\tVN:1.6\tSO:queryname
+@HD\tVN:1.6\tSO:coordinate
 @SQ\tSN:chr1\tLN:100
+r2\t0\tchr1\t10\t60\t4M\t*\t0\t0\tACGT\t!!!!
 r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!
 ",
     )
@@ -1838,6 +1852,17 @@ r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!
             "stats",
             &[
                 "-o",
+                out_queryname_header.to_str().unwrap(),
+                sam_queryname_header.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-o",
                 out_unsorted.to_str().unwrap(),
                 sam_unsorted.to_str().unwrap()
             ]
@@ -1846,8 +1871,10 @@ r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!
     );
 
     let sorted_text = std::fs::read_to_string(&out_sorted).unwrap();
+    let queryname_header_text = std::fs::read_to_string(&out_queryname_header).unwrap();
     let unsorted_text = std::fs::read_to_string(&out_unsorted).unwrap();
     assert_eq!(stats_sn_value(&sorted_text, "is sorted"), 1);
+    assert_eq!(stats_sn_value(&queryname_header_text, "is sorted"), 1);
     assert_eq!(stats_sn_value(&unsorted_text, "is sorted"), 0);
 }
 
