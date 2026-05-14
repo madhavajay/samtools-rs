@@ -296,6 +296,7 @@ pub(crate) fn run_merge(
         let (input_header, mut input_records) = read_records(path, filter.as_ref())?;
         let reference_id_map = merge_reference_sequences(&mut header, &input_header)?;
         merge_read_groups(&mut header, &input_header)?;
+        merge_comments(&mut header, &input_header);
         remap_records(&mut input_records, &reference_id_map)?;
         records.append(&mut input_records);
     }
@@ -529,6 +530,12 @@ fn merge_read_groups(
     }
 
     Ok(())
+}
+
+fn merge_comments(output_header: &mut sam::Header, input_header: &sam::Header) {
+    output_header
+        .comments_mut()
+        .extend(input_header.comments().iter().cloned());
 }
 
 fn coordinate_key(r: &RecordBuf) -> (i32, i64) {
