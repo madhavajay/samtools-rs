@@ -17,14 +17,15 @@
 //!  - `-c` — clear existing duplicate flags and duplicate metadata tags before
 //!    marking.
 //!  - `-t` — add `do:Z:<original>` duplicate-origin tags for duplicates.
+//!  - `-d DISTANCE` — add `dt:Z:SQ` / `dt:Z:LB` duplicate-type tags using
+//!    Illumina-style read-name tile/x/y optical-distance checks.
 //!  - `-b TAG` / `--barcode-tag TAG` — include a string aux tag in the
 //!    duplicate key.
 //!  - `-O sam|bam` / `--output-fmt sam|bam` — output format (default `bam`).
 //!  - `-o FILE` — output file (default stdout).
 //!  - `--no-PG` — suppress the default samtools `@PG` line.
 //!
-//! Not yet supported: optical-duplicate distance (`-d`), exact upstream stats
-//! output, CRAM.
+//! Not yet supported: exact upstream stats output, CRAM.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -63,6 +64,7 @@ struct MarkdupOptions {
     emit_stats: bool,
     clear_existing_dups: bool,
     duplicate_origin_tag: bool,
+    optical_distance: Option<u32>,
     barcode_tag: Option<Tag>,
 }
 
@@ -75,6 +77,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut emit_stats = false;
     let mut clear_existing_dups = false;
     let mut duplicate_origin_tag = false;
+    let mut optical_distance = None;
     let mut no_pg = false;
     let mut barcode_tag: Option<Tag> = None;
 
@@ -89,6 +92,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
             "-c" => clear_existing_dups = true,
             "-t" => duplicate_origin_tag = true,
+            "-d" => {
+                let Some(v) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("markdup", "missing value for -d");
+                    return ExitCode::from(1);
+                };
+                match v.parse::<u32>() {
+                    Ok(distance) => optical_distance = Some(distance),
+                    Err(_) => {
+                        print_error("markdup", format!("invalid optical distance \"{}\"", v));
+                        return ExitCode::from(1);
+                    }
+                }
+            }
             "-O" | "--output-fmt" => {
                 let Some(v) = iter.next().and_then(|a| a.to_str()) else {
                     print_error("markdup", format!("missing value for {}", s));
@@ -120,7 +136,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 };
             }
             "--no-PG" => no_pg = true,
-            "-@" | "--threads" | "-l" | "-m" | "-d" | "-T" => {
+            "-@" | "--threads" | "-l" | "-m" | "-T" => {
                 // Accepted-but-ignored for compatibility.
                 let _ = iter.next();
             }
@@ -171,6 +187,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         emit_stats,
         clear_existing_dups,
         duplicate_origin_tag,
+        optical_distance,
         barcode_tag,
     };
     let result = match format.exact {
@@ -201,6 +218,30 @@ struct MarkdupStats {
     duplicate_single_optical: u64,
     duplicate_non_primary: u64,
     duplicate_non_primary_optical: u64,
+}
+
+#[derive(Clone, Copy)]
+enum DuplicateType {
+    Library,
+    Optical,
+}
+
+impl DuplicateType {
+    fn tag_value(self) -> &'static [u8] {
+        match self {
+            Self::Library => b"LB",
+            Self::Optical => b"SQ",
+        }
+    }
+
+    fn is_optical(self) -> bool {
+        matches!(self, Self::Optical)
+    }
+}
+
+struct DuplicateMetadata {
+    origin: Vec<u8>,
+    duplicate_type: Option<DuplicateType>,
 }
 
 fn run_bam_markdup(
@@ -306,7 +347,7 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
     let mut se_best: HashMap<SeKey, usize> = HashMap::new();
     let mut pair_pending: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut pair_best: HashMap<PairKey, PairIdx> = HashMap::new();
-    let mut duplicate_primary_origins: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    let mut duplicate_primary_metadata: HashMap<Vec<u8>, DuplicateMetadata> = HashMap::new();
     let mut stats = MarkdupStats {
         read: records.len() as u64,
         written: records.len() as u64,
@@ -390,52 +431,76 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
                                     .name()
                                     .map(|name| name.to_vec())
                                     .unwrap_or_default();
+                                let prev_duplicate_type = duplicate_type(
+                                    &records[prev_first],
+                                    &records[first_idx],
+                                    options.optical_distance,
+                                );
                                 mark_duplicate(
                                     &mut records[prev_first],
                                     Some(&origin),
                                     options.duplicate_origin_tag,
+                                    prev_duplicate_type,
                                 );
                                 mark_duplicate(
                                     &mut records[prev_second],
                                     Some(&origin),
                                     options.duplicate_origin_tag,
+                                    prev_duplicate_type,
                                 );
-                                remember_duplicate_origin(
-                                    &mut duplicate_primary_origins,
+                                remember_duplicate_metadata(
+                                    &mut duplicate_primary_metadata,
                                     &records[prev_first],
                                     &origin,
+                                    prev_duplicate_type,
                                 );
-                                remember_duplicate_origin(
-                                    &mut duplicate_primary_origins,
+                                remember_duplicate_metadata(
+                                    &mut duplicate_primary_metadata,
                                     &records[prev_second],
                                     &origin,
+                                    prev_duplicate_type,
                                 );
+                                if prev_duplicate_type.is_some_and(DuplicateType::is_optical) {
+                                    stats.duplicate_pair_optical += 2;
+                                }
                                 pair_best.insert(key, (first_idx, i));
                             } else {
                                 let origin = records[prev_first]
                                     .name()
                                     .map(|name| name.to_vec())
                                     .unwrap_or_default();
+                                let current_duplicate_type = duplicate_type(
+                                    &records[first_idx],
+                                    &records[prev_first],
+                                    options.optical_distance,
+                                );
                                 mark_duplicate(
                                     &mut records[first_idx],
                                     Some(&origin),
                                     options.duplicate_origin_tag,
+                                    current_duplicate_type,
                                 );
                                 mark_duplicate(
                                     &mut records[i],
                                     Some(&origin),
                                     options.duplicate_origin_tag,
+                                    current_duplicate_type,
                                 );
-                                remember_duplicate_origin(
-                                    &mut duplicate_primary_origins,
+                                remember_duplicate_metadata(
+                                    &mut duplicate_primary_metadata,
                                     &records[first_idx],
                                     &origin,
+                                    current_duplicate_type,
                                 );
-                                remember_duplicate_origin(
-                                    &mut duplicate_primary_origins,
+                                remember_duplicate_metadata(
+                                    &mut duplicate_primary_metadata,
                                     &records[i],
                                     &origin,
+                                    current_duplicate_type,
                                 );
+                                if current_duplicate_type.is_some_and(DuplicateType::is_optical) {
+                                    stats.duplicate_pair_optical += 2;
+                                }
                             }
                             stats.duplicate_pair += 2;
                         }
@@ -459,24 +524,46 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
                         .name()
                         .map(|name| name.to_vec())
                         .unwrap_or_default();
+                    let prev_duplicate_type =
+                        duplicate_type(&records[idx], &records[i], options.optical_distance);
                     mark_duplicate(
                         &mut records[idx],
                         Some(&origin),
                         options.duplicate_origin_tag,
+                        prev_duplicate_type,
                     );
-                    remember_duplicate_origin(
-                        &mut duplicate_primary_origins,
+                    remember_duplicate_metadata(
+                        &mut duplicate_primary_metadata,
                         &records[idx],
                         &origin,
+                        prev_duplicate_type,
                     );
+                    if prev_duplicate_type.is_some_and(DuplicateType::is_optical) {
+                        stats.duplicate_single_optical += 1;
+                    }
                     se_best.insert(se_key, i);
                 } else {
                     let origin = records[idx]
                         .name()
                         .map(|name| name.to_vec())
                         .unwrap_or_default();
-                    mark_duplicate(&mut records[i], Some(&origin), options.duplicate_origin_tag);
-                    remember_duplicate_origin(&mut duplicate_primary_origins, &records[i], &origin);
+                    let current_duplicate_type =
+                        duplicate_type(&records[i], &records[idx], options.optical_distance);
+                    mark_duplicate(
+                        &mut records[i],
+                        Some(&origin),
+                        options.duplicate_origin_tag,
+                        current_duplicate_type,
+                    );
+                    remember_duplicate_metadata(
+                        &mut duplicate_primary_metadata,
+                        &records[i],
+                        &origin,
+                        current_duplicate_type,
+                    );
+                    if current_duplicate_type.is_some_and(DuplicateType::is_optical) {
+                        stats.duplicate_single_optical += 1;
+                    }
                 }
                 stats.duplicate_single += 1;
             }
@@ -507,13 +594,20 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
             continue;
         };
         if duplicate_primary_names.contains(name) {
-            let origin = duplicate_primary_origins.get(name);
+            let metadata = duplicate_primary_metadata.get(name);
             if mark_duplicate(
                 record,
-                origin.map(Vec::as_slice),
+                metadata.map(|metadata| metadata.origin.as_slice()),
                 options.duplicate_origin_tag,
+                metadata.and_then(|metadata| metadata.duplicate_type),
             ) {
                 stats.duplicate_non_primary += 1;
+                if metadata
+                    .and_then(|metadata| metadata.duplicate_type)
+                    .is_some_and(DuplicateType::is_optical)
+                {
+                    stats.duplicate_non_primary_optical += 1;
+                }
             }
         }
     }
@@ -540,17 +634,29 @@ fn clear_duplicate_marks(records: &mut [RecordBuf]) {
     }
 }
 
-fn remember_duplicate_origin(
-    origins: &mut HashMap<Vec<u8>, Vec<u8>>,
+fn remember_duplicate_metadata(
+    metadata: &mut HashMap<Vec<u8>, DuplicateMetadata>,
     record: &RecordBuf,
     origin: &[u8],
+    duplicate_type: Option<DuplicateType>,
 ) {
     if let Some(name) = record.name() {
-        origins.insert(name.to_vec(), origin.to_vec());
+        metadata.insert(
+            name.to_vec(),
+            DuplicateMetadata {
+                origin: origin.to_vec(),
+                duplicate_type,
+            },
+        );
     }
 }
 
-fn mark_duplicate(record: &mut RecordBuf, origin: Option<&[u8]>, add_origin_tag: bool) -> bool {
+fn mark_duplicate(
+    record: &mut RecordBuf,
+    origin: Option<&[u8]>,
+    add_origin_tag: bool,
+    duplicate_type: Option<DuplicateType>,
+) -> bool {
     let was_new = set_dup(record);
     if add_origin_tag && let Some(origin) = origin {
         record.data_mut().insert(
@@ -558,7 +664,69 @@ fn mark_duplicate(record: &mut RecordBuf, origin: Option<&[u8]>, add_origin_tag:
             Value::String(BString::from(origin.to_vec())),
         );
     }
+    if let Some(duplicate_type) = duplicate_type {
+        record.data_mut().insert(
+            Tag::from([b'd', b't']),
+            Value::String(BString::from(duplicate_type.tag_value().to_vec())),
+        );
+    }
     was_new
+}
+
+fn duplicate_type(
+    duplicate: &RecordBuf,
+    original: &RecordBuf,
+    optical_distance: Option<u32>,
+) -> Option<DuplicateType> {
+    let distance = optical_distance?;
+    Some(if is_optical_duplicate(duplicate, original, distance) {
+        DuplicateType::Optical
+    } else {
+        DuplicateType::Library
+    })
+}
+
+fn is_optical_duplicate(duplicate: &RecordBuf, original: &RecordBuf, distance: u32) -> bool {
+    let Some(duplicate_location) = duplicate
+        .name()
+        .and_then(|name| optical_location(name.as_ref()))
+    else {
+        return false;
+    };
+    let Some(original_location) = original
+        .name()
+        .and_then(|name| optical_location(name.as_ref()))
+    else {
+        return false;
+    };
+    duplicate_location.is_within_distance(original_location, distance)
+}
+
+#[derive(Clone, Copy)]
+struct OpticalLocation {
+    tile: i64,
+    x: i64,
+    y: i64,
+}
+
+impl OpticalLocation {
+    fn is_within_distance(self, other: Self, distance: u32) -> bool {
+        self.tile == other.tile
+            && self.x.abs_diff(other.x) <= distance as u64
+            && self.y.abs_diff(other.y) <= distance as u64
+    }
+}
+
+fn optical_location(name: &[u8]) -> Option<OpticalLocation> {
+    let mut fields = name.rsplit(|&b| b == b':');
+    let y = parse_i64_ascii(fields.next()?)?;
+    let x = parse_i64_ascii(fields.next()?)?;
+    let tile = parse_i64_ascii(fields.next()?)?;
+    Some(OpticalLocation { tile, x, y })
+}
+
+fn parse_i64_ascii(bytes: &[u8]) -> Option<i64> {
+    std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
 fn set_dup(record: &mut RecordBuf) -> bool {
@@ -690,6 +858,7 @@ fn print_usage() -> io::Result<()> {
         "  -c            clear existing duplicate flags/tags first"
     )?;
     writeln!(w, "  -t            add duplicate-origin do tags")?;
+    writeln!(w, "  -d DISTANCE   add duplicate-type dt tags")?;
     writeln!(
         w,
         "  -b TAG        include barcode aux tag in duplicate key"

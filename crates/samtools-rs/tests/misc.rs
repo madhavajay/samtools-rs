@@ -4662,6 +4662,58 @@ fn markdup_t_adds_duplicate_origin_tag() {
 }
 
 #[test]
+fn markdup_d_adds_duplicate_type_tags() {
+    use samtools_rs::commands::markdup;
+    let tmp = tmp_dir("markdup-duplicate-type");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:100\n",
+            "INST:1:FC:1:1101:100:100\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "INST:1:FC:1:1101:105:108\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "INST:1:FC:1:1102:105:108\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "-d",
+                "10",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let original = text
+        .lines()
+        .find(|line| line.starts_with("INST:1:FC:1:1101:100:100\t"))
+        .unwrap();
+    let optical = text
+        .lines()
+        .find(|line| line.starts_with("INST:1:FC:1:1101:105:108\t"))
+        .unwrap();
+    let library = text
+        .lines()
+        .find(|line| line.starts_with("INST:1:FC:1:1102:105:108\t"))
+        .unwrap();
+    assert!(!original.contains("\tdt:Z:"));
+    assert!(optical.contains("\tdt:Z:SQ"));
+    assert!(library.contains("\tdt:Z:LB"));
+}
+
+#[test]
 fn markdup_c_removes_stale_duplicate_tags_before_t_retags_duplicates() {
     use samtools_rs::commands::markdup;
     let tmp = tmp_dir("markdup-clear-retag");

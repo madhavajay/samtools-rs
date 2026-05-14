@@ -168,7 +168,7 @@ samtools-rs status legend:
 - **C source:** `bam_markdup.c` (~89k LOC)
 - **HTSlib APIs used:** name-sort grouping, position-sort grouping, barcode parsing, duplicate marking via flag updates
 - **htslib-rs coverage:** ⚠️ — mutable SAM/BAM `RecordBuf` paths cover current flag and aux-tag reads; indexed/streaming parity and CRAM remain.
-- **samtools-rs status:** 🟡 — single-end and paired-end duplicate marking for SAM/BAM exists with optional barcode-key grouping (`-b`/`--barcode-tag`), duplicate flag/tag clearing (`-c`), `-S` compatibility for supplementary propagation, `-t` duplicate-origin `do` tags, secondary/supplementary qname propagation, `-r`, upstream-shaped `-s` summary fields, `-O`, `-o`, default `@PG`, and `--no-PG`; optical duplicate distance, `dt` optical/library tags, exact stats parity, and CRAM remain.
+- **samtools-rs status:** 🟡 — single-end and paired-end duplicate marking for SAM/BAM exists with optional barcode-key grouping (`-b`/`--barcode-tag`), duplicate flag/tag clearing (`-c`), `-S` compatibility for supplementary propagation, `-t` duplicate-origin `do` tags, `-d` optical-distance duplicate classification with `dt:Z:SQ`/`dt:Z:LB` tags, secondary/supplementary qname propagation, `-r`, upstream-shaped `-s` summary fields, `-O`, `-o`, default `@PG`, and `--no-PG`; exact stats parity, library-size parity, and CRAM remain.
 
 ### rmdup
 
