@@ -66,7 +66,7 @@ samtools-rs status legend:
 - **htslib-rs coverage:** ⚠️
   - `read_associated_bam_index` returns `Box<dyn csi::BinningIndex>` — ✅
   - Per-reference mapped/unmapped counts from index meta — needs accessor — ❌ (must extend `htslib-rs::index_compat`)
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** 🟡 — BAM index counts exist, with streaming slow-path counts for SAM, reference-backed CRAM, and unindexed BAM; index-derived CRAM counting without an explicit reference and full harness parity remain.
 
 ### faidx / fqidx
 
@@ -146,7 +146,7 @@ samtools-rs status legend:
 - **C source:** `bam_fastq.c` (~48k LOC)
 - **HTSlib APIs used:** record iteration, aux tag access for barcodes/QT/RX/QX
 - **htslib-rs coverage:** ⚠️ — `view_sam_as_fastq_text_from_path_with_limit` exists; full feature set (paired/single, barcode-aware) needs more
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** 🟡 — SAM/BAM FASTQ/FASTA conversion supports basic single-output and split-output paths, flag filters, read-name suffix controls, selected/all aux comments, aux-tag filtering, `-t`, and FASTQ `-O` original-quality `OQ` tags; barcode/index files, exact name-grouped routing, and CRAM remain.
 
 ### import
 

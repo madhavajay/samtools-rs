@@ -1323,6 +1323,47 @@ fn fastq_excludes_secondary_and_supplementary_by_default() {
 }
 
 #[test]
+fn fastq_uses_original_quality_tag_when_requested() {
+    let tmp = tmp_dir("fastq-original-quality");
+    let sam = tmp.join("in.sam");
+    let bam = tmp.join("in.bam");
+    let sam_out = tmp.join("sam.fq");
+    let bam_out = tmp.join("bam.fq");
+    let text = concat!(
+        "@HD\tVN:1.6\n",
+        "@SQ\tSN:chr1\tLN:8\n",
+        "plain\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tOQ:Z:abcd\n",
+        "reverse\t16\tchr1\t1\t60\t4M\t*\t0\t0\tACGC\t####\tOQ:Z:1234\n",
+        "fallback\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t$$$$\n",
+    );
+    std::fs::write(&sam, text).unwrap();
+    write_bam_from_sam_text(&bam, text);
+
+    for (input, output) in [(&sam, &sam_out), (&bam, &bam_out)] {
+        assert_eq!(
+            exit_to_u8(fastq::main(&argv(
+                "fastq",
+                &[
+                    "-O",
+                    "-o",
+                    output.to_str().unwrap(),
+                    input.to_str().unwrap(),
+                ]
+            ))),
+            0
+        );
+    }
+
+    let expected = concat!(
+        "@plain\nACGT\n+\nabcd\n",
+        "@reverse\nGCGT\n+\n4321\n",
+        "@fallback\nTGCA\n+\n$$$$\n",
+    );
+    assert_eq!(std::fs::read_to_string(sam_out).unwrap(), expected);
+    assert_eq!(std::fs::read_to_string(bam_out).unwrap(), expected);
+}
+
+#[test]
 fn fastq_single_sam_path_filters_by_aux_tag_value() {
     let tmp = tmp_dir("fastq-aux-filter-value");
     let sam = tmp.join("in.sam");
