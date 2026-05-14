@@ -73,6 +73,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut tag_filters = Vec::new();
     let mut append_read_number_override: Option<bool> = None;
     let mut use_original_quality = false;
+    let mut default_quality: Option<u8> = None;
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
         let s = arg.to_str().unwrap_or("");
@@ -170,6 +171,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-O" => {
                 use_original_quality = true;
             }
+            "-v" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error(sub_name, "missing value for -v");
+                    return ExitCode::from(1);
+                };
+                default_quality = match raw.parse::<u8>() {
+                    Ok(q) if q <= 93 => Some(q),
+                    _ => {
+                        print_error(sub_name, format!("invalid -v value \"{}\"", raw));
+                        return ExitCode::from(1);
+                    }
+                };
+            }
             "-@" | "--threads" => {
                 let _ = iter.next();
             }
@@ -255,6 +269,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     flag_filters,
                     append_read_number,
                     use_original_quality,
+                    default_quality,
                     &aux_selection,
                     &tag_filters,
                 )
@@ -267,6 +282,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     flag_filters,
                     append_read_number,
                     use_original_quality,
+                    default_quality,
                     &aux_selection,
                     &tag_filters,
                 ),
@@ -288,6 +304,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     flag_filters,
                     append_read_number,
                     use_original_quality,
+                    default_quality,
                     &aux_selection,
                     &tag_filters,
                 ),
@@ -389,6 +406,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 flag_filters,
                 append_read_number,
                 use_original_quality,
+                default_quality,
                 &aux_selection,
                 &tag_filters,
             )
@@ -418,6 +436,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             fasta_mode,
             filtering,
             use_original_quality
+                || default_quality.is_some()
                 || aux_selection.is_enabled()
                 || !tag_filters.is_empty()
                 || (!fasta_mode && flag_filters.include_any != 0),
@@ -427,6 +446,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             flag_filters,
             append_read_number,
             use_original_quality,
+            default_quality,
             &aux_selection,
             &tag_filters,
         ),
@@ -494,6 +514,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             flag_filters,
             append_read_number,
             use_original_quality,
+            default_quality,
             &aux_selection,
             &tag_filters,
         ),
@@ -579,6 +600,7 @@ fn view_sam_path_as_fastq_split(
     flag_filters: FlagFilters,
     append_read_number: bool,
     use_original_quality: bool,
+    default_quality: Option<u8>,
     aux_selection: &AuxSelection,
     tag_filters: &[TagFilter],
 ) -> io::Result<htslib_rs::alignment_compat::FastxSplitText> {
@@ -589,6 +611,7 @@ fn view_sam_path_as_fastq_split(
         flag_filters,
         append_read_number,
         use_original_quality,
+        default_quality,
         aux_selection,
         tag_filters,
     )
@@ -599,6 +622,7 @@ fn view_sam_path_as_fastq_text_with_aux(
     flag_filters: FlagFilters,
     append_read_number: bool,
     use_original_quality: bool,
+    default_quality: Option<u8>,
     aux_selection: &AuxSelection,
     tag_filters: &[TagFilter],
 ) -> io::Result<String> {
@@ -609,6 +633,7 @@ fn view_sam_path_as_fastq_text_with_aux(
         flag_filters,
         append_read_number,
         use_original_quality,
+        default_quality,
         aux_selection,
         tag_filters,
     )
@@ -639,6 +664,7 @@ fn view_bam_path_as_fastq_text_with_aux(
     flag_filters: FlagFilters,
     append_read_number: bool,
     use_original_quality: bool,
+    default_quality: Option<u8>,
     aux_selection: &AuxSelection,
     tag_filters: &[TagFilter],
 ) -> io::Result<String> {
@@ -661,6 +687,7 @@ fn view_bam_path_as_fastq_text_with_aux(
                 &record,
                 append_read_number,
                 use_original_quality,
+                default_quality,
                 aux_selection,
             )?;
         }
@@ -698,6 +725,7 @@ fn view_bam_path_as_fastq_split_with_aux(
     flag_filters: FlagFilters,
     append_read_number: bool,
     use_original_quality: bool,
+    default_quality: Option<u8>,
     aux_selection: &AuxSelection,
     tag_filters: &[TagFilter],
 ) -> io::Result<htslib_rs::alignment_compat::FastxSplitText> {
@@ -720,6 +748,7 @@ fn view_bam_path_as_fastq_split_with_aux(
                 &record,
                 append_read_number,
                 use_original_quality,
+                default_quality,
                 aux_selection,
             )?;
         }
@@ -757,6 +786,7 @@ fn view_sam_reader_as_fastq_text_with_aux<R>(
     flag_filters: FlagFilters,
     append_read_number: bool,
     use_original_quality: bool,
+    default_quality: Option<u8>,
     aux_selection: &AuxSelection,
     tag_filters: &[TagFilter],
 ) -> io::Result<String>
@@ -776,6 +806,7 @@ where
                 &record,
                 append_read_number,
                 use_original_quality,
+                default_quality,
                 aux_selection,
             )?;
         }
@@ -810,6 +841,7 @@ fn view_sam_reader_as_fastq_split_with_aux<R>(
     flag_filters: FlagFilters,
     append_read_number: bool,
     use_original_quality: bool,
+    default_quality: Option<u8>,
     aux_selection: &AuxSelection,
     tag_filters: &[TagFilter],
 ) -> io::Result<htslib_rs::alignment_compat::FastxSplitText>
@@ -829,6 +861,7 @@ where
                 &record,
                 append_read_number,
                 use_original_quality,
+                default_quality,
                 aux_selection,
             )?;
         }
@@ -883,6 +916,7 @@ fn write_fastq_record_to_split<R>(
     record: &R,
     append_read_number: bool,
     use_original_quality: bool,
+    default_quality: Option<u8>,
     aux_selection: &AuxSelection,
 ) -> io::Result<()>
 where
@@ -902,6 +936,7 @@ where
         record,
         append_read_number,
         use_original_quality,
+        default_quality,
         aux_selection,
     )
 }
@@ -982,6 +1017,7 @@ fn write_fastq_record_with_aux<W, R>(
     record: &R,
     append_read_number: bool,
     use_original_quality: bool,
+    default_quality: Option<u8>,
     aux_selection: &AuxSelection,
 ) -> io::Result<()>
 where
@@ -991,7 +1027,7 @@ where
     let name = fastq_record_name(record)?;
     let name = append_fastq_read_number(name, record, append_read_number)?;
     let sequence = fastq_sequence_string(record);
-    let quality = fastq_quality_scores_string(record, use_original_quality)?;
+    let quality = fastq_quality_scores_string(record, use_original_quality, default_quality)?;
 
     if sequence.len() != quality.len() {
         return Err(io::Error::new(
@@ -1075,7 +1111,11 @@ where
     String::from_utf8_lossy(&bases).into_owned()
 }
 
-fn fastq_quality_scores_string<R>(record: &R, use_original_quality: bool) -> io::Result<String>
+fn fastq_quality_scores_string<R>(
+    record: &R,
+    use_original_quality: bool,
+    default_quality: Option<u8>,
+) -> io::Result<String>
 where
     R: htslib_rs::sam::alignment::Record + ?Sized,
 {
@@ -1090,6 +1130,12 @@ where
         .quality_scores()
         .iter()
         .collect::<io::Result<Vec<_>>>()?;
+    if scores.is_empty()
+        && let Some(default_quality) = default_quality
+    {
+        let len = record.sequence().iter().count();
+        return Ok(std::iter::repeat_n(char::from(default_quality + b'!'), len).collect());
+    }
     let mut bytes = scores
         .into_iter()
         .map(|score| {
@@ -1370,6 +1416,10 @@ fn print_usage(sub: &str) -> io::Result<()> {
     writeln!(w, "  -n           do not append /1 or /2 to read names")?;
     writeln!(w, "  -N           append /1 or /2 to read names")?;
     writeln!(w, "  -O           use OQ tag qualities when present")?;
+    writeln!(
+        w,
+        "  -v INT       default quality score for missing qualities"
+    )?;
     writeln!(w, "  -T TAGLIST   copy aux tags to FASTQ comments")?;
     writeln!(w, "  -d, --tag TAG[:VAL] filter by aux tag presence/value")?;
     writeln!(

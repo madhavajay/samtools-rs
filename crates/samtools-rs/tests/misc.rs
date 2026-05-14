@@ -1517,6 +1517,53 @@ fn fastq_uses_original_quality_tag_when_requested() {
 }
 
 #[test]
+fn fastq_v_supplies_default_quality_for_missing_quality() {
+    let tmp = tmp_dir("fastq-default-quality");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("reads.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "missing\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t*\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-v",
+                "2",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        "@missing\nACGT\n+\n####\n"
+    );
+}
+
+#[test]
+fn fastq_rejects_invalid_default_quality() {
+    let sam = fixtures_dir().join("dat").join("view.001.sam");
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &["-v", "94", sam.to_str().unwrap()]
+        ))),
+        1
+    );
+}
+
+#[test]
 fn fastq_single_sam_path_filters_by_aux_tag_value() {
     let tmp = tmp_dir("fastq-aux-filter-value");
     let sam = tmp.join("in.sam");
