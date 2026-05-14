@@ -1990,13 +1990,50 @@ fn fixmate_sam_input_fills_mate_fields_to_sam_output() {
     assert_eq!(records[0][1], "65");
     assert_eq!(records[0][6], "=");
     assert_eq!(records[0][7], "5");
+    assert_eq!(records[0][8], "4");
     assert!(records[0].contains(&"MC:Z:4M"));
     assert!(records[0].contains(&"MQ:i:60"));
     assert_eq!(records[1][1], "129");
     assert_eq!(records[1][6], "=");
     assert_eq!(records[1][7], "1");
+    assert_eq!(records[1][8], "-4");
     assert!(records[1].contains(&"MC:Z:4M"));
     assert!(records[1].contains(&"MQ:i:60"));
+}
+
+#[test]
+fn fixmate_recomputes_template_lengths_from_five_prime_positions() {
+    let tmp = tmp_dir("fixmate-tlen");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("fixed.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:queryname\n",
+            "@SQ\tSN:ref1\tLN:10000000100\n",
+            "pair\t99\tref1\t10000000010\t30\t23M\t=\t10000000008\t2\tAAGTCGGCAGCGTCAGATGTGTA\t???????????????????????\n",
+            "pair\t147\tref1\t10000000008\t30\t23M\t=\t10000000010\t-2\tCTGTCTCTTATACACATCTCCTT\t???????????????????????\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fixmate::main(&argv(
+            "fixmate",
+            &["-O", "sam", sam.to_str().unwrap(), out.to_str().unwrap(),]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let records: Vec<Vec<_>> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').collect())
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0][8], "21");
+    assert_eq!(records[1][8], "-21");
 }
 
 #[test]

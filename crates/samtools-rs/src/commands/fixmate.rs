@@ -403,6 +403,7 @@ fn pair_fixmate(
     apply_mate_flags(&mut b, &a);
     update_mate_aux_tags(&mut a, &b);
     update_mate_aux_tags(&mut b, &a);
+    update_template_lengths(&mut a, &mut b);
     if add_template_cigar {
         update_template_cigar_tag(&mut a, &mut b);
     }
@@ -433,6 +434,40 @@ fn pair_fixmate(
         }
     }
     (a, b)
+}
+
+fn update_template_lengths(a: &mut RecordBuf, b: &mut RecordBuf) {
+    let tlen = if a.flags().is_unmapped()
+        || b.flags().is_unmapped()
+        || a.reference_sequence_id().is_none()
+        || a.reference_sequence_id() != b.reference_sequence_id()
+    {
+        None
+    } else {
+        match (five_prime_position(a), five_prime_position(b)) {
+            (Some(a5), Some(b5)) => Some((b5 - a5, a5 - b5)),
+            _ => None,
+        }
+    };
+
+    match tlen {
+        Some((a_tlen, b_tlen)) => {
+            *a.template_length_mut() = i32::try_from(a_tlen).unwrap_or(0);
+            *b.template_length_mut() = i32::try_from(b_tlen).unwrap_or(0);
+        }
+        None => {
+            *a.template_length_mut() = 0;
+            *b.template_length_mut() = 0;
+        }
+    }
+}
+
+fn five_prime_position(record: &RecordBuf) -> Option<i64> {
+    if record.flags().is_reverse_complemented() {
+        record.alignment_end().map(|pos| pos.get() as i64)
+    } else {
+        record.alignment_start().map(|pos| pos.get() as i64 - 1)
+    }
 }
 
 fn update_template_cigar_tag(a: &mut RecordBuf, b: &mut RecordBuf) {
