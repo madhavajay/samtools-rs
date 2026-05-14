@@ -251,6 +251,7 @@ fn run_fixmate_bam(
 ) -> io::Result<()> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let mut header = reader.read_header()?;
+    reject_coordinate_sorted(&header)?;
     if let Some(argv) = pg_argv {
         header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
     }
@@ -291,6 +292,7 @@ fn run_fixmate_sam(
 ) -> io::Result<()> {
     let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
     let mut header = reader.read_header()?;
+    reject_coordinate_sorted(&header)?;
     if let Some(argv) = pg_argv {
         header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
     }
@@ -318,6 +320,29 @@ fn run_fixmate_sam(
         sink.write_record(&header, &rec)?;
     }
     Ok(())
+}
+
+fn reject_coordinate_sorted(header: &sam::Header) -> io::Result<()> {
+    let is_coordinate_sorted = header
+        .header()
+        .as_ref()
+        .and_then(|hd| {
+            hd.other_fields()
+                .get(&sam::header::record::value::map::header::tag::SORT_ORDER)
+        })
+        .is_some_and(|value| {
+            let bytes: &[u8] = value.as_ref();
+            bytes.eq_ignore_ascii_case(b"coordinate")
+        });
+
+    if is_coordinate_sorted {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Coordinate sorted, require grouped/sorted by queryname.",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// `-r` skips secondary and unmapped alignments from the output.

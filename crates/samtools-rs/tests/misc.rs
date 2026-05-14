@@ -2080,6 +2080,37 @@ fn fixmate_c_adds_template_cigar_tag_and_replaces_stale_tags() {
 }
 
 #[test]
+fn fixmate_rejects_coordinate_sorted_input() {
+    let tmp = tmp_dir("fixmate-coordinate-sort");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("fixed.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:100\n",
+            "pair\t65\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "pair\t129\tchr1\t10\t60\t3M\t*\t0\t0\tTGA\t###\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fixmate::main(&argv(
+            "fixmate",
+            &[
+                "--output-fmt",
+                "sam",
+                sam.to_str().unwrap(),
+                out.to_str().unwrap(),
+            ]
+        ))),
+        1
+    );
+    assert!(!out.exists());
+}
+
+#[test]
 fn faidx_builds_index() {
     let tmp = tmp_dir("fai");
     let src = fixtures_dir().join("dat").join("dict.fa");
