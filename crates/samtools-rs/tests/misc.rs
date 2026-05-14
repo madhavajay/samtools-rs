@@ -2043,6 +2043,43 @@ fn fixmate_m_adds_mate_score_tags() {
 }
 
 #[test]
+fn fixmate_c_adds_template_cigar_tag_and_replaces_stale_tags() {
+    let tmp = tmp_dir("fixmate-ct");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("fixed.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:queryname\n",
+            "@SQ\tSN:chr1\tLN:100\n",
+            "pair\t65\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tct:Z:stale-a\n",
+            "pair\t145\tchr1\t10\t60\t3M\t*\t0\t0\tTGA\t###\tct:Z:stale-b\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fixmate::main(&argv(
+            "fixmate",
+            &["-cO", "sam", sam.to_str().unwrap(), out.to_str().unwrap(),]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let records: Vec<Vec<_>> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').collect())
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert!(records[0].contains(&"ct:Z:1F4M5T2R3M"));
+    assert!(!records[0].contains(&"ct:Z:stale-a"));
+    assert!(!records[1].contains(&"ct:Z:stale-b"));
+    assert!(!records[1].iter().any(|field| field.starts_with("ct:Z:")));
+}
+
+#[test]
 fn faidx_builds_index() {
     let tmp = tmp_dir("fai");
     let src = fixtures_dir().join("dat").join("dict.fa");

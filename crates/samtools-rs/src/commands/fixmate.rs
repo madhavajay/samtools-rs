@@ -5,8 +5,7 @@
 //! paired up and their `FMUNMAP`/`FMREVERSE` flags + `mate_reference_sequence_id`
 //! + `mate_alignment_start` are made consistent.
 //!
-//! **Not yet supported:** record-level sanitizer mutation, `-c` (calculate CT),
-//! CRAM input/output.
+//! **Not yet supported:** record-level sanitizer mutation, CRAM input/output.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -75,6 +74,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         pg_argv,
         opts.remove_reads,
         opts.mate_score,
+        opts.add_template_cigar,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -97,6 +97,8 @@ struct Opts {
     remove_reads: bool,
     /// `-m`: add `ms:i` mate score tags for duplicate marking.
     mate_score: bool,
+    /// `-c`: add lowercase `ct:Z` template CIGAR tag.
+    add_template_cigar: bool,
 }
 
 impl Default for Opts {
@@ -109,6 +111,7 @@ impl Default for Opts {
             no_pg: false,
             remove_reads: false,
             mate_score: false,
+            add_template_cigar: false,
         }
     }
 }
@@ -128,11 +131,7 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
         match s {
             "-O" | "--output-fmt" => {
                 let v = next_value(&mut iter, s)?;
-                opts.output_fmt = match v.to_lowercase().as_str() {
-                    "sam" => OutFmt::Sam,
-                    "bam" => OutFmt::Bam,
-                    _ => OutFmt::Bam,
-                };
+                opts.output_fmt = parse_output_fmt(&v);
             }
             "-@" | "--threads" | "-l" => {
                 let _ = next_value(&mut iter, s)?;
@@ -150,7 +149,19 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
             "-m" => {
                 opts.mate_score = true;
             }
-            "-c" | "-p" => {
+            "-c" => {
+                opts.add_template_cigar = true;
+            }
+            _ if s.starts_with("-cO") => {
+                opts.add_template_cigar = true;
+                let v = if s.len() > 3 {
+                    s[3..].to_owned()
+                } else {
+                    next_value(&mut iter, "-O")?
+                };
+                opts.output_fmt = parse_output_fmt(&v);
+            }
+            "-p" => {
                 // Accepted but not yet implemented.
             }
             "--help" => return Err(ParseError::Usage),
@@ -168,6 +179,14 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
     }
 
     Ok(opts)
+}
+
+fn parse_output_fmt(raw: &str) -> OutFmt {
+    match raw.to_lowercase().as_str() {
+        "sam" => OutFmt::Sam,
+        "bam" => OutFmt::Bam,
+        _ => OutFmt::Bam,
+    }
 }
 
 fn next_value<'a, I>(iter: &mut I, option: &str) -> Result<String, ParseError>
@@ -192,11 +211,28 @@ fn run_fixmate(
     pg_argv: Option<&[OsString]>,
     remove_reads: bool,
     mate_score: bool,
+    add_template_cigar: bool,
 ) -> io::Result<()> {
     let format = sam_io::sam_open_format(input)?;
     match format.exact {
-        Exact::Sam => run_fixmate_sam(input, output, fmt, pg_argv, remove_reads, mate_score),
-        Exact::Bam => run_fixmate_bam(input, output, fmt, pg_argv, remove_reads, mate_score),
+        Exact::Sam => run_fixmate_sam(
+            input,
+            output,
+            fmt,
+            pg_argv,
+            remove_reads,
+            mate_score,
+            add_template_cigar,
+        ),
+        Exact::Bam => run_fixmate_bam(
+            input,
+            output,
+            fmt,
+            pg_argv,
+            remove_reads,
+            mate_score,
+            add_template_cigar,
+        ),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "only SAM and BAM input are currently supported (CRAM TODO)",
@@ -211,6 +247,7 @@ fn run_fixmate_bam(
     pg_argv: Option<&[OsString]>,
     remove_reads: bool,
     mate_score: bool,
+    add_template_cigar: bool,
 ) -> io::Result<()> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let mut header = reader.read_header()?;
@@ -232,6 +269,7 @@ fn run_fixmate_bam(
             next.clone(),
             remove_reads,
             mate_score,
+            add_template_cigar,
         )?;
     }
     if let Some(rec) = pending
@@ -249,6 +287,7 @@ fn run_fixmate_sam(
     pg_argv: Option<&[OsString]>,
     remove_reads: bool,
     mate_score: bool,
+    add_template_cigar: bool,
 ) -> io::Result<()> {
     let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
     let mut header = reader.read_header()?;
@@ -270,6 +309,7 @@ fn run_fixmate_sam(
             next.clone(),
             remove_reads,
             mate_score,
+            add_template_cigar,
         )?;
     }
     if let Some(rec) = pending
@@ -296,6 +336,7 @@ fn write_fixed_record(
     next: RecordBuf,
     remove_reads: bool,
     mate_score: bool,
+    add_template_cigar: bool,
 ) -> io::Result<()> {
     match pending.take() {
         None => *pending = Some(next),
@@ -303,7 +344,7 @@ fn write_fixed_record(
             let prev_name = prev.name().map(|n| n.to_vec());
             let next_name = next.name().map(|n| n.to_vec());
             if prev_name == next_name && next_name.is_some() {
-                let (a, b) = pair_fixmate(prev, next, remove_reads, mate_score);
+                let (a, b) = pair_fixmate(prev, next, remove_reads, mate_score, add_template_cigar);
                 if !skip_for_remove_reads(&a, remove_reads) {
                     sink.write_record(header, &a)?;
                 }
@@ -327,6 +368,7 @@ fn pair_fixmate(
     mut b: RecordBuf,
     remove_reads: bool,
     mate_score: bool,
+    add_template_cigar: bool,
 ) -> (RecordBuf, RecordBuf) {
     let a_tid = a.reference_sequence_id();
     let b_tid = b.reference_sequence_id();
@@ -336,6 +378,9 @@ fn pair_fixmate(
     apply_mate_flags(&mut b, &a);
     update_mate_aux_tags(&mut a, &b);
     update_mate_aux_tags(&mut b, &a);
+    if add_template_cigar {
+        update_template_cigar_tag(&mut a, &mut b);
+    }
     if mate_score {
         update_mate_score_tag(&mut a, &b);
         update_mate_score_tag(&mut b, &a);
@@ -363,6 +408,64 @@ fn pair_fixmate(
         }
     }
     (a, b)
+}
+
+fn update_template_cigar_tag(a: &mut RecordBuf, b: &mut RecordBuf) {
+    let ct_tag = Tag::from([b'c', b't']);
+    a.data_mut().remove(&ct_tag);
+    b.data_mut().remove(&ct_tag);
+
+    if a.flags().is_unmapped()
+        || b.flags().is_unmapped()
+        || a.reference_sequence_id().is_none()
+        || a.reference_sequence_id() != b.reference_sequence_id()
+    {
+        return;
+    }
+
+    let (Some(a_start), Some(b_start)) = (a.alignment_start(), b.alignment_start()) else {
+        return;
+    };
+    let (Some(a_end), Some(b_end)) = (a.alignment_end(), b.alignment_end()) else {
+        return;
+    };
+
+    let (left, left_start, left_end, right, right_start) = if a_start > b_start {
+        (b, b_start, b_end, a, a_start)
+    } else {
+        (a, a_start, a_end, b, b_start)
+    };
+
+    let gap = right_start.get() as isize - left_end.get() as isize - 1;
+    let ct = format!(
+        "{}{}{}{}T{}{}{}",
+        segment_index(left),
+        strand(left),
+        format_cigar(left.cigar()),
+        gap,
+        segment_index(right),
+        strand(right),
+        format_cigar(right.cigar())
+    );
+    debug_assert!(left_start <= right_start);
+    left.data_mut()
+        .insert(ct_tag, Value::String(BString::from(ct)));
+}
+
+fn segment_index(record: &RecordBuf) -> char {
+    if record.flags().is_first_segment() {
+        '1'
+    } else {
+        '2'
+    }
+}
+
+fn strand(record: &RecordBuf) -> char {
+    if record.flags().is_reverse_complemented() {
+        'R'
+    } else {
+        'F'
+    }
 }
 
 fn apply_mate_flags(target: &mut RecordBuf, mate: &RecordBuf) {
@@ -507,6 +610,7 @@ fn print_usage() -> io::Result<()> {
     writeln!(w, "Usage: samtools fixmate [options] <in.bam> [<out.bam>]")?;
     writeln!(w, "  -O sam|bam   output format (default: bam)")?;
     writeln!(w, "  -m           add mate score tags")?;
+    writeln!(w, "  -c           add template CIGAR ct tag")?;
     writeln!(w, "  -z, --sanitize FLAG[,FLAG]")?;
     Ok(())
 }
