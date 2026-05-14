@@ -266,7 +266,7 @@ samtools-rs status legend:
 - **C source:** `bam_checksum.c` (~47k LOC)
 - **HTSlib APIs used:** `sam_open_format`, `sam_hdr_read`, `sam_read1`, `bam_aux_*`, `bam_sanitize`, `hts_crc32`, `hts_set_threads`
 - **htslib-rs coverage:** ⚠️ — SAM/BAM record iteration is available; whole-CRAM record iteration and lower-level raw aux/CIGAR byte access still need coverage for full parity.
-- **samtools-rs status:** 🟡 — default SAM/BAM checksum output works with read-group grouping, flag filters/masks, reverse-complement handling, selected and wildcard/exclusion scalar/string/array aux tags with canonical integer encoding, `-N`, `-o`, `-q`, `-v`, `-T`, `-O`, `-P` position columns, `-C` CIGAR columns, `-M` mate columns, `-B` bamseqchksum-compatible formatting, and `-m` merging for default/position/CIGAR/mate-column checksum reports; CRAM, all-field mode, and sanitizer mutation remain.
+- **samtools-rs status:** 🟡 — default SAM/BAM checksum output works with read-group grouping, flag filters/masks, reverse-complement handling, selected and wildcard/exclusion scalar/string/array aux tags with canonical integer encoding, `-N`, `-o`, `-q`, `-v`, `-T`, `-O`, `-P` position columns, `-C` CIGAR columns, `-M` mate columns, `-B` bamseqchksum-compatible formatting, `-a` all-field shorthand with upstream-style sanitizer defaults, `-z`/`--sanitize` record mutation, and `-m` merging for default/position/CIGAR/mate-column checksum reports; CRAM and full harness parity remain.
 
 ### samples
 

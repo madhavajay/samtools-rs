@@ -678,6 +678,64 @@ fn checksum_all_expands_to_full_field_options_for_sam_and_bam() {
 }
 
 #[test]
+fn checksum_sanitize_mutates_records_before_field_checks() {
+    let tmp = tmp_dir("checksum-sanitize");
+    let header = "@HD\tVN:1.6\n@SQ\tSN:x\tLN:5\n";
+    let dirty = tmp.join("dirty.sam");
+    let clean = tmp.join("clean.sam");
+    let dirty_out = tmp.join("dirty.chk");
+    let clean_out = tmp.join("clean.chk");
+    std::fs::write(
+        &dirty,
+        format!("{header}r1\t0\tx\t6\t60\t4M\t*\t0\t0\tACGT\t!!!!\tMD:Z:4\tNM:i:0\tZZ:Z:z\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        &clean,
+        format!("{header}r1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\t!!!!\tZZ:Z:z\n"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(checksum::main(&argv(
+            "checksum",
+            &[
+                "-z",
+                "all",
+                "-P",
+                "-C",
+                "-t",
+                "*,cF",
+                dirty.to_str().unwrap(),
+                "-o",
+                dirty_out.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(checksum::main(&argv(
+            "checksum",
+            &[
+                "-P",
+                "-C",
+                "-t",
+                "*,cF",
+                clean.to_str().unwrap(),
+                "-o",
+                clean_out.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        normalize_checksum_file_line(&std::fs::read_to_string(dirty_out).unwrap()),
+        normalize_checksum_file_line(&std::fs::read_to_string(clean_out).unwrap())
+    );
+}
+
+#[test]
 fn checksum_aux_wildcard_includes_sorted_tags() {
     let tmp = tmp_dir("checksum-aux-wildcard");
     let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:100\n";

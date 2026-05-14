@@ -2,8 +2,7 @@
 //!
 //! This is a partial port of `bam_checksum.c`. It supports SAM/BAM input for
 //! the default checksum columns and common filters. CRAM input needs an
-//! all-record CRAM iterator, and sanitizer-backed all-field (`-a`) parity still
-//! needs record mutation support, so those pieces remain deferred.
+//! all-record CRAM iterator, so that piece remains deferred.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -22,6 +21,7 @@ use crate::bam_flag::{
 };
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
+use crate::sanitize::{SanitizeFlags, parse_sanitize_options, sanitize_record};
 
 const PRIME: u64 = (1u64 << 31) - 1;
 
@@ -43,6 +43,7 @@ struct ChecksumOptions {
     check_cigar: bool,
     check_mate: bool,
     compat: bool,
+    sanitize_flags: SanitizeFlags,
 }
 
 impl Default for ChecksumOptions {
@@ -64,6 +65,7 @@ impl Default for ChecksumOptions {
             check_cigar: false,
             check_mate: false,
             compat: false,
+            sanitize_flags: SanitizeFlags::empty(),
         }
     }
 }
@@ -251,11 +253,17 @@ fn parse_args(args: &[OsString]) -> Result<(ChecksumOptions, Vec<PathBuf>), Pars
             }
             "-a" | "--all" => apply_all_options(&mut opts),
             "-z" | "--sanitize" => {
-                print_error(
-                    "checksum",
-                    format!("option `{s}` is not yet supported in samtools-rs checksum"),
-                );
-                return Err(ParseOutcome::Error);
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("checksum", "missing value for -z");
+                    return Err(ParseOutcome::Error);
+                };
+                opts.sanitize_flags = match parse_sanitize_options(raw) {
+                    Ok(flags) => flags,
+                    Err(e) => {
+                        print_error("checksum", e);
+                        return Err(ParseOutcome::Error);
+                    }
+                };
             }
             "--help" | "-h" => {
                 let _ = print_usage();
@@ -281,6 +289,7 @@ fn apply_all_options(opts: &mut ChecksumOptions) {
     opts.check_pos = true;
     opts.check_cigar = true;
     opts.check_mate = true;
+    opts.sanitize_flags = SanitizeFlags::ALL_WITH_CIGARX;
     opts.tags = "*,cF,MD,NM".to_string();
 }
 
@@ -347,7 +356,14 @@ fn checksum_path(input: &Path, opts: &ChecksumOptions, writer: &mut dyn Write) -
                     if n == 0 {
                         break;
                     }
-                    if update_record(&header, &record, opts, &mut all, &mut no_rg, &mut groups)? {
+                    if update_record_buf(
+                        &header,
+                        &mut record,
+                        opts,
+                        &mut all,
+                        &mut no_rg,
+                        &mut groups,
+                    )? {
                         seen += 1;
                         if opts.nrec != 0 && seen == opts.nrec {
                             break;
@@ -385,9 +401,13 @@ where
     R: io::BufRead,
 {
     let mut seen = 0u64;
-    for result in reader.records() {
-        let record = result?;
-        if update_record(header, &record, opts, all, no_rg, groups)? {
+    let mut record = sam::alignment::RecordBuf::default();
+    loop {
+        let n = reader.read_record_buf(header, &mut record)?;
+        if n == 0 {
+            break;
+        }
+        if update_record_buf(header, &mut record, opts, all, no_rg, groups)? {
             seen += 1;
             if opts.nrec != 0 && seen == opts.nrec {
                 break;
@@ -397,25 +417,24 @@ where
     Ok(())
 }
 
-fn update_record<R>(
+fn update_record_buf(
     header: &sam::Header,
-    record: &R,
+    record: &mut sam::alignment::RecordBuf,
     opts: &ChecksumOptions,
     all: &mut Sums,
     no_rg: &mut Sums,
     groups: &mut BTreeMap<String, Sums>,
-) -> io::Result<bool>
-where
-    R: sam::alignment::Record + ?Sized,
-{
-    let flag = record.flags()?.bits();
-    if flag & opts.exclude_flags != 0 {
+) -> io::Result<bool> {
+    let original_flag = record.flags().bits();
+    if original_flag & opts.exclude_flags != 0 {
         return Ok(false);
     }
-    if (flag & opts.require_flags) != opts.require_flags {
+    if (original_flag & opts.require_flags) != opts.require_flags {
         return Ok(false);
     }
 
+    sanitize_record(header, record, opts.sanitize_flags);
+    let flag = record.flags().bits();
     let crcs = record_crcs(header, record, opts, flag)?;
     let qcfail = flag & BAM_FQCFAIL as u16 != 0;
     let group = read_group(record)?;
@@ -1239,6 +1258,10 @@ fn print_usage() -> io::Result<()> {
     writeln!(
         w,
         "  -M, --check-mate            Also checksum PNEXT / RNEXT / TLEN [off]"
+    )?;
+    writeln!(
+        w,
+        "  -z, --sanitize FLAGS        Perform sanity checks and fix records [off]"
     )?;
     writeln!(
         w,

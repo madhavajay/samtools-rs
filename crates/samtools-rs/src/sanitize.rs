@@ -37,6 +37,7 @@ impl SanitizeFlags {
 
     /// Upstream's `FIX_ALL`; intentionally excludes `FIX_CIGARX`.
     pub const ALL: Self = Self(127);
+    pub const ALL_WITH_CIGARX: Self = Self(Self::ALL.bits() | Self::CIGARX.bits());
 
     pub const fn empty() -> Self {
         Self(0)
