@@ -10,8 +10,8 @@ use std::sync::Mutex;
 use htslib_rs::bam;
 use htslib_rs::sam;
 use samtools_rs::commands::{
-    addreplacerg, bedcov, calmd, cat, checksum, faidx, fastq, fixmate, flagstat, fqidx, idxstats,
-    import, index, reference, reheader, reset, rmdup, samples, split, view,
+    addreplacerg, bedcov, calmd, cat, checksum, depad, faidx, fastq, fixmate, flagstat, fqidx,
+    idxstats, import, index, reference, reheader, reset, rmdup, samples, split, view,
 };
 use samtools_rs::header_text;
 use samtools_rs::run as samtools_run;
@@ -96,12 +96,53 @@ fn write_bam_from_sam_text(path: &std::path::Path, text: &str) {
     }
 }
 
+fn without_pg_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.starts_with("@PG\t"))
+        .map(|line| {
+            let mut line = line.to_string();
+            line.push('\n');
+            line
+        })
+        .collect()
+}
+
 #[test]
 fn flagstat_succeeds() {
     let p = sample_bam();
     assert_eq!(
         exit_to_u8(flagstat::main(&argv("flagstat", &[p.to_str().unwrap()]))),
         0
+    );
+}
+
+#[test]
+fn depad_sam_matches_upstream_fixture() {
+    let tmp = tmp_dir("depad-sam");
+    let output = tmp.join("depad.sam");
+    let input = fixtures_dir().join("dat").join("depad.001p.sam");
+    let reference = fixtures_dir().join("dat").join("depad.001.fa");
+    let expected = fixtures_dir().join("dat").join("depad.001u.sam");
+
+    assert_eq!(
+        exit_to_u8(depad::main(&argv(
+            "depad",
+            &[
+                "-T",
+                reference.to_str().unwrap(),
+                "-s",
+                "--no-PG",
+                "-o",
+                output.to_str().unwrap(),
+                input.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(output).unwrap(),
+        without_pg_lines(&std::fs::read_to_string(expected).unwrap())
     );
 }
 

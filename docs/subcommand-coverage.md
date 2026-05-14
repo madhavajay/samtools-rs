@@ -248,7 +248,7 @@ samtools-rs status legend:
 ### depad / pad2unpad
 
 - **C source:** `padding.c`
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** 🟡 — SAM input with `-T` padded FASTA reference and `-s` SAM output converts padded reference columns to unpadded coordinates/CIGAR and matches the upstream `depad.001` fixture with `--no-PG`; BAM input/output, CRAM, binary output modes, and full harness parity remain.
 
 ### ampliconstats
 
