@@ -382,6 +382,62 @@ fn merge_sam_inputs_to_sam_output() {
 }
 
 #[test]
+fn merge_reads_inputs_from_file_list() {
+    let tmp = tmp_dir("merge-input-list");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let list = tmp.join("inputs.txt");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "b\t0\tchr1\t4\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &list,
+        format!("{}\n\n{}\n", sam_a.display(), sam_b.display()),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--no-PG",
+        "-b",
+        list.to_str().unwrap(),
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let names: Vec<_> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').next().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+}
+
+#[test]
 fn merge_unions_different_sq_headers_and_remaps_records() {
     let tmp = tmp_dir("merge-union-sq");
     let sam_a = tmp.join("a.sam");

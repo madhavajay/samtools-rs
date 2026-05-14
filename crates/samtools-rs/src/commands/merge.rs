@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -35,6 +35,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut region: Option<String> = None;
     let mut bed: Option<PathBuf> = None;
     let mut tag_sort: Option<[u8; 2]> = None;
+    let mut input_lists: Vec<PathBuf> = Vec::new();
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -87,6 +88,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-L" => {
                 bed = iter.next().map(PathBuf::from);
             }
+            "-b" => {
+                let Some(path) = iter.next() else {
+                    print_error("merge", "missing value for -b");
+                    return ExitCode::from(1);
+                };
+                input_lists.push(PathBuf::from(path));
+            }
             "-@" | "--threads" | "-l" | "--compression-level" => {
                 let _ = iter.next();
             }
@@ -116,7 +124,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     // Upstream synopsis: `samtools merge [options] <out.bam> <in1.bam> [<in2.bam>...]`.
     // If `-o` is given, all positionals are inputs; otherwise the first
     // positional is the output path.
-    let (out_path, inputs): (Option<PathBuf>, Vec<PathBuf>) = if output.is_some() {
+    let (out_path, mut inputs): (Option<PathBuf>, Vec<PathBuf>) = if output.is_some() {
         (output, positional)
     } else if positional.is_empty() {
         let _ = print_usage();
@@ -127,6 +135,16 @@ pub fn main(args: &[OsString]) -> ExitCode {
         let inputs: Vec<_> = iter.collect();
         (out, inputs)
     };
+
+    for list in &input_lists {
+        match read_input_list(list) {
+            Ok(list_inputs) => inputs.extend(list_inputs),
+            Err(e) => {
+                print_error("merge", e.to_string());
+                return ExitCode::from(1);
+            }
+        }
+    }
 
     if inputs.is_empty() {
         let _ = print_usage();
@@ -242,6 +260,21 @@ fn parse_tag(raw: &str) -> Result<[u8; 2], String> {
             raw
         ))
     }
+}
+
+fn read_input_list(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let file = File::open(path)?;
+    let mut inputs = Vec::new();
+
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let line = line.trim();
+        if !line.is_empty() {
+            inputs.push(PathBuf::from(line));
+        }
+    }
+
+    Ok(inputs)
 }
 
 #[derive(Clone, Copy)]
