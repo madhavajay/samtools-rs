@@ -1355,7 +1355,32 @@ fn write_coverage_histogram(
 fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
     writeln!(w, "Usage: samtools stats [options] <in.bam>")?;
-    writeln!(w, "  -o FILE      output FILE")?;
+    writeln!(w, "  -o, --output FILE             output FILE")?;
+    writeln!(
+        w,
+        "  -f, --required-flag FLAG      require all FLAG bits or names"
+    )?;
+    writeln!(
+        w,
+        "  -F, --filtering-flag FLAG     filter records with any FLAG bits or names"
+    )?;
+    writeln!(
+        w,
+        "  -l, --read-length LEN         include only records with sequence length LEN"
+    )?;
+    writeln!(
+        w,
+        "  -c, --coverage MIN,MAX,STEP   coverage histogram bucket range"
+    )?;
+    writeln!(
+        w,
+        "  -g, --cov-threshold DEPTH     target coverage percentage threshold"
+    )?;
+    writeln!(w, "  -t, --target-regions FILE     BED-like target regions")?;
+    writeln!(
+        w,
+        "  -d, --remove-dups             filter duplicate records"
+    )?;
     writeln!(w)?;
     writeln!(
         w,
