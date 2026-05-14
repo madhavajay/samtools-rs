@@ -2265,6 +2265,33 @@ fn fixmate_rejects_coordinate_sorted_input() {
 }
 
 #[test]
+fn fixmate_default_sanitizer_matches_upstream_fixture() {
+    let tmp = tmp_dir("fixmate-sanitize");
+    let out = tmp.join("fixed.sam");
+    let input = fixtures_dir().join("fixmate").join("sanitize.sam");
+    let expected = fixtures_dir().join("fixmate").join("sanitize.sam.expected");
+
+    assert_eq!(
+        exit_to_u8(fixmate::main(&argv(
+            "fixmate",
+            &[
+                "--no-PG",
+                "-O",
+                "sam",
+                input.to_str().unwrap(),
+                out.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        std::fs::read_to_string(expected).unwrap()
+    );
+}
+
+#[test]
 fn faidx_builds_index() {
     let tmp = tmp_dir("fai");
     let src = fixtures_dir().join("dat").join("dict.fa");

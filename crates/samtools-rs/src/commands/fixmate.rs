@@ -5,7 +5,7 @@
 //! paired up and their `FMUNMAP`/`FMREVERSE` flags + `mate_reference_sequence_id`
 //! + `mate_alignment_start` are made consistent.
 //!
-//! **Not yet supported:** record-level sanitizer mutation, CRAM input/output.
+//! **Not yet supported:** CRAM input/output.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -28,7 +28,7 @@ use htslib_rs::sam::{
 
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
-use crate::sanitize::{SanitizeFlags, parse_sanitize_options};
+use crate::sanitize::{SanitizeFlags, parse_sanitize_options, sanitize_record};
 
 /// Entry point for `samtools fixmate`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -43,8 +43,6 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-
-    let _ = opts.sanitize_flags; // Parsed for parity; record mutation is still TODO.
 
     let Some(input) = opts.input else {
         let _ = print_usage();
@@ -67,14 +65,18 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     let pg_argv = if opts.no_pg { None } else { Some(args) };
+    let settings = FixmateSettings {
+        remove_reads: opts.remove_reads,
+        mate_score: opts.mate_score,
+        add_template_cigar: opts.add_template_cigar,
+        sanitize_flags: opts.sanitize_flags.unwrap_or(SanitizeFlags::ALL),
+    };
     match run_fixmate(
         &input,
         opts.output.as_deref(),
         opts.output_fmt,
         pg_argv,
-        opts.remove_reads,
-        opts.mate_score,
-        opts.add_template_cigar,
+        settings,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -204,35 +206,25 @@ enum OutFmt {
     Bam,
 }
 
+#[derive(Clone, Copy)]
+struct FixmateSettings {
+    remove_reads: bool,
+    mate_score: bool,
+    add_template_cigar: bool,
+    sanitize_flags: SanitizeFlags,
+}
+
 fn run_fixmate(
     input: &Path,
     output: Option<&Path>,
     fmt: OutFmt,
     pg_argv: Option<&[OsString]>,
-    remove_reads: bool,
-    mate_score: bool,
-    add_template_cigar: bool,
+    settings: FixmateSettings,
 ) -> io::Result<()> {
     let format = sam_io::sam_open_format(input)?;
     match format.exact {
-        Exact::Sam => run_fixmate_sam(
-            input,
-            output,
-            fmt,
-            pg_argv,
-            remove_reads,
-            mate_score,
-            add_template_cigar,
-        ),
-        Exact::Bam => run_fixmate_bam(
-            input,
-            output,
-            fmt,
-            pg_argv,
-            remove_reads,
-            mate_score,
-            add_template_cigar,
-        ),
+        Exact::Sam => run_fixmate_sam(input, output, fmt, pg_argv, settings),
+        Exact::Bam => run_fixmate_bam(input, output, fmt, pg_argv, settings),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "only SAM and BAM input are currently supported (CRAM TODO)",
@@ -245,9 +237,7 @@ fn run_fixmate_bam(
     output: Option<&Path>,
     fmt: OutFmt,
     pg_argv: Option<&[OsString]>,
-    remove_reads: bool,
-    mate_score: bool,
-    add_template_cigar: bool,
+    settings: FixmateSettings,
 ) -> io::Result<()> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let mut header = reader.read_header()?;
@@ -263,18 +253,19 @@ fn run_fixmate_bam(
         if n == 0 {
             break;
         }
+        sanitize_record(&header, &mut next, settings.sanitize_flags);
         write_fixed_record(
             &header,
             sink.as_mut(),
             &mut pending,
             next.clone(),
-            remove_reads,
-            mate_score,
-            add_template_cigar,
+            settings.remove_reads,
+            settings.mate_score,
+            settings.add_template_cigar,
         )?;
     }
     if let Some(rec) = pending
-        && !skip_for_remove_reads(&rec, remove_reads)
+        && !skip_for_remove_reads(&rec, settings.remove_reads)
     {
         sink.write_record(&header, &rec)?;
     }
@@ -286,9 +277,7 @@ fn run_fixmate_sam(
     output: Option<&Path>,
     fmt: OutFmt,
     pg_argv: Option<&[OsString]>,
-    remove_reads: bool,
-    mate_score: bool,
-    add_template_cigar: bool,
+    settings: FixmateSettings,
 ) -> io::Result<()> {
     let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
     let mut header = reader.read_header()?;
@@ -304,18 +293,19 @@ fn run_fixmate_sam(
         if n == 0 {
             break;
         }
+        sanitize_record(&header, &mut next, settings.sanitize_flags);
         write_fixed_record(
             &header,
             sink.as_mut(),
             &mut pending,
             next.clone(),
-            remove_reads,
-            mate_score,
-            add_template_cigar,
+            settings.remove_reads,
+            settings.mate_score,
+            settings.add_template_cigar,
         )?;
     }
     if let Some(rec) = pending
-        && !skip_for_remove_reads(&rec, remove_reads)
+        && !skip_for_remove_reads(&rec, settings.remove_reads)
     {
         sink.write_record(&header, &rec)?;
     }
