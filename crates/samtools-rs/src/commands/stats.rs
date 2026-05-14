@@ -30,11 +30,12 @@ use crate::io as sam_io;
 use crate::sam_global::current_global_args;
 use crate::version::SAMTOOLS_VERSION;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct StatsConfig {
     remove_dups: bool,
     required_flags: u32,
     filter_flags: u32,
+    id_filter: Option<String>,
     read_length_filter: Option<usize>,
     trim_quality: u8,
     coverage_min: u32,
@@ -49,6 +50,7 @@ impl Default for StatsConfig {
             remove_dups: false,
             required_flags: 0,
             filter_flags: 0,
+            id_filter: None,
             read_length_filter: None,
             trim_quality: 0,
             coverage_min: 1,
@@ -117,6 +119,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 Ok(flags) => config.filter_flags |= flags,
                 Err(()) => return ExitCode::from(1),
             },
+            "-I" | "--id" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("stats", "option -I requires an argument");
+                    return ExitCode::from(1);
+                };
+                config.id_filter = Some(raw.to_owned());
+            }
             "-l" | "--read-length" => {
                 let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
                     print_error("stats", "option -l requires an argument");
@@ -143,7 +152,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     }
                 }
             }
-            "-@" | "--threads" | "-r" | "--reference" | "-I" | "--id" | "-S" | "--split" | "-P"
+            "-@" | "--threads" | "-r" | "--reference" | "-S" | "--split" | "-P"
             | "--split-prefix" | "-G" => {
                 let _ = iter.next();
             }
@@ -233,13 +242,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
 
     let stats_input = match format.exact {
-        Exact::Sam if parsed_regions.is_empty() => collect_sam_full_stats(&input, config)
+        Exact::Sam if parsed_regions.is_empty() => collect_sam_full_stats(&input, &config)
             .map(|counts| StatsInput::Counts(Box::new(counts))),
-        Exact::Sam => collect_sam_region_stats(&input, &parsed_regions, config)
+        Exact::Sam => collect_sam_region_stats(&input, &parsed_regions, &config)
             .map(|counts| StatsInput::Counts(Box::new(counts))),
-        Exact::Bam if parsed_regions.is_empty() => collect_bam_full_stats(&input, config)
+        Exact::Bam if parsed_regions.is_empty() => collect_bam_full_stats(&input, &config)
             .map(|counts| StatsInput::Counts(Box::new(counts))),
-        Exact::Bam => collect_bam_region_stats(&input, &parsed_regions, config)
+        Exact::Bam => collect_bam_region_stats(&input, &parsed_regions, &config)
             .map(|counts| StatsInput::Counts(Box::new(counts))),
         Exact::Cram => {
             let Some(reference) = current_global_args().reference else {
@@ -252,7 +261,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 )
                 .map(StatsInput::Summaries)
             } else {
-                collect_cram_region_stats(&input, reference, &parsed_regions, config)
+                collect_cram_region_stats(&input, reference, &parsed_regions, &config)
                     .map(|counts| StatsInput::Counts(Box::new(counts)))
             }
         }
@@ -532,27 +541,65 @@ fn target_base_count(targets: &[RegionTarget]) -> u64 {
     total
 }
 
+fn matching_read_group_ids(header: &sam::Header, id: Option<&str>) -> Option<HashSet<String>> {
+    let requested = id?;
+    let sample_tag = sam::header::record::value::map::read_group::tag::SAMPLE;
+    Some(
+        header
+            .read_groups()
+            .iter()
+            .filter_map(|(rg_id, rg)| {
+                let id_matches = rg_id.as_slice() == requested.as_bytes();
+                let sample_matches = rg
+                    .other_fields()
+                    .get(&sample_tag)
+                    .is_some_and(|sample| sample.as_slice() == requested.as_bytes());
+                if id_matches || sample_matches {
+                    Some(String::from_utf8_lossy(rg_id.as_slice()).into_owned())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    )
+}
+
+fn record_read_group(rec: &(impl sam::alignment::Record + ?Sized)) -> io::Result<Option<String>> {
+    use sam::alignment::record::data::field::{Tag, Value};
+    let rg_tag = Tag::from([b'R', b'G']);
+    let data = rec.data();
+    let Some(value) = data.get(&rg_tag).transpose()? else {
+        return Ok(None);
+    };
+    match value {
+        Value::String(s) => Ok(Some(s.to_string())),
+        _ => Ok(None),
+    }
+}
+
 /// Iterates all SAM records to build a `StatsCounts` with sequence-length
 /// and quality accumulators populated (which the `summarize_*` path can
 /// not provide because `AlignmentRecordSummary` discards sequence and
 /// quality data).
-fn collect_sam_full_stats(input: &PathBuf, config: StatsConfig) -> io::Result<StatsCounts> {
+fn collect_sam_full_stats(input: &PathBuf, config: &StatsConfig) -> io::Result<StatsCounts> {
     let mut reader = File::open(input)
         .map(BufReader::new)
         .map(sam::io::Reader::new)?;
     let header = reader.read_header()?;
+    let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
     let mut counts = StatsCounts::default();
     for result in reader.records() {
         let record = result?;
-        counts.update_record(&header, &record, config);
+        counts.update_record(&header, &record, config, read_group_filter.as_ref());
     }
     Ok(counts)
 }
 
-fn collect_bam_full_stats(input: &PathBuf, config: StatsConfig) -> io::Result<StatsCounts> {
+fn collect_bam_full_stats(input: &PathBuf, config: &StatsConfig) -> io::Result<StatsCounts> {
     use htslib_rs::bam;
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let header = reader.read_header()?;
+    let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
     let mut counts = StatsCounts::default();
     let mut record = bam::Record::default();
     loop {
@@ -560,7 +607,7 @@ fn collect_bam_full_stats(input: &PathBuf, config: StatsConfig) -> io::Result<St
         if n == 0 {
             break;
         }
-        counts.update_record(&header, &record, config);
+        counts.update_record(&header, &record, config, read_group_filter.as_ref());
     }
     Ok(counts)
 }
@@ -568,12 +615,13 @@ fn collect_bam_full_stats(input: &PathBuf, config: StatsConfig) -> io::Result<St
 fn collect_sam_region_stats(
     input: &PathBuf,
     regions: &[Region],
-    config: StatsConfig,
+    config: &StatsConfig,
 ) -> io::Result<StatsCounts> {
     let mut reader = File::open(input)
         .map(BufReader::new)
         .map(sam::io::Reader::new)?;
     let header = reader.read_header()?;
+    let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
     let targets = region_targets(&header, regions)?;
     let mut counts = StatsCounts {
         target_bases: target_base_count(&targets),
@@ -586,7 +634,13 @@ fn collect_sam_region_stats(
         if record_overlaps_targets(&header, &record, &targets)
             && seen.insert(record_identity(&header, &record))
         {
-            counts.update_record_with_targets(&header, &record, config, Some(&targets));
+            counts.update_record_with_targets(
+                &header,
+                &record,
+                config,
+                read_group_filter.as_ref(),
+                Some(&targets),
+            );
         }
     }
 
@@ -596,9 +650,10 @@ fn collect_sam_region_stats(
 fn collect_bam_region_stats(
     input: &PathBuf,
     regions: &[Region],
-    config: StatsConfig,
+    config: &StatsConfig,
 ) -> io::Result<StatsCounts> {
     let header = htslib_rs::alignment_compat::read_bam_header_from_path(input)?;
+    let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
     let targets = region_targets(&header, regions)?;
     let mut counts = StatsCounts {
         target_bases: target_base_count(&targets),
@@ -608,7 +663,13 @@ fn collect_bam_region_stats(
     for region in regions {
         for record in htslib_rs::alignment_compat::query_bam_records_from_path(input, region)? {
             if seen.insert(record_identity(&header, &record)) {
-                counts.update_record_with_targets(&header, &record, config, Some(&targets));
+                counts.update_record_with_targets(
+                    &header,
+                    &record,
+                    config,
+                    read_group_filter.as_ref(),
+                    Some(&targets),
+                );
             }
         }
     }
@@ -619,9 +680,10 @@ fn collect_cram_region_stats(
     input: &PathBuf,
     reference: PathBuf,
     regions: &[Region],
-    config: StatsConfig,
+    config: &StatsConfig,
 ) -> io::Result<StatsCounts> {
     let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
+    let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
     let targets = region_targets(&header, regions)?;
     let mut counts = StatsCounts {
         target_bases: target_base_count(&targets),
@@ -633,7 +695,13 @@ fn collect_cram_region_stats(
             input, region, &reference,
         )? {
             if seen.insert(record_identity(&header, &record)) {
-                counts.update_record_with_targets(&header, &record, config, Some(&targets));
+                counts.update_record_with_targets(
+                    &header,
+                    &record,
+                    config,
+                    read_group_filter.as_ref(),
+                    Some(&targets),
+                );
             }
         }
     }
@@ -778,18 +846,29 @@ impl StatsCounts {
         &mut self,
         header: &sam::Header,
         rec: &(impl sam::alignment::Record + ?Sized),
-        config: StatsConfig,
+        config: &StatsConfig,
+        read_group_filter: Option<&HashSet<String>>,
     ) {
-        self.update_record_with_targets(header, rec, config, None);
+        self.update_record_with_targets(header, rec, config, read_group_filter, None);
     }
 
     fn update_record_with_targets(
         &mut self,
         header: &sam::Header,
         rec: &(impl sam::alignment::Record + ?Sized),
-        config: StatsConfig,
+        config: &StatsConfig,
+        read_group_filter: Option<&HashSet<String>>,
         targets: Option<&[RegionTarget]>,
     ) {
+        if let Some(allowed_read_groups) = read_group_filter {
+            let Ok(Some(read_group)) = record_read_group(rec) else {
+                return;
+            };
+            if !allowed_read_groups.contains(&read_group) {
+                return;
+            }
+        }
+
         let Ok(flags) = rec.flags() else {
             return;
         };
@@ -959,7 +1038,7 @@ impl StatsCounts {
         }
     }
 
-    fn update_summary(&mut self, rec: &AlignmentRecordSummary, config: StatsConfig) {
+    fn update_summary(&mut self, rec: &AlignmentRecordSummary, config: &StatsConfig) {
         self.update(
             StatsRecordFields {
                 flag: rec.flags_u16() as u32,
@@ -973,7 +1052,7 @@ impl StatsCounts {
         );
     }
 
-    fn update(&mut self, rec: StatsRecordFields, config: StatsConfig) {
+    fn update(&mut self, rec: StatsRecordFields, config: &StatsConfig) {
         let flag = rec.flag;
         if config.required_flags != 0 && flag & config.required_flags != config.required_flags {
             self.raw_total += 1;
@@ -1150,7 +1229,7 @@ fn write_stats(
 ) -> io::Result<()> {
     let mut counts = StatsCounts::default();
     for rec in recs {
-        counts.update_summary(rec, config);
+        counts.update_summary(rec, &config);
     }
     write_stats_counts(out, &counts, config, is_sorted)
 }
@@ -1446,6 +1525,10 @@ fn print_usage() -> io::Result<()> {
     writeln!(
         w,
         "  -F, --filtering-flag FLAG     filter records with any FLAG bits or names"
+    )?;
+    writeln!(
+        w,
+        "  -I, --id ID                   include only read group ID or sample"
     )?;
     writeln!(
         w,

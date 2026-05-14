@@ -2170,6 +2170,77 @@ r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\tIIII
 }
 
 #[test]
+fn stats_id_filter_matches_read_group_id_or_sample() {
+    let tmp = tmp_dir("stats-id-filter");
+    let sam = tmp.join("rg.sam");
+    let sample_out = tmp.join("sample.stats");
+    let group_out = tmp.join("group.stats");
+    let missing_out = tmp.join("missing.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:100
+@RG\tID:g1\tSM:s1
+@RG\tID:g2\tSM:s1
+@RG\tID:g3\tSM:s2
+r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\tIIII\tRG:Z:g1
+r2\t0\tchr1\t5\t60\t4M\t*\t0\t0\tCCCC\tIIII\tRG:Z:g2
+r3\t0\tchr1\t9\t60\t4M\t*\t0\t0\tGGGG\tIIII\tRG:Z:g3
+r4\t0\tchr1\t13\t60\t4M\t*\t0\t0\tTTTT\tIIII
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-I",
+                "s1",
+                "-o",
+                sample_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-I",
+                "g3",
+                "-o",
+                group_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-I",
+                "missing",
+                "-o",
+                missing_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let sample_text = std::fs::read_to_string(sample_out).unwrap();
+    let group_text = std::fs::read_to_string(group_out).unwrap();
+    let missing_text = std::fs::read_to_string(missing_out).unwrap();
+    assert_eq!(stats_sn_value(&sample_text, "sequences"), 2);
+    assert_eq!(stats_sn_value(&group_text, "sequences"), 1);
+    assert_eq!(stats_sn_value(&missing_text, "sequences"), 0);
+}
+
+#[test]
 fn stats_filters_required_and_filtering_flags() {
     let tmp = tmp_dir("stats-flag-filters");
     let sam = tmp.join("flags.sam");
