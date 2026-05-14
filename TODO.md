@@ -42,7 +42,7 @@ Rust tests: 351 currently passing. `cargo fmt --all --check`, `cargo clippy -p s
 Progress snapshot PR chain:
 - noodles: https://github.com/madhavajay/noodles/pull/1
 - htslib-rs: https://github.com/madhavajay/htslib-rs/pull/5
-- samtools-rs: https://github.com/madhavajay/samtools-rs/pull/3
+- samtools-rs: https://github.com/madhavajay/samtools-rs/pull/6
 
 ## What's Next — Decision Points
 
