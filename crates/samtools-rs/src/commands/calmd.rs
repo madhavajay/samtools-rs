@@ -13,14 +13,14 @@
 //! `-d` (drop BAQ), `-C cap`, BAM/CRAM I/O.
 
 use std::ffi::OsString;
-use std::fs::File;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
 
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
 
 /// Entry point for `samtools calmd` / `samtools fillmd`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -76,13 +76,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
-    let format = match detect_path(&input) {
+    let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,
         Err(e) => {
-            print_error(
-                "calmd",
-                format!("failed to detect format of \"{}\": {}", input.display(), e),
-            );
+            print_error("calmd", e.to_string());
             return ExitCode::from(1);
         }
     };
@@ -125,17 +122,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     };
 
-    let mut out: Box<dyn Write> = match output.as_ref() {
-        Some(p) => match File::create(p) {
-            Ok(f) => Box::new(f),
-            Err(e) => {
-                print_error_errno("calmd", "open -o output", &e);
-                return ExitCode::from(1);
-            }
-        },
-        None => Box::new(io::stdout().lock()),
+    let mut out = match sam_io::open_text_output(output.as_deref()) {
+        Ok(out) => out,
+        Err(e) => {
+            print_error_errno("calmd", "open -o output", &e);
+            return ExitCode::from(1);
+        }
     };
-    if let Err(e) = out.write_all(text.as_bytes())
+    if let Err(e) = sam_io::write_all_and_close(&mut out, text.as_bytes())
         && e.kind() != io::ErrorKind::BrokenPipe
     {
         print_error_errno("calmd", "write output", &e);

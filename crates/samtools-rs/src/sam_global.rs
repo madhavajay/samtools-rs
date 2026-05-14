@@ -6,6 +6,7 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 /// Parsed values for upstream's standard `sam_global_args` option family.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -18,6 +19,27 @@ pub struct SamGlobalArgs {
     pub threads: Option<usize>,
     pub write_index: bool,
     pub verbosity: Option<i32>,
+}
+
+static CURRENT_GLOBAL_ARGS: OnceLock<Mutex<SamGlobalArgs>> = OnceLock::new();
+
+/// Stores globals parsed by the top-level dispatcher for command I/O paths.
+pub fn set_current_global_args(globals: SamGlobalArgs) {
+    *global_args_cell()
+        .lock()
+        .expect("global args mutex poisoned") = globals;
+}
+
+/// Returns the globals parsed by the top-level dispatcher.
+pub fn current_global_args() -> SamGlobalArgs {
+    global_args_cell()
+        .lock()
+        .expect("global args mutex poisoned")
+        .clone()
+}
+
+fn global_args_cell() -> &'static Mutex<SamGlobalArgs> {
+    CURRENT_GLOBAL_ARGS.get_or_init(|| Mutex::new(SamGlobalArgs::default()))
 }
 
 /// Applies top-level samtools global options and returns argv without them.
@@ -235,6 +257,20 @@ mod tests {
             parse_top_level_global_args(args).unwrap_err(),
             "missing value for --reference"
         );
+    }
+
+    #[test]
+    fn stores_and_returns_current_global_args() {
+        let _guard = LOG_LOCK.lock().unwrap();
+        let globals = SamGlobalArgs {
+            reference: Some(PathBuf::from("ref.fa")),
+            threads: Some(2),
+            ..SamGlobalArgs::default()
+        };
+
+        set_current_global_args(globals.clone());
+        assert_eq!(current_global_args(), globals);
+        set_current_global_args(SamGlobalArgs::default());
     }
 
     #[test]

@@ -4,11 +4,16 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Mutex;
 
 use samtools_rs::commands::{
-    bedcov, cat, faidx, fastq, flagstat, fqidx, idxstats, import, index, reheader, rmdup, samples,
-    split,
+    bedcov, cat, faidx, fastq, fixmate, flagstat, fqidx, idxstats, import, index, reheader, reset,
+    rmdup, samples, split,
 };
+use samtools_rs::header_text;
+use samtools_rs::run as samtools_run;
+
+static GLOBAL_ARGS_LOCK: Mutex<()> = Mutex::new(());
 
 fn fixtures_dir() -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -18,6 +23,18 @@ fn fixtures_dir() -> PathBuf {
         .parent()
         .unwrap()
         .join("samtools")
+        .join("test")
+}
+
+fn htslib_fixtures_dir() -> PathBuf {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    PathBuf::from(manifest)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("htslib-rs")
+        .join("htslib")
         .join("test")
 }
 
@@ -51,6 +68,41 @@ fn flagstat_succeeds() {
     let p = sample_bam();
     assert_eq!(
         exit_to_u8(flagstat::main(&argv("flagstat", &[p.to_str().unwrap()]))),
+        0
+    );
+}
+
+#[test]
+fn flagstat_cram_uses_top_level_reference() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "flagstat",
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+}
+
+#[test]
+fn flagstat_cram_without_reference_fails_cleanly() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let cram = htslib_fixtures_dir().join("range.cram");
+
+    assert_ne!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &["flagstat", cram.to_str().unwrap()],
+        ))),
         0
     );
 }
@@ -101,6 +153,41 @@ fn idxstats_sam_uses_slow_path() {
     .unwrap();
     assert_eq!(
         exit_to_u8(idxstats::main(&argv("idxstats", &[sam.to_str().unwrap()]))),
+        0
+    );
+}
+
+#[test]
+fn idxstats_cram_uses_top_level_reference() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "idxstats",
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+}
+
+#[test]
+fn idxstats_cram_without_reference_fails_cleanly() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let cram = htslib_fixtures_dir().join("range.cram");
+
+    assert_ne!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &["idxstats", cram.to_str().unwrap()],
+        ))),
         0
     );
 }
@@ -269,6 +356,41 @@ fn cat_two_succeeds() {
         0
     );
     assert!(out.exists());
+}
+
+#[test]
+fn cat_adds_pg_by_default() {
+    let tmp = tmp_dir("cat-pg");
+    let out = tmp.join("cat.bam");
+    let p = sample_bam();
+    assert_eq!(
+        exit_to_u8(cat::main(&argv(
+            "cat",
+            &[p.to_str().unwrap(), "-o", out.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let header = header_text::read_raw_header_text(&out).unwrap();
+    assert!(header.contains("\tPN:samtools\tVN:"));
+    assert!(header.contains("\tCL:cat "));
+}
+
+#[test]
+fn cat_no_pg_suppresses_pg() {
+    let tmp = tmp_dir("cat-no-pg");
+    let out = tmp.join("cat.bam");
+    let p = sample_bam();
+    assert_eq!(
+        exit_to_u8(cat::main(&argv(
+            "cat",
+            &["--no-PG", p.to_str().unwrap(), "-o", out.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let header = header_text::read_raw_header_text(&out).unwrap();
+    assert!(!header.contains("\tCL:cat "));
 }
 
 #[test]
@@ -504,6 +626,51 @@ fn fastq_zero_routes_unpaired_reads_in_split_mode() {
         std::fs::read_to_string(other).unwrap(),
         "@solo\nNNNN\n+\n$$$$\n"
     );
+}
+
+#[test]
+fn fixmate_sam_input_fills_mate_fields_to_sam_output() {
+    let tmp = tmp_dir("fixmate-sam");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("fixed.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:queryname\n",
+            "@SQ\tSN:chr1\tLN:16\n",
+            "pair\t65\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "pair\t129\tchr1\t5\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fixmate::main(&argv(
+            "fixmate",
+            &[
+                "--output-fmt",
+                "sam",
+                sam.to_str().unwrap(),
+                out.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let records: Vec<Vec<_>> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').collect())
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0][0], "pair");
+    assert_eq!(records[0][1], "65");
+    assert_eq!(records[0][6], "=");
+    assert_eq!(records[0][7], "5");
+    assert_eq!(records[1][1], "129");
+    assert_eq!(records[1][6], "=");
+    assert_eq!(records[1][7], "1");
 }
 
 #[test]
@@ -1506,6 +1673,84 @@ fn rmdup_succeeds() {
 }
 
 #[test]
+fn rmdup_sam_input_keeps_best_single_end_duplicate() {
+    let tmp = tmp_dir("rmdup-sam");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("dedup.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "low\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "reverse\t16\tchr1\t1\t30\t4M\t*\t0\t0\tCCCC\t$$$$\n",
+            "unmapped\t4\t*\t0\t0\t*\t*\t0\t0\tNNNN\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(rmdup::main(&argv(
+            "rmdup",
+            &[sam.to_str().unwrap(), out.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(!text.contains("\nlow\t"));
+    assert!(text.contains("\nhigh\t"));
+    assert!(text.contains("\nreverse\t"));
+    assert!(text.contains("\nunmapped\t"));
+}
+
+#[test]
+fn reset_sam_input_clears_alignment_fields_and_default_tags() {
+    let tmp = tmp_dir("reset-sam");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("reset.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t99\tchr1\t2\t60\t4M\t=\t6\t8\tACGT\t!!!!\tNM:i:1\tMD:Z:3A\tRG:Z:g1\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(reset::main(&argv(
+            "reset",
+            &[
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let record = text.lines().find(|line| !line.starts_with('@')).unwrap();
+    let fields: Vec<_> = record.split('\t').collect();
+    assert_eq!(fields[1], "69");
+    assert_eq!(fields[2], "*");
+    assert_eq!(fields[3], "0");
+    assert_eq!(fields[4], "255");
+    assert_eq!(fields[5], "*");
+    assert_eq!(fields[6], "*");
+    assert_eq!(fields[7], "0");
+    assert_eq!(fields[8], "0");
+    assert!(!record.contains("\tNM:i:"));
+    assert!(!record.contains("\tMD:Z:"));
+    assert!(record.contains("\tRG:Z:g1"));
+}
+
+#[test]
 fn split_by_rg() {
     let tmp = tmp_dir("split");
     let bam = tmp.join("in.bam");
@@ -1525,4 +1770,338 @@ fn split_by_rg() {
         ))),
         0
     );
+}
+
+#[test]
+fn split_sam_input_by_rg_to_sam_outputs() {
+    let tmp = tmp_dir("split-sam");
+    let sam = tmp.join("in.sam");
+    let tmpl = tmp.join("out.%!.%.");
+    let unk = tmp.join("unknown.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:g1\tSM:s1\n",
+            "@RG\tID:g2\tSM:s2\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:g1\n",
+            "r2\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\tRG:Z:g2\n",
+            "r3\t0\tchr1\t3\t60\t4M\t*\t0\t0\tCCCC\t$$$$\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(split::main(&argv(
+            "split",
+            &[
+                "--output-fmt",
+                "sam",
+                "-f",
+                tmpl.to_str().unwrap(),
+                "-u",
+                unk.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let g1 = std::fs::read_to_string(tmp.join("out.g1.sam")).unwrap();
+    let g2 = std::fs::read_to_string(tmp.join("out.g2.sam")).unwrap();
+    let unknown = std::fs::read_to_string(unk).unwrap();
+    assert!(g1.contains("@RG\tID:g1"));
+    assert!(!g1.contains("@RG\tID:g2"));
+    assert!(g2.contains("@RG\tID:g2"));
+    assert!(!g2.contains("@RG\tID:g1"));
+    assert!(g1.lines().any(|line| line.starts_with("r1\t")));
+    assert!(g2.lines().any(|line| line.starts_with("r2\t")));
+    assert!(unknown.lines().any(|line| line.starts_with("r3\t")));
+}
+
+#[test]
+fn split_by_explicit_aux_tag_creates_outputs_on_demand() {
+    let tmp = tmp_dir("split-aux-tag");
+    let sam = tmp.join("in.sam");
+    let tmpl = tmp.join("%*_%#_%!.%.");
+    let unk = tmp.join("unknown.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tBC:Z:AA\n",
+            "r2\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\tBC:Z:BB\n",
+            "r3\t0\tchr1\t3\t60\t4M\t*\t0\t0\tCCCC\t$$$$\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(split::main(&argv(
+            "split",
+            &[
+                "--output-fmt",
+                "sam",
+                "-d",
+                "BC",
+                "-f",
+                tmpl.to_str().unwrap(),
+                "-u",
+                unk.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let aa = std::fs::read_to_string(tmp.join("in_0_AA.sam")).unwrap();
+    let bb = std::fs::read_to_string(tmp.join("in_1_BB.sam")).unwrap();
+    let unknown = std::fs::read_to_string(unk).unwrap();
+    assert!(aa.lines().any(|line| line.starts_with("r1\t")));
+    assert!(bb.lines().any(|line| line.starts_with("r2\t")));
+    assert!(unknown.lines().any(|line| line.starts_with("r3\t")));
+}
+
+#[test]
+fn split_by_explicit_integer_tag_honors_max_split() {
+    let tmp = tmp_dir("split-aux-int-max");
+    let sam = tmp.join("in.sam");
+    let tmpl = tmp.join("tag_%!.%.");
+    let unk = tmp.join("unknown.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tZZ:i:7\n",
+            "r2\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\tZZ:i:8\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(split::main(&argv(
+            "split",
+            &[
+                "--output-fmt",
+                "sam",
+                "-d",
+                "ZZ",
+                "-M",
+                "1",
+                "-f",
+                tmpl.to_str().unwrap(),
+                "-u",
+                unk.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let first = std::fs::read_to_string(tmp.join("tag_7.sam")).unwrap();
+    let unknown = std::fs::read_to_string(unk).unwrap();
+    assert!(first.lines().any(|line| line.starts_with("r1\t")));
+    assert!(unknown.lines().any(|line| line.starts_with("r2\t")));
+    assert!(!tmp.join("tag_8.sam").exists());
+}
+
+#[test]
+fn split_unaccounted_output_can_use_header_override() {
+    let tmp = tmp_dir("split-unaccounted-header");
+    let sam = tmp.join("in.sam");
+    let header = tmp.join("unaccounted-header.sam");
+    let tmpl = tmp.join("out.%!.%.");
+    let unk = tmp.join("unknown.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:g1\tSM:s1\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:g1\n",
+            "r2\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &header,
+        concat!(
+            "@HD\tVN:1.6\tSO:unknown\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@CO\tcustom unaccounted header\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(split::main(&argv(
+            "split",
+            &[
+                "--output-fmt",
+                "sam",
+                "-f",
+                tmpl.to_str().unwrap(),
+                "-u",
+                unk.to_str().unwrap(),
+                "-h",
+                header.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let unknown = std::fs::read_to_string(unk).unwrap();
+    assert!(unknown.contains("@CO\tcustom unaccounted header\n"));
+    assert!(unknown.lines().any(|line| line.starts_with("r2\t")));
+}
+
+#[test]
+fn split_explicit_rg_tag_adds_header_for_unknown_read_group() {
+    let tmp = tmp_dir("split-explicit-rg-unknown");
+    let sam = tmp.join("in.sam");
+    let tmpl = tmp.join("out.%!.%.");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:g1\tSM:s1\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:g2\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(split::main(&argv(
+            "split",
+            &[
+                "--output-fmt",
+                "sam",
+                "-d",
+                "RG",
+                "-f",
+                tmpl.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let g2 = std::fs::read_to_string(tmp.join("out.g2.sam")).unwrap();
+    assert!(g2.contains("@RG\tID:g2\n"));
+    assert!(!g2.contains("@RG\tID:g1"));
+    assert!(g2.lines().any(|line| line.starts_with("r1\t")));
+}
+
+#[test]
+fn split_adds_pg_by_default() {
+    let tmp = tmp_dir("split-default-pg");
+    let sam = tmp.join("in.sam");
+    let tmpl = tmp.join("out.%!.%.");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:g1\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:g1\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(split::main(&argv(
+            "split",
+            &[
+                "--output-fmt",
+                "sam",
+                "-f",
+                tmpl.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let g1 = std::fs::read_to_string(tmp.join("out.g1.sam")).unwrap();
+    assert!(g1.contains("@PG\tID:samtools\tPN:samtools\tVN:"));
+    assert!(g1.contains("\tCL:split "));
+    assert!(g1.lines().any(|line| line.starts_with("r1\t")));
+}
+
+#[test]
+fn split_write_index_builds_bai_for_bam_outputs() {
+    let tmp = tmp_dir("split-write-index");
+    let sam = tmp.join("in.sam");
+    let tmpl = tmp.join("out.%!.%.");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:g1\n",
+            "@RG\tID:g2\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:g1\n",
+            "r2\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\tRG:Z:g2\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(split::main(&argv(
+            "split",
+            &[
+                "--write-index",
+                "-f",
+                tmpl.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    assert!(tmp.join("out.g1.bam").exists());
+    assert!(tmp.join("out.g1.bam.bai").exists());
+    assert!(tmp.join("out.g2.bam").exists());
+    assert!(tmp.join("out.g2.bam.bai").exists());
+}
+
+#[test]
+fn split_accepts_no_pg_option() {
+    let tmp = tmp_dir("split-no-pg");
+    let sam = tmp.join("in.sam");
+    let tmpl = tmp.join("out.%!.%.");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:g1\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:g1\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(split::main(&argv(
+            "split",
+            &[
+                "--output-fmt",
+                "sam",
+                "--no-PG",
+                "-f",
+                tmpl.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let g1 = std::fs::read_to_string(tmp.join("out.g1.sam")).unwrap();
+    assert!(!g1.contains("@PG\tID:samtools"));
+    assert!(g1.lines().any(|line| line.starts_with("r1\t")));
 }

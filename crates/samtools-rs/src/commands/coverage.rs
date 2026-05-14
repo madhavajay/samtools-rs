@@ -18,19 +18,24 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use htslib_rs::bam;
 use htslib_rs::core::Region;
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
+use htslib_rs::sam;
 
 use crate::bam_flag::{BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FUNMAP};
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
 /// Entry point for `samtools coverage`.
 pub fn main(args: &[OsString]) -> ExitCode {
     let mut min_mapq: u8 = 0;
+    let mut min_baseq: u8 = 0;
+    let mut min_depth: u32 = 1;
     let mut no_header = false;
     let mut output: Option<PathBuf> = None;
     let mut region: Option<String> = None;
@@ -47,6 +52,20 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
             }
+            "-Q" | "--min-BQ" => {
+                min_baseq = iter
+                    .next()
+                    .and_then(|a| a.to_str())
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            }
+            "-d" | "--depth" | "--min-depth" => {
+                min_depth = iter
+                    .next()
+                    .and_then(|a| a.to_str())
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1);
+            }
             "-H" | "--no-header" => no_header = true,
             "-o" | "--output" => {
                 output = iter.next().map(PathBuf::from);
@@ -54,8 +73,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-r" | "--region" => {
                 region = iter.next().and_then(|a| a.to_str().map(str::to_owned));
             }
-            "-l" | "--min-read-len" | "-Q" | "--min-BQ" | "--rf" | "--ff" | "-d" | "--depth"
-            | "--min-depth" | "-w" | "--n-bins" => {
+            "-l" | "--min-read-len" | "--rf" | "--ff" | "-w" | "--n-bins" => {
                 let _ = iter.next();
             }
             "-m" | "--histogram" | "-D" | "--plot-depth" | "-A" | "--ascii" => {
@@ -78,35 +96,46 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    let mut has_cram = false;
     for path in &inputs {
-        let format = match detect_path(path) {
+        let format = match sam_io::sam_open_format(path) {
             Ok(f) => f,
             Err(e) => {
-                print_error(
-                    "coverage",
-                    format!("failed to detect format of \"{}\": {}", path.display(), e),
-                );
+                print_error("coverage", e.to_string());
                 return ExitCode::from(1);
             }
         };
-        if format.exact != Exact::Bam {
-            print_error(
-                "coverage",
-                "only BAM input is currently supported (SAM/CRAM TODO)",
-            );
-            return ExitCode::from(1);
+        match format.exact {
+            Exact::Bam => {}
+            Exact::Cram => has_cram = true,
+            _ => {
+                print_error(
+                    "coverage",
+                    "only BAM and reference-backed CRAM input are currently supported (SAM TODO)",
+                );
+                return ExitCode::from(1);
+            }
         }
     }
 
-    let mut writer: Box<dyn Write> = match output.as_ref() {
-        Some(p) => match File::create(p) {
-            Ok(f) => Box::new(f),
-            Err(e) => {
-                print_error_errno("coverage", "open -o output", &e);
+    let reference = if has_cram {
+        match current_global_args().reference {
+            Some(reference) => Some(reference),
+            None => {
+                print_error("coverage", "CRAM input requires top-level --reference FILE");
                 return ExitCode::from(1);
             }
-        },
-        None => Box::new(io::stdout().lock()),
+        }
+    } else {
+        None
+    };
+
+    let mut writer = match sam_io::open_text_output(output.as_deref()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            print_error_errno("coverage", "open -o output", &e);
+            return ExitCode::from(1);
+        }
     };
 
     if !no_header {
@@ -116,8 +145,26 @@ pub fn main(args: &[OsString]) -> ExitCode {
         );
     }
 
-    match run_coverage(&inputs, &mut *writer, min_mapq, region.as_deref()) {
-        Ok(()) => ExitCode::SUCCESS,
+    match run_coverage(
+        &inputs,
+        &mut *writer,
+        CoverageConfig {
+            min_mapq,
+            min_baseq,
+            min_depth,
+        },
+        region.as_deref(),
+        reference.as_deref(),
+    ) {
+        Ok(()) => match sam_io::check_sam_close(&mut writer) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+            Err(e) => {
+                print_error_errno("coverage", "close output", &e);
+                ExitCode::from(1)
+            }
+        },
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(e) => {
             print_error_errno("coverage", "coverage failed", &e);
             ExitCode::from(1)
@@ -125,75 +172,215 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CoverageConfig {
+    min_mapq: u8,
+    min_baseq: u8,
+    min_depth: u32,
+}
+
 fn run_coverage(
     inputs: &[PathBuf],
     out: &mut dyn Write,
-    min_mapq: u8,
+    config: CoverageConfig,
     region: Option<&str>,
+    reference: Option<&Path>,
 ) -> io::Result<()> {
     let exclude_flags = BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP;
-    let region = region
-        .map(|s| {
-            s.parse::<Region>().map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid region \"{}\": {}", s, e),
-                )
-            })
-        })
-        .transpose()?;
+    let region = region.map(parse_region).transpose()?;
 
+    let mut merged_refs: Option<Vec<RefStats>> = None;
     for path in inputs {
-        let mut reader = bam::io::Reader::new(File::open(path)?);
-        let header = reader.read_header()?;
-        let mut refs = coverage_targets(&header, region.as_ref())?;
-
-        if let Some(region) = region.as_ref() {
-            for record in htslib_rs::alignment_compat::query_bam_records_from_path(path, region)? {
-                update_targets(&mut refs, &record, exclude_flags, min_mapq);
+        let refs = match sam_io::sam_open_format(path)?.exact {
+            Exact::Bam => collect_bam_coverage(path, exclude_flags, config, region.as_ref())?,
+            Exact::Cram => collect_cram_coverage(
+                path,
+                reference.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "CRAM input requires top-level --reference FILE",
+                    )
+                })?,
+                exclude_flags,
+                config,
+                region.as_ref(),
+            )?,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "only BAM and reference-backed CRAM input are currently supported",
+                ));
             }
+        };
+
+        if let Some(merged_refs) = &mut merged_refs {
+            merge_coverage_refs(merged_refs, refs)?;
         } else {
-            let mut record = bam::Record::default();
-            loop {
-                let n = reader.read_record(&mut record)?;
-                if n == 0 {
-                    break;
-                }
-                update_targets(&mut refs, &record, exclude_flags, min_mapq);
+            merged_refs = Some(refs);
+        }
+    }
+    if let Some(refs) = merged_refs {
+        emit_coverage(out, &refs, config.min_depth)?;
+    }
+    Ok(())
+}
+
+fn parse_region(s: &str) -> io::Result<Region> {
+    s.parse::<Region>().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid region \"{}\": {}", s, e),
+        )
+    })
+}
+
+fn collect_bam_coverage(
+    path: &Path,
+    exclude_flags: u32,
+    config: CoverageConfig,
+    region: Option<&Region>,
+) -> io::Result<Vec<RefStats>> {
+    let mut reader = bam::io::Reader::new(File::open(path)?);
+    let header = reader.read_header()?;
+    let mut refs = coverage_targets(&header, region)?;
+
+    if let Some(region) = region {
+        for record in htslib_rs::alignment_compat::query_bam_records_from_path(path, region)? {
+            update_targets(&header, &mut refs, &record, exclude_flags, config);
+        }
+    } else {
+        let mut record = bam::Record::default();
+        loop {
+            let n = reader.read_record(&mut record)?;
+            if n == 0 {
+                break;
+            }
+            update_targets(&header, &mut refs, &record, exclude_flags, config);
+        }
+    }
+
+    Ok(refs)
+}
+
+fn collect_cram_coverage(
+    path: &Path,
+    reference: &Path,
+    exclude_flags: u32,
+    config: CoverageConfig,
+    region: Option<&Region>,
+) -> io::Result<Vec<RefStats>> {
+    let header = htslib_rs::alignment_compat::read_cram_header_from_path(path)?;
+    let mut refs = coverage_targets(&header, region)?;
+
+    if let Some(region) = region {
+        for record in htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
+            path, region, reference,
+        )? {
+            update_targets(&header, &mut refs, &record, exclude_flags, config);
+        }
+    } else {
+        for rs in &mut refs {
+            let region = ref_region(rs)?;
+            for record in htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
+                path, &region, reference,
+            )? {
+                update_target(&header, rs, &record, exclude_flags, config);
             }
         }
+    }
 
-        for rs in &refs {
-            let covbases = rs.covered.iter().filter(|&&b| b).count();
-            let coverage_pct = if rs.length > 0 {
-                covbases as f64 / rs.length as f64 * 100.0
-            } else {
-                0.0
-            };
-            let meandepth = if rs.length > 0 {
-                rs.aligned_bases as f64 / rs.length as f64
-            } else {
-                0.0
-            };
-            let meanmapq = if rs.num_reads > 0 {
-                rs.mapq_sum as f64 / rs.num_reads as f64
-            } else {
-                0.0
-            };
-            writeln!(
-                out,
-                "{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
-                rs.name,
-                rs.output_start,
-                rs.output_end,
-                rs.num_reads,
-                covbases,
-                coverage_pct,
-                meandepth,
-                0.0_f64, // meanbaseq — not computed without per-base access
-                meanmapq,
-            )?;
+    Ok(refs)
+}
+
+fn merge_coverage_refs(merged: &mut [RefStats], next: Vec<RefStats>) -> io::Result<()> {
+    if merged.len() != next.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "coverage inputs have incompatible reference dictionaries",
+        ));
+    }
+
+    for (left, right) in merged.iter_mut().zip(next) {
+        if left.name != right.name
+            || left.length != right.length
+            || left.output_start != right.output_start
+            || left.output_end != right.output_end
+            || left.start0 != right.start0
+            || left.end0 != right.end0
+            || left.depths.len() != right.depths.len()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "coverage inputs have incompatible reference dictionaries",
+            ));
         }
+
+        for (left_depth, right_depth) in left.depths.iter_mut().zip(right.depths) {
+            *left_depth = left_depth.saturating_add(right_depth);
+        }
+        left.num_reads = left.num_reads.saturating_add(right.num_reads);
+        left.aligned_bases = left.aligned_bases.saturating_add(right.aligned_bases);
+        left.baseq_sum = left.baseq_sum.saturating_add(right.baseq_sum);
+        left.baseq_count = left.baseq_count.saturating_add(right.baseq_count);
+        left.mapq_sum = left.mapq_sum.saturating_add(right.mapq_sum);
+    }
+
+    Ok(())
+}
+
+fn ref_region(target: &RefStats) -> io::Result<Region> {
+    format!(
+        "{}:{}-{}",
+        target.name, target.output_start, target.output_end
+    )
+    .parse::<Region>()
+    .map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "region \"{}:{}-{}\": {}",
+                target.name, target.output_start, target.output_end, e
+            ),
+        )
+    })
+}
+
+fn emit_coverage(out: &mut dyn Write, refs: &[RefStats], min_depth: u32) -> io::Result<()> {
+    for rs in refs {
+        let covbases = rs.depths.iter().filter(|&&d| d >= min_depth).count();
+        let coverage_pct = if rs.length > 0 {
+            covbases as f64 / rs.length as f64 * 100.0
+        } else {
+            0.0
+        };
+        let meandepth = if rs.length > 0 {
+            rs.aligned_bases as f64 / rs.length as f64
+        } else {
+            0.0
+        };
+        let meanmapq = if rs.num_reads > 0 {
+            rs.mapq_sum as f64 / rs.num_reads as f64
+        } else {
+            0.0
+        };
+        let meanbaseq = if rs.baseq_count > 0 {
+            rs.baseq_sum as f64 / rs.baseq_count as f64
+        } else {
+            0.0
+        };
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+            rs.name,
+            rs.output_start,
+            rs.output_end,
+            rs.num_reads,
+            covbases,
+            coverage_pct,
+            meandepth,
+            meanbaseq,
+            meanmapq,
+        )?;
     }
     Ok(())
 }
@@ -206,9 +393,11 @@ struct RefStats {
     output_end: usize,
     start0: usize,
     end0: usize,
-    covered: Vec<bool>,
+    depths: Vec<u32>,
     num_reads: u64,
     aligned_bases: u64,
+    baseq_sum: u64,
+    baseq_count: u64,
     mapq_sum: u64,
 }
 
@@ -256,9 +445,11 @@ fn coverage_targets(
                 output_end,
                 start0,
                 end0,
-                covered: vec![false; length],
+                depths: vec![0u32; length],
                 num_reads: 0,
                 aligned_bases: 0u64,
+                baseq_sum: 0u64,
+                baseq_count: 0u64,
                 mapq_sum: 0u64,
             }])
         }
@@ -276,9 +467,11 @@ fn coverage_targets(
                     output_end: length,
                     start0: 0,
                     end0: length,
-                    covered: vec![false; length],
+                    depths: vec![0u32; length],
                     num_reads: 0,
                     aligned_bases: 0u64,
+                    baseq_sum: 0u64,
+                    baseq_count: 0u64,
                     mapq_sum: 0u64,
                 }
             })
@@ -286,31 +479,96 @@ fn coverage_targets(
     }
 }
 
-fn update_targets(refs: &mut [RefStats], record: &bam::Record, exclude_flags: u32, min_mapq: u8) {
-    let flag = u16::from(record.flags()) as u32;
+fn update_targets(
+    header: &sam::Header,
+    refs: &mut [RefStats],
+    record: &(impl sam::alignment::Record + ?Sized),
+    exclude_flags: u32,
+    config: CoverageConfig,
+) {
+    let flag = match record.flags() {
+        Ok(flags) => u16::from(flags) as u32,
+        Err(_) => return,
+    };
     if flag & exclude_flags != 0 {
         return;
     }
-    let mapq = record.mapping_quality().map(u8::from).unwrap_or(0);
-    if mapq < min_mapq {
+    let mapq = match record.mapping_quality() {
+        Some(Ok(q)) => u8::from(q),
+        Some(Err(_)) => return,
+        None => 0,
+    };
+    if mapq < config.min_mapq {
         return;
     }
-    let tid = match record.reference_sequence_id().and_then(|r| r.ok()) {
-        Some(t) => t,
-        None => return,
-    };
-    let start = match record.alignment_start().and_then(|r| r.ok()) {
-        Some(p) => usize::from(p) - 1,
-        None => return,
+    let tid = match record.reference_sequence_id(header).transpose() {
+        Ok(Some(t)) => t,
+        _ => return,
     };
     let Some(rs) = refs.iter_mut().find(|rs| rs.tid == tid) else {
         return;
     };
 
+    update_target_after_filter(rs, record, mapq, config.min_baseq);
+}
+
+fn update_target(
+    header: &sam::Header,
+    rs: &mut RefStats,
+    record: &(impl sam::alignment::Record + ?Sized),
+    exclude_flags: u32,
+    config: CoverageConfig,
+) {
+    let flag = match record.flags() {
+        Ok(flags) => u16::from(flags) as u32,
+        Err(_) => return,
+    };
+    if flag & exclude_flags != 0 {
+        return;
+    }
+    let mapq = match record.mapping_quality() {
+        Some(Ok(q)) => u8::from(q),
+        Some(Err(_)) => return,
+        None => 0,
+    };
+    if mapq < config.min_mapq {
+        return;
+    }
+    if record
+        .reference_sequence_id(header)
+        .transpose()
+        .unwrap_or_default()
+        != Some(rs.tid)
+    {
+        return;
+    }
+
+    update_target_after_filter(rs, record, mapq, config.min_baseq);
+}
+
+fn update_target_after_filter(
+    rs: &mut RefStats,
+    record: &(impl sam::alignment::Record + ?Sized),
+    mapq: u8,
+    min_baseq: u8,
+) {
+    let start = match record.alignment_start().transpose() {
+        Ok(Some(p)) => usize::from(p) - 1,
+        _ => return,
+    };
+
     rs.num_reads += 1;
     rs.mapq_sum += mapq as u64;
 
+    let quality_scores = record.quality_scores();
+    let qualities = if quality_scores.is_empty() {
+        None
+    } else {
+        quality_scores.iter().collect::<io::Result<Vec<_>>>().ok()
+    };
+
     let mut ref_pos = start;
+    let mut query_pos = 0usize;
     for op in record.cigar().iter() {
         let op = match op {
             Ok(op) => op,
@@ -326,18 +584,39 @@ fn update_targets(refs: &mut [RefStats], record: &bam::Record, exclude_flags: u3
                 if hi > lo {
                     for p in lo..hi {
                         let offset = p - rs.start0;
-                        if offset < rs.covered.len() && !rs.covered[offset] {
-                            rs.covered[offset] = true;
+                        if offset >= rs.depths.len() {
+                            continue;
+                        }
+                        let passes_baseq = if let Some(qualities) = qualities.as_ref() {
+                            let query_offset = query_pos + (p - ref_pos);
+                            match qualities.get(query_offset) {
+                                Some(&quality) if quality >= min_baseq => {
+                                    rs.baseq_sum += quality as u64;
+                                    rs.baseq_count += 1;
+                                    true
+                                }
+                                Some(_) => false,
+                                None => min_baseq == 0,
+                            }
+                        } else {
+                            min_baseq == 0
+                        };
+                        if passes_baseq {
+                            rs.depths[offset] = rs.depths[offset].saturating_add(1);
+                            rs.aligned_bases += 1;
                         }
                     }
-                    rs.aligned_bases += (hi - lo) as u64;
                 }
                 ref_pos = op_end;
+                query_pos = query_pos.saturating_add(len);
             }
             Kind::Deletion | Kind::Skip => {
                 ref_pos = ref_pos.saturating_add(len);
             }
-            Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
+            Kind::Insertion | Kind::SoftClip => {
+                query_pos = query_pos.saturating_add(len);
+            }
+            Kind::HardClip | Kind::Pad => {}
         }
     }
 }
@@ -346,6 +625,8 @@ fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
     writeln!(w, "Usage: samtools coverage [options] <in.bam>")?;
     writeln!(w, "  -q INT       min mapping quality [0]")?;
+    writeln!(w, "  -Q INT       min base quality [0]")?;
+    writeln!(w, "  -d INT       min depth for covered bases [1]")?;
     writeln!(w, "  -H           no header")?;
     writeln!(w, "  -o FILE      output FILE")?;
     writeln!(w, "  -r REGION    restrict to REGION")?;

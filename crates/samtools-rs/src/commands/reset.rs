@@ -18,13 +18,13 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use htslib_rs::bam;
 use htslib_rs::bgzf;
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
 use htslib_rs::sam::{
     self,
     alignment::{RecordBuf, record::Flags},
@@ -32,6 +32,7 @@ use htslib_rs::sam::{
 
 use crate::aux_list::{AuxTag, parse_aux_list};
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
 
 const DEFAULT_DROP_TAGS: &[&[u8; 2]] = &[
     b"NM", b"MD", b"AS", b"XS", b"SA", b"MC", b"MQ", b"NH", b"HI", b"ms",
@@ -121,26 +122,24 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
-    let format = match detect_path(&input) {
+    let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,
         Err(e) => {
-            print_error(
-                "reset",
-                format!("failed to detect format of \"{}\": {}", input.display(), e),
-            );
+            print_error("reset", e.to_string());
             return ExitCode::from(1);
         }
     };
-    if format.exact != Exact::Bam {
+    if !matches!(format.exact, Exact::Sam | Exact::Bam) {
         print_error(
             "reset",
-            "only BAM input is currently supported (SAM/CRAM TODO)",
+            "only SAM and BAM input are currently supported (CRAM TODO)",
         );
         return ExitCode::from(1);
     }
 
     match run_reset(
         &input,
+        format.exact,
         output.as_deref(),
         output_fmt,
         &extra_drop,
@@ -162,6 +161,21 @@ enum OutFmt {
 
 fn run_reset(
     input: &Path,
+    input_format: Exact,
+    output: Option<&Path>,
+    fmt: OutFmt,
+    extra_drop: &[[u8; 2]],
+    keep_only: Option<&HashSet<[u8; 2]>>,
+) -> io::Result<()> {
+    match input_format {
+        Exact::Sam => run_reset_sam(input, output, fmt, extra_drop, keep_only),
+        Exact::Bam => run_reset_bam(input, output, fmt, extra_drop, keep_only),
+        _ => unreachable!("input format checked by caller"),
+    }
+}
+
+fn run_reset_bam(
+    input: &Path,
     output: Option<&Path>,
     fmt: OutFmt,
     extra_drop: &[[u8; 2]],
@@ -175,6 +189,28 @@ fn run_reset(
     loop {
         let n = reader.read_record_buf(&header, &mut record)?;
         if n == 0 {
+            break;
+        }
+        reset_record(&mut record, extra_drop, keep_only);
+        sink.write_record(&header, &record)?;
+    }
+    Ok(())
+}
+
+fn run_reset_sam(
+    input: &Path,
+    output: Option<&Path>,
+    fmt: OutFmt,
+    extra_drop: &[[u8; 2]],
+    keep_only: Option<&HashSet<[u8; 2]>>,
+) -> io::Result<()> {
+    let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
+    let header = reader.read_header()?;
+    let mut sink = open_output(output, fmt, &header)?;
+
+    loop {
+        let mut record = RecordBuf::default();
+        if reader.read_record_buf(&header, &mut record)? == 0 {
             break;
         }
         reset_record(&mut record, extra_drop, keep_only);
@@ -293,7 +329,7 @@ fn open_output(out: Option<&Path>, fmt: OutFmt, header: &sam::Header) -> io::Res
 
 fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
-    writeln!(w, "Usage: samtools reset [options] <in.bam>")?;
+    writeln!(w, "Usage: samtools reset [options] <in.bam|in.sam>")?;
     writeln!(w, "  -o FILE                 output FILE")?;
     writeln!(w, "  -O sam|bam              output format")?;
     writeln!(

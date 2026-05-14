@@ -6,7 +6,7 @@
 //! and many auxiliary flags.
 //!
 //! This initial Rust port supports **in-memory coordinate sort or name sort
-//! for BAM**, which is sufficient for small/medium inputs. Records are
+//! for BAM/SAM**, which is sufficient for small/medium inputs. Records are
 //! sorted by `(reference_sequence_id, alignment_start)` for coordinate mode
 //! or by `qname` for name mode, then written to the output.
 //!
@@ -23,16 +23,17 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use htslib_rs::bam;
 use htslib_rs::bgzf;
-use htslib_rs::format::{Exact, detect_path};
-use htslib_rs::sam;
+use htslib_rs::format::Exact;
+use htslib_rs::sam::{self, alignment::RecordBuf};
 
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
 
 /// Entry point for `samtools sort`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -97,20 +98,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
-    let format = match detect_path(&input) {
+    let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,
         Err(e) => {
-            print_error(
-                "sort",
-                format!("failed to detect format of \"{}\": {}", input.display(), e),
-            );
+            print_error("sort", e.to_string());
             return ExitCode::from(1);
         }
     };
-    if format.exact != Exact::Bam {
+    if !matches!(format.exact, Exact::Sam | Exact::Bam) {
         print_error(
             "sort",
-            "only BAM input is currently supported (SAM/CRAM TODO)",
+            "only SAM and BAM input are currently supported (CRAM TODO)",
         );
         return ExitCode::from(1);
     }
@@ -136,18 +134,17 @@ pub(crate) fn run_sort(
     name_sort: bool,
     fmt: OutFmt,
 ) -> io::Result<()> {
-    let mut reader = bam::io::Reader::new(File::open(input)?);
-    let mut header = reader.read_header()?;
-
-    let mut records: Vec<bam::Record> = Vec::new();
-    let mut record = bam::Record::default();
-    loop {
-        let n = reader.read_record(&mut record)?;
-        if n == 0 {
-            break;
+    let format = sam_io::sam_open_format(input)?;
+    let (mut header, mut records) = match format.exact {
+        Exact::Sam => read_sam_records(input)?,
+        Exact::Bam => read_bam_records(input)?,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "only SAM and BAM input are currently supported (CRAM TODO)",
+            ));
         }
-        records.push(record.clone());
-    }
+    };
 
     if name_sort {
         records.sort_by(|a, b| {
@@ -159,17 +156,12 @@ pub(crate) fn run_sort(
         // Coordinate sort: by (reference_sequence_id, alignment_start).
         records.sort_by(|a, b| {
             // Records with no reference (unmapped) sort to the end.
-            let key = |r: &bam::Record| -> (i32, i64) {
+            let key = |r: &RecordBuf| -> (i32, i64) {
                 let tid = r
                     .reference_sequence_id()
-                    .and_then(|res| res.ok())
                     .map(|t| t as i32)
                     .unwrap_or(i32::MAX);
-                let pos = r
-                    .alignment_start()
-                    .and_then(|res| res.ok())
-                    .map(|p| usize::from(p) as i64)
-                    .unwrap_or(0);
+                let pos = r.alignment_start().map(usize::from).unwrap_or(0) as i64;
                 (tid, pos)
             };
             key(a).cmp(&key(b))
@@ -190,6 +182,34 @@ pub(crate) fn run_sort(
     Ok(())
 }
 
+fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+    let mut reader = bam::io::Reader::new(File::open(input)?);
+    let header = reader.read_header()?;
+    let mut records = Vec::new();
+    loop {
+        let mut record = RecordBuf::default();
+        if reader.read_record_buf(&header, &mut record)? == 0 {
+            break;
+        }
+        records.push(record);
+    }
+    Ok((header, records))
+}
+
+fn read_sam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+    let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
+    let header = reader.read_header()?;
+    let mut records = Vec::new();
+    loop {
+        let mut record = RecordBuf::default();
+        if reader.read_record_buf(&header, &mut record)? == 0 {
+            break;
+        }
+        records.push(record);
+    }
+    Ok((header, records))
+}
+
 fn set_sort_order(header: &mut sam::Header, so: &str) {
     use bstr::BString;
     use sam::header::record::value::map::{self, Map};
@@ -204,8 +224,8 @@ fn set_sort_order(header: &mut sam::Header, so: &str) {
     }
 }
 
-trait BamLike {
-    fn write_record(&mut self, header: &sam::Header, record: &bam::Record) -> io::Result<()>;
+trait SortSink {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()>;
 }
 
 struct BamFile(bam::io::Writer<bgzf::io::Writer<File>>);
@@ -213,24 +233,26 @@ struct BamStdout(bam::io::Writer<bgzf::io::Writer<io::Stdout>>);
 struct SamFile(sam::io::Writer<File>);
 struct SamStdout(sam::io::Writer<io::Stdout>);
 
-impl BamLike for BamFile {
-    fn write_record(&mut self, header: &sam::Header, record: &bam::Record) -> io::Result<()> {
-        self.0.write_record(header, record)
-    }
-}
-impl BamLike for BamStdout {
-    fn write_record(&mut self, header: &sam::Header, record: &bam::Record) -> io::Result<()> {
-        self.0.write_record(header, record)
-    }
-}
-impl BamLike for SamFile {
-    fn write_record(&mut self, header: &sam::Header, record: &bam::Record) -> io::Result<()> {
+impl SortSink for BamFile {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
         use sam::alignment::io::Write as _;
         self.0.write_alignment_record(header, record)
     }
 }
-impl BamLike for SamStdout {
-    fn write_record(&mut self, header: &sam::Header, record: &bam::Record) -> io::Result<()> {
+impl SortSink for BamStdout {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        use sam::alignment::io::Write as _;
+        self.0.write_alignment_record(header, record)
+    }
+}
+impl SortSink for SamFile {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        use sam::alignment::io::Write as _;
+        self.0.write_alignment_record(header, record)
+    }
+}
+impl SortSink for SamStdout {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
         use sam::alignment::io::Write as _;
         self.0.write_alignment_record(header, record)
     }
@@ -240,7 +262,7 @@ fn open_output(
     out: Option<&Path>,
     fmt: OutFmt,
     header: &sam::Header,
-) -> io::Result<Box<dyn BamLike>> {
+) -> io::Result<Box<dyn SortSink>> {
     match (out, fmt) {
         (Some(p), OutFmt::Sam) => {
             let file = File::create(p)?;
@@ -269,7 +291,7 @@ fn open_output(
 
 fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
-    writeln!(w, "Usage: samtools sort [options] <in.bam>")?;
+    writeln!(w, "Usage: samtools sort [options] <in.bam|in.sam>")?;
     writeln!(
         w,
         "  -n              sort by read name (default: coordinate)"

@@ -14,10 +14,11 @@ use std::io::{self, BufReader, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
 
 use crate::aux_list::parse_aux_list;
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
 
 /// Entry point for `samtools fastq` / `samtools fasta` / `samtools bam2fq`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -122,13 +123,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
         None
     } else {
         let input = input.as_ref().expect("non-stdin input exists");
-        match detect_path(input) {
+        match sam_io::sam_open_format(input) {
             Ok(f) => Some(f),
             Err(e) => {
-                print_error(
-                    sub_name,
-                    format!("failed to detect format of \"{}\": {}", input.display(), e),
-                );
+                print_error(sub_name, e.to_string());
                 return ExitCode::from(1);
             }
         }
@@ -389,15 +387,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
 
     let output = output.as_ref().or(other_output.as_ref());
-    let mut out: Box<dyn Write> = match output {
-        Some(p) => match File::create(p) {
-            Ok(f) => Box::new(f),
-            Err(e) => {
-                print_error_errno(sub_name, "open -o output", &e);
-                return ExitCode::from(1);
-            }
-        },
-        None => Box::new(io::stdout().lock()),
+    let mut out = match sam_io::open_text_output(output.map(PathBuf::as_path)) {
+        Ok(out) => out,
+        Err(e) => {
+            print_error_errno(sub_name, "open -o output", &e);
+            return ExitCode::from(1);
+        }
     };
     if let Err(e) = out.write_all(text.as_bytes())
         && e.kind() != io::ErrorKind::BrokenPipe
@@ -405,7 +400,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
         print_error_errno(sub_name, "write output", &e);
         return ExitCode::from(1);
     }
-    ExitCode::SUCCESS
+    match sam_io::check_sam_close(&mut out) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => {
+            print_error_errno(sub_name, "close output", &e);
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn write_text_file(path: &std::path::Path, text: &[u8]) -> io::Result<()> {

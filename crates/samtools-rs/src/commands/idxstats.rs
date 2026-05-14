@@ -17,11 +17,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use htslib_rs::csi::BinningIndex;
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
 
 use crate::bam_flag::BAM_FUNMAP;
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::header_text::read_raw_header_text_with_format;
+use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
 /// Entry point for `samtools idxstats`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -56,17 +58,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
-    let format = match detect_path(&input) {
+    let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,
         Err(e) => {
-            print_error("idxstats", format!("failed to detect format: {}", e));
+            print_error("idxstats", e.to_string());
             return ExitCode::from(1);
         }
     };
-    if !matches!(format.exact, Exact::Sam | Exact::Bam) {
+    if !matches!(format.exact, Exact::Sam | Exact::Bam | Exact::Cram) {
         print_error(
             "idxstats",
-            "only SAM and BAM input is currently supported (CRAM TODO)",
+            "only SAM, BAM, and CRAM input is currently supported",
         );
         return ExitCode::from(1);
     }
@@ -113,6 +115,15 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let summaries = match format.exact {
         Exact::Sam => htslib_rs::alignment_compat::summarize_sam_records_from_path(&input),
         Exact::Bam => htslib_rs::alignment_compat::summarize_bam_records_from_path(&input),
+        Exact::Cram => {
+            let Some(reference) = current_global_args().reference else {
+                print_error("idxstats", "CRAM input requires top-level --reference FILE");
+                return ExitCode::from(1);
+            };
+            htslib_rs::alignment_compat::summarize_cram_records_from_path_with_reference(
+                &input, reference,
+            )
+        }
         _ => unreachable!(),
     };
     let summaries = match summaries {
