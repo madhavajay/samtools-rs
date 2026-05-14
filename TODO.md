@@ -14,14 +14,15 @@ the underlying libraries.
 
 ## Current Handoff — 2026-05-15
 
-Active branch / PR:
-- Branch: `stats-cov-threshold-target-lines`
-- PR: https://github.com/madhavajay/samtools-rs/pull/7
-- PR state at last check: open, non-draft, merge state clean, base `main`, head `stats-cov-threshold-target-lines`
-- Worktree at last check: clean, with local branch tracking `origin/stats-cov-threshold-target-lines`
-- Latest commit on the branch: `288f992 Support fastq CASAVA barcode fields`
+Merged baseline:
+- PR #7, https://github.com/madhavajay/samtools-rs/pull/7, is merged into `main`.
+- Merge commit: `ae15e4ad603892912fe0c5175491e1d0e3f210eb`.
+- Previous branch: `stats-cov-threshold-target-lines`.
+- Local worktree at last check: clean on `main`.
+- The next work should start from `main` on a new short-lived branch.
 
-Recent unmerged branch work in PR #7, newest first:
+Recently merged work from PR #7, newest first:
+- `e4f2f9e` — documented the current project handoff and corrected the active samtools-rs PR pointer.
 - `288f992` — `fastq -i` / `--barcode-tag` CASAVA barcode fields for SAM/BAM FASTQ/FASTA local paths.
 - `f88e172` — `fastq -U` / `--UMI-tag` UMI read-name suffixes.
 - `0cc6202` — `fastq -v INT` default-quality output for missing qualities.
@@ -39,12 +40,12 @@ Estimated whole-project completion:
 - Roughly 55-60% complete toward the full `samtools` replacement goal.
 - Rationale: core workspace/subcommand layout, common I/O, many read/write/index/file-operation/statistics/editing commands, and 404 Rust tests are in place. The remaining risk is concentrated in byte-for-byte upstream parity, pileup-dependent commands, full CRAM streaming, large external algorithms, and several partially implemented high-complexity commands.
 
-What to do next in this branch:
-1. Continue with small samtools-rs-only increments from the `fastq` TODO, because the branch is already warm there and the next item is self-contained.
+What to do next:
+1. Create a new branch from `main`, e.g. `fastq-index-files`.
 2. Implement a narrow `fastq --i1 FILE` / `--i2 FILE` index FASTQ extraction slice for SAM/BAM local FASTQ paths, using `BC` / `QT` by default and honoring `--barcode-tag`, `--quality-tag`, and a small `--index-format` parser if feasible.
 3. Keep the first index-file slice honest in docs: mark it as basic barcode-derived index FASTQ output, and leave exact name-grouped paired/singleton/other routing as pending until the full upstream grouping model is ported.
 4. Add Rust integration coverage around barcode `BC:Z` plus quality `QT:Z` extraction to `i1.fq` / `i2.fq`; expected next test count is 405 if only one test is added.
-5. Run the full gate, update `TODO.md`, `docs/subcommand-coverage.md`, and `docs/test-status.md`, then commit, push, and update PR #7.
+5. Run the full gate, update `TODO.md`, `docs/subcommand-coverage.md`, and `docs/test-status.md`, then commit, push, and open the next PR.
 
 Good next implementation shape for `fastq --i1/--i2`:
 - Start in `crates/samtools-rs/src/commands/fastq.rs`; avoid changing `htslib-rs`.
