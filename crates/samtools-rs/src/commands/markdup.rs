@@ -20,6 +20,7 @@
 //!  - `-d DISTANCE` — add `dt:Z:SQ` / `dt:Z:LB` duplicate-type tags using
 //!    Illumina-style read-name tile/x/y optical-distance checks.
 //!  - `--include-fails` — include QCFAIL reads in duplicate marking.
+//!  - `-m t|s` / `--mode t|s` — accepted duplicate-decision mode selector.
 //!  - `-b TAG` / `--barcode-tag TAG` — include a string aux tag in the
 //!    duplicate key.
 //!  - `-O sam|bam` / `--output-fmt sam|bam` — output format (default `bam`).
@@ -96,6 +97,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "--include-fails" => include_fails = true,
             "-c" => clear_existing_dups = true,
             "-t" => duplicate_origin_tag = true,
+            "-m" | "--mode" => {
+                let Some(v) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("markdup", format!("missing value for {}", s));
+                    return ExitCode::from(1);
+                };
+                if !matches!(v, "t" | "s") {
+                    print_error("markdup", format!("unknown mode '{}'", v));
+                    return ExitCode::from(1);
+                }
+                // Current PE grouping uses the implemented coordinate key for both modes.
+            }
             "-d" => {
                 let Some(v) = iter.next().and_then(|a| a.to_str()) else {
                     print_error("markdup", "missing value for -d");
@@ -140,7 +152,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 };
             }
             "--no-PG" => no_pg = true,
-            "-@" | "--threads" | "-l" | "-m" | "-T" => {
+            "-@" | "--threads" | "-l" | "-T" => {
                 // Accepted-but-ignored for compatibility.
                 let _ = iter.next();
             }
@@ -923,6 +935,7 @@ fn print_usage() -> io::Result<()> {
     writeln!(w, "  -t            add duplicate-origin do tags")?;
     writeln!(w, "  -d DISTANCE   add duplicate-type dt tags")?;
     writeln!(w, "  --include-fails include QCFAIL reads")?;
+    writeln!(w, "  -m t|s        duplicate decision mode")?;
     writeln!(
         w,
         "  -b TAG        include barcode aux tag in duplicate key"

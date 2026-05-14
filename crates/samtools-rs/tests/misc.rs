@@ -4826,6 +4826,60 @@ fn markdup_include_fails_controls_qcfail_duplicate_marking() {
 }
 
 #[test]
+fn markdup_mode_accepts_valid_values_and_rejects_invalid() {
+    use samtools_rs::commands::markdup;
+    let tmp = tmp_dir("markdup-mode");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:100\n",
+            "high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "low\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "--mode",
+                "s",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "-m",
+                "bad",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        1
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let low = text.lines().find(|line| line.starts_with("low\t")).unwrap();
+    let flag = low.split('\t').nth(1).unwrap().parse::<u32>().unwrap();
+    assert_eq!(flag & 0x400, 0x400);
+}
+
+#[test]
 fn markdup_propagates_duplicate_flag_to_supplementary_records() {
     use samtools_rs::commands::markdup;
     let tmp = tmp_dir("markdup-supplementary");
