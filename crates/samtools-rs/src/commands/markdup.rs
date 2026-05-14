@@ -14,7 +14,8 @@
 //!  - `-r` — remove duplicates from the output (rather than just flagging).
 //!  - `-s` — emit upstream-shaped summary counts to stderr.
 //!  - `-S` — accepted; supplementary propagation is always performed.
-//!  - `-c` — clear existing duplicate flags before marking.
+//!  - `-c` — clear existing duplicate flags and duplicate metadata tags before
+//!    marking.
 //!  - `-t` — add `do:Z:<original>` duplicate-origin tags for duplicates.
 //!  - `-b TAG` / `--barcode-tag TAG` — include a string aux tag in the
 //!    duplicate key.
@@ -223,7 +224,7 @@ fn run_bam_markdup(
         records.push(record.clone());
     }
     if options.clear_existing_dups {
-        clear_duplicate_flags(&mut records);
+        clear_duplicate_marks(&mut records);
     }
     let mut stats = mark_duplicates(&mut records, options);
     stats.written = output_record_count(&records, options.remove_dups);
@@ -261,7 +262,7 @@ fn run_sam_markdup(
         records.push(record);
     }
     if options.clear_existing_dups {
-        clear_duplicate_flags(&mut records);
+        clear_duplicate_marks(&mut records);
     }
     let mut stats = mark_duplicates(&mut records, options);
     stats.written = output_record_count(&records, options.remove_dups);
@@ -527,11 +528,15 @@ fn output_record_count(records: &[RecordBuf], remove_dups: bool) -> u64 {
         .count() as u64
 }
 
-fn clear_duplicate_flags(records: &mut [RecordBuf]) {
+fn clear_duplicate_marks(records: &mut [RecordBuf]) {
+    let duplicate_origin_tag = Tag::from([b'd', b'o']);
+    let duplicate_type_tag = Tag::from([b'd', b't']);
     for record in records {
         let mut flags = record.flags();
         flags.remove(sam::alignment::record::Flags::DUPLICATE);
         *record.flags_mut() = flags;
+        record.data_mut().remove(&duplicate_origin_tag);
+        record.data_mut().remove(&duplicate_type_tag);
     }
 }
 
@@ -680,7 +685,10 @@ fn print_usage() -> io::Result<()> {
     writeln!(w, "  -r            remove duplicate records")?;
     writeln!(w, "  -s            emit summary counts to stderr")?;
     writeln!(w, "  -S            mark supplementary duplicates (default)")?;
-    writeln!(w, "  -c            clear existing duplicate flags first")?;
+    writeln!(
+        w,
+        "  -c            clear existing duplicate flags/tags first"
+    )?;
     writeln!(w, "  -t            add duplicate-origin do tags")?;
     writeln!(
         w,

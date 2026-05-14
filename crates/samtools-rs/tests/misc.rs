@@ -4533,7 +4533,7 @@ fn markdup_r_removes_duplicates_from_output() {
 }
 
 #[test]
-fn markdup_c_clears_existing_duplicate_flags_and_s_accepts_supplementary_mode() {
+fn markdup_c_clears_existing_duplicate_marks_and_s_accepts_supplementary_mode() {
     use samtools_rs::commands::markdup;
     let tmp = tmp_dir("markdup-clear");
     let sam = tmp.join("in.sam");
@@ -4543,7 +4543,7 @@ fn markdup_c_clears_existing_duplicate_flags_and_s_accepts_supplementary_mode() 
         concat!(
             "@HD\tVN:1.6\tSO:coordinate\n",
             "@SQ\tSN:chr1\tLN:100\n",
-            "previous\t1024\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "previous\t1024\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tdo:Z:old\tdt:Z:LB\n",
             "unique\t0\tchr1\t10\t60\t4M\t*\t0\t0\tTGCA\t####\n",
         ),
     )
@@ -4572,6 +4572,8 @@ fn markdup_c_clears_existing_duplicate_flags_and_s_accepts_supplementary_mode() 
         .unwrap();
     let flag = previous.split('\t').nth(1).unwrap().parse::<u32>().unwrap();
     assert_eq!(flag & 0x400, 0);
+    assert!(!previous.contains("\tdo:Z:"));
+    assert!(!previous.contains("\tdt:Z:"));
 }
 
 #[test]
@@ -4614,6 +4616,46 @@ fn markdup_t_adds_duplicate_origin_tag() {
     let low = text.lines().find(|line| line.starts_with("low\t")).unwrap();
     assert!(!high.contains("\tdo:Z:"));
     assert!(low.contains("\tdo:Z:high"));
+}
+
+#[test]
+fn markdup_c_removes_stale_duplicate_tags_before_t_retags_duplicates() {
+    use samtools_rs::commands::markdup;
+    let tmp = tmp_dir("markdup-clear-retag");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:100\n",
+            "high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "low\t1024\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\tdo:Z:stale\tdt:Z:LB\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "-c",
+                "-t",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let low = text.lines().find(|line| line.starts_with("low\t")).unwrap();
+    assert!(low.contains("\tdo:Z:high"));
+    assert!(!low.contains("\tdo:Z:stale"));
+    assert!(!low.contains("\tdt:Z:"));
 }
 
 #[test]
