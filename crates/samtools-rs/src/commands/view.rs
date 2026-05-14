@@ -516,11 +516,7 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
     if effective_out_fmt == OutputFmt::Bam {
         reject_unselected_binary_output(opts)?;
         let filter = combined_filter_expr(opts);
-        let dst = opts
-            .output
-            .clone()
-            .ok_or_else(|| io::Error::other("BAM output to stdout requires -o file (TODO)"))?;
-        let dst_file = File::create(&dst)?;
+        let dst_file = open_binary_output(opts)?;
         match input_exact {
             Exact::Sam => {
                 if let Some(expr) = filter.as_deref() {
@@ -791,11 +787,7 @@ fn run_sam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
 
     if effective_out_fmt == OutputFmt::Bam {
         reject_unselected_binary_output(opts)?;
-        let dst = opts
-            .output
-            .clone()
-            .ok_or_else(|| io::Error::other("BAM output to stdout requires -o file (TODO)"))?;
-        let dst_file = File::create(&dst)?;
+        let dst_file = open_binary_output(opts)?;
         let filter = combined_filter_expr(opts);
         if let Some(expr) = filter.as_deref() {
             if has_tag_filter(opts) {
@@ -952,11 +944,7 @@ fn run_bam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
     if effective_out_fmt == OutputFmt::Bam {
         reject_unselected_binary_output(opts)?;
         let filter = combined_filter_expr(opts);
-        let dst = opts
-            .output
-            .clone()
-            .ok_or_else(|| io::Error::other("BAM output to stdout requires -o file (TODO)"))?;
-        let dst_file = File::create(&dst)?;
+        let dst_file = open_binary_output(opts)?;
         if let Some(expr) = filter.as_deref() {
             htslib_rs::alignment_compat::write_bam_matching_filter(
                 io::Cursor::new(input),
@@ -1079,11 +1067,7 @@ fn run_cram_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
     if effective_out_fmt == OutputFmt::Bam {
         reject_unselected_binary_output(opts)?;
         let filter = combined_filter_expr(opts);
-        let dst = opts
-            .output
-            .clone()
-            .ok_or_else(|| io::Error::other("BAM output to stdout requires -o file (TODO)"))?;
-        let dst_file = File::create(&dst)?;
+        let dst_file = open_binary_output(opts)?;
         if let Some(expr) = filter.as_deref() {
             htslib_rs::alignment_compat::write_cram_records_matching_filter_as_bam_with_reference(
                 io::Cursor::new(input),
@@ -1151,6 +1135,13 @@ fn resolved_output_fmt(opts: &Opts) -> io::Result<OutputFmt> {
 
 fn open_text_output(opts: &Opts) -> io::Result<Box<dyn Write>> {
     sam_io::open_text_output(opts.output.as_deref())
+}
+
+fn open_binary_output(opts: &Opts) -> io::Result<Box<dyn Write>> {
+    match opts.output.as_deref() {
+        Some(path) => File::create(path).map(|file| Box::new(file) as Box<dyn Write>),
+        None => Ok(Box::new(io::stdout())),
+    }
 }
 
 fn open_unselected_text_output(opts: &Opts) -> io::Result<Option<Box<dyn Write>>> {

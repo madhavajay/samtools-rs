@@ -11,7 +11,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -134,12 +134,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
         };
         match format.exact {
-            Exact::Bam => {}
+            Exact::Sam | Exact::Bam => {}
             Exact::Cram => has_cram = true,
             _ => {
                 print_error(
                     "depth",
-                    "only BAM and reference-backed CRAM input are currently supported (SAM TODO)",
+                    "only SAM, BAM, and reference-backed CRAM input are currently supported",
                 );
                 return ExitCode::from(1);
             }
@@ -236,6 +236,7 @@ pub(crate) fn run_depth(
     for path in inputs {
         let format = sam_io::sam_open_format(path)?;
         let targets = match format.exact {
+            Exact::Sam => collect_sam_depth(path, walk, &regions)?,
             Exact::Bam => collect_bam_depth(path, walk, &regions)?,
             Exact::Cram => collect_cram_depth(
                 path,
@@ -251,7 +252,7 @@ pub(crate) fn run_depth(
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "only BAM and reference-backed CRAM input are currently supported",
+                    "only SAM, BAM, and reference-backed CRAM input are currently supported",
                 ));
             }
         };
@@ -259,6 +260,29 @@ pub(crate) fn run_depth(
     }
 
     emit_depths(out, &per_input_targets, walk.min_depth, walk.a_mode)
+}
+
+fn collect_sam_depth(
+    path: &Path,
+    config: DepthWalkConfig,
+    regions: &[Region],
+) -> io::Result<Vec<DepthTarget>> {
+    let mut reader = sam::io::Reader::new(BufReader::new(File::open(path)?));
+    let header = reader.read_header()?;
+    let mut targets = depth_targets(&header, regions)?;
+
+    for result in reader.records() {
+        let record = result?;
+        update_targets(
+            &header,
+            &mut targets,
+            &record,
+            config.exclude_flags,
+            config.min_mapq,
+        );
+    }
+
+    Ok(targets)
 }
 
 fn collect_bam_depth(

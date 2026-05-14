@@ -119,6 +119,7 @@ where
             Some(sorted_bam.path()),
             true,
             sort_command::OutFmt::Bam,
+            false,
         )?;
         Some(sorted_bam)
     } else {
@@ -238,6 +239,7 @@ where
         Some(output_bam.as_ref()),
         by_name,
         sort_command::OutFmt::Bam,
+        false,
     )
 }
 
@@ -280,7 +282,13 @@ where
         .iter()
         .map(|path| path.as_ref().to_path_buf())
         .collect();
-    merge_command::run_merge(&inputs, Some(output_bam), false, merge_command::OutFmt::Bam)
+    merge_command::run_merge(
+        &inputs,
+        Some(output_bam),
+        false,
+        merge_command::OutFmt::Bam,
+        false,
+    )
 }
 
 /// Quickly validates a BAM/CRAM/SAM input.

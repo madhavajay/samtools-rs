@@ -90,12 +90,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
         };
         match format.exact {
-            Exact::Bam => {}
+            Exact::Sam | Exact::Bam => {}
             Exact::Cram => has_cram = true,
             _ => {
                 print_error(
                     "bedcov",
-                    "only BAM and reference-backed CRAM input are currently supported (SAM TODO)",
+                    "only SAM, BAM, and reference-backed CRAM input are currently supported",
                 );
                 return ExitCode::from(1);
             }
@@ -309,6 +309,25 @@ fn compute_region_metrics(
 
     let mut metrics = RegionMetrics::default();
     match sam_io::sam_open_format(alignment_path)?.exact {
+        Exact::Sam => {
+            let mut reader = sam::io::Reader::new(BufReader::new(File::open(alignment_path)?));
+            let header = reader.read_header()?;
+            for result in reader.records() {
+                let rec = result?;
+                update_region_metrics(
+                    &header,
+                    &rec,
+                    RegionMetricConfig {
+                        beg,
+                        end,
+                        exclude_flags,
+                        min_mapq,
+                    },
+                    &mut metrics,
+                    depths.as_mut(),
+                );
+            }
+        }
         Exact::Bam => {
             let header = htslib_rs::alignment_compat::read_bam_header_from_path(alignment_path)?;
             for rec in
@@ -358,7 +377,7 @@ fn compute_region_metrics(
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "only BAM and reference-backed CRAM input are currently supported",
+                "only SAM, BAM, and reference-backed CRAM input are currently supported",
             ));
         }
     }

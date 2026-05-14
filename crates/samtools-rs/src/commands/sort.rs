@@ -13,13 +13,14 @@
 //! Supported flags:
 //!  - `-n` — name sort (default is coordinate sort).
 //!  - `-o FILE` — output file (default stdout).
-//!  - `--output-fmt sam|bam` — output format (default: bam).
+//!  - `-O sam|bam`, `--output-fmt sam|bam` — output format (default: bam).
 //!  - `-@`/`--threads`, `-m`/`--max-mem`, `-T`/`--temp` — accepted but ignored.
 //!  - `--no-PG` — accepted, silently ignored.
+//!  - `--write-index` — write a BAI next to coordinate-sorted BAM output.
 //!
 //! Not yet supported: external merge (large inputs spill to disk), tag
 //! sort (`-t TAG`), template-coordinate sort (`-M`), minimiser sort (`-N`),
-//! CRAM I/O, write-index.
+//! CRAM I/O.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -34,6 +35,7 @@ use htslib_rs::sam::{self, alignment::RecordBuf};
 
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
 /// Entry point for `samtools sort`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -41,6 +43,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut output: Option<PathBuf> = None;
     let mut output_fmt = OutFmt::Bam;
     let mut input: Option<PathBuf> = None;
+    let mut local_write_index = false;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -52,12 +55,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-o" | "--output" => {
                 output = iter.next().map(PathBuf::from);
             }
-            "--output-fmt" => {
-                let v = iter.next().and_then(|a| a.to_str()).unwrap_or("bam");
-                output_fmt = match v.to_lowercase().as_str() {
-                    "sam" => OutFmt::Sam,
-                    "bam" => OutFmt::Bam,
-                    _ => OutFmt::Bam,
+            "-O" | "--output-fmt" => {
+                let Some(v) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("sort", format!("missing value for {}", s));
+                    return ExitCode::from(1);
+                };
+                output_fmt = match parse_output_format(v) {
+                    Ok(fmt) => fmt,
+                    Err(e) => {
+                        print_error("sort", e);
+                        return ExitCode::from(1);
+                    }
                 };
             }
             "-@"
@@ -71,7 +79,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
             | "-K" => {
                 let _ = iter.next();
             }
-            "--no-PG" | "--write-index" | "-O" | "-u" => {
+            "--write-index" => {
+                local_write_index = true;
+            }
+            "--no-PG" | "-u" => {
                 // Accepted but ignored for the in-memory port.
             }
             "--help" => {
@@ -113,12 +124,42 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    match run_sort(&input, output.as_deref(), name_sort, output_fmt) {
+    let write_index = local_write_index || current_global_args().write_index;
+    if write_index {
+        if output.is_none() {
+            print_error("sort", "--write-index requires -o FILE");
+            return ExitCode::from(1);
+        }
+        if name_sort {
+            print_error("sort", "--write-index requires coordinate sort output");
+            return ExitCode::from(1);
+        }
+        if !matches!(output_fmt, OutFmt::Bam) {
+            print_error("sort", "--write-index is only supported for BAM output");
+            return ExitCode::from(1);
+        }
+    }
+
+    match run_sort(
+        &input,
+        output.as_deref(),
+        name_sort,
+        output_fmt,
+        write_index,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             print_error_errno("sort", "sort failed", &e);
             ExitCode::from(1)
         }
+    }
+}
+
+fn parse_output_format(raw: &str) -> Result<OutFmt, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "sam" => Ok(OutFmt::Sam),
+        "bam" => Ok(OutFmt::Bam),
+        _ => Err(format!("unsupported output format \"{}\"", raw)),
     }
 }
 
@@ -133,6 +174,7 @@ pub(crate) fn run_sort(
     output: Option<&Path>,
     name_sort: bool,
     fmt: OutFmt,
+    write_index: bool,
 ) -> io::Result<()> {
     let format = sam_io::sam_open_format(input)?;
     let (mut header, mut records) = match format.exact {
@@ -175,9 +217,21 @@ pub(crate) fn run_sort(
         if name_sort { "queryname" } else { "coordinate" },
     );
 
-    let mut writer = open_output(output, fmt, &header)?;
-    for rec in &records {
-        writer.write_record(&header, rec)?;
+    {
+        let mut writer = open_output(output, fmt, &header)?;
+        for rec in &records {
+            writer.write_record(&header, rec)?;
+        }
+    }
+
+    if write_index {
+        let Some(path) = output else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--write-index requires -o FILE",
+            ));
+        };
+        write_bam_index(path)?;
     }
     Ok(())
 }
@@ -289,6 +343,18 @@ fn open_output(
     }
 }
 
+fn write_bam_index(path: &Path) -> io::Result<()> {
+    let index = htslib_rs::index_compat::build_bai(path)?;
+    htslib_rs::index_compat::write_bai(append_extension(path, "bai"), &index)
+}
+
+fn append_extension(path: &Path, ext: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".");
+    s.push(ext);
+    PathBuf::from(s)
+}
+
 fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
     writeln!(w, "Usage: samtools sort [options] <in.bam|in.sam>")?;
@@ -302,5 +368,6 @@ fn print_usage() -> io::Result<()> {
         w,
         "  -@/-m/-T/-K     accepted but currently ignored (in-memory sort only)"
     )?;
+    writeln!(w, "  --write-index   write BAI index for BAM file output")?;
     Ok(())
 }

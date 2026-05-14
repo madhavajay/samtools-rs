@@ -150,6 +150,42 @@ fn depth_bed_outputs_only_bed_interval() {
 }
 
 #[test]
+fn depth_sam_input_supports_region_restriction() {
+    let tmp = tmp_dir("depth-sam-region");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("depth.tsv");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t2\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "r2\t0\tchr1\t4\t60\t3M\t*\t0\t0\tTGC\t###\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(depth::main(&argv(
+            "depth",
+            &[
+                "-r",
+                "chr1:3-5",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        "chr1\t3\t1\nchr1\t4\t2\nchr1\t5\t2\n"
+    );
+}
+
+#[test]
 fn depth_multi_input_outputs_one_column_per_input() {
     let p = indexed_bam();
     let tmp = tmp_dir("depth-multi");
@@ -322,6 +358,44 @@ fn coverage_region_outputs_requested_interval() {
     assert!(rows[0].starts_with("17\t1\t10000\t"));
     let fields: Vec<_> = rows[0].split('\t').collect();
     assert!(fields[7].parse::<f64>().unwrap() > 0.0);
+}
+
+#[test]
+fn coverage_sam_input_supports_region_restriction() {
+    let tmp = tmp_dir("coverage-sam-region");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("coverage.tsv");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "r2\t0\tchr1\t3\t30\t4M\t*\t0\t0\tTGCA\tIIII\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-r",
+                "chr1:3-5",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let rows: Vec<_> = text.lines().filter(|line| !line.starts_with('#')).collect();
+    assert_eq!(
+        rows,
+        ["chr1\t3\t5\t2\t3\t100.000000\t1.666667\t24.000000\t45.000000"]
+    );
 }
 
 #[test]
@@ -757,6 +831,38 @@ fn bedcov_depth_column_succeeds() {
         exit_to_u8(bedcov::main(&argv(
             "bedcov",
             &["-d", "2", bed.to_str().unwrap(), bam.to_str().unwrap()]
+        ))),
+        0
+    );
+}
+
+#[test]
+fn bedcov_sam_input_supports_depth_and_count_columns() {
+    let tmp = tmp_dir("bedcov-sam");
+    let bed = tmp.join("r.bed");
+    let sam = tmp.join("in.sam");
+    std::fs::write(&bed, "chr1\t2\t5\n").unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "r2\t0\tchr1\t3\t30\t4M\t*\t0\t0\tTGCA\tIIII\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(bedcov::main(&argv(
+            "bedcov",
+            &[
+                "-d",
+                "2",
+                "-c",
+                bed.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
         ))),
         0
     );

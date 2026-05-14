@@ -6,7 +6,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -38,7 +38,7 @@ pub fn fqidx_main(args: &[OsString]) -> ExitCode {
 fn run_faidx(args: &[OsString], is_fastq: bool) -> Result<ExitCode, String> {
     let mut opts = Opts {
         is_fastq,
-        line_len: 50,
+        line_len: 60,
         ..Opts::default()
     };
     let mut i = 1;
@@ -126,6 +126,9 @@ fn run_faidx(args: &[OsString], is_fastq: bool) -> Result<ExitCode, String> {
                     .ok_or_else(|| format!("missing value for {s}"))?;
                 i += 1;
             }
+            _ if s.starts_with("--output-fmt-opt=") => {
+                i += 1;
+            }
             "--continue" => {
                 opts.continue_on_missing = true;
                 i += 1;
@@ -155,7 +158,12 @@ fn run_faidx(args: &[OsString], is_fastq: bool) -> Result<ExitCode, String> {
     // Build-only path: a single positional arg and no region file.
     if opts.positional.len() == 1 && opts.region_file.is_none() {
         let input = &opts.positional[0];
-        match build_index(input, opts.fai_path.as_deref(), opts.is_fastq) {
+        match build_index(
+            input,
+            opts.fai_path.as_deref(),
+            opts.gzi_path.as_deref(),
+            opts.is_fastq,
+        ) {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
                 print_error_errno(
@@ -205,13 +213,39 @@ enum MarkStrand {
     },
 }
 
-fn build_index(input: &Path, fai_path: Option<&Path>, is_fastq: bool) -> std::io::Result<()> {
-    let file = File::open(input)?;
-    let reader = BufReader::new(file);
+fn build_index(
+    input: &Path,
+    fai_path: Option<&Path>,
+    gzi_path: Option<&Path>,
+    is_fastq: bool,
+) -> std::io::Result<()> {
+    let src = std::fs::read(input)?;
     let fai_out = fai_path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| append_extension(input, "fai"));
     let out_file = File::create(&fai_out)?;
+
+    let reader: Box<dyn BufRead> = match htslib_rs::bgzf_compat::detect_compression_kind(&src) {
+        htslib_rs::bgzf_compat::CompressionKind::Uncompressed => {
+            Box::new(BufReader::new(Cursor::new(src)))
+        }
+        htslib_rs::bgzf_compat::CompressionKind::Gzip => {
+            let data = htslib_rs::bgzf_compat::read_auto(&src)?;
+            Box::new(BufReader::new(Cursor::new(data)))
+        }
+        htslib_rs::bgzf_compat::CompressionKind::Bgzf => {
+            let mut cursor = Cursor::new(&src);
+            let gzi = htslib_rs::bgzf_compat::build_gzi(&mut cursor)?;
+            let gzi_out = gzi_path
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| append_extension(input, "gzi"));
+            htslib_rs::bgzf_compat::write_gzi_to_path(gzi_out, &gzi)?;
+
+            let data = htslib_rs::bgzf_compat::read_all(&src[..])?;
+            Box::new(BufReader::new(Cursor::new(data)))
+        }
+    };
+
     if is_fastq {
         let index = htslib_rs::faidx_compat::build_fastq_index(reader)?;
         htslib_rs::faidx_compat::write_fastq_index(out_file, &index)?;
@@ -232,12 +266,22 @@ fn run_retrieval(input: &Path, opts: &Opts) -> Result<(), String> {
         return Err("no regions specified".into());
     }
 
-    let mut out = sam_io::open_text_output(opts.output.as_deref()).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
 
     if opts.is_fastq {
         let index = read_or_build_fastq_index(input, opts.fai_path.as_deref())?;
-        let mut reader = File::open(input).map_err(|e| e.to_string())?;
+        let mut reader = read_indexed_source(input).map_err(|e| e.to_string())?;
         for region in regions {
+            if let Some(action) = fastq_retrieval_bounds_action(&index, &region) {
+                match action {
+                    RetrievalBoundsAction::Zero => {
+                        warn_zero_length_region(&region);
+                        continue;
+                    }
+                    RetrievalBoundsAction::Truncated => warn_truncated_region(&region),
+                }
+            }
+
             let sequence =
                 htslib_rs::faidx_compat::fetch_fastq_region_sequence(&mut reader, &index, &region);
             let quality =
@@ -269,8 +313,18 @@ fn run_retrieval(input: &Path, opts: &Opts) -> Result<(), String> {
         }
     } else {
         let index = read_or_build_index(input, opts.fai_path.as_deref())?;
-        let mut reader = File::open(input).map_err(|e| e.to_string())?;
+        let mut reader = read_indexed_source(input).map_err(|e| e.to_string())?;
         for region in regions {
+            if let Some(action) = retrieval_bounds_action(&index, &region) {
+                match action {
+                    RetrievalBoundsAction::Zero => {
+                        warn_zero_length_region(&region);
+                        continue;
+                    }
+                    RetrievalBoundsAction::Truncated => warn_truncated_region(&region),
+                }
+            }
+
             match htslib_rs::faidx_compat::fetch_region_sequence(&mut reader, &index, &region) {
                 Ok(mut sequence) => {
                     let name =
@@ -297,7 +351,14 @@ fn run_retrieval(input: &Path, opts: &Opts) -> Result<(), String> {
         }
     }
 
-    sam_io::check_sam_close(&mut out).map_err(|e| e.to_string())?;
+    write_output(opts.output.as_deref(), &out).map_err(|e| e.to_string())?;
+
+    if opts.write_index
+        && let Some(output) = opts.output.as_deref()
+    {
+        build_index(output, None, None, opts.is_fastq).map_err(|e| e.to_string())?;
+    }
+
     Ok(())
 }
 
@@ -314,7 +375,7 @@ fn read_or_build_index(
             .map_err(|e| e.to_string());
     }
 
-    build_index(input, Some(&path), false).map_err(|e| e.to_string())?;
+    build_index(input, Some(&path), None, false).map_err(|e| e.to_string())?;
     let file = File::open(&path).map_err(|e| e.to_string())?;
     htslib_rs::faidx_compat::read_index(BufReader::new(file)).map_err(|e| e.to_string())
 }
@@ -332,7 +393,7 @@ fn read_or_build_fastq_index(
             .map_err(|e| e.to_string());
     }
 
-    build_index(input, Some(&path), true).map_err(|e| e.to_string())?;
+    build_index(input, Some(&path), None, true).map_err(|e| e.to_string())?;
     let file = File::open(&path).map_err(|e| e.to_string())?;
     htslib_rs::faidx_compat::read_fastq_index(BufReader::new(file)).map_err(|e| e.to_string())
 }
@@ -354,6 +415,126 @@ fn read_region_file(path: &Path) -> Result<Vec<String>, String> {
     }
 
     Ok(regions)
+}
+
+fn read_indexed_source(input: &Path) -> io::Result<Cursor<Vec<u8>>> {
+    let src = std::fs::read(input)?;
+    let data = htslib_rs::bgzf_compat::read_auto(&src)?;
+
+    Ok(Cursor::new(data))
+}
+
+fn write_output(output: Option<&Path>, data: &[u8]) -> io::Result<()> {
+    if let Some(path) = output {
+        if is_bgzf_output_path(path) {
+            let encoded = htslib_rs::bgzf_compat::write_all_with_kind(
+                data,
+                htslib_rs::bgzf_compat::CompressionKind::Bgzf,
+            )?;
+            std::fs::write(path, encoded)
+        } else {
+            let mut out = sam_io::open_text_output(Some(path))?;
+            out.write_all(data)?;
+            sam_io::check_sam_close(&mut out)
+        }
+    } else {
+        let mut out = sam_io::open_text_output(None)?;
+        out.write_all(data)?;
+        sam_io::check_sam_close(&mut out)
+    }
+}
+
+enum RetrievalBoundsAction {
+    Zero,
+    Truncated,
+}
+
+fn retrieval_bounds_action(
+    index: &htslib_rs::faidx_compat::Index,
+    region: &str,
+) -> Option<RetrievalBoundsAction> {
+    let parsed = parse_region_bounds(region)?;
+    let len = htslib_rs::faidx_compat::sequence_len(index, parsed.name)?;
+
+    bounds_action(parsed, len)
+}
+
+fn fastq_retrieval_bounds_action(
+    index: &htslib_rs::faidx_compat::FastqIndex,
+    region: &str,
+) -> Option<RetrievalBoundsAction> {
+    let parsed = parse_region_bounds(region)?;
+    let len = htslib_rs::faidx_compat::fastq_sequence_len(index, parsed.name)?;
+
+    bounds_action(parsed, len)
+}
+
+fn bounds_action(parsed: ParsedRegionBounds<'_>, len: u64) -> Option<RetrievalBoundsAction> {
+    let start = parsed.start.unwrap_or(1);
+    let end = parsed.end.unwrap_or(len);
+
+    if start == 0 || start > len || start > end {
+        Some(RetrievalBoundsAction::Zero)
+    } else if end > len {
+        Some(RetrievalBoundsAction::Truncated)
+    } else {
+        None
+    }
+}
+
+struct ParsedRegionBounds<'a> {
+    name: &'a str,
+    start: Option<u64>,
+    end: Option<u64>,
+}
+
+fn parse_region_bounds(region: &str) -> Option<ParsedRegionBounds<'_>> {
+    let (name, interval) = region.rsplit_once(':')?;
+    if name.is_empty() {
+        return None;
+    }
+
+    let (start, end) = interval
+        .split_once('-')
+        .map_or((interval, ""), |(start, end)| (start, end));
+
+    Some(ParsedRegionBounds {
+        name,
+        start: parse_region_position(start),
+        end: parse_region_position(end),
+    })
+}
+
+fn parse_region_position(value: &str) -> Option<u64> {
+    if value.is_empty() {
+        return None;
+    }
+
+    value
+        .bytes()
+        .filter(|b| *b != b',')
+        .try_fold(0_u64, |n, b| {
+            if b.is_ascii_digit() {
+                Some(n.saturating_mul(10).saturating_add(u64::from(b - b'0')))
+            } else {
+                None
+            }
+        })
+}
+
+fn warn_zero_length_region(region: &str) {
+    eprintln!("[W::fai_get_val] Zero length sequence returned for {region}");
+}
+
+fn warn_truncated_region(region: &str) {
+    eprintln!("[W::fai_get_val] Truncated sequence returned for {region}");
+}
+
+fn is_bgzf_output_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("gz" | "bgz" | "bgzf")
+    )
 }
 
 fn write_retrieval_record<W>(
