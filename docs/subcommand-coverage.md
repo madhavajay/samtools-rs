@@ -132,7 +132,7 @@ samtools-rs status legend:
 - **C source:** `bam_reheader.c`
 - **HTSlib APIs used:** BAM/CRAM header rewriting, in-place mode for CRAM
 - **htslib-rs coverage:** ❌ — in-place CRAM header replacement is not exposed
-- **samtools-rs status:** 🟡 — record-level BAM header replacement works with default `@PG` insertion and `--no-PG`; BGZF block-level fast path, CRAM `--in-place`, and `-c <command>` external filtering remain.
+- **samtools-rs status:** 🟡 — record-level BAM header replacement works with default `@PG` insertion, `--no-PG`, and BAM `-c <command>` external header filtering; BGZF block-level fast path and CRAM `--in-place` remain.
 
 ### addreplacerg
 

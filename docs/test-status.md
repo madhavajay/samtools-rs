@@ -52,7 +52,7 @@ Status values:
 | `test_calmd` | partial | BAQ paths for SAM input exist; MD/NM recomputation, BAM/CRAM I/O, and remaining flags remain. |
 | `test_idxstat` | partial | BAM index counts exist, with streaming slow-path counts for SAM and unindexed BAM. CRAM slow path and full harness parity remain. |
 | `test_quickcheck` | passing | TODO marks byte-for-byte parity against `quickcheck/all.expected`; covered by `crates/samtools-rs/tests/quickcheck.rs`. |
-| `test_reheader` | partial | Basic BAM header replacement exists with default `@PG` insertion and `--no-PG` suppression; BGZF fast path, CRAM in-place, and command filter remain. |
+| `test_reheader` | partial | Basic BAM header replacement exists with default `@PG` insertion, `--no-PG` suppression, and BAM `-c <command>` header filtering; BGZF fast path and CRAM in-place remain. |
 | `test_addrprg` | partial | SAM text add/replace exists; BAM/CRAM aux mutation, `orphan_first`, and mate-aware behavior remain. |
 | `test_markdup` | not-yet-ported | `markdup` is a stub. |
 | `test_bedcov` | partial | CIGAR-walk BAM coverage, `-H` output headers, `-c` read-count columns, and `-d` depth-threshold columns exist; exact pileup behavior remains. |
