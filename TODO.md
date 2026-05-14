@@ -12,6 +12,56 @@ next samtools-only item. Stop once the only remaining actionable work requires
 `htslib-rs` or noodles changes, and report those blockers instead of modifying
 the underlying libraries.
 
+## Current Handoff — 2026-05-15
+
+Active branch / PR:
+- Branch: `stats-cov-threshold-target-lines`
+- PR: https://github.com/madhavajay/samtools-rs/pull/7
+- PR state at last check: open, non-draft, merge state clean, base `main`, head `stats-cov-threshold-target-lines`
+- Worktree at last check: clean, with local branch tracking `origin/stats-cov-threshold-target-lines`
+- Latest commit on the branch: `288f992 Support fastq CASAVA barcode fields`
+
+Recent unmerged branch work in PR #7, newest first:
+- `288f992` — `fastq -i` / `--barcode-tag` CASAVA barcode fields for SAM/BAM FASTQ/FASTA local paths.
+- `f88e172` — `fastq -U` / `--UMI-tag` UMI read-name suffixes.
+- `0cc6202` — `fastq -v INT` default-quality output for missing qualities.
+- `c9a20c6` — accepted `collate -n INT` temporary-file-count compatibility.
+- `ca58fcc` — `cat -b FILE` input file lists.
+- `f22f0bc` through `820dbf8` / `b1bff15` / `1103de7` / `f2af4aa` / `d0c1587` / `35586da` / `e3d6b5e` / `192b193` — merge input lists, tag ordering, and richer header reconciliation.
+- Earlier PR #7 commits include stats coverage/filtering/read-length/trim/read-group/insert-size work, markdup/fixmate compatibility increments, reference indexed-BAM regions, SAM depad conversion, sanitizer options, CRAM-backed sort/collate input, and docs/status synchronization.
+
+Latest known validation:
+- Rust tests: 404 passing.
+- Last full gate before the latest push: `cargo fmt --all --check`, `cargo clippy -p samtools-rs --all-targets -- -D warnings`, `cargo test -p samtools-rs`, `cargo test -p samtools-rs -- --list | rg ': test$' | wc -l`, and `git diff --check`.
+- Last single focused fastq tests added: `fastq_v_supplies_default_quality_for_missing_quality`, `fastq_umi_appends_aux_tag_to_read_names`, and `fastq_i_adds_casava_fields_from_barcode_tags`.
+
+Estimated whole-project completion:
+- Roughly 55-60% complete toward the full `samtools` replacement goal.
+- Rationale: core workspace/subcommand layout, common I/O, many read/write/index/file-operation/statistics/editing commands, and 404 Rust tests are in place. The remaining risk is concentrated in byte-for-byte upstream parity, pileup-dependent commands, full CRAM streaming, large external algorithms, and several partially implemented high-complexity commands.
+
+What to do next in this branch:
+1. Continue with small samtools-rs-only increments from the `fastq` TODO, because the branch is already warm there and the next item is self-contained.
+2. Implement a narrow `fastq --i1 FILE` / `--i2 FILE` index FASTQ extraction slice for SAM/BAM local FASTQ paths, using `BC` / `QT` by default and honoring `--barcode-tag`, `--quality-tag`, and a small `--index-format` parser if feasible.
+3. Keep the first index-file slice honest in docs: mark it as basic barcode-derived index FASTQ output, and leave exact name-grouped paired/singleton/other routing as pending until the full upstream grouping model is ported.
+4. Add Rust integration coverage around barcode `BC:Z` plus quality `QT:Z` extraction to `i1.fq` / `i2.fq`; expected next test count is 405 if only one test is added.
+5. Run the full gate, update `TODO.md`, `docs/subcommand-coverage.md`, and `docs/test-status.md`, then commit, push, and update PR #7.
+
+Good next implementation shape for `fastq --i1/--i2`:
+- Start in `crates/samtools-rs/src/commands/fastq.rs`; avoid changing `htslib-rs`.
+- Parse `--i1`, `--i2`, `--quality-tag` (default `QT`), and `--index-format` (default upstream-style `i*i*`).
+- Reuse the existing local SAM/BAM aux-aware render path rather than the htslib-rs fast path, because index extraction needs aux tags and side-output files.
+- Derive index reads from per-record barcode/quality aux tags in the current input order. This is not the final exact upstream name-grouped model, so document it as partial.
+- Prefer a helper that computes index segments from `(barcode, quality, index_format)`, where `i` emits index sequence and `n` skips bases. Support `i*` / `n*` separator-delimited segments and fixed-width `iN` / `nN` first; reject malformed formats cleanly.
+- Use the rendered read name without CASAVA comments for index FASTQ record names, respecting existing `-n`/`-N` and UMI suffix behavior where practical.
+- If split output plus index output is too large for the first slice, reject that combination with a clear message and keep the TODO pending for full grouped split semantics.
+
+After `fastq --i1/--i2`, the next best samtools-rs-only items are:
+- Extend `fastq` toward exact name-grouped paired/singleton/other routing, still without touching `htslib-rs`.
+- Pick one small `view` parity slice that can be done with existing mutable BAM/SAM record infrastructure.
+- Pick one `checksum`, `reference`, `depad`, `markdup`, `sort`, or `merge` parity case from the upstream harness that does not require pileup, CRAM internals, or noodles changes.
+- Keep deferring pileup-dependent commands (`mpileup`, `consensus`, `targetcut`, `phase`, `ampliconstats`) until `htslib-rs` exposes a pileup iterator.
+- Keep deferring CRAM whole-file stats/checksum/reference paths until `htslib-rs` exposes a CRAM all-record iterator.
+
 ## Progress Snapshot
 
 **Phases 0–2 complete; Wave A complete (with partials); Wave B substantially complete (with partials); Wave D substantially complete (with partials); Wave C in progress (`fixmate`, `rmdup`, `calmd`, `reset`, `markdup`, `depad` partials landed); Phases 4–5 pending. Remaining work largely blocks on htslib-rs infrastructure (pileup APIs, CRAM all-record iterator, custom-index paths) or on substantial per-subcommand efforts (full `mpileup`/`consensus`/`phase`/`ampliconstats`/`targetcut`, full `depad`, full `checksum`, full `reference`, `markdup` full stats parity, `fastq` exact paired/singleton/other semantics, `sort` external merge / template-coordinate / minimiser sorts).**
@@ -42,7 +92,7 @@ Rust tests: 404 currently passing. `cargo fmt --all --check`, `cargo clippy -p s
 Progress snapshot PR chain:
 - noodles: https://github.com/madhavajay/noodles/pull/1
 - htslib-rs: https://github.com/madhavajay/htslib-rs/pull/5
-- samtools-rs: https://github.com/madhavajay/samtools-rs/pull/6
+- samtools-rs: https://github.com/madhavajay/samtools-rs/pull/7
 
 ## What's Next — Decision Points
 
