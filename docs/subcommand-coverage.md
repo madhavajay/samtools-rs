@@ -151,7 +151,7 @@ samtools-rs status legend:
 
 - **C source:** `bam_import.c`
 - **HTSlib APIs used:** FASTA/FASTQ reading + SAM/BAM/CRAM writing
-- **samtools-rs status:** 🟡 — single FASTA/FASTQ, paired FASTQ, positional interleaved FASTQ, index reads, CASAVA/SRA name parsing, UMI/barcode/comment aux tags, read-group header/tag support, and SAM/BAM output are implemented for the covered fixtures; paired singleton/other grouping, full read-group parity, and CRAM output remain.
+- **samtools-rs status:** 🟡 — single FASTA/FASTQ, paired FASTQ, `-0` singleton input alongside paired `-1`/`-2`, positional interleaved FASTQ, index reads, CASAVA/SRA name parsing, UMI/barcode/comment aux tags, read-group header/tag support, and SAM/BAM output are implemented for the covered fixtures; full paired singleton/other grouping parity, full read-group parity, and CRAM output remain.
 
 ## Wave C — Editing / Mate-aware
 

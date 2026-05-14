@@ -2904,6 +2904,41 @@ fn import_paired_fastq_to_sam() {
 }
 
 #[test]
+fn import_paired_fastq_accepts_zero_singleton_input() {
+    let tmp = tmp_dir("imp-paired-zero");
+    let r1 = tmp.join("r1.fq");
+    let r2 = tmp.join("r2.fq");
+    let r0 = tmp.join("r0.fq");
+    std::fs::write(&r1, "@p\nAC\n+\n!!\n").unwrap();
+    std::fs::write(&r2, "@p\nTG\n+\n##\n").unwrap();
+    std::fs::write(&r0, "@solo\nNN\n+\n$$\n").unwrap();
+    let out = tmp.join("out.sam");
+
+    assert_eq!(
+        exit_to_u8(import::main(&argv(
+            "import",
+            &[
+                "-1",
+                r1.to_str().unwrap(),
+                "-2",
+                r2.to_str().unwrap(),
+                "-0",
+                r0.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "p\t77\t*\t0\t0\t*\t*\t0\t0\tAC\t!!\n\
+p\t141\t*\t0\t0\t*\t*\t0\t0\tTG\t##\n\
+solo\t4\t*\t0\t0\t*\t*\t0\t0\tNN\t$$\n"
+    );
+}
+
+#[test]
 fn import_parses_fastq_metadata_options() {
     let tmp = tmp_dir("imp-meta");
     let fq = tmp.join("in.fq");
