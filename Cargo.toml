@@ -16,8 +16,8 @@ version = "0.0.1"
 # we consume htslib-rs (and transitively noodles) from this workspace.
 [workspace.dependencies]
 samtools-rs = { path = "crates/samtools-rs" }
-htslib-rs = { path = "../bcftools-rs/htslib-rs/crates/htslib-rs" }
-noodles = { path = "../bcftools-rs/htslib-rs/noodles/noodles", features = [
+htslib-rs = { path = "htslib-rs/crates/htslib-rs" }
+noodles = { path = "htslib-rs/noodles/noodles", features = [
     "bam",
     "bcf",
     "bgzf",
