@@ -13,6 +13,8 @@
 //! Supported flags:
 //!  - `-r` — remove duplicates from the output (rather than just flagging).
 //!  - `-s` — emit upstream-shaped summary counts to stderr.
+//!  - `-S` — accepted; supplementary propagation is always performed.
+//!  - `-c` — clear existing duplicate flags before marking.
 //!  - `-b TAG` / `--barcode-tag TAG` — include a string aux tag in the
 //!    duplicate key.
 //!  - `-O sam|bam` / `--output-fmt sam|bam` — output format (default `bam`).
@@ -52,6 +54,14 @@ enum OutFmt {
     Bam,
 }
 
+#[derive(Clone, Copy)]
+struct MarkdupOptions {
+    remove_dups: bool,
+    emit_stats: bool,
+    clear_existing_dups: bool,
+    barcode_tag: Option<Tag>,
+}
+
 /// Entry point for `samtools markdup`.
 pub fn main(args: &[OsString]) -> ExitCode {
     let mut input: Option<PathBuf> = None;
@@ -59,6 +69,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut output_fmt = OutFmt::Bam;
     let mut remove_dups = false;
     let mut emit_stats = false;
+    let mut clear_existing_dups = false;
     let mut no_pg = false;
     let mut barcode_tag: Option<Tag> = None;
 
@@ -68,6 +79,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
         match s {
             "-r" => remove_dups = true,
             "-s" => emit_stats = true,
+            "-S" => {
+                // Supplementary duplicate propagation is always performed.
+            }
+            "-c" => clear_existing_dups = true,
             "-O" | "--output-fmt" => {
                 let Some(v) = iter.next().and_then(|a| a.to_str()) else {
                     print_error("markdup", format!("missing value for {}", s));
@@ -99,9 +114,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 };
             }
             "--no-PG" => no_pg = true,
-            "-@" | "--threads" | "-l" | "-m" | "-c" | "-d" | "-t" | "-T" => {
+            "-@" | "--threads" | "-l" | "-m" | "-d" | "-T" => {
                 // Accepted-but-ignored for compatibility.
                 let _ = iter.next();
+            }
+            "-t" => {
+                // Accepted-but-ignored for compatibility.
             }
             "--help" => {
                 let _ = print_usage();
@@ -145,25 +163,15 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     let pg_argv = if no_pg { None } else { Some(args) };
+    let options = MarkdupOptions {
+        remove_dups,
+        emit_stats,
+        clear_existing_dups,
+        barcode_tag,
+    };
     let result = match format.exact {
-        Exact::Sam => run_sam_markdup(
-            &input,
-            output.as_deref(),
-            output_fmt,
-            pg_argv,
-            remove_dups,
-            emit_stats,
-            barcode_tag,
-        ),
-        Exact::Bam => run_bam_markdup(
-            &input,
-            output.as_deref(),
-            output_fmt,
-            pg_argv,
-            remove_dups,
-            emit_stats,
-            barcode_tag,
-        ),
+        Exact::Sam => run_sam_markdup(&input, output.as_deref(), output_fmt, pg_argv, options),
+        Exact::Bam => run_bam_markdup(&input, output.as_deref(), output_fmt, pg_argv, options),
         _ => unreachable!("format checked above"),
     };
 
@@ -196,9 +204,7 @@ fn run_bam_markdup(
     output: Option<&Path>,
     fmt: OutFmt,
     pg_argv: Option<&[OsString]>,
-    remove_dups: bool,
-    emit_stats: bool,
-    barcode_tag: Option<Tag>,
+    options: MarkdupOptions,
 ) -> io::Result<()> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let mut header = reader.read_header()?;
@@ -213,16 +219,19 @@ fn run_bam_markdup(
         }
         records.push(record.clone());
     }
-    let mut stats = mark_duplicates(&mut records, barcode_tag);
-    stats.written = output_record_count(&records, remove_dups);
+    if options.clear_existing_dups {
+        clear_duplicate_flags(&mut records);
+    }
+    let mut stats = mark_duplicates(&mut records, options.barcode_tag);
+    stats.written = output_record_count(&records, options.remove_dups);
     let mut sink = open_output(output, fmt, &header)?;
     for rec in &records {
-        if remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
+        if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
             continue;
         }
         sink.write_record(&header, rec)?;
     }
-    if emit_stats {
+    if options.emit_stats {
         write_markdup_stats(&mut io::stderr().lock(), &stats)?;
     }
     Ok(())
@@ -233,9 +242,7 @@ fn run_sam_markdup(
     output: Option<&Path>,
     fmt: OutFmt,
     pg_argv: Option<&[OsString]>,
-    remove_dups: bool,
-    emit_stats: bool,
-    barcode_tag: Option<Tag>,
+    options: MarkdupOptions,
 ) -> io::Result<()> {
     let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
     let mut header = reader.read_header()?;
@@ -250,16 +257,19 @@ fn run_sam_markdup(
         }
         records.push(record);
     }
-    let mut stats = mark_duplicates(&mut records, barcode_tag);
-    stats.written = output_record_count(&records, remove_dups);
+    if options.clear_existing_dups {
+        clear_duplicate_flags(&mut records);
+    }
+    let mut stats = mark_duplicates(&mut records, options.barcode_tag);
+    stats.written = output_record_count(&records, options.remove_dups);
     let mut sink = open_output(output, fmt, &header)?;
     for rec in &records {
-        if remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
+        if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
             continue;
         }
         sink.write_record(&header, rec)?;
     }
-    if emit_stats {
+    if options.emit_stats {
         write_markdup_stats(&mut io::stderr().lock(), &stats)?;
     }
     Ok(())
@@ -444,6 +454,14 @@ fn output_record_count(records: &[RecordBuf], remove_dups: bool) -> u64 {
         .count() as u64
 }
 
+fn clear_duplicate_flags(records: &mut [RecordBuf]) {
+    for record in records {
+        let mut flags = record.flags();
+        flags.remove(sam::alignment::record::Flags::DUPLICATE);
+        *record.flags_mut() = flags;
+    }
+}
+
 fn set_dup(record: &mut RecordBuf) -> bool {
     let mut flags = record.flags();
     let was_duplicate = flags.contains(sam::alignment::record::Flags::DUPLICATE);
@@ -567,6 +585,8 @@ fn print_usage() -> io::Result<()> {
     writeln!(w, "Usage: samtools markdup [options] <in.bam> [out.bam]")?;
     writeln!(w, "  -r            remove duplicate records")?;
     writeln!(w, "  -s            emit summary counts to stderr")?;
+    writeln!(w, "  -S            mark supplementary duplicates (default)")?;
+    writeln!(w, "  -c            clear existing duplicate flags first")?;
     writeln!(
         w,
         "  -b TAG        include barcode aux tag in duplicate key"

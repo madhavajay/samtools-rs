@@ -4533,6 +4533,48 @@ fn markdup_r_removes_duplicates_from_output() {
 }
 
 #[test]
+fn markdup_c_clears_existing_duplicate_flags_and_s_accepts_supplementary_mode() {
+    use samtools_rs::commands::markdup;
+    let tmp = tmp_dir("markdup-clear");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:100\n",
+            "previous\t1024\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "unique\t0\tchr1\t10\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "-c",
+                "-S",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let previous = text
+        .lines()
+        .find(|line| line.starts_with("previous\t"))
+        .unwrap();
+    let flag = previous.split('\t').nth(1).unwrap().parse::<u32>().unwrap();
+    assert_eq!(flag & 0x400, 0);
+}
+
+#[test]
 fn markdup_propagates_duplicate_flag_to_supplementary_records() {
     use samtools_rs::commands::markdup;
     let tmp = tmp_dir("markdup-supplementary");
