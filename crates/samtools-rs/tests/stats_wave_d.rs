@@ -2120,6 +2120,29 @@ r2\t0\tchr1\t3\t60\t4M\t*\t0\t0\tCCCC\tIIII
 }
 
 #[test]
+fn stats_cov_threshold_requires_target_regions() {
+    let tmp = tmp_dir("stats-cov-threshold-requires-targets");
+    let sam = tmp.join("cov.sam");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:10
+r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\tIIII
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &["-g", "1", sam.to_str().unwrap()]
+        ))),
+        1
+    );
+}
+
+#[test]
 fn stats_filters_required_and_filtering_flags() {
     let tmp = tmp_dir("stats-flag-filters");
     let sam = tmp.join("flags.sam");

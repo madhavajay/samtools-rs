@@ -207,6 +207,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if config.cov_threshold > 0 && parsed_regions.is_empty() {
+        print_error(
+            "stats",
+            "Coverage percentage calculation requires a list of target regions",
+        );
+        return ExitCode::from(1);
+    }
 
     enum StatsInput {
         Summaries(Vec<AlignmentRecordSummary>),
