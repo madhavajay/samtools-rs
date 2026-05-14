@@ -23,9 +23,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use flate2::read::MultiGzDecoder;
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
 
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -103,13 +104,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
-    let format = match detect_path(&input) {
+    let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,
         Err(e) => {
-            print_error(
-                "addreplacerg",
-                format!("failed to detect format of \"{}\": {}", input.display(), e),
-            );
+            print_error("addreplacerg", e.to_string());
             return ExitCode::from(1);
         }
     };
@@ -143,22 +141,29 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
-    let mut writer: Box<dyn Write> = match output.as_ref() {
-        Some(p) => match File::create(p) {
-            Ok(f) => Box::new(f),
-            Err(e) => {
-                print_error_errno("addreplacerg", "open -o output", &e);
-                return ExitCode::from(1);
-            }
-        },
-        None => Box::new(io::stdout().lock()),
+    let mut writer = match sam_io::open_text_output(output.as_deref()) {
+        Ok(writer) => writer,
+        Err(e) => {
+            print_error_errno("addreplacerg", "open -o output", &e);
+            return ExitCode::from(1);
+        }
     };
 
     if let Err(e) = rewrite_sam(&input, &mut writer, rg_line.as_deref(), &rg_id, mode) {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            return ExitCode::SUCCESS;
+        }
         print_error_errno("addreplacerg", "rewrite failed", &e);
         return ExitCode::from(1);
     }
-    ExitCode::SUCCESS
+    match sam_io::check_sam_close(&mut writer) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => {
+            print_error_errno("addreplacerg", "close output", &e);
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn build_rg_line(pieces: &[String]) -> Result<Option<String>, String> {

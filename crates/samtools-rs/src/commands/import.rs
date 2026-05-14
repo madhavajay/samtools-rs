@@ -17,6 +17,7 @@ use std::process::ExitCode;
 use flate2::read::MultiGzDecoder;
 
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
 
 /// Entry point for `samtools import`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -228,15 +229,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
         (None, None) => None,
     };
 
-    let mut out: Box<dyn Write> = match output.as_ref() {
-        Some(p) => match File::create(p) {
-            Ok(f) => Box::new(f),
-            Err(e) => {
-                print_error_errno("import", "open -o output", &e);
-                return ExitCode::from(1);
-            }
-        },
-        None => Box::new(io::stdout().lock()),
+    let mut out = match sam_io::open_text_output(output.as_deref()) {
+        Ok(out) => out,
+        Err(e) => {
+            print_error_errno("import", "open -o output", &e);
+            return ExitCode::from(1);
+        }
     };
 
     if let Some(interleaved) = interleaved_input {
@@ -330,7 +328,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     }
-    ExitCode::SUCCESS
+    match sam_io::check_sam_close(&mut out) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => {
+            print_error_errno("import", "close output", &e);
+            ExitCode::from(1)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

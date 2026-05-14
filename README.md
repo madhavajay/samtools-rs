@@ -63,9 +63,13 @@ status.
 
 ```sh
 cargo build --release -p samtools-rs-cli
-cd samtools/test
-perl test.pl -e samtools="$PWD/../../target/release/samtools"
+cp target/release/samtools samtools/samtools
+cd samtools
+perl test/test.pl
 ```
+
+The pinned upstream harness constructs most commands from `./samtools`, so the
+Rust binary is staged at the ignored `samtools/samtools` path before running it.
 
 Local developers may regenerate expected outputs from the C samtools
 (requires `autoconf`, a C toolchain, and the `htslib` C library):

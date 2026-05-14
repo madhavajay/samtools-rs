@@ -14,6 +14,8 @@ use std::process::ExitCode;
 
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::header_text::read_raw_header_text;
+use crate::io as sam_io;
+use crate::reference::matching_reference;
 
 /// Entry point for `samtools samples`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -44,15 +46,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     };
 
-    let mut out = match opts.output.as_ref() {
-        Some(p) => match File::create(p) {
-            Ok(f) => Box::new(f) as Box<dyn Write>,
-            Err(e) => {
-                print_error_errno("samples", "open output for writing", &e);
-                return ExitCode::from(1);
-            }
-        },
-        None => Box::new(io::stdout().lock()) as Box<dyn Write>,
+    let mut out = match sam_io::open_text_output(opts.output.as_deref()) {
+        Ok(out) => out,
+        Err(e) => {
+            print_error_errno("samples", "open output for writing", &e);
+            return ExitCode::from(1);
+        }
     };
 
     if opts.print_header {
@@ -77,7 +76,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
             overall = ExitCode::from(1);
         }
     }
-    overall
+    match sam_io::check_sam_close(&mut out) {
+        Ok(()) => overall,
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => {
+            print_error_errno("samples", "close output", &e);
+            ExitCode::from(1)
+        }
+    }
 }
 
 struct Opts {
@@ -311,7 +317,9 @@ fn print_samples_for<W: Write>(out: &mut W, input: &InputSpec, opts: &Opts) -> i
     let ref_suffix = if opts.fa_paths.is_empty() {
         String::new()
     } else {
-        let m = matching_reference(&opts.fa_paths, &sq_dict).unwrap_or_else(|| ".".to_string());
+        let m = matching_reference(&opts.fa_paths, &sq_dict)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
         format!("\t{}", m)
     };
     let suffix = format!("{}{}", index_suffix, ref_suffix);
@@ -342,54 +350,6 @@ fn parse_sq(line: &str) -> (String, u64) {
         }
     }
     (sn, ln)
-}
-
-/// Returns the FASTA path whose `.fai` index `(name, length)` order
-/// exactly matches the BAM's `@SQ` dictionary. Builds the `.fai` if
-/// absent.
-fn matching_reference(fa_paths: &[PathBuf], sq_dict: &[(String, u64)]) -> Option<String> {
-    if sq_dict.is_empty() {
-        return None;
-    }
-    for fa in fa_paths {
-        let dict = load_fai_dict(fa).ok()?;
-        if dict.len() == sq_dict.len()
-            && dict
-                .iter()
-                .zip(sq_dict.iter())
-                .all(|((n1, l1), (n2, l2))| n1 == n2 && l1 == l2)
-        {
-            return Some(fa.display().to_string());
-        }
-    }
-    None
-}
-
-fn load_fai_dict(fa: &Path) -> io::Result<Vec<(String, u64)>> {
-    let fai_path = {
-        let mut p = fa.as_os_str().to_owned();
-        p.push(".fai");
-        PathBuf::from(p)
-    };
-    if !fai_path.exists() {
-        // Build it on the fly.
-        let file = File::open(fa)?;
-        let index = htslib_rs::faidx_compat::build_index(io::BufReader::new(file))?;
-        let out = File::create(&fai_path)?;
-        htslib_rs::faidx_compat::write_index(out, &index)?;
-    }
-    let file = File::open(&fai_path)?;
-    let mut dict: Vec<(String, u64)> = Vec::new();
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        let mut fields = line.split('\t');
-        let name = fields.next().unwrap_or("").to_string();
-        let length: u64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        if !name.is_empty() && length > 0 {
-            dict.push((name, length));
-        }
-    }
-    Ok(dict)
 }
 
 fn index_present(fname: &Path, custom_index: Option<&Path>) -> bool {

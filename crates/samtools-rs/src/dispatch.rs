@@ -8,6 +8,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use crate::commands;
+use crate::sam_global::{apply_top_level_global_args, set_current_global_args};
 use crate::version::{HTSLIB_VERSION, SAMTOOLS_VERSION};
 
 /// Subcommand entry-point signature. Each subcommand receives its own
@@ -30,6 +31,17 @@ pub struct Subcommand {
 /// Top-level entry point used by the binary crate. Parses
 /// `argv[1]` and dispatches to the matching subcommand, or prints help.
 pub fn run(args: Vec<OsString>) -> ExitCode {
+    let args = match apply_top_level_global_args(args) {
+        Ok((args, globals)) => {
+            set_current_global_args(globals);
+            args
+        }
+        Err(e) => {
+            let _ = writeln!(io::stderr(), "[main] {e}");
+            return ExitCode::from(1);
+        }
+    };
+
     if args.len() < 2 {
         let _ = print_usage(&mut io::stderr());
         return ExitCode::from(1);

@@ -1,16 +1,19 @@
 //! Native Rust API wrappers for samtools operations needed by BioScript.
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
 
+use crate::bedidx::load_bed_index;
 use crate::commands::{
     depth as depth_command, merge as merge_command, quickcheck, sort as sort_command,
 };
+use crate::io as sam_io;
+use crate::tmp_file::{self, TempPath};
 
 /// Per-position depth for one reference coordinate.
 #[derive(Clone, Debug, PartialEq)]
@@ -109,10 +112,11 @@ where
 {
     let input_bam = input_bam.as_ref();
     let sorted_bam = if name_sort {
-        let sorted_bam = temp_bam_path("samtools-rs-fastq-name-sort");
+        let (_file, sorted_bam) =
+            tmp_file::create_temp_file("samtools-rs-fastq-name-sort", Some("bam"))?;
         sort_command::run_sort(
             input_bam,
-            Some(&sorted_bam),
+            Some(sorted_bam.path()),
             true,
             sort_command::OutFmt::Bam,
         )?;
@@ -120,7 +124,7 @@ where
     } else {
         None
     };
-    let source = sorted_bam.as_deref().unwrap_or(input_bam);
+    let source = sorted_bam.as_ref().map(TempPath::path).unwrap_or(input_bam);
     let split =
         htslib_rs::alignment_compat::view_bam_as_fastq_split_text_from_path_with_flag_filter_and_suffix(
             source,
@@ -138,10 +142,6 @@ where
     }
     if let Some(path) = singleton_fastq {
         write_text_or_gzip(path, split.singleton.as_bytes())?;
-    }
-
-    if let Some(path) = sorted_bam {
-        let _ = std::fs::remove_file(path);
     }
 
     Ok(())
@@ -181,11 +181,14 @@ where
     depth_command::run_depth(
         &[input_bam.as_ref().to_path_buf()],
         &mut out,
-        0,
-        1,
-        a_mode,
-        Some(region.as_ref()),
-        None,
+        depth_command::DepthRunConfig {
+            min_mapq: 0,
+            min_depth: 1,
+            a_mode,
+            region: Some(region.as_ref()),
+            bed: None,
+            reference: None,
+        },
     )?;
     parse_depth_output(&out)
 }
@@ -341,10 +344,7 @@ where
 {
     let input_alignment = input_alignment.as_ref();
     let output = File::create(output_bam)?;
-    match detect_path(input_alignment)
-        .map_err(|e| io::Error::other(format!("failed to detect input format: {e}")))?
-        .exact
-    {
+    match sam_io::sam_open_format(input_alignment)?.exact {
         Exact::Bam => {
             htslib_rs::alignment_compat::write_bam_records_with_required_flags_from_path(
                 input_alignment,
@@ -412,10 +412,7 @@ where
     let input = input_bam.as_ref();
     let region = parse_region(region.as_ref())?;
     let output = File::create(output_bam)?;
-    match detect_path(input)
-        .map_err(|e| io::Error::other(format!("failed to detect input format: {e}")))?
-        .exact
-    {
+    match sam_io::sam_open_format(input)?.exact {
         Exact::Bam => {
             htslib_rs::alignment_compat::write_bam_regions_from_path(input, &[region], output)?;
         }
@@ -519,10 +516,7 @@ where
     let input = input_bam.as_ref();
     let regions = load_bed_regions(bed_file.as_ref())?;
     let output = File::create(output_bam)?;
-    match detect_path(input)
-        .map_err(|e| io::Error::other(format!("failed to detect input format: {e}")))?
-        .exact
-    {
+    match sam_io::sam_open_format(input)?.exact {
         Exact::Bam => {
             htslib_rs::alignment_compat::write_bam_regions_from_path(input, &regions, output)?;
         }
@@ -560,33 +554,7 @@ fn parse_region(region: &str) -> io::Result<htslib_rs::core::Region> {
 }
 
 fn load_bed_regions(path: &Path) -> io::Result<Vec<htslib_rs::core::Region>> {
-    let file = File::open(path)?;
-    let mut regions = Vec::new();
-
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        let s = line.trim_end();
-        if s.is_empty()
-            || s.starts_with('#')
-            || s.starts_with("track ")
-            || s.starts_with("browser ")
-        {
-            continue;
-        }
-
-        let mut fields = s.split('\t');
-        let chrom = fields.next().unwrap_or("");
-        let beg: u64 = fields.next().and_then(|t| t.parse().ok()).unwrap_or(0);
-        let end: u64 = fields.next().and_then(|t| t.parse().ok()).unwrap_or(0);
-
-        if chrom.is_empty() || end <= beg {
-            continue;
-        }
-
-        regions.push(parse_region(&format!("{}:{}-{}", chrom, beg + 1, end))?);
-    }
-
-    Ok(regions)
+    load_bed_index(path)?.to_htslib_regions()
 }
 
 fn append_extension(path: &Path, ext: &str) -> PathBuf {
@@ -652,14 +620,6 @@ fn summarize_depths(depths: &[PerBaseDepth]) -> DepthSummary {
         max: values[values.len() - 1],
         uncovered,
     }
-}
-
-fn temp_bam_path(prefix: &str) -> PathBuf {
-    let id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    std::env::temp_dir().join(format!("{}-{}-{}.bam", prefix, std::process::id(), id))
 }
 
 fn write_text_or_gzip(path: &Path, text: &[u8]) -> io::Result<()> {

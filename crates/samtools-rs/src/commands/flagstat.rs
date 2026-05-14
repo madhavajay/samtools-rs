@@ -1,4 +1,4 @@
-//! `samtools flagstat` — flag statistics for a SAM/BAM file.
+//! `samtools flagstat` — flag statistics for a SAM/BAM/CRAM file.
 //!
 //! Mirrors `bam_flagstat` in `bam_stat.c`. Output format is the upstream
 //! "default" format unless `-O json|tsv` is given.
@@ -8,13 +8,15 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use htslib_rs::format::{Exact, detect_path};
+use htslib_rs::format::Exact;
 
 use crate::bam_flag::{
     BAM_FDUP, BAM_FMUNMAP, BAM_FPAIRED, BAM_FPROPER_PAIR, BAM_FQCFAIL, BAM_FREAD1, BAM_FREAD2,
     BAM_FSECONDARY, BAM_FSUPPLEMENTARY, BAM_FUNMAP,
 };
 use crate::diagnostics::{print_error, print_error_errno};
+use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum OutFmt {
@@ -81,13 +83,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
-    let format = match detect_path(&input) {
+    let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,
         Err(e) => {
-            print_error(
-                "flagstat",
-                format!("Cannot open input file \"{}\": {}", input.display(), e),
-            );
+            print_error("flagstat", format!("Cannot open input file: {}", e));
             return ExitCode::from(1);
         }
     };
@@ -95,10 +94,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let summaries = match format.exact {
         Exact::Sam => htslib_rs::alignment_compat::summarize_sam_records_from_path(&input),
         Exact::Bam => htslib_rs::alignment_compat::summarize_bam_records_from_path(&input),
+        Exact::Cram => {
+            let Some(reference) = current_global_args().reference else {
+                print_error("flagstat", "CRAM input requires top-level --reference FILE");
+                return ExitCode::from(1);
+            };
+            htslib_rs::alignment_compat::summarize_cram_records_from_path_with_reference(
+                &input, reference,
+            )
+        }
         _ => {
             print_error(
                 "flagstat",
-                "only SAM and BAM input is currently supported (CRAM TODO)",
+                "only SAM, BAM, and CRAM input is currently supported",
             );
             return ExitCode::from(1);
         }
