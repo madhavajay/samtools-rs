@@ -295,7 +295,7 @@ pub(crate) fn run_merge(
     for path in &inputs[1..] {
         let (input_header, mut input_records) = read_records(path, filter.as_ref())?;
         let reference_id_map = merge_reference_sequences(&mut header, &input_header)?;
-        merge_header_metadata(&mut header, &input_header);
+        merge_header_metadata(&mut header, &input_header)?;
         merge_read_groups(&mut header, &input_header)?;
         merge_programs(&mut header, &input_header)?;
         merge_comments(&mut header, &input_header);
@@ -483,12 +483,41 @@ fn merge_reference_sequences(
     Ok(reference_id_map)
 }
 
-fn merge_header_metadata(output_header: &mut sam::Header, input_header: &sam::Header) {
-    if output_header.header().is_none()
-        && let Some(input_hd) = input_header.header()
-    {
+fn merge_header_metadata(
+    output_header: &mut sam::Header,
+    input_header: &sam::Header,
+) -> io::Result<()> {
+    use sam::header::record::value::map::header::tag::{SORT_ORDER, SUBSORT_ORDER};
+
+    let Some(input_hd) = input_header.header() else {
+        return Ok(());
+    };
+
+    let Some(output_hd) = output_header.header_mut() else {
         *output_header.header_mut() = Some(input_hd.clone());
+        return Ok(());
+    };
+
+    for (tag, input_value) in input_hd.other_fields() {
+        if *tag == SORT_ORDER || *tag == SUBSORT_ORDER {
+            continue;
+        }
+
+        if let Some(output_value) = output_hd.other_fields().get(tag) {
+            if output_value != input_value {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("conflicting @HD {} field", tag),
+                ));
+            }
+        } else {
+            output_hd
+                .other_fields_mut()
+                .insert(*tag, input_value.clone());
+        }
     }
+
+    Ok(())
 }
 
 fn remap_records(records: &mut [RecordBuf], reference_id_map: &[usize]) -> io::Result<()> {
