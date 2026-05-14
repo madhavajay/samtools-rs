@@ -452,8 +452,8 @@ fn merge_reference_sequences(
 
         let new_id = if let Some(index) = existing_index {
             let (_, output_reference_sequence) = output_header
-                .reference_sequences()
-                .get_index(index)
+                .reference_sequences_mut()
+                .get_index_mut(index)
                 .expect("reference index from position must exist");
 
             if output_reference_sequence.length() != input_reference_sequence.length() {
@@ -468,6 +468,12 @@ fn merge_reference_sequences(
                 ));
             }
 
+            merge_reference_sequence_metadata(
+                name,
+                output_reference_sequence,
+                input_reference_sequence,
+            )?;
+
             index
         } else {
             let index = output_header.reference_sequences().len();
@@ -481,6 +487,37 @@ fn merge_reference_sequences(
     }
 
     Ok(reference_id_map)
+}
+
+fn merge_reference_sequence_metadata(
+    name: &[u8],
+    output_reference_sequence: &mut sam::header::record::value::Map<
+        sam::header::record::value::map::ReferenceSequence,
+    >,
+    input_reference_sequence: &sam::header::record::value::Map<
+        sam::header::record::value::map::ReferenceSequence,
+    >,
+) -> io::Result<()> {
+    for (tag, input_value) in input_reference_sequence.other_fields() {
+        if let Some(output_value) = output_reference_sequence.other_fields().get(tag) {
+            if output_value != input_value {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "conflicting @SQ {} field for {}",
+                        tag,
+                        String::from_utf8_lossy(name)
+                    ),
+                ));
+            }
+        } else {
+            output_reference_sequence
+                .other_fields_mut()
+                .insert(*tag, input_value.clone());
+        }
+    }
+
+    Ok(())
 }
 
 fn merge_header_metadata(

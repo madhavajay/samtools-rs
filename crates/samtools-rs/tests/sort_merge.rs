@@ -471,6 +471,94 @@ fn merge_rejects_conflicting_sq_lengths() {
 }
 
 #[test]
+fn merge_unions_compatible_sq_metadata_fields() {
+    let tmp = tmp_dir("merge-sq-fields");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\tM5:0123456789abcdef0123456789abcdef\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--no-PG",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("@SQ\tSN:chr1\tLN:8\tM5:0123456789abcdef0123456789abcdef\n"));
+}
+
+#[test]
+fn merge_rejects_conflicting_sq_metadata_fields() {
+    let tmp = tmp_dir("merge-conflicting-sq-fields");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\tM5:0123456789abcdef0123456789abcdef\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\tM5:fedcba9876543210fedcba9876543210\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--no-PG",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 1);
+    assert!(!out.exists());
+}
+
+#[test]
 fn merge_unions_read_group_headers() {
     let tmp = tmp_dir("merge-union-rg");
     let sam_a = tmp.join("a.sam");
