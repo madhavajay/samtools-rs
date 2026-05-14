@@ -289,9 +289,13 @@ pub(crate) fn run_merge(
     };
 
     let (mut header, mut records) = read_records(&inputs[0], filter.as_ref())?;
+    let first_reference_id_map: Vec<_> = (0..header.reference_sequences().len()).collect();
+    remap_records(&mut records, &first_reference_id_map)?;
 
     for path in &inputs[1..] {
-        let (_h, mut input_records) = read_records(path, filter.as_ref())?;
+        let (input_header, mut input_records) = read_records(path, filter.as_ref())?;
+        let reference_id_map = merge_reference_sequences(&mut header, &input_header)?;
+        remap_records(&mut input_records, &reference_id_map)?;
         records.append(&mut input_records);
     }
 
@@ -428,6 +432,77 @@ fn record_key(record: &RecordBuf) -> (Vec<u8>, u16, Option<usize>, Option<usize>
         record.alignment_start().map(usize::from),
         format!("{:?}", record.cigar().as_ref()),
     )
+}
+
+fn merge_reference_sequences(
+    output_header: &mut sam::Header,
+    input_header: &sam::Header,
+) -> io::Result<Vec<usize>> {
+    let mut reference_id_map = Vec::with_capacity(input_header.reference_sequences().len());
+
+    for (name, input_reference_sequence) in input_header.reference_sequences() {
+        let existing_index = output_header
+            .reference_sequences()
+            .iter()
+            .position(|(existing_name, _)| existing_name == name);
+
+        let new_id = if let Some(index) = existing_index {
+            let (_, output_reference_sequence) = output_header
+                .reference_sequences()
+                .get_index(index)
+                .expect("reference index from position must exist");
+
+            if output_reference_sequence.length() != input_reference_sequence.length() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "conflicting @SQ length for {}: {} != {}",
+                        String::from_utf8_lossy(name),
+                        usize::from(output_reference_sequence.length()),
+                        usize::from(input_reference_sequence.length())
+                    ),
+                ));
+            }
+
+            index
+        } else {
+            let index = output_header.reference_sequences().len();
+            output_header
+                .reference_sequences_mut()
+                .insert(name.clone(), input_reference_sequence.clone());
+            index
+        };
+
+        reference_id_map.push(new_id);
+    }
+
+    Ok(reference_id_map)
+}
+
+fn remap_records(records: &mut [RecordBuf], reference_id_map: &[usize]) -> io::Result<()> {
+    for record in records {
+        if let Some(tid) = record.reference_sequence_id() {
+            let Some(&new_tid) = reference_id_map.get(tid) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("record reference id {tid} is not present in its input header"),
+                ));
+            };
+            *record.reference_sequence_id_mut() = Some(new_tid);
+        }
+
+        if let Some(tid) = record.mate_reference_sequence_id() {
+            let Some(&new_tid) = reference_id_map.get(tid) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("record mate reference id {tid} is not present in its input header"),
+                ));
+            };
+            *record.mate_reference_sequence_id_mut() = Some(new_tid);
+        }
+    }
+
+    Ok(())
 }
 
 fn coordinate_key(r: &RecordBuf) -> (i32, i64) {

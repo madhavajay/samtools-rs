@@ -382,6 +382,95 @@ fn merge_sam_inputs_to_sam_output() {
 }
 
 #[test]
+fn merge_unions_different_sq_headers_and_remaps_records() {
+    let tmp = tmp_dir("merge-union-sq");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr2\tLN:9\n",
+            "b\t0\tchr2\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("@SQ\tSN:chr1\tLN:8\n"));
+    assert!(text.contains("@SQ\tSN:chr2\tLN:9\n"));
+    assert!(text.contains("\na\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n"));
+    assert!(text.contains("\nb\t0\tchr2\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n"));
+}
+
+#[test]
+fn merge_rejects_conflicting_sq_lengths() {
+    let tmp = tmp_dir("merge-conflicting-sq");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:9\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 1);
+    assert!(!out.exists());
+}
+
+#[test]
 fn merge_short_output_format_consumes_value() {
     let tmp = tmp_dir("merge-short-output-fmt");
     let sam_a = tmp.join("a.sam");
