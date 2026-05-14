@@ -57,7 +57,7 @@ samtools-rs status legend:
 - **C source:** `bam_index.c`
 - **HTSlib APIs used:** `sam_index_build3`, `sam_index_build`, `sam_index_save`, `hts_set_threads`, `bgzf_check_EOF`
 - **htslib-rs coverage:** ✅ via `htslib_rs::index_compat::build_bai` / `build_bam_csi` / `build_cram_crai`
-- **samtools-rs status:** 🟡 — `-Q`, `-g`/`-G`, `-H`, `-c`, and `-d` implemented with SAM/BAM/reference-backed CRAM input; exact pileup parity remains.
+- **samtools-rs status:** ✅ — BAI/CSI/CRAI build, `-c` CSI mode, `--min-shift`, `-M`, `-o`, and legacy `<in> <out.idx>` synopsis are implemented; `-@` threads are not yet propagated to noodles workers.
 
 ### idxstats
 
@@ -73,22 +73,21 @@ samtools-rs status legend:
 - **C source:** `faidx.c`
 - **HTSlib APIs used:** `fai_build`, `fai_load`, `fai_fetch`, `faidx_fetch_seq64`, `fai_destroy`
 - **htslib-rs coverage:** ✅ via `htslib_rs::faidx_compat::build_index`, `read_index`, `write_index`, `fetch_sequence`, `fetch_region_sequence`
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** 🟡 — FASTA/FASTQ index build and local region extraction work, including BGZF input with `.gzi`, region files, `-o`, BGZF output, `--length`, `--write-index`, `faidx -f`, reverse-complement `-i`, mark-strand modes, and missing/truncated-region handling; exact warning text parity, compression-level/thread effects, and broader BGZI edge cases remain.
 
 ### dict
 
 - **C source:** `dict.c`
 - **HTSlib APIs used:** `gzopen`, `kseq_*`, `hts_md5_*` — only HTSlib's md5 wrapper is used; everything else is its own FASTA reader
 - **htslib-rs coverage:** 🟦 (use `noodles-fasta` for FASTA iteration + `md-5` crate for MD5)
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** ✅ — sequence dictionary output matches upstream `dict.out`, `dict.alias.out`, and `dict.alt.out` fixtures byte-for-byte.
 
 ### flagstat
 
 - **C source:** `bam_stat.c`
 - **HTSlib APIs used:** `sam_open_format`, `sam_hdr_read`, `sam_read1`, `hts_set_threads`, `hts_set_opt` (CRAM_OPT_REQUIRED_FIELDS)
-- **htslib-rs coverage:** ⚠️
-  - Full BAM record iteration with access to `flag`, `tid`, `mtid`, `qual` — not yet exposed via a public accessor on `AlignmentRecordSummary` (private fields). Must extend `htslib-rs::alignment_compat` to expose accessors or add a streaming record iterator. — ❌
-- **samtools-rs status:** ⬜
+- **htslib-rs coverage:** ✅ — `AlignmentRecordSummary` exposes flag/reference/mate/mapq accessors, with SAM/BAM/reference-backed CRAM summary helpers.
+- **samtools-rs status:** 🟡 — SAM, BAM, and reference-backed CRAM input are implemented with default text, `-O json`, and `-O tsv` output; CRAM input without an explicit reference remains unsupported.
 
 ## Wave B — File Operations
 
@@ -152,7 +151,7 @@ samtools-rs status legend:
 
 - **C source:** `bam_import.c`
 - **HTSlib APIs used:** FASTA/FASTQ reading + SAM/BAM/CRAM writing
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** 🟡 — single FASTA/FASTQ, paired FASTQ, positional interleaved FASTQ, index reads, CASAVA/SRA name parsing, UMI/barcode/comment aux tags, read-group header/tag support, and SAM/BAM output are implemented for the covered fixtures; paired singleton/other grouping, full read-group parity, and CRAM output remain.
 
 ## Wave C — Editing / Mate-aware
 
@@ -274,7 +273,7 @@ samtools-rs status legend:
 - **C source:** `bam_samples.c`
 - **HTSlib APIs used:** `sam_hdr_*` to list `@RG` SM values
 - **htslib-rs coverage:** ✅
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** ✅ — lists `@RG SM:` samples across inputs with header-driven de-duplication, `-T`, `-o`, `-h`, `-i`, `-f`/`-F`, stdin path lists, `-X` custom index pairs, and CRAM headers.
 
 ### reference
 
