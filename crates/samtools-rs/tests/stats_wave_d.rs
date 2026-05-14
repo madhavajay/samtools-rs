@@ -1328,6 +1328,47 @@ r1\t2147\tchr1\t1\t60\t10M\t*\t0\t0\tACGTACGTAC\t!!!!!!!!!!
 }
 
 #[test]
+fn stats_most_inserts_limits_insert_size_summary_bulk() {
+    let tmp = tmp_dir("stats-most-inserts");
+    let sam = tmp.join("paired.sam");
+    let out = tmp.join("paired.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:2000
+r1\t99\tchr1\t1\t60\t10M\t=\t91\t100\tACGTACGTAC\t!!!!!!!!!!
+r1\t147\tchr1\t91\t60\t10M\t=\t1\t-100\tACGTACGTAC\t!!!!!!!!!!
+r2\t99\tchr1\t201\t60\t10M\t=\t291\t100\tACGTACGTAC\t!!!!!!!!!!
+r2\t147\tchr1\t291\t60\t10M\t=\t201\t-100\tACGTACGTAC\t!!!!!!!!!!
+r3\t99\tchr1\t501\t60\t10M\t=\t1391\t900\tACGTACGTAC\t!!!!!!!!!!
+r3\t147\tchr1\t1391\t60\t10M\t=\t501\t-900\tACGTACGTAC\t!!!!!!!!!!
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-m",
+                "0.5",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    let text = std::fs::read_to_string(out).unwrap();
+    assert_eq!(stats_sn_text(&text, "insert size average"), "100.0");
+    assert_eq!(
+        stats_sn_text(&text, "insert size standard deviation"),
+        "0.0"
+    );
+}
+
+#[test]
 fn stats_classifies_outward_and_other_orientation() {
     let tmp = tmp_dir("stats-orientation");
     let sam = tmp.join("oriented.sam");

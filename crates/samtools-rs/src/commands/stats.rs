@@ -37,6 +37,7 @@ struct StatsConfig {
     filter_flags: u32,
     id_filter: Option<String>,
     insert_size_max: u32,
+    insert_size_main_bulk: f64,
     read_length_filter: Option<usize>,
     trim_quality: u8,
     coverage_min: u32,
@@ -53,6 +54,7 @@ impl Default for StatsConfig {
             filter_flags: 0,
             id_filter: None,
             insert_size_max: 8000,
+            insert_size_main_bulk: 0.99,
             read_length_filter: None,
             trim_quality: 0,
             coverage_min: 1,
@@ -137,6 +139,28 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     Ok(max) => config.insert_size_max = max,
                     Err(e) => {
                         print_error("stats", format!("invalid insert size \"{raw}\": {e}"));
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            "-m" | "--most-inserts" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("stats", "option -m requires an argument");
+                    return ExitCode::from(1);
+                };
+                match raw.parse::<f64>() {
+                    Ok(value) if value.is_finite() && value >= 0.0 => {
+                        config.insert_size_main_bulk = value
+                    }
+                    Ok(_) => {
+                        print_error("stats", format!("invalid most-inserts value \"{raw}\""));
+                        return ExitCode::from(1);
+                    }
+                    Err(e) => {
+                        print_error(
+                            "stats",
+                            format!("invalid most-inserts value \"{raw}\": {e}"),
+                        );
                         return ExitCode::from(1);
                     }
                 }
@@ -809,12 +833,10 @@ struct StatsCounts {
     isize_inward: u64,
     isize_outward: u64,
     isize_other: u64,
-    // Per-record abs(template_length) accumulators across the same
-    // population that feeds the orientation bins. Used to compute the
-    // mean / standard deviation reported in SN.
-    isize_sum: u64,
-    isize_sum_sq: f64,
-    isize_count: u64,
+    // Per-record abs(template_length) histogram across the same population
+    // that feeds the orientation bins. Used to apply `-m/--most-inserts`
+    // before computing the reported mean / standard deviation.
+    isize_hist: BTreeMap<u64, u64>,
     // Sequence-length and quality accumulators (only populated when the
     // collection path has access to record-level data — currently SAM /
     // BAM iteration and any region path, but not the CRAM-non-region
@@ -1162,9 +1184,7 @@ impl StatsCounts {
         if insert_size_max > 0 {
             isize = isize.min(u64::from(insert_size_max));
         }
-        self.isize_count += 1;
-        self.isize_sum = self.isize_sum.saturating_add(isize);
-        self.isize_sum_sq += (isize as f64) * (isize as f64);
+        *self.isize_hist.entry(isize).or_default() += 1;
 
         if read_reverse == mate_reverse {
             self.isize_other += 1;
@@ -1355,17 +1375,8 @@ fn write_stats_counts(
     writeln!(out, "SN\taverage quality:\t{:.1}", avg_quality)?;
     writeln!(out, "SN\tsingletons:\t{}", counts.singletons)?;
 
-    let avg_isize = if counts.isize_count > 0 {
-        counts.isize_sum as f64 / counts.isize_count as f64
-    } else {
-        0.0
-    };
-    let sd_isize = if counts.isize_count > 0 {
-        let mean_sq = counts.isize_sum_sq / counts.isize_count as f64;
-        (mean_sq - avg_isize * avg_isize).max(0.0).sqrt()
-    } else {
-        0.0
-    };
+    let (avg_isize, sd_isize) =
+        insert_size_mean_sd(&counts.isize_hist, config.insert_size_main_bulk);
     writeln!(out, "SN\tinsert size average:\t{:.1}", avg_isize)?;
     writeln!(out, "SN\tinsert size standard deviation:\t{:.1}", sd_isize)?;
     writeln!(
@@ -1417,6 +1428,43 @@ fn write_stats_counts(
     write_gc_histograms(out, counts)?;
     write_coverage_histogram(out, counts, config)?;
     Ok(())
+}
+
+fn insert_size_mean_sd(isize_hist: &BTreeMap<u64, u64>, main_bulk: f64) -> (f64, f64) {
+    let total: u64 = isize_hist.values().sum();
+    if total == 0 {
+        return (0.0, 0.0);
+    }
+
+    let mut selected = Vec::new();
+    let mut selected_count = 0_u64;
+    let mut selected_sum = 0.0;
+    for (&isize, &count) in isize_hist {
+        if count == 0 {
+            continue;
+        }
+        selected.push((isize, count));
+        selected_count = selected_count.saturating_add(count);
+        selected_sum += isize as f64 * count as f64;
+        if selected_count as f64 / total as f64 > main_bulk {
+            break;
+        }
+    }
+
+    if selected_count == 0 {
+        return (0.0, 0.0);
+    }
+
+    let avg = selected_sum / selected_count as f64;
+    let variance = selected
+        .iter()
+        .map(|(isize, count)| {
+            let delta = *isize as f64 - avg;
+            *count as f64 * delta * delta
+        })
+        .sum::<f64>()
+        / selected_count as f64;
+    (avg, variance.max(0.0).sqrt())
 }
 
 fn write_quality_histograms(out: &mut dyn Write, counts: &StatsCounts) -> io::Result<()> {
@@ -1551,6 +1599,10 @@ fn print_usage() -> io::Result<()> {
     writeln!(
         w,
         "  -i, --insert-size INT         maximum insert size for summaries"
+    )?;
+    writeln!(
+        w,
+        "  -m, --most-inserts FLOAT     report only the main insert-size bulk"
     )?;
     writeln!(
         w,
