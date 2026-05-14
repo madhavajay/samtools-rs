@@ -1,15 +1,15 @@
 //! `samtools stats` — alignment statistics summary.
 //!
 //! Mirrors `stats.c` (123k LOC). Upstream produces a large blob with many
-//! `SN`/`FFQ`/`LFQ`/`COV`/`GCF`/etc. sections. This initial Rust port emits
-//! only the basic `SN` summary numbers that can be computed from
-//! `AlignmentRecordSummary` without per-base access or pileup.
+//! `SN`/`FFQ`/`LFQ`/`COV`/`GCF`/etc. sections. This Rust port emits the
+//! `SN` summary numbers plus record-level quality, GC, and approximate
+//! CIGAR-walk coverage histograms that can be computed without pileup.
 //!
-//! **Pending:** quality histograms (FFQ/LFQ), insert size distributions
-//! (IS), GC content (GCF), coverage histograms (COV), per-cycle stats,
-//! BAQ adjustments, reference-based mismatch counts.
+//! **Pending:** insert size distributions (IS), exact pileup-backed coverage
+//! histograms, per-cycle stats, BAQ adjustments, and deeper reference-based
+//! mismatch parity.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -23,16 +23,30 @@ use htslib_rs::sam;
 
 use crate::bam_flag::{
     BAM_FDUP, BAM_FMUNMAP, BAM_FPAIRED, BAM_FPROPER_PAIR, BAM_FQCFAIL, BAM_FREAD1, BAM_FREAD2,
-    BAM_FSECONDARY, BAM_FUNMAP,
+    BAM_FREVERSE, BAM_FSECONDARY, BAM_FSUPPLEMENTARY, BAM_FUNMAP,
 };
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
 use crate::sam_global::current_global_args;
 use crate::version::SAMTOOLS_VERSION;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct StatsConfig {
     remove_dups: bool,
+    coverage_min: u32,
+    coverage_max: u32,
+    coverage_step: u32,
+}
+
+impl Default for StatsConfig {
+    fn default() -> Self {
+        Self {
+            remove_dups: false,
+            coverage_min: 1,
+            coverage_max: 1000,
+            coverage_step: 1,
+        }
+    }
 }
 
 /// Entry point for `samtools stats`.
@@ -51,6 +65,23 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
             "-t" | "--target-regions" => {
                 target_file = iter.next().map(PathBuf::from);
+            }
+            "-c" | "--coverage" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("stats", "option -c requires an argument");
+                    return ExitCode::from(1);
+                };
+                match parse_coverage_range(raw) {
+                    Ok((min, max, step)) => {
+                        config.coverage_min = min;
+                        config.coverage_max = max;
+                        config.coverage_step = step;
+                    }
+                    Err(e) => {
+                        print_error("stats", e);
+                        return ExitCode::from(1);
+                    }
+                }
             }
             "-@" | "--threads" | "-r" | "--reference" | "-l" | "--read-length" | "-I" | "--id"
             | "-S" | "--split" | "-P" | "--split-prefix" | "-g" | "--cov-threshold" | "-G" => {
@@ -119,24 +150,30 @@ pub fn main(args: &[OsString]) -> ExitCode {
 
     enum StatsInput {
         Summaries(Vec<AlignmentRecordSummary>),
-        Counts(StatsCounts),
+        Counts(Box<StatsCounts>),
     }
 
+    let header_sort_order = match read_input_header_sort_order(&input, format.exact) {
+        Ok(so) => so,
+        Err(e) => {
+            print_error_errno(
+                "stats",
+                format!("error reading header from \"{}\"", input.display()),
+                &e,
+            );
+            return ExitCode::from(1);
+        }
+    };
+
     let stats_input = match format.exact {
-        Exact::Sam if parsed_regions.is_empty() => {
-            htslib_rs::alignment_compat::summarize_sam_records_from_path(&input)
-                .map(StatsInput::Summaries)
-        }
-        Exact::Sam => {
-            collect_sam_region_stats(&input, &parsed_regions, config).map(StatsInput::Counts)
-        }
-        Exact::Bam if parsed_regions.is_empty() => {
-            htslib_rs::alignment_compat::summarize_bam_records_from_path(&input)
-                .map(StatsInput::Summaries)
-        }
-        Exact::Bam => {
-            collect_bam_region_stats(&input, &parsed_regions, config).map(StatsInput::Counts)
-        }
+        Exact::Sam if parsed_regions.is_empty() => collect_sam_full_stats(&input, config)
+            .map(|counts| StatsInput::Counts(Box::new(counts))),
+        Exact::Sam => collect_sam_region_stats(&input, &parsed_regions, config)
+            .map(|counts| StatsInput::Counts(Box::new(counts))),
+        Exact::Bam if parsed_regions.is_empty() => collect_bam_full_stats(&input, config)
+            .map(|counts| StatsInput::Counts(Box::new(counts))),
+        Exact::Bam => collect_bam_region_stats(&input, &parsed_regions, config)
+            .map(|counts| StatsInput::Counts(Box::new(counts))),
         Exact::Cram => {
             let Some(reference) = current_global_args().reference else {
                 print_error("stats", "CRAM input requires top-level --reference FILE");
@@ -149,7 +186,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 .map(StatsInput::Summaries)
             } else {
                 collect_cram_region_stats(&input, reference, &parsed_regions, config)
-                    .map(StatsInput::Counts)
+                    .map(|counts| StatsInput::Counts(Box::new(counts)))
             }
         }
         _ => {
@@ -179,9 +216,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let is_sorted = header_sort_order
+        .as_deref()
+        .map(|so| so == "coordinate")
+        .unwrap_or(false);
     let write_result = match stats_input {
-        StatsInput::Summaries(summaries) => write_stats(&mut writer, &summaries, config),
-        StatsInput::Counts(counts) => write_stats_counts(&mut writer, &counts),
+        StatsInput::Summaries(summaries) => write_stats(&mut writer, &summaries, config, is_sorted),
+        StatsInput::Counts(counts) => write_stats_counts(&mut writer, &counts, config, is_sorted),
     };
     if let Err(e) = write_result {
         if e.kind() == io::ErrorKind::BrokenPipe {
@@ -200,6 +241,55 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 }
 
+/// Looks up a record's `NM` (edit distance) aux tag and returns its numeric
+/// value if present. Returns `None` if the tag is absent or has an
+/// unexpected type (which we treat as 0 contribution, matching upstream's
+/// silent skip).
+fn read_nm_aux(rec: &(impl sam::alignment::Record + ?Sized)) -> Option<u64> {
+    use sam::alignment::record::data::field::{Tag, Value};
+    let nm_tag = Tag::from([b'N', b'M']);
+    let data = rec.data();
+    let value = data.get(&nm_tag)?.ok()?;
+    let n = match value {
+        Value::Int8(v) => v as i64,
+        Value::UInt8(v) => v as i64,
+        Value::Int16(v) => v as i64,
+        Value::UInt16(v) => v as i64,
+        Value::Int32(v) => v as i64,
+        Value::UInt32(v) => v as i64,
+        _ => return None,
+    };
+    if n < 0 { None } else { Some(n as u64) }
+}
+
+/// Returns the `SO:` value from the input's `@HD` line, lower-cased, or
+/// `None` if the header has no sort-order tag. Mirrors how upstream's
+/// `samtools stats` populates the `is sorted` summary line: a coordinate-
+/// sorted header reports `1`, everything else reports `0`. Without per-
+/// record position tracking we trust the header tag here, which differs
+/// from upstream's runtime check when the header claims coordinate sort
+/// but the records are not actually in order.
+fn read_input_header_sort_order(
+    input: &std::path::Path,
+    exact: Exact,
+) -> io::Result<Option<String>> {
+    let header = match exact {
+        Exact::Sam => htslib_rs::alignment_compat::read_sam_header_from_path(input)?,
+        Exact::Bam => htslib_rs::alignment_compat::read_bam_header_from_path(input)?,
+        Exact::Cram => htslib_rs::alignment_compat::read_cram_header_from_path(input)?,
+        _ => return Ok(None),
+    };
+    let so = header
+        .header()
+        .as_ref()
+        .and_then(|hd| {
+            hd.other_fields()
+                .get(&sam::header::record::value::map::header::tag::SORT_ORDER)
+        })
+        .map(|value| String::from_utf8_lossy(value.as_ref()).to_lowercase());
+    Ok(so)
+}
+
 fn parse_region(s: &str) -> io::Result<Region> {
     s.parse::<Region>().map_err(|e| {
         io::Error::new(
@@ -207,6 +297,28 @@ fn parse_region(s: &str) -> io::Result<Region> {
             format!("region \"{}\": {}", s, e),
         )
     })
+}
+
+fn parse_coverage_range(raw: &str) -> Result<(u32, u32, u32), String> {
+    let fields: Vec<_> = raw.split(',').collect();
+    if fields.len() != 3 {
+        return Err(format!("coverage range \"{raw}\" must have MIN,MAX,STEP"));
+    }
+    let min = fields[0]
+        .parse::<u32>()
+        .map_err(|e| format!("invalid coverage min \"{}\": {}", fields[0], e))?;
+    let max = fields[1]
+        .parse::<u32>()
+        .map_err(|e| format!("invalid coverage max \"{}\": {}", fields[1], e))?;
+    let step = fields[2]
+        .parse::<u32>()
+        .map_err(|e| format!("invalid coverage step \"{}\": {}", fields[2], e))?;
+    if min == 0 || max < min || step == 0 {
+        return Err(format!(
+            "invalid coverage range \"{raw}\": require 0 < MIN <= MAX and STEP > 0"
+        ));
+    }
+    Ok((min, max, step))
 }
 
 fn read_target_regions(path: &std::path::Path) -> io::Result<Vec<Region>> {
@@ -313,6 +425,39 @@ fn region_targets(header: &sam::Header, regions: &[Region]) -> io::Result<Vec<Re
         .collect()
 }
 
+/// Iterates all SAM records to build a `StatsCounts` with sequence-length
+/// and quality accumulators populated (which the `summarize_*` path can
+/// not provide because `AlignmentRecordSummary` discards sequence and
+/// quality data).
+fn collect_sam_full_stats(input: &PathBuf, config: StatsConfig) -> io::Result<StatsCounts> {
+    let mut reader = File::open(input)
+        .map(BufReader::new)
+        .map(sam::io::Reader::new)?;
+    let header = reader.read_header()?;
+    let mut counts = StatsCounts::default();
+    for result in reader.records() {
+        let record = result?;
+        counts.update_record(&header, &record, config);
+    }
+    Ok(counts)
+}
+
+fn collect_bam_full_stats(input: &PathBuf, config: StatsConfig) -> io::Result<StatsCounts> {
+    use htslib_rs::bam;
+    let mut reader = bam::io::Reader::new(File::open(input)?);
+    let header = reader.read_header()?;
+    let mut counts = StatsCounts::default();
+    let mut record = bam::Record::default();
+    loop {
+        let n = reader.read_record(&mut record)?;
+        if n == 0 {
+            break;
+        }
+        counts.update_record(&header, &record, config);
+    }
+    Ok(counts)
+}
+
 fn collect_sam_region_stats(
     input: &PathBuf,
     regions: &[Region],
@@ -331,7 +476,7 @@ fn collect_sam_region_stats(
         if record_overlaps_targets(&header, &record, &targets)
             && seen.insert(record_identity(&header, &record))
         {
-            counts.update_record(&header, &record, config);
+            counts.update_record_with_targets(&header, &record, config, Some(&targets));
         }
     }
 
@@ -344,12 +489,13 @@ fn collect_bam_region_stats(
     config: StatsConfig,
 ) -> io::Result<StatsCounts> {
     let header = htslib_rs::alignment_compat::read_bam_header_from_path(input)?;
+    let targets = region_targets(&header, regions)?;
     let mut counts = StatsCounts::default();
     let mut seen = HashSet::new();
     for region in regions {
         for record in htslib_rs::alignment_compat::query_bam_records_from_path(input, region)? {
             if seen.insert(record_identity(&header, &record)) {
-                counts.update_record(&header, &record, config);
+                counts.update_record_with_targets(&header, &record, config, Some(&targets));
             }
         }
     }
@@ -363,6 +509,7 @@ fn collect_cram_region_stats(
     config: StatsConfig,
 ) -> io::Result<StatsCounts> {
     let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
+    let targets = region_targets(&header, regions)?;
     let mut counts = StatsCounts::default();
     let mut seen = HashSet::new();
     for region in regions {
@@ -370,7 +517,7 @@ fn collect_cram_region_stats(
             input, region, &reference,
         )? {
             if seen.insert(record_identity(&header, &record)) {
-                counts.update_record(&header, &record, config);
+                counts.update_record_with_targets(&header, &record, config, Some(&targets));
             }
         }
     }
@@ -453,9 +600,48 @@ struct StatsCounts {
     dup: u64,
     qc_fail: u64,
     secondary: u64,
+    supplementary: u64,
     mq0: u64,
     singletons: u64,
     diffchr: u64,
+    // Per-record orientation bins (double-counted because each pair
+    // contributes both reads). Halved on output to match upstream's
+    // per-pair semantics.
+    isize_inward: u64,
+    isize_outward: u64,
+    isize_other: u64,
+    // Per-record abs(template_length) accumulators across the same
+    // population that feeds the orientation bins. Used to compute the
+    // mean / standard deviation reported in SN.
+    isize_sum: u64,
+    isize_sum_sq: f64,
+    isize_count: u64,
+    // Sequence-length and quality accumulators (only populated when the
+    // collection path has access to record-level data — currently SAM /
+    // BAM iteration and any region path, but not the CRAM-non-region
+    // summary path).
+    total_len: u64,
+    total_len_1st: u64,
+    total_len_2nd: u64,
+    max_len: u32,
+    max_len_1st: u32,
+    max_len_2nd: u32,
+    qual_sum: u64,
+    qual_count: u64,
+    first_qual_hist: Vec<[u64; 256]>,
+    last_qual_hist: Vec<[u64; 256]>,
+    first_gc_hist: BTreeMap<u16, u64>,
+    last_gc_hist: BTreeMap<u16, u64>,
+    coverage_depths: BTreeMap<(usize, usize), u32>,
+    // Bases mapped (sum of sequence lengths for mapped reads, ignoring
+    // clipping), bases mapped from CIGAR (sum of M/=/X ops), and total
+    // NM aux values across reads. Used for the `bases mapped`,
+    // `bases mapped (cigar)`, `mismatches`, and `error rate` SN lines.
+    bases_mapped: u64,
+    bases_mapped_cigar: u64,
+    nmismatches: u64,
+    // Sum of sequence lengths for records carrying the duplicate flag.
+    bases_dup: u64,
 }
 
 impl StatsCounts {
@@ -464,6 +650,16 @@ impl StatsCounts {
         header: &sam::Header,
         rec: &(impl sam::alignment::Record + ?Sized),
         config: StatsConfig,
+    ) {
+        self.update_record_with_targets(header, rec, config, None);
+    }
+
+    fn update_record_with_targets(
+        &mut self,
+        header: &sam::Header,
+        rec: &(impl sam::alignment::Record + ?Sized),
+        config: StatsConfig,
+        targets: Option<&[RegionTarget]>,
     ) {
         let Ok(flags) = rec.flags() else {
             return;
@@ -478,14 +674,128 @@ impl StatsCounts {
             .mate_reference_sequence_id(header)
             .transpose()
             .unwrap_or_default();
+        let template_length = rec.template_length().ok().unwrap_or(0);
 
+        let pre_total = self.total;
         self.update(
             flag,
             mapq,
             reference_sequence_id,
             mate_reference_sequence_id,
+            template_length,
             config,
         );
+
+        // Only accumulate seq/quality stats for primary, non-supplementary
+        // reads that were not filtered out by `--remove-dups` — i.e. the
+        // ones that contributed to `total`.
+        if self.total > pre_total {
+            let seq_len = rec.sequence().len() as u32;
+            if seq_len > 0 {
+                self.total_len += u64::from(seq_len);
+                if seq_len > self.max_len {
+                    self.max_len = seq_len;
+                }
+                if flag & BAM_FREAD1 != 0 {
+                    self.total_len_1st += u64::from(seq_len);
+                    if seq_len > self.max_len_1st {
+                        self.max_len_1st = seq_len;
+                    }
+                }
+                if flag & BAM_FREAD2 != 0 {
+                    self.total_len_2nd += u64::from(seq_len);
+                    if seq_len > self.max_len_2nd {
+                        self.max_len_2nd = seq_len;
+                    }
+                }
+            }
+            for (cycle, q) in rec.quality_scores().iter().flatten().enumerate() {
+                self.qual_sum += u64::from(q);
+                self.qual_count += 1;
+                if flag & BAM_FREAD1 != 0 {
+                    increment_quality_hist(&mut self.first_qual_hist, cycle, q);
+                }
+                if flag & BAM_FREAD2 != 0 {
+                    increment_quality_hist(&mut self.last_qual_hist, cycle, q);
+                }
+            }
+
+            if flag & BAM_FDUP != 0 {
+                self.bases_dup += u64::from(seq_len);
+            }
+
+            if seq_len > 0 {
+                let gc_percent = gc_percent_hundredths(rec.sequence().iter());
+                if flag & BAM_FREAD1 != 0 {
+                    *self.first_gc_hist.entry(gc_percent).or_default() += 1;
+                }
+                if flag & BAM_FREAD2 != 0 {
+                    *self.last_gc_hist.entry(gc_percent).or_default() += 1;
+                }
+            }
+
+            if flag & BAM_FUNMAP == 0 {
+                self.bases_mapped += u64::from(seq_len);
+                use sam::alignment::record::cigar::op::Kind;
+                for op in rec.cigar().iter().flatten() {
+                    if matches!(
+                        op.kind(),
+                        Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch
+                    ) {
+                        self.bases_mapped_cigar += op.len() as u64;
+                    }
+                }
+                if let Some(nm) = read_nm_aux(rec) {
+                    self.nmismatches += nm;
+                }
+                self.update_coverage_depths(header, rec, targets);
+            }
+        }
+    }
+
+    fn update_coverage_depths(
+        &mut self,
+        header: &sam::Header,
+        rec: &(impl sam::alignment::Record + ?Sized),
+        targets: Option<&[RegionTarget]>,
+    ) {
+        let tid = match rec.reference_sequence_id(header).transpose() {
+            Ok(Some(tid)) => tid,
+            _ => return,
+        };
+        let mut ref_pos = match rec.alignment_start().transpose() {
+            Ok(Some(start)) => usize::from(start) - 1,
+            _ => return,
+        };
+
+        use sam::alignment::record::cigar::op::Kind;
+        for op in rec.cigar().iter().flatten() {
+            let len = op.len();
+            match op.kind() {
+                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                    for pos0 in ref_pos..ref_pos.saturating_add(len) {
+                        if targets
+                            .map(|targets| {
+                                targets.iter().any(|target| {
+                                    target.tid == tid
+                                        && target.start <= pos0.saturating_add(1)
+                                        && pos0.saturating_add(1) <= target.end
+                                })
+                            })
+                            .unwrap_or(true)
+                        {
+                            let depth = self.coverage_depths.entry((tid, pos0)).or_default();
+                            *depth = depth.saturating_add(1);
+                        }
+                    }
+                    ref_pos = ref_pos.saturating_add(len);
+                }
+                Kind::Deletion | Kind::Skip => {
+                    ref_pos = ref_pos.saturating_add(len);
+                }
+                Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
+            }
+        }
     }
 
     fn update_summary(&mut self, rec: &AlignmentRecordSummary, config: StatsConfig) {
@@ -494,6 +804,7 @@ impl StatsCounts {
             rec.mapping_quality(),
             rec.reference_sequence_id(),
             rec.mate_reference_sequence_id(),
+            rec.template_length(),
             config,
         );
     }
@@ -504,10 +815,15 @@ impl StatsCounts {
         mapq: Option<u8>,
         reference_sequence_id: Option<usize>,
         mate_reference_sequence_id: Option<usize>,
+        template_length: i32,
         config: StatsConfig,
     ) {
         if flag & BAM_FSECONDARY != 0 {
             self.secondary += 1;
+            return;
+        }
+        if flag & BAM_FSUPPLEMENTARY != 0 {
+            self.supplementary += 1;
             return;
         }
         self.raw_total += 1;
@@ -544,6 +860,11 @@ impl StatsCounts {
                 {
                     self.diffchr += 1;
                 }
+                if reference_sequence_id == mate_reference_sequence_id
+                    && reference_sequence_id.is_some()
+                {
+                    self.update_isize_bin(flag, template_length);
+                }
             }
             if flag & BAM_FMUNMAP != 0 && flag & BAM_FUNMAP == 0 {
                 self.singletons += 1;
@@ -556,21 +877,87 @@ impl StatsCounts {
             self.qc_fail += 1;
         }
     }
+
+    /// Classify an insert-size observation into inward/outward/other,
+    /// mirroring `stats.c`'s orientation logic. Each record contributes
+    /// once; the output divides by two to obtain per-pair counts.
+    ///
+    /// Without alignment positions we infer "5' end" from the sign of
+    /// `template_length`: the leftmost read has positive TLEN. A pair
+    /// with opposite strands is FR (inward) when the leftmost read is
+    /// forward, and RF (outward) otherwise. Same-direction pairs are
+    /// classified as "other".
+    fn update_isize_bin(&mut self, flag: u32, template_length: i32) {
+        let read_reverse = flag & BAM_FREVERSE != 0;
+        let mate_reverse = flag & 0x20 /* BAM_FMREVERSE */ != 0;
+        let isize = template_length.unsigned_abs() as u64;
+        self.isize_count += 1;
+        self.isize_sum = self.isize_sum.saturating_add(isize);
+        self.isize_sum_sq += (isize as f64) * (isize as f64);
+
+        if read_reverse == mate_reverse {
+            self.isize_other += 1;
+        } else if template_length == 0 {
+            // Upstream stats.c treats exactly overlapping mates as inward.
+            self.isize_inward += 1;
+        } else {
+            let leftmost = template_length > 0;
+            let inward = if leftmost {
+                !read_reverse
+            } else {
+                read_reverse
+            };
+            if inward {
+                self.isize_inward += 1;
+            } else {
+                self.isize_outward += 1;
+            }
+        }
+    }
+}
+
+fn increment_quality_hist(hist: &mut Vec<[u64; 256]>, cycle: usize, quality: u8) {
+    if hist.len() <= cycle {
+        hist.resize_with(cycle + 1, || [0; 256]);
+    }
+    hist[cycle][usize::from(quality)] += 1;
+}
+
+fn gc_percent_hundredths(bases: impl IntoIterator<Item = u8>) -> u16 {
+    let mut len = 0u64;
+    let mut gc = 0u64;
+    for base in bases {
+        len += 1;
+        if matches!(base.to_ascii_uppercase(), b'G' | b'C') {
+            gc += 1;
+        }
+    }
+    if len == 0 {
+        return 0;
+    }
+
+    ((gc * 10_000 + (len / 2)) / len) as u16
 }
 
 fn write_stats(
     out: &mut dyn Write,
     recs: &[AlignmentRecordSummary],
     config: StatsConfig,
+    is_sorted: bool,
 ) -> io::Result<()> {
     let mut counts = StatsCounts::default();
     for rec in recs {
         counts.update_summary(rec, config);
     }
-    write_stats_counts(out, &counts)
+    write_stats_counts(out, &counts, config, is_sorted)
 }
 
-fn write_stats_counts(out: &mut dyn Write, counts: &StatsCounts) -> io::Result<()> {
+fn write_stats_counts(
+    out: &mut dyn Write,
+    counts: &StatsCounts,
+    config: StatsConfig,
+    is_sorted: bool,
+) -> io::Result<()> {
     writeln!(
         out,
         "# This file was produced by samtools-rs stats (samtools-{}+htslib-rs)",
@@ -580,6 +967,7 @@ fn write_stats_counts(out: &mut dyn Write, counts: &StatsCounts) -> io::Result<(
     writeln!(out, "SN\traw total sequences:\t{}", counts.raw_total)?;
     writeln!(out, "SN\tfiltered sequences:\t{}", counts.filtered)?;
     writeln!(out, "SN\tsequences:\t{}", counts.total)?;
+    writeln!(out, "SN\tis sorted:\t{}", if is_sorted { 1 } else { 0 })?;
     writeln!(out, "SN\t1st fragments:\t{}", counts.read1)?;
     writeln!(out, "SN\tlast fragments:\t{}", counts.read2)?;
     writeln!(out, "SN\treads mapped:\t{}", counts.mapped)?;
@@ -595,13 +983,238 @@ fn write_stats_counts(out: &mut dyn Write, counts: &StatsCounts) -> io::Result<(
     writeln!(out, "SN\treads MQ0:\t{}", counts.mq0)?;
     writeln!(out, "SN\treads QC failed:\t{}", counts.qc_fail)?;
     writeln!(out, "SN\tnon-primary alignments:\t{}", counts.secondary)?;
-    writeln!(out, "SN\tsupplementary alignments:\t0")?;
+    writeln!(
+        out,
+        "SN\tsupplementary alignments:\t{}",
+        counts.supplementary
+    )?;
+    writeln!(out, "SN\ttotal length:\t{}", counts.total_len)?;
+    writeln!(
+        out,
+        "SN\ttotal first fragment length:\t{}",
+        counts.total_len_1st
+    )?;
+    writeln!(
+        out,
+        "SN\ttotal last fragment length:\t{}",
+        counts.total_len_2nd
+    )?;
+    writeln!(out, "SN\tbases mapped:\t{}", counts.bases_mapped)?;
+    writeln!(
+        out,
+        "SN\tbases mapped (cigar):\t{}",
+        counts.bases_mapped_cigar
+    )?;
+    writeln!(out, "SN\tbases trimmed:\t0")?;
+    writeln!(out, "SN\tbases duplicated:\t{}", counts.bases_dup)?;
+    writeln!(out, "SN\tmismatches:\t{}", counts.nmismatches)?;
+    let error_rate = if counts.bases_mapped_cigar > 0 {
+        counts.nmismatches as f64 / counts.bases_mapped_cigar as f64
+    } else {
+        0.0
+    };
+    writeln!(out, "SN\terror rate:\t{:.6e}", error_rate)?;
+    let avg_len = if counts.raw_total > 0 {
+        counts.total_len as f64 / counts.raw_total as f64
+    } else {
+        0.0
+    };
+    let avg_len_1st = if counts.read1 > 0 {
+        counts.total_len_1st as f64 / counts.read1 as f64
+    } else {
+        0.0
+    };
+    let avg_len_2nd = if counts.read2 > 0 {
+        counts.total_len_2nd as f64 / counts.read2 as f64
+    } else {
+        0.0
+    };
+    writeln!(out, "SN\taverage length:\t{:.0}", avg_len)?;
+    writeln!(
+        out,
+        "SN\taverage first fragment length:\t{:.0}",
+        avg_len_1st
+    )?;
+    writeln!(out, "SN\taverage last fragment length:\t{:.0}", avg_len_2nd)?;
+    writeln!(out, "SN\tmaximum length:\t{}", counts.max_len)?;
+    writeln!(
+        out,
+        "SN\tmaximum first fragment length:\t{}",
+        counts.max_len_1st
+    )?;
+    writeln!(
+        out,
+        "SN\tmaximum last fragment length:\t{}",
+        counts.max_len_2nd
+    )?;
+    let avg_quality = if counts.qual_count > 0 {
+        counts.qual_sum as f64 / counts.qual_count as f64
+    } else {
+        0.0
+    };
+    writeln!(out, "SN\taverage quality:\t{:.1}", avg_quality)?;
     writeln!(out, "SN\tsingletons:\t{}", counts.singletons)?;
+
+    let avg_isize = if counts.isize_count > 0 {
+        counts.isize_sum as f64 / counts.isize_count as f64
+    } else {
+        0.0
+    };
+    let sd_isize = if counts.isize_count > 0 {
+        let mean_sq = counts.isize_sum_sq / counts.isize_count as f64;
+        (mean_sq - avg_isize * avg_isize).max(0.0).sqrt()
+    } else {
+        0.0
+    };
+    writeln!(out, "SN\tinsert size average:\t{:.1}", avg_isize)?;
+    writeln!(out, "SN\tinsert size standard deviation:\t{:.1}", sd_isize)?;
+    writeln!(
+        out,
+        "SN\tinward oriented pairs:\t{}",
+        counts.isize_inward / 2
+    )?;
+    writeln!(
+        out,
+        "SN\toutward oriented pairs:\t{}",
+        counts.isize_outward / 2
+    )?;
+    writeln!(
+        out,
+        "SN\tpairs with other orientation:\t{}",
+        counts.isize_other / 2
+    )?;
     writeln!(
         out,
         "SN\tpairs on different chromosomes:\t{}",
         counts.diffchr / 2
     )?;
+    let denom = counts.read1 + counts.read2;
+    let proper_pct = if denom > 0 {
+        100.0 * counts.proper_paired as f64 / denom as f64
+    } else {
+        0.0
+    };
+    writeln!(
+        out,
+        "SN\tpercentage of properly paired reads (%):\t{:.1}",
+        proper_pct
+    )?;
+    write_quality_histograms(out, counts)?;
+    write_gc_histograms(out, counts)?;
+    write_coverage_histogram(out, counts, config)?;
+    Ok(())
+}
+
+fn write_quality_histograms(out: &mut dyn Write, counts: &StatsCounts) -> io::Result<()> {
+    if !counts.first_qual_hist.is_empty() {
+        writeln!(
+            out,
+            "# First Fragment Qualities. Use `grep ^FFQ | cut -f 2-` to extract this part."
+        )?;
+        writeln!(
+            out,
+            "# Columns correspond to qualities and rows to cycles. First column is the cycle number."
+        )?;
+        write_quality_histogram(out, "FFQ", &counts.first_qual_hist)?;
+    }
+    if !counts.last_qual_hist.is_empty() {
+        writeln!(
+            out,
+            "# Last Fragment Qualities. Use `grep ^LFQ | cut -f 2-` to extract this part."
+        )?;
+        writeln!(
+            out,
+            "# Columns correspond to qualities and rows to cycles. First column is the cycle number."
+        )?;
+        write_quality_histogram(out, "LFQ", &counts.last_qual_hist)?;
+    }
+    Ok(())
+}
+
+fn write_quality_histogram(
+    out: &mut dyn Write,
+    label: &str,
+    hist: &[[u64; 256]],
+) -> io::Result<()> {
+    for (cycle, row) in hist.iter().enumerate() {
+        write!(out, "{}\t{}", label, cycle + 1)?;
+        for count in row {
+            write!(out, "\t{}", count)?;
+        }
+        writeln!(out)?;
+    }
+    Ok(())
+}
+
+fn write_gc_histograms(out: &mut dyn Write, counts: &StatsCounts) -> io::Result<()> {
+    if !counts.first_gc_hist.is_empty() {
+        writeln!(
+            out,
+            "# GC Content of first fragments. Use `grep ^GCF | cut -f 2-` to extract this part."
+        )?;
+        write_gc_histogram(out, "GCF", &counts.first_gc_hist)?;
+    }
+    if !counts.last_gc_hist.is_empty() {
+        writeln!(
+            out,
+            "# GC Content of last fragments. Use `grep ^GCL | cut -f 2-` to extract this part."
+        )?;
+        write_gc_histogram(out, "GCL", &counts.last_gc_hist)?;
+    }
+    Ok(())
+}
+
+fn write_gc_histogram(
+    out: &mut dyn Write,
+    label: &str,
+    hist: &BTreeMap<u16, u64>,
+) -> io::Result<()> {
+    for (percent, count) in hist {
+        writeln!(
+            out,
+            "{}\t{}.{:02}\t{}",
+            label,
+            percent / 100,
+            percent % 100,
+            count
+        )?;
+    }
+    Ok(())
+}
+
+fn write_coverage_histogram(
+    out: &mut dyn Write,
+    counts: &StatsCounts,
+    config: StatsConfig,
+) -> io::Result<()> {
+    if counts.coverage_depths.is_empty() {
+        return Ok(());
+    }
+
+    let mut hist: BTreeMap<(u32, u32), u64> = BTreeMap::new();
+    for &depth in counts.coverage_depths.values() {
+        if depth < config.coverage_min {
+            continue;
+        }
+        let capped = depth.min(config.coverage_max);
+        let bucket_start = config.coverage_min
+            + ((capped - config.coverage_min) / config.coverage_step) * config.coverage_step;
+        let bucket_end = bucket_start
+            .saturating_add(config.coverage_step - 1)
+            .min(config.coverage_max);
+        *hist.entry((bucket_start, bucket_end)).or_default() += 1;
+    }
+    if hist.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(
+        out,
+        "# Coverage distribution. Use `grep ^COV | cut -f 2-` to extract this part."
+    )?;
+    for ((lo, hi), count) in hist {
+        writeln!(out, "COV\t[{lo}-{hi}]\t{lo}\t{count}")?;
+    }
     Ok(())
 }
 
@@ -612,7 +1225,7 @@ fn print_usage() -> io::Result<()> {
     writeln!(w)?;
     writeln!(
         w,
-        "Note: only the `SN` summary lines are currently produced."
+        "Note: `SN` plus record-level quality, GC, and approximate coverage histogram sections are currently produced."
     )?;
     Ok(())
 }

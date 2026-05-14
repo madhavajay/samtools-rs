@@ -1,8 +1,9 @@
-//! `samtools reheader` — replace the header of a BAM file.
+//! `samtools reheader` — replace the header of an alignment file.
 //!
 //! Mirrors `main_reheader` in `bam_reheader.c`. The basic mode is
 //! `samtools reheader <new.hdr.sam> <in.bam>` → write a new BAM to stdout
 //! with the records from `<in.bam>` and the header from `<new.hdr.sam>`.
+//! SAM input is also supported and writes SAM output.
 //!
 //! Not yet supported: `--in-place` (CRAM rewrite) and BGZF block-level fast
 //! paths.
@@ -15,7 +16,7 @@ use std::process::{Command, ExitCode, Stdio};
 
 use htslib_rs::bam;
 use htslib_rs::format::Exact;
-use htslib_rs::sam;
+use htslib_rs::sam::{self, alignment::RecordBuf};
 
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
@@ -60,7 +61,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let input_bam_path = if external_cmd.is_some() {
+    let input_path = if external_cmd.is_some() {
         if positional.len() != 1 {
             let _ = print_usage();
             return ExitCode::from(1);
@@ -80,25 +81,25 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let format = match sam_io::sam_open_format(input_bam_path) {
+    let format = match sam_io::sam_open_format(input_path) {
         Ok(f) => f,
         Err(e) => {
             print_error("reheader", e.to_string());
             return ExitCode::from(1);
         }
     };
-    if format.exact != Exact::Bam {
+    if !matches!(format.exact, Exact::Sam | Exact::Bam) {
         print_error(
             "reheader",
-            "only BAM input is currently supported (CRAM/SAM TODO)",
+            "only SAM and BAM input are currently supported (CRAM TODO)",
         );
         return ExitCode::from(1);
     }
 
     let result = if let Some(command) = external_cmd.as_deref() {
-        run_reheader_command(command, input_bam_path, !no_pg, args)
+        run_reheader_command(command, input_path, !no_pg, args)
     } else {
-        run_reheader(&positional[0], input_bam_path, !no_pg, args)
+        run_reheader(&positional[0], input_path, !no_pg, args)
     };
 
     match result {
@@ -134,25 +135,26 @@ fn run_reheader_command(
 
 pub(crate) fn run_reheader_to_writer<W: Write>(
     new_header_path: &Path,
-    input_bam: &Path,
+    input: &Path,
     add_pg: bool,
     argv: &[OsString],
     output: W,
 ) -> io::Result<()> {
     let new_header = read_header_from_path(new_header_path)?;
-    rewrite_bam_with_header(new_header, input_bam, add_pg, argv, output)
+    rewrite_with_header(new_header, input, add_pg, argv, output)
 }
 
 pub(crate) fn run_reheader_command_to_writer<W: Write>(
     command: &str,
-    input_bam: &Path,
+    input: &Path,
     add_pg: bool,
     argv: &[OsString],
     output: W,
 ) -> io::Result<()> {
-    let header_text = crate::header_text::read_raw_header_text_with_format(input_bam, Exact::Bam)?;
+    let exact = sam_io::sam_open_format(input)?.exact;
+    let header_text = crate::header_text::read_raw_header_text_with_format(input, exact)?;
     let new_header = read_header_from_command(command, &header_text)?;
-    rewrite_bam_with_header(new_header, input_bam, add_pg, argv, output)
+    rewrite_with_header(new_header, input, add_pg, argv, output)
 }
 
 fn read_header_from_path(path: &Path) -> io::Result<sam::Header> {
@@ -220,6 +222,53 @@ fn rewrite_bam_with_header<W: Write>(
             break;
         }
         writer.write_record(&input_header, &record)?;
+    }
+    Ok(())
+}
+
+fn rewrite_with_header<W: Write>(
+    new_header: sam::Header,
+    input: &Path,
+    add_pg: bool,
+    argv: &[OsString],
+    output: W,
+) -> io::Result<()> {
+    match sam_io::sam_open_format(input)?.exact {
+        Exact::Sam => rewrite_sam_with_header(new_header, input, add_pg, argv, output),
+        Exact::Bam => rewrite_bam_with_header(new_header, input, add_pg, argv, output),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only SAM and BAM input are currently supported",
+        )),
+    }
+}
+
+fn rewrite_sam_with_header<W: Write>(
+    new_header: sam::Header,
+    input_sam: &Path,
+    add_pg: bool,
+    argv: &[OsString],
+    output: W,
+) -> io::Result<()> {
+    use sam::alignment::io::Write as _;
+
+    let new_header = if add_pg {
+        crate::pg::add_samtools_pg_to_header(&new_header, argv)?
+    } else {
+        new_header
+    };
+
+    let mut input = sam::io::Reader::new(BufReader::new(File::open(input_sam)?));
+    let input_header = input.read_header()?;
+    let mut writer = sam::io::Writer::new(output);
+    writer.write_header(&new_header)?;
+
+    loop {
+        let mut record = RecordBuf::default();
+        if input.read_record_buf(&input_header, &mut record)? == 0 {
+            break;
+        }
+        writer.write_alignment_record(&new_header, &record)?;
     }
     Ok(())
 }
@@ -326,5 +375,36 @@ mod tests {
         assert!(header_text.contains("@CO\treheader command"));
         assert!(header_text.contains("\tCL:reheader "));
         let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn reheader_sam_input_writes_sam_with_replacement_header() {
+        let input = tmp_path("input.sam");
+        let header = tmp_path("header.sam");
+        let argv = [
+            OsString::from("reheader"),
+            header.clone().into(),
+            input.clone().into(),
+        ];
+        std::fs::write(
+            &input,
+            "@HD\tVN:1.6\n@SQ\tSN:old\tLN:20\nr1\t0\told\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &header,
+            "@HD\tVN:1.6\n@SQ\tSN:old\tLN:20\n@CO\tnew header\n",
+        )
+        .unwrap();
+
+        let mut output = Vec::new();
+        run_reheader_to_writer(&header, &input, false, &argv, &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("@CO\tnew header\n"));
+        assert!(text.contains("r1\t0\told\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n"));
+        assert!(!text.contains("\tCL:reheader "));
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(header);
     }
 }

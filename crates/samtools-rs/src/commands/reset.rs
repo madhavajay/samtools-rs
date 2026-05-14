@@ -52,7 +52,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut keep_only: Option<HashSet<AuxTag>> = None;
     let mut preserve_duplicate = false;
     let mut remove_read_groups = false;
-    let mut remove_programs = false;
+    let mut no_pg = false;
     let mut reject_programs = Vec::new();
 
     let mut iter = args.iter().skip(1).peekable();
@@ -114,7 +114,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 }
             }
             "--no-PG" => {
-                remove_programs = true;
+                no_pg = true;
             }
             "-T" => {
                 if matches!(s, "-T") {
@@ -145,8 +145,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
         keep_only: keep_only.as_ref(),
         preserve_duplicate,
         remove_read_groups,
-        remove_programs,
+        no_pg,
         reject_programs: &reject_programs,
+        pg_argv: Some(args),
     };
 
     let result = match input {
@@ -197,8 +198,9 @@ struct ResetSettings<'a> {
     keep_only: Option<&'a HashSet<[u8; 2]>>,
     preserve_duplicate: bool,
     remove_read_groups: bool,
-    remove_programs: bool,
+    no_pg: bool,
     reject_programs: &'a [String],
+    pg_argv: Option<&'a [OsString]>,
 }
 
 fn run_reset(
@@ -235,7 +237,7 @@ where
     R: Read,
 {
     let mut header = reader.read_header()?;
-    reset_header(&mut header, settings);
+    reset_header(&mut header, settings)?;
     let mut sink = open_output(output, fmt, &header)?;
 
     let mut record = RecordBuf::default();
@@ -298,7 +300,7 @@ where
     R: BufRead,
 {
     let mut header = reader.read_header()?;
-    reset_header(&mut header, settings);
+    reset_header(&mut header, settings)?;
     let mut sink = open_output(output, fmt, &header)?;
 
     loop {
@@ -312,16 +314,21 @@ where
     Ok(())
 }
 
-fn reset_header(header: &mut sam::Header, settings: &ResetSettings<'_>) {
+fn reset_header(header: &mut sam::Header, settings: &ResetSettings<'_>) -> io::Result<()> {
     if settings.remove_read_groups {
         header.read_groups_mut().clear();
     }
 
-    if settings.remove_programs {
-        header.programs_mut().as_mut().clear();
-    } else if !settings.reject_programs.is_empty() {
+    if !settings.reject_programs.is_empty() {
         reject_header_programs(header, settings.reject_programs);
     }
+
+    if !settings.no_pg
+        && let Some(argv) = settings.pg_argv
+    {
+        *header = crate::pg::add_samtools_pg_to_header(header, argv)?;
+    }
+    Ok(())
 }
 
 fn reject_header_programs(header: &mut sam::Header, rejected_ids: &[String]) {
@@ -595,8 +602,9 @@ mod tests {
             keep_only: None,
             preserve_duplicate: false,
             remove_read_groups: false,
-            remove_programs: false,
+            no_pg: true,
             reject_programs: &[],
+            pg_argv: None,
         };
         let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(input.as_bytes())));
 
@@ -647,8 +655,9 @@ mod tests {
             keep_only: None,
             preserve_duplicate: false,
             remove_read_groups: false,
-            remove_programs: false,
+            no_pg: true,
             reject_programs: &[],
+            pg_argv: None,
         };
         let mut reader = bam::io::Reader::new(Cursor::new(bam_bytes));
 

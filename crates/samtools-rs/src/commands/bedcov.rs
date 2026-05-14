@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use htslib_rs::format::Exact;
 use htslib_rs::sam;
 
-use crate::bam_flag::{BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FUNMAP};
+use crate::bam_flag::{BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FUNMAP, str_to_flag};
 use crate::bedidx::parse_bed_line;
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
@@ -28,6 +28,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut print_header = false;
     let mut print_read_count = false;
     let mut min_depth: Option<u32> = None;
+    let mut exclude_flags = default_exclude_flags();
+    let mut skip_deletions = false;
     let mut positionals: Vec<PathBuf> = Vec::new();
 
     let mut iter = args.iter().skip(1).peekable();
@@ -55,9 +57,20 @@ pub fn main(args: &[OsString]) -> ExitCode {
                         .unwrap_or(0),
                 );
             }
-            "-X" | "-j" | "-g" | "-G" | "--max-depth" => {
+            "-g" => match parse_flag_value(iter.next(), "-g") {
+                Ok(flags) => exclude_flags &= !flags,
+                Err(()) => return ExitCode::from(1),
+            },
+            "-G" => match parse_flag_value(iter.next(), "-G") {
+                Ok(flags) => exclude_flags |= flags,
+                Err(()) => return ExitCode::from(1),
+            },
+            "-j" => {
+                skip_deletions = true;
+            }
+            "-X" | "--max-depth" => {
                 // Filters/columns not yet supported; consume value-taking flags.
-                if matches!(s, "-g" | "-G" | "--max-depth") {
+                if matches!(s, "--max-depth") {
                     let _ = iter.next();
                 }
             }
@@ -116,6 +129,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
 
     let opts = BedcovOpts {
         min_mapq,
+        exclude_flags,
+        skip_deletions,
         print_header,
         print_read_count,
         min_depth,
@@ -131,9 +146,27 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 }
 
+fn default_exclude_flags() -> u32 {
+    BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP
+}
+
+fn parse_flag_value(value: Option<&OsString>, option: &str) -> Result<u32, ()> {
+    let Some(raw) = value.and_then(|a| a.to_str()) else {
+        print_error("bedcov", format!("option {option} requires an argument"));
+        return Err(());
+    };
+    let Some(flags) = str_to_flag(raw) else {
+        print_error("bedcov", format!("flag value \"{}\" is not supported", raw));
+        return Err(());
+    };
+    Ok(flags as u32)
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct BedcovOpts<'a> {
     min_mapq: u8,
+    exclude_flags: u32,
+    skip_deletions: bool,
     print_header: bool,
     print_read_count: bool,
     min_depth: Option<u32>,
@@ -183,15 +216,7 @@ where
         let mut depth_counts = Vec::new();
         let mut read_counts = Vec::new();
         for bam_path in bams {
-            let metrics = compute_region_metrics(
-                bam_path,
-                &interval.chrom,
-                start,
-                end,
-                opts.min_mapq,
-                opts.min_depth,
-                opts.reference,
-            )?;
+            let metrics = compute_region_metrics(bam_path, &interval.chrom, start, end, opts)?;
             let cov = metrics.coverage;
             write!(out, "\t{}", cov)?;
             if opts.min_depth.is_some() {
@@ -282,6 +307,7 @@ struct RegionMetricConfig {
     end: i64,
     exclude_flags: u32,
     min_mapq: u8,
+    skip_deletions: bool,
 }
 
 fn compute_region_metrics(
@@ -289,9 +315,7 @@ fn compute_region_metrics(
     chrom: &str,
     beg: i64,
     end: i64,
-    min_mapq: u8,
-    min_depth: Option<u32>,
-    reference: Option<&Path>,
+    opts: &BedcovOpts<'_>,
 ) -> io::Result<RegionMetrics> {
     let region_str = format!("{}:{}-{}", chrom, beg + 1, end);
     let region: htslib_rs::core::Region = region_str.parse().map_err(|e| {
@@ -300,8 +324,7 @@ fn compute_region_metrics(
             format!("invalid region \"{}\": {}", region_str, e),
         )
     })?;
-    let exclude_flags = BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP;
-    let mut depths = if min_depth.is_some() && end > beg {
+    let mut depths = if opts.min_depth.is_some() && end > beg {
         Some(vec![0u32; (end - beg) as usize])
     } else {
         None
@@ -320,8 +343,9 @@ fn compute_region_metrics(
                     RegionMetricConfig {
                         beg,
                         end,
-                        exclude_flags,
-                        min_mapq,
+                        exclude_flags: opts.exclude_flags,
+                        min_mapq: opts.min_mapq,
+                        skip_deletions: opts.skip_deletions,
                     },
                     &mut metrics,
                     depths.as_mut(),
@@ -339,8 +363,9 @@ fn compute_region_metrics(
                     RegionMetricConfig {
                         beg,
                         end,
-                        exclude_flags,
-                        min_mapq,
+                        exclude_flags: opts.exclude_flags,
+                        min_mapq: opts.min_mapq,
+                        skip_deletions: opts.skip_deletions,
                     },
                     &mut metrics,
                     depths.as_mut(),
@@ -348,7 +373,7 @@ fn compute_region_metrics(
             }
         }
         Exact::Cram => {
-            let Some(reference) = reference else {
+            let Some(reference) = opts.reference else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "CRAM input requires top-level --reference FILE",
@@ -366,8 +391,9 @@ fn compute_region_metrics(
                     RegionMetricConfig {
                         beg,
                         end,
-                        exclude_flags,
-                        min_mapq,
+                        exclude_flags: opts.exclude_flags,
+                        min_mapq: opts.min_mapq,
+                        skip_deletions: opts.skip_deletions,
                     },
                     &mut metrics,
                     depths.as_mut(),
@@ -382,7 +408,7 @@ fn compute_region_metrics(
         }
     }
 
-    if let Some(min_depth) = min_depth {
+    if let Some(min_depth) = opts.min_depth {
         metrics.depth_bases = depths
             .as_deref()
             .unwrap_or(&[])
@@ -452,7 +478,22 @@ fn update_region_metrics(
                 ref_pos = op_end;
             }
             Kind::Deletion | Kind::Skip => {
-                ref_pos += len;
+                let op_end = ref_pos + len;
+                if !config.skip_deletions {
+                    let lo = ref_pos.max(config.beg);
+                    let hi = op_end.min(config.end);
+                    if hi > lo {
+                        metrics.coverage += hi - lo;
+                        if let Some(depths) = depths.as_deref_mut() {
+                            let offset_start = (lo - config.beg) as usize;
+                            let offset_end = (hi - config.beg) as usize;
+                            for depth in &mut depths[offset_start..offset_end] {
+                                *depth = depth.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+                ref_pos = op_end;
             }
             Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
         }
@@ -476,7 +517,47 @@ fn print_usage() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::write_bedcov_header;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        static NEXT_TMP_ID: AtomicUsize = AtomicUsize::new(0);
+
+        let id = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "samtools-rs-bedcov-{}-{}-{}",
+            name,
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn write_bedcov_to_string(
+        bed: &Path,
+        sam: &Path,
+        exclude_flags: u32,
+    ) -> std::io::Result<String> {
+        write_bedcov_to_string_with_opts(
+            bed,
+            sam,
+            super::BedcovOpts {
+                exclude_flags,
+                ..super::BedcovOpts::default()
+            },
+        )
+    }
+
+    fn write_bedcov_to_string_with_opts(
+        bed: &Path,
+        sam: &Path,
+        opts: super::BedcovOpts<'_>,
+    ) -> std::io::Result<String> {
+        let mut out = Vec::new();
+        super::run_bedcov(&mut out, bed, &[sam.to_path_buf()], &opts)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
 
     #[test]
     fn writes_bedcov_header_from_existing_bed_header() {
@@ -545,6 +626,82 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "#chrom\tchromStart\tchromEnd\ta.bam_cov\ta.bam_depth\ta.bam_count\n"
+        );
+    }
+
+    #[test]
+    fn flag_mask_controls_duplicate_record_filtering() {
+        let tmp = tmp_dir("flag-mask");
+        let bed = tmp.join("r.bed");
+        let sam = tmp.join("in.sam");
+        std::fs::write(&bed, "chr1\t0\t4\n").unwrap();
+        std::fs::write(
+            &sam,
+            concat!(
+                "@HD\tVN:1.6\n",
+                "@SQ\tSN:chr1\tLN:8\n",
+                "normal\t0\tchr1\t1\t60\t2M\t*\t0\t0\tAA\tII\n",
+                "dup\t1024\tchr1\t2\t60\t2M\t*\t0\t0\tCC\tII\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            write_bedcov_to_string(&bed, &sam, super::default_exclude_flags()).unwrap(),
+            "chr1\t0\t4\t2\n"
+        );
+        assert_eq!(
+            write_bedcov_to_string(
+                &bed,
+                &sam,
+                super::default_exclude_flags() & !super::BAM_FDUP
+            )
+            .unwrap(),
+            "chr1\t0\t4\t4\n"
+        );
+    }
+
+    #[test]
+    fn deletion_and_refskip_bases_are_counted_unless_j_is_set() {
+        let tmp = tmp_dir("skip-deletions");
+        let bed = tmp.join("r.bed");
+        let sam = tmp.join("in.sam");
+        std::fs::write(&bed, "chr1\t0\t6\n").unwrap();
+        std::fs::write(
+            &sam,
+            concat!(
+                "@HD\tVN:1.6\n",
+                "@SQ\tSN:chr1\tLN:8\n",
+                "with_del\t0\tchr1\t1\t60\t2M2D2M\t*\t0\t0\tAAAA\tIIII\n",
+                "with_skip\t0\tchr1\t1\t60\t2M2N2M\t*\t0\t0\tCCCC\tIIII\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            write_bedcov_to_string_with_opts(
+                &bed,
+                &sam,
+                super::BedcovOpts {
+                    exclude_flags: super::default_exclude_flags(),
+                    ..super::BedcovOpts::default()
+                }
+            )
+            .unwrap(),
+            "chr1\t0\t6\t12\n"
+        );
+        assert_eq!(
+            write_bedcov_to_string_with_opts(
+                &bed,
+                &sam,
+                super::BedcovOpts {
+                    exclude_flags: super::default_exclude_flags(),
+                    skip_deletions: true,
+                    ..super::BedcovOpts::default()
+                }
+            )
+            .unwrap(),
+            "chr1\t0\t6\t8\n"
         );
     }
 }
