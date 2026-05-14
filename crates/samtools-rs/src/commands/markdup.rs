@@ -12,14 +12,14 @@
 //!
 //! Supported flags:
 //!  - `-r` — remove duplicates from the output (rather than just flagging).
-//!  - `-s` — emit basic counts to stderr.
+//!  - `-s` — emit upstream-shaped summary counts to stderr.
 //!  - `-b TAG` / `--barcode-tag TAG` — include a string aux tag in the
 //!    duplicate key.
 //!  - `-O sam|bam` / `--output-fmt sam|bam` — output format (default `bam`).
 //!  - `-o FILE` — output file (default stdout).
 //!  - `--no-PG` — suppress the default samtools `@PG` line.
 //!
-//! Not yet supported: optical-duplicate distance (`-d`), full upstream stats
+//! Not yet supported: optical-duplicate distance (`-d`), exact upstream stats
 //! output, CRAM.
 
 use std::collections::{HashMap, HashSet};
@@ -177,8 +177,18 @@ pub fn main(args: &[OsString]) -> ExitCode {
 }
 
 struct MarkdupStats {
-    duplicates: u64,
+    read: u64,
+    written: u64,
+    excluded: u64,
     examined: u64,
+    paired: u64,
+    single: u64,
+    duplicate_pair: u64,
+    duplicate_single: u64,
+    duplicate_pair_optical: u64,
+    duplicate_single_optical: u64,
+    duplicate_non_primary: u64,
+    duplicate_non_primary_optical: u64,
 }
 
 fn run_bam_markdup(
@@ -203,7 +213,8 @@ fn run_bam_markdup(
         }
         records.push(record.clone());
     }
-    let stats = mark_duplicates(&mut records, barcode_tag);
+    let mut stats = mark_duplicates(&mut records, barcode_tag);
+    stats.written = output_record_count(&records, remove_dups);
     let mut sink = open_output(output, fmt, &header)?;
     for rec in &records {
         if remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
@@ -212,7 +223,7 @@ fn run_bam_markdup(
         sink.write_record(&header, rec)?;
     }
     if emit_stats {
-        emit_basic_stats(&stats);
+        write_markdup_stats(&mut io::stderr().lock(), &stats)?;
     }
     Ok(())
 }
@@ -239,7 +250,8 @@ fn run_sam_markdup(
         }
         records.push(record);
     }
-    let stats = mark_duplicates(&mut records, barcode_tag);
+    let mut stats = mark_duplicates(&mut records, barcode_tag);
+    stats.written = output_record_count(&records, remove_dups);
     let mut sink = open_output(output, fmt, &header)?;
     for rec in &records {
         if remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
@@ -248,7 +260,7 @@ fn run_sam_markdup(
         sink.write_record(&header, rec)?;
     }
     if emit_stats {
-        emit_basic_stats(&stats);
+        write_markdup_stats(&mut io::stderr().lock(), &stats)?;
     }
     Ok(())
 }
@@ -280,15 +292,27 @@ fn mark_duplicates(records: &mut [RecordBuf], barcode_tag: Option<Tag>) -> Markd
     let mut se_best: HashMap<SeKey, usize> = HashMap::new();
     let mut pair_pending: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut pair_best: HashMap<PairKey, PairIdx> = HashMap::new();
-    let mut duplicates = 0u64;
-    let mut examined = 0u64;
+    let mut stats = MarkdupStats {
+        read: records.len() as u64,
+        written: records.len() as u64,
+        excluded: 0,
+        examined: 0,
+        paired: 0,
+        single: 0,
+        duplicate_pair: 0,
+        duplicate_single: 0,
+        duplicate_pair_optical: 0,
+        duplicate_single_optical: 0,
+        duplicate_non_primary: 0,
+        duplicate_non_primary_optical: 0,
+    };
 
     for i in 0..records.len() {
         let flag = records[i].flags().bits() as u32;
         if flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY) != 0 {
             continue;
         }
-        examined += 1;
+        stats.examined += 1;
         let tid = records[i]
             .reference_sequence_id()
             .map(|t| t as i32)
@@ -300,6 +324,7 @@ fn mark_duplicates(records: &mut [RecordBuf], barcode_tag: Option<Tag>) -> Markd
 
         let paired_both_mapped = flag & BAM_FPAIRED != 0 && flag & BAM_FMUNMAP == 0;
         if paired_both_mapped {
+            stats.paired += 1;
             // Look for the partner record by qname; pair them when both
             // ends have been seen. The first read of the pair sits in
             // `pair_pending`; the second read computes the pair key and
@@ -353,7 +378,7 @@ fn mark_duplicates(records: &mut [RecordBuf], barcode_tag: Option<Tag>) -> Markd
                                 set_dup(&mut records[first_idx]);
                                 set_dup(&mut records[i]);
                             }
-                            duplicates += 2;
+                            stats.duplicate_pair += 2;
                         }
                         None => {
                             pair_best.insert(key, (first_idx, i));
@@ -365,6 +390,7 @@ fn mark_duplicates(records: &mut [RecordBuf], barcode_tag: Option<Tag>) -> Markd
         }
 
         // SE path: mate not mapped (singleton) or unpaired primary.
+        stats.single += 1;
         let se_key = (me, barcode_value(&records[i], barcode_tag));
         match se_best.get(&se_key).copied() {
             Some(idx) => {
@@ -375,7 +401,7 @@ fn mark_duplicates(records: &mut [RecordBuf], barcode_tag: Option<Tag>) -> Markd
                 } else {
                     set_dup(&mut records[i]);
                 }
-                duplicates += 1;
+                stats.duplicate_single += 1;
             }
             None => {
                 se_best.insert(se_key, i);
@@ -404,14 +430,18 @@ fn mark_duplicates(records: &mut [RecordBuf], barcode_tag: Option<Tag>) -> Markd
             continue;
         };
         if duplicate_primary_names.contains(name) && set_dup(record) {
-            duplicates += 1;
+            stats.duplicate_non_primary += 1;
         }
     }
 
-    MarkdupStats {
-        duplicates,
-        examined,
-    }
+    stats
+}
+
+fn output_record_count(records: &[RecordBuf], remove_dups: bool) -> u64 {
+    records
+        .iter()
+        .filter(|record| !remove_dups || record.flags().bits() as u32 & BAM_FDUP == 0)
+        .count() as u64
 }
 
 fn set_dup(record: &mut RecordBuf) -> bool {
@@ -444,13 +474,37 @@ fn barcode_value(record: &RecordBuf, tag: Option<Tag>) -> Option<Vec<u8>> {
     }
 }
 
-fn emit_basic_stats(stats: &MarkdupStats) {
-    let _ = writeln!(
-        io::stderr(),
-        "READ: {}\nDUPLICATE TOTAL: {}",
-        stats.examined,
-        stats.duplicates
-    );
+fn write_markdup_stats(mut w: impl Write, stats: &MarkdupStats) -> io::Result<()> {
+    let duplicate_primary_total = stats.duplicate_pair + stats.duplicate_single;
+    let duplicate_total = duplicate_primary_total + stats.duplicate_non_primary;
+    writeln!(w, "READ: {}", stats.read)?;
+    writeln!(w, "WRITTEN: {}", stats.written)?;
+    writeln!(w, "EXCLUDED: {}", stats.excluded)?;
+    writeln!(w, "EXAMINED: {}", stats.examined)?;
+    writeln!(w, "PAIRED: {}", stats.paired)?;
+    writeln!(w, "SINGLE: {}", stats.single)?;
+    writeln!(w, "DUPLICATE PAIR: {}", stats.duplicate_pair)?;
+    writeln!(w, "DUPLICATE SINGLE: {}", stats.duplicate_single)?;
+    writeln!(
+        w,
+        "DUPLICATE PAIR OPTICAL: {}",
+        stats.duplicate_pair_optical
+    )?;
+    writeln!(
+        w,
+        "DUPLICATE SINGLE OPTICAL: {}",
+        stats.duplicate_single_optical
+    )?;
+    writeln!(w, "DUPLICATE NON PRIMARY: {}", stats.duplicate_non_primary)?;
+    writeln!(
+        w,
+        "DUPLICATE NON PRIMARY OPTICAL: {}",
+        stats.duplicate_non_primary_optical
+    )?;
+    writeln!(w, "DUPLICATE PRIMARY TOTAL: {duplicate_primary_total}")?;
+    writeln!(w, "DUPLICATE TOTAL: {duplicate_total}")?;
+    writeln!(w, "ESTIMATED_LIBRARY_SIZE: 0")?;
+    Ok(())
 }
 
 trait Sink {
@@ -512,7 +566,7 @@ fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
     writeln!(w, "Usage: samtools markdup [options] <in.bam> [out.bam]")?;
     writeln!(w, "  -r            remove duplicate records")?;
-    writeln!(w, "  -s            emit basic counts to stderr")?;
+    writeln!(w, "  -s            emit summary counts to stderr")?;
     writeln!(
         w,
         "  -b TAG        include barcode aux tag in duplicate key"
@@ -521,4 +575,38 @@ fn print_usage() -> io::Result<()> {
     writeln!(w, "  -o FILE       output file (default stdout)")?;
     writeln!(w, "  --no-PG       do not add a @PG line")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdup_stats_text_uses_upstream_field_names() {
+        let stats = MarkdupStats {
+            read: 5,
+            written: 3,
+            excluded: 0,
+            examined: 4,
+            paired: 2,
+            single: 2,
+            duplicate_pair: 2,
+            duplicate_single: 1,
+            duplicate_pair_optical: 0,
+            duplicate_single_optical: 0,
+            duplicate_non_primary: 1,
+            duplicate_non_primary_optical: 0,
+        };
+        let mut out = Vec::new();
+        write_markdup_stats(&mut out, &stats).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("READ: 5\n"));
+        assert!(text.contains("WRITTEN: 3\n"));
+        assert!(text.contains("DUPLICATE PAIR: 2\n"));
+        assert!(text.contains("DUPLICATE SINGLE: 1\n"));
+        assert!(text.contains("DUPLICATE NON PRIMARY: 1\n"));
+        assert!(text.contains("DUPLICATE PRIMARY TOTAL: 3\n"));
+        assert!(text.contains("DUPLICATE TOTAL: 4\n"));
+        assert!(text.contains("ESTIMATED_LIBRARY_SIZE: 0\n"));
+    }
 }
