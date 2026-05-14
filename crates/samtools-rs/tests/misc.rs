@@ -4754,6 +4754,78 @@ fn markdup_c_removes_stale_duplicate_tags_before_t_retags_duplicates() {
 }
 
 #[test]
+fn markdup_include_fails_controls_qcfail_duplicate_marking() {
+    use samtools_rs::commands::markdup;
+    let tmp = tmp_dir("markdup-include-fails");
+    let sam = tmp.join("in.sam");
+    let default_out = tmp.join("default.sam");
+    let include_out = tmp.join("include.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:100\n",
+            "pass\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "fail\t512\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "-O",
+                "sam",
+                "-o",
+                default_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "--include-fails",
+                "-O",
+                "sam",
+                "-o",
+                include_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let default_text = std::fs::read_to_string(&default_out).unwrap();
+    let include_text = std::fs::read_to_string(&include_out).unwrap();
+    let default_fail = default_text
+        .lines()
+        .find(|line| line.starts_with("fail\t"))
+        .unwrap();
+    let include_fail = include_text
+        .lines()
+        .find(|line| line.starts_with("fail\t"))
+        .unwrap();
+    let default_flag = default_fail
+        .split('\t')
+        .nth(1)
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    let include_flag = include_fail
+        .split('\t')
+        .nth(1)
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    assert_eq!(default_flag & 0x400, 0);
+    assert_eq!(include_flag & 0x400, 0x400);
+}
+
+#[test]
 fn markdup_propagates_duplicate_flag_to_supplementary_records() {
     use samtools_rs::commands::markdup;
     let tmp = tmp_dir("markdup-supplementary");

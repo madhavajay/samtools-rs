@@ -19,6 +19,7 @@
 //!  - `-t` — add `do:Z:<original>` duplicate-origin tags for duplicates.
 //!  - `-d DISTANCE` — add `dt:Z:SQ` / `dt:Z:LB` duplicate-type tags using
 //!    Illumina-style read-name tile/x/y optical-distance checks.
+//!  - `--include-fails` — include QCFAIL reads in duplicate marking.
 //!  - `-b TAG` / `--barcode-tag TAG` — include a string aux tag in the
 //!    duplicate key.
 //!  - `-O sam|bam` / `--output-fmt sam|bam` — output format (default `bam`).
@@ -46,8 +47,8 @@ use htslib_rs::sam::{
 };
 
 use crate::bam_flag::{
-    BAM_FDUP, BAM_FMUNMAP, BAM_FPAIRED, BAM_FREVERSE, BAM_FSECONDARY, BAM_FSUPPLEMENTARY,
-    BAM_FUNMAP,
+    BAM_FDUP, BAM_FMUNMAP, BAM_FPAIRED, BAM_FQCFAIL, BAM_FREVERSE, BAM_FSECONDARY,
+    BAM_FSUPPLEMENTARY, BAM_FUNMAP,
 };
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
@@ -65,6 +66,7 @@ struct MarkdupOptions {
     clear_existing_dups: bool,
     duplicate_origin_tag: bool,
     optical_distance: Option<u32>,
+    include_fails: bool,
     barcode_tag: Option<Tag>,
 }
 
@@ -78,6 +80,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut clear_existing_dups = false;
     let mut duplicate_origin_tag = false;
     let mut optical_distance = None;
+    let mut include_fails = false;
     let mut no_pg = false;
     let mut barcode_tag: Option<Tag> = None;
 
@@ -90,6 +93,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-S" => {
                 // Supplementary duplicate propagation is always performed.
             }
+            "--include-fails" => include_fails = true,
             "-c" => clear_existing_dups = true,
             "-t" => duplicate_origin_tag = true,
             "-d" => {
@@ -188,6 +192,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         clear_existing_dups,
         duplicate_origin_tag,
         optical_distance,
+        include_fails,
         barcode_tag,
     };
     let result = match format.exact {
@@ -366,6 +371,10 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
     for i in 0..records.len() {
         let flag = records[i].flags().bits() as u32;
         if flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY) != 0 {
+            continue;
+        }
+        if flag & BAM_FQCFAIL != 0 && !options.include_fails {
+            stats.excluded += 1;
             continue;
         }
         stats.examined += 1;
@@ -913,6 +922,7 @@ fn print_usage() -> io::Result<()> {
     )?;
     writeln!(w, "  -t            add duplicate-origin do tags")?;
     writeln!(w, "  -d DISTANCE   add duplicate-type dt tags")?;
+    writeln!(w, "  --include-fails include QCFAIL reads")?;
     writeln!(
         w,
         "  -b TAG        include barcode aux tag in duplicate key"
