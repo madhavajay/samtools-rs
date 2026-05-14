@@ -1564,6 +1564,70 @@ fn fastq_rejects_invalid_default_quality() {
 }
 
 #[test]
+fn fastq_umi_appends_aux_tag_to_read_names() {
+    let tmp = tmp_dir("fastq-umi");
+    let sam = tmp.join("in.sam");
+    let bam = tmp.join("in.bam");
+    let sam_out = tmp.join("sam.fq");
+    let bam_out = tmp.join("bam.fq");
+    let custom_out = tmp.join("custom.fq");
+    let text = concat!(
+        "@HD\tVN:1.6\n",
+        "@SQ\tSN:chr1\tLN:8\n",
+        "rx\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRX:Z:ACG-TT\n",
+        "ox\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\tOX:Z:TT\tRX:Z:AA\n",
+        "hash#7\t65\tchr1\t1\t60\t4M\t=\t5\t8\tGGGG\t$$$$\tRX:Z:GG\n",
+        "custom\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t%%%%\tMI:Z:CC\tRX:Z:RR\n",
+    );
+    std::fs::write(&sam, text).unwrap();
+    write_bam_from_sam_text(&bam, text);
+
+    for (input, output) in [(&sam, &sam_out), (&bam, &bam_out)] {
+        assert_eq!(
+            exit_to_u8(fastq::main(&argv(
+                "fastq",
+                &[
+                    "-U",
+                    "-o",
+                    output.to_str().unwrap(),
+                    input.to_str().unwrap(),
+                ]
+            ))),
+            0
+        );
+    }
+
+    let expected = concat!(
+        "@rx:ACG+TT\nACGT\n+\n!!!!\n",
+        "@ox:TT\nTGCA\n+\n####\n",
+        "@hash:GG#7/1\nGGGG\n+\n$$$$\n",
+        "@custom:RR\nCCCC\n+\n%%%%\n",
+    );
+    assert_eq!(std::fs::read_to_string(sam_out).unwrap(), expected);
+    assert_eq!(std::fs::read_to_string(bam_out).unwrap(), expected);
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-U",
+                "--UMI-tag",
+                "MI,RX",
+                "-o",
+                custom_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert!(
+        std::fs::read_to_string(custom_out)
+            .unwrap()
+            .contains("@custom:CC\nCCCC\n+\n%%%%\n")
+    );
+}
+
+#[test]
 fn fastq_single_sam_path_filters_by_aux_tag_value() {
     let tmp = tmp_dir("fastq-aux-filter-value");
     let sam = tmp.join("in.sam");
