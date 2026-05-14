@@ -106,7 +106,7 @@ samtools-rs status legend:
 
 - **C source:** `bam_sort.c::bam_merge_core`
 - **HTSlib APIs used:** as above
-- **samtools-rs status:** 🟡 — in-memory coordinate, query-name, and `-t TAG` merge works for BAM and SAM inputs, including differing `@SQ` union/remap, stdout `-`, accepted `-s`, `--output-fmt=FORMAT`, and `-R region` / `-L BED` restriction for indexed BAM; streaming k-way merge, broader header reconciliation, and CRAM remain.
+- **samtools-rs status:** 🟡 — in-memory coordinate, query-name, and `-t TAG` merge works for BAM and SAM inputs, including differing `@SQ` union/remap, compatible `@RG` union, stdout `-`, accepted `-s`, `--output-fmt=FORMAT`, and `-R region` / `-L BED` restriction for indexed BAM; streaming k-way merge, broader header reconciliation beyond `@SQ`/`@RG`, and CRAM remain.
 
 ### collate / bamshuf
 

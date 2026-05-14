@@ -295,6 +295,7 @@ pub(crate) fn run_merge(
     for path in &inputs[1..] {
         let (input_header, mut input_records) = read_records(path, filter.as_ref())?;
         let reference_id_map = merge_reference_sequences(&mut header, &input_header)?;
+        merge_read_groups(&mut header, &input_header)?;
         remap_records(&mut input_records, &reference_id_map)?;
         records.append(&mut input_records);
     }
@@ -499,6 +500,31 @@ fn remap_records(records: &mut [RecordBuf], reference_id_map: &[usize]) -> io::R
                 ));
             };
             *record.mate_reference_sequence_id_mut() = Some(new_tid);
+        }
+    }
+
+    Ok(())
+}
+
+fn merge_read_groups(
+    output_header: &mut sam::Header,
+    input_header: &sam::Header,
+) -> io::Result<()> {
+    for (id, input_read_group) in input_header.read_groups() {
+        if let Some(output_read_group) = output_header.read_groups().get(id) {
+            if output_read_group != input_read_group {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "conflicting @RG definition for {}",
+                        String::from_utf8_lossy(id)
+                    ),
+                ));
+            }
+        } else {
+            output_header
+                .read_groups_mut()
+                .insert(id.clone(), input_read_group.clone());
         }
     }
 
