@@ -119,7 +119,7 @@ samtools-rs status legend:
 - **C source:** `bam_cat.c`
 - **HTSlib APIs used:** BGZF passthrough — fast concatenation without re-decompression
 - **htslib-rs coverage:** ⚠️ — BGZF block-level concatenation is not yet a first-class API in `htslib-rs::bgzf_compat`. Must be added. — ❌
-- **samtools-rs status:** 🟡 — record-level SAM and BAM concatenation works with `-o`, `-h`, default `@PG` insertion, `--no-PG`, and `-r region` for indexed BAM; BGZF block-level fast path, CRAM, and `-p` remain.
+- **samtools-rs status:** 🟡 — record-level SAM and BAM concatenation works with `-o`, `-h`, `-b FILE` input lists, default `@PG` insertion, `--no-PG`, and `-r region` for indexed BAM; BGZF block-level fast path, CRAM, and `-p` remain.
 
 ### split
 

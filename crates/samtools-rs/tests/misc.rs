@@ -1241,6 +1241,60 @@ fn cat_sam_inputs_write_sam_output_with_single_header() {
 }
 
 #[test]
+fn cat_reads_inputs_from_file_list_before_positionals() {
+    let tmp = tmp_dir("cat-input-list");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let sam_c = tmp.join("c.sam");
+    let list = tmp.join("inputs.txt");
+    let out = tmp.join("cat.sam");
+    let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:100\n";
+    std::fs::write(
+        &sam_a,
+        format!("{header}a1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        format!("{header}b1\t0\tchr1\t5\t60\t4M\t*\t0\t0\tTGCA\t####\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_c,
+        format!("{header}c1\t0\tchr1\t9\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        &list,
+        format!("{}\n\n{}\n", sam_a.display(), sam_b.display()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(cat::main(&argv(
+            "cat",
+            &[
+                "--no-PG",
+                "-b",
+                list.to_str().unwrap(),
+                sam_c.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let names: Vec<_> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').next().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["a1", "b1", "c1"]);
+}
+
+#[test]
 fn reheader_succeeds() {
     let tmp = tmp_dir("reh");
     let hdr = fixtures_dir().join("reheader").join("hdr.sam");

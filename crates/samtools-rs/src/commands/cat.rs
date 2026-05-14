@@ -2,7 +2,8 @@
 //!
 //! Mirrors `main_cat` in `bam_cat.c`. The upstream implementation
 //! concatenates BAM files at the BGZF block level for speed and supports
-//! `-h <hdr>` (replace header), `-o <out>` (output), and `-p N/M` for CRAM.
+//! `-b <fofn>` (input file list), `-h <hdr>` (replace header), `-o <out>`
+//! (output), and `-p N/M` for CRAM.
 //!
 //! This Rust port implements record-level concatenation (decompress +
 //! re-encode) for SAM and BAM. CRAM concatenation and `-p` are not yet
@@ -10,7 +11,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -28,6 +29,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut output: Option<PathBuf> = None;
     let mut no_pg = false;
     let mut region: Option<String> = None;
+    let mut input_lists: Vec<PathBuf> = Vec::new();
     let mut inputs: Vec<PathBuf> = Vec::new();
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -41,13 +43,20 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 let v = iter.next().map(PathBuf::from);
                 output = v;
             }
+            "-b" => {
+                let Some(v) = iter.next() else {
+                    print_error("cat", "missing value for -b");
+                    return ExitCode::from(1);
+                };
+                input_lists.push(PathBuf::from(v));
+            }
             "--no-PG" => {
                 no_pg = true;
             }
             "-r" => {
                 region = iter.next().and_then(|a| a.to_str().map(str::to_owned));
             }
-            "-p" | "-q" | "-f" | "-b" => {
+            "-p" | "-q" | "-f" => {
                 // Reserved upstream flags not yet supported.
                 print_error(
                     "cat",
@@ -65,10 +74,25 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     }
 
+    if !input_lists.is_empty() {
+        let mut expanded = Vec::new();
+        for list in &input_lists {
+            match read_input_list(list) {
+                Ok(mut list_inputs) => expanded.append(&mut list_inputs),
+                Err(e) => {
+                    print_error("cat", e.to_string());
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        expanded.extend(inputs);
+        inputs = expanded;
+    }
+
     if inputs.is_empty() {
         let _ = writeln!(
             io::stderr(),
-            "Usage: samtools cat [-h hdr] [-o out] in1.bam ..."
+            "Usage: samtools cat [-b list] [-h hdr] [-o out] in1.bam ..."
         );
         return ExitCode::from(1);
     }
@@ -112,6 +136,21 @@ pub fn main(args: &[OsString]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn read_input_list(path: &Path) -> io::Result<Vec<PathBuf>> {
+    let file = File::open(path)?;
+    let mut inputs = Vec::new();
+
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let line = line.trim();
+        if !line.is_empty() {
+            inputs.push(PathBuf::from(line));
+        }
+    }
+
+    Ok(inputs)
 }
 
 fn run_bam_cat(
