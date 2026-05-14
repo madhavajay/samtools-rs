@@ -1263,6 +1263,55 @@ fn collate_fast_mode_pairs_primary_reads_and_drops_supplementary() {
 }
 
 #[test]
+fn collate_accepts_temporary_file_count_option() {
+    let tmp = tmp_dir("collate-temp-count");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("collated.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "b\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "collate",
+        "--output-fmt=sam",
+        "-n",
+        "3",
+        "-o",
+        out.to_str().unwrap(),
+        sam.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(collate::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let names: Vec<_> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').next().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+}
+
+#[test]
+fn collate_rejects_invalid_temporary_file_count() {
+    let argv: Vec<OsString> = ["collate", "-n", "0", sample_bam().to_str().unwrap()]
+        .iter()
+        .map(OsString::from)
+        .collect();
+
+    assert_eq!(exit_to_u8(collate::main(&argv)), 1);
+}
+
+#[test]
 fn collate_cram_input_uses_top_level_reference() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let tmp = tmp_dir("collate-cram");

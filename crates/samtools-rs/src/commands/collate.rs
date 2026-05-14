@@ -35,6 +35,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut no_pg = false;
     let mut fast = false;
     let mut reads_store = 10_000usize;
+    let mut _temp_files = 64usize;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -86,6 +87,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
                         print_error("collate", format!("invalid -r value \"{}\"", v));
                         return ExitCode::from(1);
                     }
+                };
+            }
+            "-n" => {
+                let Some(v) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("collate", "missing value for -n");
+                    return ExitCode::from(1);
+                };
+                _temp_files = match v.parse::<usize>() {
+                    Ok(0) | Err(_) => {
+                        print_error("collate", format!("invalid -n value \"{}\"", v));
+                        return ExitCode::from(1);
+                    }
+                    Ok(n) => n,
                 };
             }
             "-@" | "--threads" => {
@@ -449,6 +463,7 @@ fn print_usage() -> io::Result<()> {
         "  -f          fast mode: output primary read pairs early"
     )?;
     writeln!(w, "  -r INT      working reads stored with -f")?;
+    writeln!(w, "  -n INT      temporary file count (accepted)")?;
     writeln!(w, "  --output-fmt sam|bam")?;
     Ok(())
 }
