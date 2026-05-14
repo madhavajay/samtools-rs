@@ -4,8 +4,12 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Mutex;
 
 use samtools_rs::commands::{collate, merge, sort};
+use samtools_rs::run as samtools_run;
+
+static GLOBAL_ARGS_LOCK: Mutex<()> = Mutex::new(());
 
 fn fixtures_dir() -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -35,6 +39,18 @@ fn tmp_dir(name: &str) -> PathBuf {
 
 fn sample_bam() -> PathBuf {
     fixtures_dir().join("checksum").join("chk1.bam")
+}
+
+fn htslib_fixtures_dir() -> PathBuf {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    PathBuf::from(manifest)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("htslib-rs")
+        .join("htslib")
+        .join("test")
 }
 
 #[test]
@@ -84,6 +100,44 @@ fn sort_name_succeeds() {
         ])
         .collect();
     assert_eq!(exit_to_u8(sort::main(&argv)), 0);
+}
+
+#[test]
+fn sort_cram_input_uses_top_level_reference() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("sort-cram");
+    let out = tmp.join("sorted.sam");
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+
+    let argv: Vec<OsString> = [
+        "samtools",
+        "--reference",
+        reference.to_str().unwrap(),
+        "sort",
+        "-n",
+        "-O",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        cram.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(samtools_run(argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.starts_with("@HD\t"));
+    assert!(text.contains("SO:queryname"));
+    let names: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').next().unwrap())
+        .collect();
+    assert!(!names.is_empty());
+    assert!(names.windows(2).all(|w| w[0] <= w[1]));
 }
 
 #[test]
@@ -328,6 +382,610 @@ fn merge_sam_inputs_to_sam_output() {
 }
 
 #[test]
+fn merge_reads_inputs_from_file_list() {
+    let tmp = tmp_dir("merge-input-list");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let list = tmp.join("inputs.txt");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "b\t0\tchr1\t4\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &list,
+        format!("{}\n\n{}\n", sam_a.display(), sam_b.display()),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--no-PG",
+        "-b",
+        list.to_str().unwrap(),
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let names: Vec<_> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').next().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+}
+
+#[test]
+fn merge_unions_different_sq_headers_and_remaps_records() {
+    let tmp = tmp_dir("merge-union-sq");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr2\tLN:9\n",
+            "b\t0\tchr2\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("@SQ\tSN:chr1\tLN:8\n"));
+    assert!(text.contains("@SQ\tSN:chr2\tLN:9\n"));
+    assert!(text.contains("\na\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n"));
+    assert!(text.contains("\nb\t0\tchr2\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n"));
+}
+
+#[test]
+fn merge_rejects_conflicting_sq_lengths() {
+    let tmp = tmp_dir("merge-conflicting-sq");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:9\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 1);
+    assert!(!out.exists());
+}
+
+#[test]
+fn merge_unions_compatible_sq_metadata_fields() {
+    let tmp = tmp_dir("merge-sq-fields");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\tM5:0123456789abcdef0123456789abcdef\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--no-PG",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("@SQ\tSN:chr1\tLN:8\tM5:0123456789abcdef0123456789abcdef\n"));
+}
+
+#[test]
+fn merge_rejects_conflicting_sq_metadata_fields() {
+    let tmp = tmp_dir("merge-conflicting-sq-fields");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\tM5:0123456789abcdef0123456789abcdef\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\tM5:fedcba9876543210fedcba9876543210\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--no-PG",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 1);
+    assert!(!out.exists());
+}
+
+#[test]
+fn merge_unions_read_group_headers() {
+    let tmp = tmp_dir("merge-union-rg");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:rg1\tSM:s1\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\tRG:Z:rg1\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:rg2\tSM:s2\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\tRG:Z:rg2\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("@RG\tID:rg1\tSM:s1\n"));
+    assert!(text.contains("@RG\tID:rg2\tSM:s2\n"));
+    assert!(text.contains("\na\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\tRG:Z:rg1\n"));
+    assert!(text.contains("\nb\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\tRG:Z:rg2\n"));
+}
+
+#[test]
+fn merge_rejects_conflicting_read_group_headers() {
+    let tmp = tmp_dir("merge-conflicting-rg");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:rg1\tSM:s1\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\tRG:Z:rg1\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:rg1\tSM:s2\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\tRG:Z:rg1\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 1);
+    assert!(!out.exists());
+}
+
+#[test]
+fn merge_appends_comments_from_all_headers() {
+    let tmp = tmp_dir("merge-comments");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@CO\tfirst input comment\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@CO\tsecond input comment\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("@CO\tfirst input comment\n"));
+    assert!(text.contains("@CO\tsecond input comment\n"));
+}
+
+#[test]
+fn merge_preserves_later_header_metadata_when_first_input_lacks_hd() {
+    let tmp = tmp_dir("merge-later-hd");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.5\tGO:query\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--no-PG",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let hd = text.lines().find(|line| line.starts_with("@HD")).unwrap();
+    assert!(hd.contains("VN:1.5"));
+    assert!(hd.contains("GO:query"));
+    assert!(hd.contains("SO:coordinate"));
+}
+
+#[test]
+fn merge_unions_compatible_header_metadata_fields() {
+    let tmp = tmp_dir("merge-hd-fields");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\tGO:query\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--no-PG",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let hd = text.lines().find(|line| line.starts_with("@HD")).unwrap();
+    assert!(hd.contains("VN:1.6"));
+    assert!(hd.contains("GO:query"));
+    assert!(hd.contains("SO:coordinate"));
+}
+
+#[test]
+fn merge_rejects_conflicting_header_metadata_fields() {
+    let tmp = tmp_dir("merge-hd-conflict");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\tGO:query\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\tGO:reference\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--no-PG",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 1);
+    assert!(!out.exists());
+}
+
+#[test]
+fn merge_unions_program_headers() {
+    let tmp = tmp_dir("merge-union-pg");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@PG\tID:pg1\tPN:tool1\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@PG\tID:pg2\tPN:tool2\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--no-PG",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("@PG\tID:pg1\tPN:tool1\n"));
+    assert!(text.contains("@PG\tID:pg2\tPN:tool2\n"));
+}
+
+#[test]
+fn merge_rejects_conflicting_program_headers() {
+    let tmp = tmp_dir("merge-conflicting-pg");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@PG\tID:pg1\tPN:tool1\n",
+            "a\t0\tchr1\t2\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@PG\tID:pg1\tPN:tool2\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "--no-PG",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 1);
+    assert!(!out.exists());
+}
+
+#[test]
 fn merge_short_output_format_consumes_value() {
     let tmp = tmp_dir("merge-short-output-fmt");
     let sam_a = tmp.join("a.sam");
@@ -363,6 +1021,88 @@ fn merge_short_output_format_consumes_value() {
     let text = std::fs::read_to_string(out).unwrap();
     assert!(text.starts_with("@HD\tVN:1.6\tSO:coordinate\n"));
     assert!(text.contains("\na\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n"));
+}
+
+#[test]
+fn merge_tag_sort_orders_by_aux_tag_and_accepts_s_option() {
+    let tmp = tmp_dir("merge-tag");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out = tmp.join("merged.sam");
+    let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:8\n";
+    std::fs::write(
+        &sam_a,
+        format!(
+            "{header}missing\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n\
+             high\t0\tchr1\t2\t60\t4M\t*\t0\t0\tCCCC\t####\tZZ:i:7\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        format!("{header}low\t0\tchr1\t3\t60\t4M\t*\t0\t0\tGGGG\t$$$$\tZZ:i:3\n"),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "-s",
+        "1",
+        "-t",
+        "ZZ",
+        "--output-fmt=sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.starts_with("@HD\tVN:1.6\tSO:unsorted\tSS:unsorted:ZZ:coordinate\n"));
+    let names: Vec<_> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').next().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["missing", "low", "high"]);
+}
+
+#[test]
+fn merge_dash_output_writes_sam_to_stdout() {
+    let tmp = tmp_dir("merge-dash-output");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:8\n";
+    std::fs::write(
+        &sam_a,
+        format!("{header}b\t0\tchr1\t4\t60\t4M\t*\t0\t0\tTGCA\t####\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        format!("{header}a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n"),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "-O",
+        "SAM",
+        "-",
+        sam_a.to_str().unwrap(),
+        sam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+    assert!(!tmp.join("-").exists());
 }
 
 #[test]
@@ -418,6 +1158,194 @@ fn collate_sam_input_groups_by_name_to_sam_output() {
         .map(|line| line.split('\t').next().unwrap().to_string())
         .collect();
     assert_eq!(names, ["a", "z", "z"]);
+}
+
+#[test]
+fn collate_positional_prefix_writes_format_extension() {
+    let tmp = tmp_dir("collate-prefix");
+    let sam = tmp.join("in.sam");
+    let out_prefix = tmp.join("legacy");
+    let out = tmp.join("legacy.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "b\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "collate",
+        "--output-fmt=sam",
+        sam.to_str().unwrap(),
+        out_prefix.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(collate::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.starts_with("@HD\tVN:1.6\tSO:unsorted\tGO:query\n"));
+    let names: Vec<_> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').next().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+}
+
+#[test]
+fn collate_rejects_output_file_with_stdout() {
+    let argv: Vec<OsString> = [
+        "collate",
+        "-O",
+        "-o",
+        "out.sam",
+        sample_bam().to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+
+    assert_eq!(exit_to_u8(collate::main(&argv)), 1);
+}
+
+#[test]
+fn collate_fast_mode_pairs_primary_reads_and_drops_supplementary() {
+    let tmp = tmp_dir("collate-fast");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("fast.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:20\n",
+            "pair\t147\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\n",
+            "supp\t2113\tchr1\t6\t60\t4M\t*\t0\t0\tCCCC\t$$$$\n",
+            "solo\t65\tchr1\t9\t60\t4M\t*\t0\t0\tGGGG\t%%%%\n",
+            "pair\t99\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "collate",
+        "--output-fmt=sam",
+        "-f",
+        "-r",
+        "2",
+        "-o",
+        out.to_str().unwrap(),
+        sam.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(collate::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.starts_with("@HD\tVN:1.6\tSO:unsorted\tGO:query\n"));
+    let records: Vec<(&str, u16)> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let name = fields.next().unwrap();
+            let flag = fields.next().unwrap().parse::<u16>().unwrap();
+            (name, flag)
+        })
+        .collect();
+    assert_eq!(records, [("pair", 99), ("pair", 147), ("solo", 65)]);
+}
+
+#[test]
+fn collate_accepts_temporary_file_count_option() {
+    let tmp = tmp_dir("collate-temp-count");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("collated.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "b\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "collate",
+        "--output-fmt=sam",
+        "-n",
+        "3",
+        "-o",
+        out.to_str().unwrap(),
+        sam.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(collate::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let names: Vec<_> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').next().unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["a", "b"]);
+}
+
+#[test]
+fn collate_rejects_invalid_temporary_file_count() {
+    let argv: Vec<OsString> = ["collate", "-n", "0", sample_bam().to_str().unwrap()]
+        .iter()
+        .map(OsString::from)
+        .collect();
+
+    assert_eq!(exit_to_u8(collate::main(&argv)), 1);
+}
+
+#[test]
+fn collate_cram_input_uses_top_level_reference() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("collate-cram");
+    let out_prefix = tmp.join("collated");
+    let out = tmp.join("collated.sam");
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
+
+    let argv: Vec<OsString> = [
+        "samtools",
+        "--reference",
+        reference.to_str().unwrap(),
+        "collate",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out_prefix.to_str().unwrap(),
+        cram.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(samtools_run(argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.starts_with("@HD\t"));
+    let names: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').next().unwrap())
+        .collect();
+    assert!(!names.is_empty());
+    assert!(names.windows(2).all(|w| w[0] <= w[1]));
 }
 
 #[test]

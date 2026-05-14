@@ -294,7 +294,7 @@ where
     merge_command::run_merge(
         &inputs,
         Some(output_bam),
-        false,
+        merge_command::MergeOrder::Coordinate,
         merge_command::OutFmt::Bam,
         false,
         None,

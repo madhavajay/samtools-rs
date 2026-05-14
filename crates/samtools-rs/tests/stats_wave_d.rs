@@ -1269,6 +1269,7 @@ fn stats_emits_insert_size_and_supplementary_sn_lines() {
     let tmp = tmp_dir("stats-insert-size");
     let sam = tmp.join("paired.sam");
     let out = tmp.join("paired.stats");
+    let capped_out = tmp.join("paired-capped.stats");
     // Three records:
     //  - r1 first/forward, r1 mate/reverse: classic FR pair with TLEN 100
     //  - supp: a supplementary alignment of r1 that must NOT contribute to
@@ -1307,6 +1308,63 @@ r1\t2147\tchr1\t1\t60\t10M\t*\t0\t0\tACGTACGTAC\t!!!!!!!!!!
     assert_eq!(
         stats_sn_text(&text, "percentage of properly paired reads (%)"),
         "100.0"
+    );
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-i",
+                "50",
+                "-o",
+                capped_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    let capped_text = std::fs::read_to_string(capped_out).unwrap();
+    assert_eq!(stats_sn_text(&capped_text, "insert size average"), "50.0");
+}
+
+#[test]
+fn stats_most_inserts_limits_insert_size_summary_bulk() {
+    let tmp = tmp_dir("stats-most-inserts");
+    let sam = tmp.join("paired.sam");
+    let out = tmp.join("paired.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:2000
+r1\t99\tchr1\t1\t60\t10M\t=\t91\t100\tACGTACGTAC\t!!!!!!!!!!
+r1\t147\tchr1\t91\t60\t10M\t=\t1\t-100\tACGTACGTAC\t!!!!!!!!!!
+r2\t99\tchr1\t201\t60\t10M\t=\t291\t100\tACGTACGTAC\t!!!!!!!!!!
+r2\t147\tchr1\t291\t60\t10M\t=\t201\t-100\tACGTACGTAC\t!!!!!!!!!!
+r3\t99\tchr1\t501\t60\t10M\t=\t1391\t900\tACGTACGTAC\t!!!!!!!!!!
+r3\t147\tchr1\t1391\t60\t10M\t=\t501\t-900\tACGTACGTAC\t!!!!!!!!!!
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-m",
+                "0.5",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    let text = std::fs::read_to_string(out).unwrap();
+    assert_eq!(stats_sn_text(&text, "insert size average"), "100.0");
+    assert_eq!(
+        stats_sn_text(&text, "insert size standard deviation"),
+        "0.0"
     );
 }
 
@@ -1797,11 +1855,13 @@ fn view_filter_expr_for_sam() {
 }
 
 #[test]
-fn stats_is_sorted_reflects_header_sort_order() {
+fn stats_is_sorted_reflects_record_order() {
     let tmp = tmp_dir("stats-is-sorted");
     let sam_sorted = tmp.join("sorted.sam");
-    let sam_unsorted = tmp.join("unsorted.sam");
+    let sam_queryname_header = tmp.join("queryname-header.sam");
+    let sam_unsorted = tmp.join("coordinate-header-unsorted.sam");
     let out_sorted = tmp.join("sorted.stats");
+    let out_queryname_header = tmp.join("queryname-header.stats");
     let out_unsorted = tmp.join("unsorted.stats");
     std::fs::write(
         &sam_sorted,
@@ -1809,14 +1869,26 @@ fn stats_is_sorted_reflects_header_sort_order() {
 @HD\tVN:1.6\tSO:coordinate
 @SQ\tSN:chr1\tLN:100
 r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!
+r2\t0\tchr1\t10\t60\t4M\t*\t0\t0\tACGT\t!!!!
+",
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_queryname_header,
+        "\
+@HD\tVN:1.6\tSO:queryname
+@SQ\tSN:chr1\tLN:100
+r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!
+r2\t0\tchr1\t10\t60\t4M\t*\t0\t0\tACGT\t!!!!
 ",
     )
     .unwrap();
     std::fs::write(
         &sam_unsorted,
         "\
-@HD\tVN:1.6\tSO:queryname
+@HD\tVN:1.6\tSO:coordinate
 @SQ\tSN:chr1\tLN:100
+r2\t0\tchr1\t10\t60\t4M\t*\t0\t0\tACGT\t!!!!
 r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!
 ",
     )
@@ -1838,6 +1910,17 @@ r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!
             "stats",
             &[
                 "-o",
+                out_queryname_header.to_str().unwrap(),
+                sam_queryname_header.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-o",
                 out_unsorted.to_str().unwrap(),
                 sam_unsorted.to_str().unwrap()
             ]
@@ -1846,8 +1929,10 @@ r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!
     );
 
     let sorted_text = std::fs::read_to_string(&out_sorted).unwrap();
+    let queryname_header_text = std::fs::read_to_string(&out_queryname_header).unwrap();
     let unsorted_text = std::fs::read_to_string(&out_unsorted).unwrap();
     assert_eq!(stats_sn_value(&sorted_text, "is sorted"), 1);
+    assert_eq!(stats_sn_value(&queryname_header_text, "is sorted"), 1);
     assert_eq!(stats_sn_value(&unsorted_text, "is sorted"), 0);
 }
 
@@ -2078,6 +2163,270 @@ r6\t0\tchr1\t5\t60\t2M\t*\t0\t0\tCC\tII
     assert!(!text.contains("COV\t[1-1]"));
     assert!(text.contains("COV\t[2-3]\t2\t4\n"));
     assert!(text.contains("COV\t[4-4]\t4\t2\n"));
+}
+
+#[test]
+fn stats_cov_threshold_reports_target_percentage() {
+    let tmp = tmp_dir("stats-cov-threshold");
+    let sam = tmp.join("cov.sam");
+    let targets = tmp.join("targets.bed");
+    let out = tmp.join("cov.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:10
+r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\tIIII
+r2\t0\tchr1\t3\t60\t4M\t*\t0\t0\tCCCC\tIIII
+",
+    )
+    .unwrap();
+    std::fs::write(&targets, "chr1\t1\t6\n").unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-t",
+                targets.to_str().unwrap(),
+                "-g",
+                "1",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("SN\tbases inside the target:\t6\n"));
+    assert!(text.contains("SN\tpercentage of target genome with coverage > 1 (%):\t33.33\n"));
+}
+
+#[test]
+fn stats_cov_threshold_requires_target_regions() {
+    let tmp = tmp_dir("stats-cov-threshold-requires-targets");
+    let sam = tmp.join("cov.sam");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:10
+r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\tIIII
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &["-g", "1", sam.to_str().unwrap()]
+        ))),
+        1
+    );
+}
+
+#[test]
+fn stats_id_filter_matches_read_group_id_or_sample() {
+    let tmp = tmp_dir("stats-id-filter");
+    let sam = tmp.join("rg.sam");
+    let sample_out = tmp.join("sample.stats");
+    let group_out = tmp.join("group.stats");
+    let missing_out = tmp.join("missing.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:100
+@RG\tID:g1\tSM:s1
+@RG\tID:g2\tSM:s1
+@RG\tID:g3\tSM:s2
+r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\tIIII\tRG:Z:g1
+r2\t0\tchr1\t5\t60\t4M\t*\t0\t0\tCCCC\tIIII\tRG:Z:g2
+r3\t0\tchr1\t9\t60\t4M\t*\t0\t0\tGGGG\tIIII\tRG:Z:g3
+r4\t0\tchr1\t13\t60\t4M\t*\t0\t0\tTTTT\tIIII
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-I",
+                "s1",
+                "-o",
+                sample_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-I",
+                "g3",
+                "-o",
+                group_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-I",
+                "missing",
+                "-o",
+                missing_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let sample_text = std::fs::read_to_string(sample_out).unwrap();
+    let group_text = std::fs::read_to_string(group_out).unwrap();
+    let missing_text = std::fs::read_to_string(missing_out).unwrap();
+    assert_eq!(stats_sn_value(&sample_text, "sequences"), 2);
+    assert_eq!(stats_sn_value(&group_text, "sequences"), 1);
+    assert_eq!(stats_sn_value(&missing_text, "sequences"), 0);
+}
+
+#[test]
+fn stats_filters_required_and_filtering_flags() {
+    let tmp = tmp_dir("stats-flag-filters");
+    let sam = tmp.join("flags.sam");
+    let required_out = tmp.join("required.stats");
+    let filtered_out = tmp.join("filtered.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:100
+read1\t65\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\tIIII
+read2\t0\tchr1\t5\t60\t4M\t*\t0\t0\tCCCC\tIIII
+read3\t4\t*\t0\t0\t*\t*\t0\t0\tGGGG\tIIII
+secondary\t256\tchr1\t9\t60\t4M\t*\t0\t0\tTTTT\tIIII
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-f",
+                "READ1",
+                "-o",
+                required_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    let required_text = std::fs::read_to_string(required_out).unwrap();
+    assert!(required_text.contains("SN\traw total sequences:\t4\n"));
+    assert!(required_text.contains("SN\tfiltered sequences:\t3\n"));
+    assert!(required_text.contains("SN\tsequences:\t1\n"));
+    assert!(required_text.contains("SN\t1st fragments:\t1\n"));
+    assert!(required_text.contains("SN\tnon-primary alignments:\t0\n"));
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-F",
+                "UNMAP",
+                "-o",
+                filtered_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    let filtered_text = std::fs::read_to_string(filtered_out).unwrap();
+    assert!(filtered_text.contains("SN\traw total sequences:\t3\n"));
+    assert!(filtered_text.contains("SN\tfiltered sequences:\t1\n"));
+    assert!(filtered_text.contains("SN\tsequences:\t2\n"));
+    assert!(filtered_text.contains("SN\treads mapped:\t2\n"));
+}
+
+#[test]
+fn stats_filters_by_exact_read_length() {
+    let tmp = tmp_dir("stats-read-length-filter");
+    let sam = tmp.join("lengths.sam");
+    let out = tmp.join("lengths.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:100
+short\t0\tchr1\t1\t60\t3M\t*\t0\t0\tAAA\tIII
+long\t0\tchr1\t5\t60\t5M\t*\t0\t0\tCCCCC\tIIIII
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-l",
+                "5",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("SN\traw total sequences:\t1\n"));
+    assert!(text.contains("SN\tfiltered sequences:\t0\n"));
+    assert!(text.contains("SN\tsequences:\t1\n"));
+    assert!(text.contains("SN\ttotal length:\t5\n"));
+    assert!(text.contains("SN\tmaximum length:\t5\n"));
+}
+
+#[test]
+fn stats_trim_quality_reports_bwa_trimmed_bases() {
+    let tmp = tmp_dir("stats-trim-quality");
+    let sam = tmp.join("trim.sam");
+    let out = tmp.join("trim.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:100
+trimmed\t0\tchr1\t1\t60\t40M\t*\t0\t0\tAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\tIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII!!!!!
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-q",
+                "20",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("SN\tsequences:\t1\n"));
+    assert!(text.contains("SN\tbases trimmed:\t4\n"));
 }
 
 #[test]

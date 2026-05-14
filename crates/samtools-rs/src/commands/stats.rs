@@ -23,28 +23,44 @@ use htslib_rs::sam;
 
 use crate::bam_flag::{
     BAM_FDUP, BAM_FMUNMAP, BAM_FPAIRED, BAM_FPROPER_PAIR, BAM_FQCFAIL, BAM_FREAD1, BAM_FREAD2,
-    BAM_FREVERSE, BAM_FSECONDARY, BAM_FSUPPLEMENTARY, BAM_FUNMAP,
+    BAM_FREVERSE, BAM_FSECONDARY, BAM_FSUPPLEMENTARY, BAM_FUNMAP, str_to_flag,
 };
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
 use crate::sam_global::current_global_args;
 use crate::version::SAMTOOLS_VERSION;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct StatsConfig {
     remove_dups: bool,
+    required_flags: u32,
+    filter_flags: u32,
+    id_filter: Option<String>,
+    insert_size_max: u32,
+    insert_size_main_bulk: f64,
+    read_length_filter: Option<usize>,
+    trim_quality: u8,
     coverage_min: u32,
     coverage_max: u32,
     coverage_step: u32,
+    cov_threshold: u32,
 }
 
 impl Default for StatsConfig {
     fn default() -> Self {
         Self {
             remove_dups: false,
+            required_flags: 0,
+            filter_flags: 0,
+            id_filter: None,
+            insert_size_max: 8000,
+            insert_size_main_bulk: 0.99,
+            read_length_filter: None,
+            trim_quality: 0,
             coverage_min: 1,
             coverage_max: 1000,
             coverage_step: 1,
+            cov_threshold: 0,
         }
     }
 }
@@ -83,8 +99,100 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     }
                 }
             }
-            "-@" | "--threads" | "-r" | "--reference" | "-l" | "--read-length" | "-I" | "--id"
-            | "-S" | "--split" | "-P" | "--split-prefix" | "-g" | "--cov-threshold" | "-G" => {
+            "-g" | "--cov-threshold" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("stats", "option -g requires an argument");
+                    return ExitCode::from(1);
+                };
+                match raw.parse::<u32>() {
+                    Ok(threshold) => config.cov_threshold = threshold,
+                    Err(e) => {
+                        print_error(
+                            "stats",
+                            format!("invalid coverage threshold \"{raw}\": {e}"),
+                        );
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            "-f" | "--required-flag" => match parse_flag_value(iter.next(), s) {
+                Ok(flags) => config.required_flags = flags,
+                Err(()) => return ExitCode::from(1),
+            },
+            "-F" | "--filtering-flag" => match parse_flag_value(iter.next(), s) {
+                Ok(flags) => config.filter_flags |= flags,
+                Err(()) => return ExitCode::from(1),
+            },
+            "-I" | "--id" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("stats", "option -I requires an argument");
+                    return ExitCode::from(1);
+                };
+                config.id_filter = Some(raw.to_owned());
+            }
+            "-i" | "--insert-size" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("stats", "option -i requires an argument");
+                    return ExitCode::from(1);
+                };
+                match raw.parse::<u32>() {
+                    Ok(max) => config.insert_size_max = max,
+                    Err(e) => {
+                        print_error("stats", format!("invalid insert size \"{raw}\": {e}"));
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            "-m" | "--most-inserts" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("stats", "option -m requires an argument");
+                    return ExitCode::from(1);
+                };
+                match raw.parse::<f64>() {
+                    Ok(value) if value.is_finite() && value >= 0.0 => {
+                        config.insert_size_main_bulk = value
+                    }
+                    Ok(_) => {
+                        print_error("stats", format!("invalid most-inserts value \"{raw}\""));
+                        return ExitCode::from(1);
+                    }
+                    Err(e) => {
+                        print_error(
+                            "stats",
+                            format!("invalid most-inserts value \"{raw}\": {e}"),
+                        );
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            "-l" | "--read-length" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("stats", "option -l requires an argument");
+                    return ExitCode::from(1);
+                };
+                match raw.parse::<usize>() {
+                    Ok(len) => config.read_length_filter = Some(len),
+                    Err(e) => {
+                        print_error("stats", format!("invalid read length \"{raw}\": {e}"));
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            "-q" | "--trim-quality" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("stats", "option -q requires an argument");
+                    return ExitCode::from(1);
+                };
+                match raw.parse::<u8>() {
+                    Ok(trim_quality) => config.trim_quality = trim_quality,
+                    Err(e) => {
+                        print_error("stats", format!("invalid trim quality \"{raw}\": {e}"));
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            "-@" | "--threads" | "-r" | "--reference" | "-S" | "--split" | "-P"
+            | "--split-prefix" | "-G" => {
                 let _ = iter.next();
             }
             "-d" | "--remove-dups" => {
@@ -147,6 +255,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if config.cov_threshold > 0 && parsed_regions.is_empty() {
+        print_error(
+            "stats",
+            "Coverage percentage calculation requires a list of target regions",
+        );
+        return ExitCode::from(1);
+    }
 
     enum StatsInput {
         Summaries(Vec<AlignmentRecordSummary>),
@@ -166,13 +281,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
 
     let stats_input = match format.exact {
-        Exact::Sam if parsed_regions.is_empty() => collect_sam_full_stats(&input, config)
+        Exact::Sam if parsed_regions.is_empty() => collect_sam_full_stats(&input, &config)
             .map(|counts| StatsInput::Counts(Box::new(counts))),
-        Exact::Sam => collect_sam_region_stats(&input, &parsed_regions, config)
+        Exact::Sam => collect_sam_region_stats(&input, &parsed_regions, &config)
             .map(|counts| StatsInput::Counts(Box::new(counts))),
-        Exact::Bam if parsed_regions.is_empty() => collect_bam_full_stats(&input, config)
+        Exact::Bam if parsed_regions.is_empty() => collect_bam_full_stats(&input, &config)
             .map(|counts| StatsInput::Counts(Box::new(counts))),
-        Exact::Bam => collect_bam_region_stats(&input, &parsed_regions, config)
+        Exact::Bam => collect_bam_region_stats(&input, &parsed_regions, &config)
             .map(|counts| StatsInput::Counts(Box::new(counts))),
         Exact::Cram => {
             let Some(reference) = current_global_args().reference else {
@@ -185,7 +300,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 )
                 .map(StatsInput::Summaries)
             } else {
-                collect_cram_region_stats(&input, reference, &parsed_regions, config)
+                collect_cram_region_stats(&input, reference, &parsed_regions, &config)
                     .map(|counts| StatsInput::Counts(Box::new(counts)))
             }
         }
@@ -216,13 +331,18 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let is_sorted = header_sort_order
-        .as_deref()
-        .map(|so| so == "coordinate")
-        .unwrap_or(false);
     let write_result = match stats_input {
-        StatsInput::Summaries(summaries) => write_stats(&mut writer, &summaries, config, is_sorted),
-        StatsInput::Counts(counts) => write_stats_counts(&mut writer, &counts, config, is_sorted),
+        StatsInput::Summaries(summaries) => {
+            let is_sorted = header_sort_order
+                .as_deref()
+                .map(|so| so == "coordinate")
+                .unwrap_or(false);
+            write_stats(&mut writer, &summaries, config, is_sorted)
+        }
+        StatsInput::Counts(counts) => {
+            let is_sorted = counts.is_coordinate_sorted();
+            write_stats_counts(&mut writer, &counts, config, is_sorted)
+        }
     };
     if let Err(e) = write_result {
         if e.kind() == io::ErrorKind::BrokenPipe {
@@ -263,12 +383,8 @@ fn read_nm_aux(rec: &(impl sam::alignment::Record + ?Sized)) -> Option<u64> {
 }
 
 /// Returns the `SO:` value from the input's `@HD` line, lower-cased, or
-/// `None` if the header has no sort-order tag. Mirrors how upstream's
-/// `samtools stats` populates the `is sorted` summary line: a coordinate-
-/// sorted header reports `1`, everything else reports `0`. Without per-
-/// record position tracking we trust the header tag here, which differs
-/// from upstream's runtime check when the header claims coordinate sort
-/// but the records are not actually in order.
+/// `None` if the header has no sort-order tag. This is only used for
+/// summary-only paths that cannot currently inspect full records.
 fn read_input_header_sort_order(
     input: &std::path::Path,
     exact: Exact,
@@ -319,6 +435,18 @@ fn parse_coverage_range(raw: &str) -> Result<(u32, u32, u32), String> {
         ));
     }
     Ok((min, max, step))
+}
+
+fn parse_flag_value(value: Option<&OsString>, option: &str) -> Result<u32, ()> {
+    let Some(raw) = value.and_then(|a| a.to_str()) else {
+        print_error("stats", format!("option {option} requires an argument"));
+        return Err(());
+    };
+    let Some(flags) = str_to_flag(raw) else {
+        print_error("stats", format!("Unknown flag '{}'", raw));
+        return Err(());
+    };
+    Ok(flags as u32)
 }
 
 fn read_target_regions(path: &std::path::Path) -> io::Result<Vec<Region>> {
@@ -425,27 +553,92 @@ fn region_targets(header: &sam::Header, regions: &[Region]) -> io::Result<Vec<Re
         .collect()
 }
 
+fn target_base_count(targets: &[RegionTarget]) -> u64 {
+    let mut intervals: Vec<_> = targets
+        .iter()
+        .map(|target| (target.tid, target.start, target.end))
+        .collect();
+    intervals.sort_unstable();
+
+    let mut total = 0u64;
+    let mut current: Option<(usize, usize, usize)> = None;
+    for (tid, start, end) in intervals {
+        match current {
+            Some((cur_tid, cur_start, cur_end)) if cur_tid == tid && start <= cur_end + 1 => {
+                current = Some((cur_tid, cur_start, cur_end.max(end)));
+            }
+            Some((_, cur_start, cur_end)) => {
+                total += (cur_end - cur_start + 1) as u64;
+                current = Some((tid, start, end));
+            }
+            None => current = Some((tid, start, end)),
+        }
+    }
+    if let Some((_, start, end)) = current {
+        total += (end - start + 1) as u64;
+    }
+    total
+}
+
+fn matching_read_group_ids(header: &sam::Header, id: Option<&str>) -> Option<HashSet<String>> {
+    let requested = id?;
+    let sample_tag = sam::header::record::value::map::read_group::tag::SAMPLE;
+    Some(
+        header
+            .read_groups()
+            .iter()
+            .filter_map(|(rg_id, rg)| {
+                let id_matches = rg_id.as_slice() == requested.as_bytes();
+                let sample_matches = rg
+                    .other_fields()
+                    .get(&sample_tag)
+                    .is_some_and(|sample| sample.as_slice() == requested.as_bytes());
+                if id_matches || sample_matches {
+                    Some(String::from_utf8_lossy(rg_id.as_slice()).into_owned())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    )
+}
+
+fn record_read_group(rec: &(impl sam::alignment::Record + ?Sized)) -> io::Result<Option<String>> {
+    use sam::alignment::record::data::field::{Tag, Value};
+    let rg_tag = Tag::from([b'R', b'G']);
+    let data = rec.data();
+    let Some(value) = data.get(&rg_tag).transpose()? else {
+        return Ok(None);
+    };
+    match value {
+        Value::String(s) => Ok(Some(s.to_string())),
+        _ => Ok(None),
+    }
+}
+
 /// Iterates all SAM records to build a `StatsCounts` with sequence-length
 /// and quality accumulators populated (which the `summarize_*` path can
 /// not provide because `AlignmentRecordSummary` discards sequence and
 /// quality data).
-fn collect_sam_full_stats(input: &PathBuf, config: StatsConfig) -> io::Result<StatsCounts> {
+fn collect_sam_full_stats(input: &PathBuf, config: &StatsConfig) -> io::Result<StatsCounts> {
     let mut reader = File::open(input)
         .map(BufReader::new)
         .map(sam::io::Reader::new)?;
     let header = reader.read_header()?;
+    let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
     let mut counts = StatsCounts::default();
     for result in reader.records() {
         let record = result?;
-        counts.update_record(&header, &record, config);
+        counts.update_record(&header, &record, config, read_group_filter.as_ref());
     }
     Ok(counts)
 }
 
-fn collect_bam_full_stats(input: &PathBuf, config: StatsConfig) -> io::Result<StatsCounts> {
+fn collect_bam_full_stats(input: &PathBuf, config: &StatsConfig) -> io::Result<StatsCounts> {
     use htslib_rs::bam;
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let header = reader.read_header()?;
+    let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
     let mut counts = StatsCounts::default();
     let mut record = bam::Record::default();
     loop {
@@ -453,7 +646,7 @@ fn collect_bam_full_stats(input: &PathBuf, config: StatsConfig) -> io::Result<St
         if n == 0 {
             break;
         }
-        counts.update_record(&header, &record, config);
+        counts.update_record(&header, &record, config, read_group_filter.as_ref());
     }
     Ok(counts)
 }
@@ -461,14 +654,18 @@ fn collect_bam_full_stats(input: &PathBuf, config: StatsConfig) -> io::Result<St
 fn collect_sam_region_stats(
     input: &PathBuf,
     regions: &[Region],
-    config: StatsConfig,
+    config: &StatsConfig,
 ) -> io::Result<StatsCounts> {
     let mut reader = File::open(input)
         .map(BufReader::new)
         .map(sam::io::Reader::new)?;
     let header = reader.read_header()?;
+    let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
     let targets = region_targets(&header, regions)?;
-    let mut counts = StatsCounts::default();
+    let mut counts = StatsCounts {
+        target_bases: target_base_count(&targets),
+        ..Default::default()
+    };
     let mut seen = HashSet::new();
 
     for result in reader.records() {
@@ -476,7 +673,13 @@ fn collect_sam_region_stats(
         if record_overlaps_targets(&header, &record, &targets)
             && seen.insert(record_identity(&header, &record))
         {
-            counts.update_record_with_targets(&header, &record, config, Some(&targets));
+            counts.update_record_with_targets(
+                &header,
+                &record,
+                config,
+                read_group_filter.as_ref(),
+                Some(&targets),
+            );
         }
     }
 
@@ -486,16 +689,26 @@ fn collect_sam_region_stats(
 fn collect_bam_region_stats(
     input: &PathBuf,
     regions: &[Region],
-    config: StatsConfig,
+    config: &StatsConfig,
 ) -> io::Result<StatsCounts> {
     let header = htslib_rs::alignment_compat::read_bam_header_from_path(input)?;
+    let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
     let targets = region_targets(&header, regions)?;
-    let mut counts = StatsCounts::default();
+    let mut counts = StatsCounts {
+        target_bases: target_base_count(&targets),
+        ..Default::default()
+    };
     let mut seen = HashSet::new();
     for region in regions {
         for record in htslib_rs::alignment_compat::query_bam_records_from_path(input, region)? {
             if seen.insert(record_identity(&header, &record)) {
-                counts.update_record_with_targets(&header, &record, config, Some(&targets));
+                counts.update_record_with_targets(
+                    &header,
+                    &record,
+                    config,
+                    read_group_filter.as_ref(),
+                    Some(&targets),
+                );
             }
         }
     }
@@ -506,18 +719,28 @@ fn collect_cram_region_stats(
     input: &PathBuf,
     reference: PathBuf,
     regions: &[Region],
-    config: StatsConfig,
+    config: &StatsConfig,
 ) -> io::Result<StatsCounts> {
     let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
+    let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
     let targets = region_targets(&header, regions)?;
-    let mut counts = StatsCounts::default();
+    let mut counts = StatsCounts {
+        target_bases: target_base_count(&targets),
+        ..Default::default()
+    };
     let mut seen = HashSet::new();
     for region in regions {
         for record in htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
             input, region, &reference,
         )? {
             if seen.insert(record_identity(&header, &record)) {
-                counts.update_record_with_targets(&header, &record, config, Some(&targets));
+                counts.update_record_with_targets(
+                    &header,
+                    &record,
+                    config,
+                    read_group_filter.as_ref(),
+                    Some(&targets),
+                );
             }
         }
     }
@@ -610,12 +833,10 @@ struct StatsCounts {
     isize_inward: u64,
     isize_outward: u64,
     isize_other: u64,
-    // Per-record abs(template_length) accumulators across the same
-    // population that feeds the orientation bins. Used to compute the
-    // mean / standard deviation reported in SN.
-    isize_sum: u64,
-    isize_sum_sq: f64,
-    isize_count: u64,
+    // Per-record abs(template_length) histogram across the same population
+    // that feeds the orientation bins. Used to apply `-m/--most-inserts`
+    // before computing the reported mean / standard deviation.
+    isize_hist: BTreeMap<u64, u64>,
     // Sequence-length and quality accumulators (only populated when the
     // collection path has access to record-level data — currently SAM /
     // BAM iteration and any region path, but not the CRAM-non-region
@@ -633,6 +854,7 @@ struct StatsCounts {
     first_gc_hist: BTreeMap<u16, u64>,
     last_gc_hist: BTreeMap<u16, u64>,
     coverage_depths: BTreeMap<(usize, usize), u32>,
+    target_bases: u64,
     // Bases mapped (sum of sequence lengths for mapped reads, ignoring
     // clipping), bases mapped from CIGAR (sum of M/=/X ops), and total
     // NM aux values across reads. Used for the `bases mapped`,
@@ -642,6 +864,18 @@ struct StatsCounts {
     nmismatches: u64,
     // Sum of sequence lengths for records carrying the duplicate flag.
     bases_dup: u64,
+    bases_trimmed: u64,
+    last_sort_position: Option<(usize, usize)>,
+    sort_order_violation: bool,
+}
+
+struct StatsRecordFields {
+    flag: u32,
+    mapq: Option<u8>,
+    reference_sequence_id: Option<usize>,
+    mate_reference_sequence_id: Option<usize>,
+    template_length: i32,
+    read_len: Option<usize>,
 }
 
 impl StatsCounts {
@@ -649,18 +883,29 @@ impl StatsCounts {
         &mut self,
         header: &sam::Header,
         rec: &(impl sam::alignment::Record + ?Sized),
-        config: StatsConfig,
+        config: &StatsConfig,
+        read_group_filter: Option<&HashSet<String>>,
     ) {
-        self.update_record_with_targets(header, rec, config, None);
+        self.update_record_with_targets(header, rec, config, read_group_filter, None);
     }
 
     fn update_record_with_targets(
         &mut self,
         header: &sam::Header,
         rec: &(impl sam::alignment::Record + ?Sized),
-        config: StatsConfig,
+        config: &StatsConfig,
+        read_group_filter: Option<&HashSet<String>>,
         targets: Option<&[RegionTarget]>,
     ) {
+        if let Some(allowed_read_groups) = read_group_filter {
+            let Ok(Some(read_group)) = record_read_group(rec) else {
+                return;
+            };
+            if !allowed_read_groups.contains(&read_group) {
+                return;
+            }
+        }
+
         let Ok(flags) = rec.flags() else {
             return;
         };
@@ -675,14 +920,18 @@ impl StatsCounts {
             .transpose()
             .unwrap_or_default();
         let template_length = rec.template_length().ok().unwrap_or(0);
+        let seq_len = rec.sequence().len();
 
         let pre_total = self.total;
         self.update(
-            flag,
-            mapq,
-            reference_sequence_id,
-            mate_reference_sequence_id,
-            template_length,
+            StatsRecordFields {
+                flag,
+                mapq,
+                reference_sequence_id,
+                mate_reference_sequence_id,
+                template_length,
+                read_len: Some(seq_len),
+            },
             config,
         );
 
@@ -690,22 +939,29 @@ impl StatsCounts {
         // reads that were not filtered out by `--remove-dups` — i.e. the
         // ones that contributed to `total`.
         if self.total > pre_total {
-            let seq_len = rec.sequence().len() as u32;
-            if seq_len > 0 {
-                self.total_len += u64::from(seq_len);
-                if seq_len > self.max_len {
-                    self.max_len = seq_len;
+            if flag & BAM_FUNMAP == 0
+                && let Ok(Some(start)) = rec.alignment_start().transpose()
+                && let Some(tid) = reference_sequence_id
+            {
+                self.update_sort_order(tid, usize::from(start));
+            }
+
+            let seq_len_u32 = seq_len as u32;
+            if seq_len_u32 > 0 {
+                self.total_len += u64::from(seq_len_u32);
+                if seq_len_u32 > self.max_len {
+                    self.max_len = seq_len_u32;
                 }
                 if flag & BAM_FREAD1 != 0 {
-                    self.total_len_1st += u64::from(seq_len);
-                    if seq_len > self.max_len_1st {
-                        self.max_len_1st = seq_len;
+                    self.total_len_1st += u64::from(seq_len_u32);
+                    if seq_len_u32 > self.max_len_1st {
+                        self.max_len_1st = seq_len_u32;
                     }
                 }
                 if flag & BAM_FREAD2 != 0 {
-                    self.total_len_2nd += u64::from(seq_len);
-                    if seq_len > self.max_len_2nd {
-                        self.max_len_2nd = seq_len;
+                    self.total_len_2nd += u64::from(seq_len_u32);
+                    if seq_len_u32 > self.max_len_2nd {
+                        self.max_len_2nd = seq_len_u32;
                     }
                 }
             }
@@ -719,12 +975,20 @@ impl StatsCounts {
                     increment_quality_hist(&mut self.last_qual_hist, cycle, q);
                 }
             }
-
-            if flag & BAM_FDUP != 0 {
-                self.bases_dup += u64::from(seq_len);
+            if config.trim_quality > 0 {
+                let reverse = flag & BAM_FREVERSE != 0;
+                self.bases_trimmed += u64::from(bwa_trim_read(
+                    config.trim_quality,
+                    rec.quality_scores().iter().flatten(),
+                    reverse,
+                ));
             }
 
-            if seq_len > 0 {
+            if flag & BAM_FDUP != 0 {
+                self.bases_dup += u64::from(seq_len_u32);
+            }
+
+            if seq_len_u32 > 0 {
                 let gc_percent = gc_percent_hundredths(rec.sequence().iter());
                 if flag & BAM_FREAD1 != 0 {
                     *self.first_gc_hist.entry(gc_percent).or_default() += 1;
@@ -735,7 +999,7 @@ impl StatsCounts {
             }
 
             if flag & BAM_FUNMAP == 0 {
-                self.bases_mapped += u64::from(seq_len);
+                self.bases_mapped += u64::from(seq_len_u32);
                 use sam::alignment::record::cigar::op::Kind;
                 for op in rec.cigar().iter().flatten() {
                     if matches!(
@@ -751,6 +1015,19 @@ impl StatsCounts {
                 self.update_coverage_depths(header, rec, targets);
             }
         }
+    }
+
+    fn is_coordinate_sorted(&self) -> bool {
+        !self.sort_order_violation
+    }
+
+    fn update_sort_order(&mut self, tid: usize, pos: usize) {
+        if let Some((last_tid, last_pos)) = self.last_sort_position
+            && (tid < last_tid || (tid == last_tid && pos < last_pos))
+        {
+            self.sort_order_violation = true;
+        }
+        self.last_sort_position = Some((tid, pos));
     }
 
     fn update_coverage_depths(
@@ -798,26 +1075,43 @@ impl StatsCounts {
         }
     }
 
-    fn update_summary(&mut self, rec: &AlignmentRecordSummary, config: StatsConfig) {
+    fn update_summary(&mut self, rec: &AlignmentRecordSummary, config: &StatsConfig) {
         self.update(
-            rec.flags_u16() as u32,
-            rec.mapping_quality(),
-            rec.reference_sequence_id(),
-            rec.mate_reference_sequence_id(),
-            rec.template_length(),
+            StatsRecordFields {
+                flag: rec.flags_u16() as u32,
+                mapq: rec.mapping_quality(),
+                reference_sequence_id: rec.reference_sequence_id(),
+                mate_reference_sequence_id: rec.mate_reference_sequence_id(),
+                template_length: rec.template_length(),
+                read_len: None,
+            },
             config,
         );
     }
 
-    fn update(
-        &mut self,
-        flag: u32,
-        mapq: Option<u8>,
-        reference_sequence_id: Option<usize>,
-        mate_reference_sequence_id: Option<usize>,
-        template_length: i32,
-        config: StatsConfig,
-    ) {
+    fn update(&mut self, rec: StatsRecordFields, config: &StatsConfig) {
+        let flag = rec.flag;
+        if config.required_flags != 0 && flag & config.required_flags != config.required_flags {
+            self.raw_total += 1;
+            self.filtered += 1;
+            return;
+        }
+        if config.filter_flags != 0 && flag & config.filter_flags != 0 {
+            self.raw_total += 1;
+            self.filtered += 1;
+            return;
+        }
+        if config.remove_dups && flag & BAM_FDUP != 0 {
+            self.raw_total += 1;
+            self.filtered += 1;
+            return;
+        }
+        if config
+            .read_length_filter
+            .is_some_and(|required_len| rec.read_len != Some(required_len))
+        {
+            return;
+        }
         if flag & BAM_FSECONDARY != 0 {
             self.secondary += 1;
             return;
@@ -827,15 +1121,11 @@ impl StatsCounts {
             return;
         }
         self.raw_total += 1;
-        if config.remove_dups && flag & BAM_FDUP != 0 {
-            self.filtered += 1;
-            return;
-        }
         self.total += 1;
 
         if flag & BAM_FUNMAP == 0 {
             self.mapped += 1;
-            if mapq == Some(0) {
+            if rec.mapq == Some(0) {
                 self.mq0 += 1;
             }
         } else {
@@ -854,16 +1144,16 @@ impl StatsCounts {
             }
             if flag & BAM_FUNMAP == 0 && flag & BAM_FMUNMAP == 0 {
                 self.mapped_and_paired += 1;
-                if reference_sequence_id != mate_reference_sequence_id
-                    && reference_sequence_id.is_some()
-                    && mate_reference_sequence_id.is_some()
+                if rec.reference_sequence_id != rec.mate_reference_sequence_id
+                    && rec.reference_sequence_id.is_some()
+                    && rec.mate_reference_sequence_id.is_some()
                 {
                     self.diffchr += 1;
                 }
-                if reference_sequence_id == mate_reference_sequence_id
-                    && reference_sequence_id.is_some()
+                if rec.reference_sequence_id == rec.mate_reference_sequence_id
+                    && rec.reference_sequence_id.is_some()
                 {
-                    self.update_isize_bin(flag, template_length);
+                    self.update_isize_bin(flag, rec.template_length, config.insert_size_max);
                 }
             }
             if flag & BAM_FMUNMAP != 0 && flag & BAM_FUNMAP == 0 {
@@ -887,13 +1177,14 @@ impl StatsCounts {
     /// with opposite strands is FR (inward) when the leftmost read is
     /// forward, and RF (outward) otherwise. Same-direction pairs are
     /// classified as "other".
-    fn update_isize_bin(&mut self, flag: u32, template_length: i32) {
+    fn update_isize_bin(&mut self, flag: u32, template_length: i32, insert_size_max: u32) {
         let read_reverse = flag & BAM_FREVERSE != 0;
         let mate_reverse = flag & 0x20 /* BAM_FMREVERSE */ != 0;
-        let isize = template_length.unsigned_abs() as u64;
-        self.isize_count += 1;
-        self.isize_sum = self.isize_sum.saturating_add(isize);
-        self.isize_sum_sq += (isize as f64) * (isize as f64);
+        let mut isize = template_length.unsigned_abs() as u64;
+        if insert_size_max > 0 {
+            isize = isize.min(u64::from(insert_size_max));
+        }
+        *self.isize_hist.entry(isize).or_default() += 1;
 
         if read_reverse == mate_reverse {
             self.isize_other += 1;
@@ -923,6 +1214,35 @@ fn increment_quality_hist(hist: &mut Vec<[u64; 256]>, cycle: usize, quality: u8)
     hist[cycle][usize::from(quality)] += 1;
 }
 
+fn bwa_trim_read(trim_quality: u8, qualities: impl IntoIterator<Item = u8>, reverse: bool) -> u32 {
+    const BWA_MIN_READ_LEN: usize = 35;
+    let qualities: Vec<_> = qualities.into_iter().collect();
+    if qualities.len() < BWA_MIN_READ_LEN {
+        return 0;
+    }
+
+    let max_trimmed = qualities.len() - BWA_MIN_READ_LEN + 1;
+    let mut sum = 0i32;
+    let mut max_sum = 0i32;
+    let mut max_l = 0u32;
+    for l in 0..max_trimmed {
+        let q = if reverse {
+            qualities[l]
+        } else {
+            qualities[qualities.len() - 1 - l]
+        };
+        sum += i32::from(trim_quality) - i32::from(q);
+        if sum < 0 {
+            break;
+        }
+        if sum > max_sum {
+            max_sum = sum;
+            max_l = l as u32;
+        }
+    }
+    max_l
+}
+
 fn gc_percent_hundredths(bases: impl IntoIterator<Item = u8>) -> u16 {
     let mut len = 0u64;
     let mut gc = 0u64;
@@ -947,7 +1267,7 @@ fn write_stats(
 ) -> io::Result<()> {
     let mut counts = StatsCounts::default();
     for rec in recs {
-        counts.update_summary(rec, config);
+        counts.update_summary(rec, &config);
     }
     write_stats_counts(out, &counts, config, is_sorted)
 }
@@ -1005,7 +1325,7 @@ fn write_stats_counts(
         "SN\tbases mapped (cigar):\t{}",
         counts.bases_mapped_cigar
     )?;
-    writeln!(out, "SN\tbases trimmed:\t0")?;
+    writeln!(out, "SN\tbases trimmed:\t{}", counts.bases_trimmed)?;
     writeln!(out, "SN\tbases duplicated:\t{}", counts.bases_dup)?;
     writeln!(out, "SN\tmismatches:\t{}", counts.nmismatches)?;
     let error_rate = if counts.bases_mapped_cigar > 0 {
@@ -1055,17 +1375,8 @@ fn write_stats_counts(
     writeln!(out, "SN\taverage quality:\t{:.1}", avg_quality)?;
     writeln!(out, "SN\tsingletons:\t{}", counts.singletons)?;
 
-    let avg_isize = if counts.isize_count > 0 {
-        counts.isize_sum as f64 / counts.isize_count as f64
-    } else {
-        0.0
-    };
-    let sd_isize = if counts.isize_count > 0 {
-        let mean_sq = counts.isize_sum_sq / counts.isize_count as f64;
-        (mean_sq - avg_isize * avg_isize).max(0.0).sqrt()
-    } else {
-        0.0
-    };
+    let (avg_isize, sd_isize) =
+        insert_size_mean_sd(&counts.isize_hist, config.insert_size_main_bulk);
     writeln!(out, "SN\tinsert size average:\t{:.1}", avg_isize)?;
     writeln!(out, "SN\tinsert size standard deviation:\t{:.1}", sd_isize)?;
     writeln!(
@@ -1099,10 +1410,61 @@ fn write_stats_counts(
         "SN\tpercentage of properly paired reads (%):\t{:.1}",
         proper_pct
     )?;
+    if counts.target_bases > 0 {
+        writeln!(out, "SN\tbases inside the target:\t{}", counts.target_bases)?;
+        let covered_above_threshold = counts
+            .coverage_depths
+            .values()
+            .filter(|&&depth| depth > config.cov_threshold)
+            .count() as u64;
+        let target_pct = 100.0 * covered_above_threshold as f64 / counts.target_bases as f64;
+        writeln!(
+            out,
+            "SN\tpercentage of target genome with coverage > {} (%):\t{:.2}",
+            config.cov_threshold, target_pct
+        )?;
+    }
     write_quality_histograms(out, counts)?;
     write_gc_histograms(out, counts)?;
     write_coverage_histogram(out, counts, config)?;
     Ok(())
+}
+
+fn insert_size_mean_sd(isize_hist: &BTreeMap<u64, u64>, main_bulk: f64) -> (f64, f64) {
+    let total: u64 = isize_hist.values().sum();
+    if total == 0 {
+        return (0.0, 0.0);
+    }
+
+    let mut selected = Vec::new();
+    let mut selected_count = 0_u64;
+    let mut selected_sum = 0.0;
+    for (&isize, &count) in isize_hist {
+        if count == 0 {
+            continue;
+        }
+        selected.push((isize, count));
+        selected_count = selected_count.saturating_add(count);
+        selected_sum += isize as f64 * count as f64;
+        if selected_count as f64 / total as f64 > main_bulk {
+            break;
+        }
+    }
+
+    if selected_count == 0 {
+        return (0.0, 0.0);
+    }
+
+    let avg = selected_sum / selected_count as f64;
+    let variance = selected
+        .iter()
+        .map(|(isize, count)| {
+            let delta = *isize as f64 - avg;
+            *count as f64 * delta * delta
+        })
+        .sum::<f64>()
+        / selected_count as f64;
+    (avg, variance.max(0.0).sqrt())
 }
 
 fn write_quality_histograms(out: &mut dyn Write, counts: &StatsCounts) -> io::Result<()> {
@@ -1221,7 +1583,48 @@ fn write_coverage_histogram(
 fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
     writeln!(w, "Usage: samtools stats [options] <in.bam>")?;
-    writeln!(w, "  -o FILE      output FILE")?;
+    writeln!(w, "  -o, --output FILE             output FILE")?;
+    writeln!(
+        w,
+        "  -f, --required-flag FLAG      require all FLAG bits or names"
+    )?;
+    writeln!(
+        w,
+        "  -F, --filtering-flag FLAG     filter records with any FLAG bits or names"
+    )?;
+    writeln!(
+        w,
+        "  -I, --id ID                   include only read group ID or sample"
+    )?;
+    writeln!(
+        w,
+        "  -i, --insert-size INT         maximum insert size for summaries"
+    )?;
+    writeln!(
+        w,
+        "  -m, --most-inserts FLOAT     report only the main insert-size bulk"
+    )?;
+    writeln!(
+        w,
+        "  -l, --read-length LEN         include only records with sequence length LEN"
+    )?;
+    writeln!(
+        w,
+        "  -q, --trim-quality QUAL       BWA trim quality parameter"
+    )?;
+    writeln!(
+        w,
+        "  -c, --coverage MIN,MAX,STEP   coverage histogram bucket range"
+    )?;
+    writeln!(
+        w,
+        "  -g, --cov-threshold DEPTH     target coverage percentage threshold"
+    )?;
+    writeln!(w, "  -t, --target-regions FILE     BED-like target regions")?;
+    writeln!(
+        w,
+        "  -d, --remove-dups             filter duplicate records"
+    )?;
     writeln!(w)?;
     writeln!(
         w,

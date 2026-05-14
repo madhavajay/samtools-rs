@@ -32,7 +32,8 @@ samtools-rs status legend:
   - `sam_hdr_add_pg` equivalent — ❌ (needed for non-`--no-PG` paths)
   - `hts_expr_*` filter evaluation — ✅ via `htslib_rs::expr` (audit needed)
   - Aux-tag filter / remove (`-x`, `--keep-tag`) — implemented for SAM output and SAM-input BAM/CRAM output; BAM/CRAM-input binary aux mutation still needs deeper mutable-record support — ⚠️
-- **samtools-rs status:** 🟡 (SAM/BAM/reference-backed CRAM count/text/BAM/CRAM paths, stdin paths, region/BED queries, simple filters, expression filters, SAM-output `-U`/`-p`, and SAM-input aux stripping work; BAM/CRAM-input binary aux mutation, binary `-U`/`-p`, multi-file inputs, paired filters, and full CRAM parity remain)
+  - Shared sanitizer mutation (`-z`/`--sanitize`) — implemented through text-record rewrites / text roundtrips for supported view output paths — ⚠️
+- **samtools-rs status:** 🟡 (SAM/BAM/reference-backed CRAM count/text/BAM/CRAM paths, stdin paths, region/BED queries, simple filters, expression filters, SAM-output `-U`/`-p`, SAM-input aux stripping, and `-z` sanitizer mutation work; BAM/CRAM-input binary aux mutation, binary `-U`/`-p`, multi-file inputs, paired filters, and full CRAM parity remain)
 
 ### head
 
@@ -57,7 +58,7 @@ samtools-rs status legend:
 - **C source:** `bam_index.c`
 - **HTSlib APIs used:** `sam_index_build3`, `sam_index_build`, `sam_index_save`, `hts_set_threads`, `bgzf_check_EOF`
 - **htslib-rs coverage:** ✅ via `htslib_rs::index_compat::build_bai` / `build_bam_csi` / `build_cram_crai`
-- **samtools-rs status:** 🟡 — `-Q`, `-g`/`-G`, `-H`, `-c`, and `-d` implemented with SAM/BAM/reference-backed CRAM input; exact pileup parity remains.
+- **samtools-rs status:** ✅ — BAI/CSI/CRAI build, `-c` CSI mode, `--min-shift`, `-M`, `-o`, and legacy `<in> <out.idx>` synopsis are implemented; `-@` threads are not yet propagated to noodles workers.
 
 ### idxstats
 
@@ -66,29 +67,28 @@ samtools-rs status legend:
 - **htslib-rs coverage:** ⚠️
   - `read_associated_bam_index` returns `Box<dyn csi::BinningIndex>` — ✅
   - Per-reference mapped/unmapped counts from index meta — needs accessor — ❌ (must extend `htslib-rs::index_compat`)
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** 🟡 — BAM index counts exist, with streaming slow-path counts for SAM, reference-backed CRAM, and unindexed BAM; index-derived CRAM counting without an explicit reference and full harness parity remain.
 
 ### faidx / fqidx
 
 - **C source:** `faidx.c`
 - **HTSlib APIs used:** `fai_build`, `fai_load`, `fai_fetch`, `faidx_fetch_seq64`, `fai_destroy`
 - **htslib-rs coverage:** ✅ via `htslib_rs::faidx_compat::build_index`, `read_index`, `write_index`, `fetch_sequence`, `fetch_region_sequence`
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** 🟡 — FASTA/FASTQ index build and local region extraction work, including BGZF input with `.gzi`, region files, `-o`, BGZF output, `--length`, `--write-index`, `faidx -f`, reverse-complement `-i`, mark-strand modes, and missing/truncated-region handling; exact warning text parity, compression-level/thread effects, and broader BGZI edge cases remain.
 
 ### dict
 
 - **C source:** `dict.c`
 - **HTSlib APIs used:** `gzopen`, `kseq_*`, `hts_md5_*` — only HTSlib's md5 wrapper is used; everything else is its own FASTA reader
 - **htslib-rs coverage:** 🟦 (use `noodles-fasta` for FASTA iteration + `md-5` crate for MD5)
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** ✅ — sequence dictionary output matches upstream `dict.out`, `dict.alias.out`, and `dict.alt.out` fixtures byte-for-byte.
 
 ### flagstat
 
 - **C source:** `bam_stat.c`
 - **HTSlib APIs used:** `sam_open_format`, `sam_hdr_read`, `sam_read1`, `hts_set_threads`, `hts_set_opt` (CRAM_OPT_REQUIRED_FIELDS)
-- **htslib-rs coverage:** ⚠️
-  - Full BAM record iteration with access to `flag`, `tid`, `mtid`, `qual` — not yet exposed via a public accessor on `AlignmentRecordSummary` (private fields). Must extend `htslib-rs::alignment_compat` to expose accessors or add a streaming record iterator. — ❌
-- **samtools-rs status:** ⬜
+- **htslib-rs coverage:** ✅ — `AlignmentRecordSummary` exposes flag/reference/mate/mapq accessors, with SAM/BAM/reference-backed CRAM summary helpers.
+- **samtools-rs status:** 🟡 — SAM, BAM, and reference-backed CRAM input are implemented with default text, `-O json`, and `-O tsv` output; CRAM input without an explicit reference remains unsupported.
 
 ## Wave B — File Operations
 
@@ -100,26 +100,26 @@ samtools-rs status legend:
   - Streaming write — ✅
   - Custom per-record sort key extraction — ✅ partial for coordinate, query-name, and aux-tag keys
   - Multi-way merge — ❌
-- **samtools-rs status:** 🟡 — in-memory coordinate, query-name, and aux-tag sort works for BAM and SAM inputs; external merge, template/minimiser sorts, write-index, thread/memory caps, and CRAM remain.
+- **samtools-rs status:** 🟡 — in-memory coordinate, query-name, and aux-tag sort works for BAM, SAM, and reference-backed CRAM inputs; external merge, template/minimiser sorts, write-index, thread/memory caps, and CRAM output remain.
 
 ### merge
 
 - **C source:** `bam_sort.c::bam_merge_core`
 - **HTSlib APIs used:** as above
-- **samtools-rs status:** 🟡 — in-memory coordinate and query-name merge works for BAM and SAM inputs, with `-R region` and `-L BED` restriction for indexed BAM; streaming k-way merge, header reconciliation for differing `@SQ`, and CRAM remain.
+- **samtools-rs status:** 🟡 — in-memory coordinate, query-name, and `-t TAG` merge works for BAM and SAM inputs, including differing `@SQ` union/remap, compatible same-name `@SQ` metadata union with conflict rejection, compatible `@HD` metadata union with conflict rejection, compatible `@RG`/`@PG` union, `@CO` comment preservation, stdout `-`, accepted `-s`, `--output-fmt=FORMAT`, `-b FILE` input lists, and `-R region` / `-L BED` restriction for indexed BAM; streaming k-way merge, broader header reconciliation beyond `@HD`/`@SQ`/`@RG`/`@PG`/`@CO`, and CRAM remain.
 
 ### collate / bamshuf
 
 - **C source:** `bamshuf.c`
 - **HTSlib APIs used:** `sam_open_format`, `sam_read1`, `sam_write1`, BGZF temp file I/O
-- **samtools-rs status:** 🟡 — in-memory name grouping works for BAM and SAM inputs; on-disk hash bucketing, random seed, record cap, and CRAM remain.
+- **samtools-rs status:** 🟡 — in-memory name grouping works for BAM, SAM, and reference-backed CRAM inputs, including `-f` fast primary-pair mode, `-r` working-read cap, accepted `-n INT` temp-count compatibility, legacy positional output prefixes, `-o`/`-O` conflict validation, and upstream-style `@HD SO:unsorted GO:query`; on-disk hash bucketing and CRAM output remain.
 
 ### cat
 
 - **C source:** `bam_cat.c`
 - **HTSlib APIs used:** BGZF passthrough — fast concatenation without re-decompression
 - **htslib-rs coverage:** ⚠️ — BGZF block-level concatenation is not yet a first-class API in `htslib-rs::bgzf_compat`. Must be added. — ❌
-- **samtools-rs status:** 🟡 — record-level SAM and BAM concatenation works with `-o`, `-h`, default `@PG` insertion, `--no-PG`, and `-r region` for indexed BAM; BGZF block-level fast path, CRAM, and `-p` remain.
+- **samtools-rs status:** 🟡 — record-level SAM and BAM concatenation works with `-o`, `-h`, `-b FILE` input lists, default `@PG` insertion, `--no-PG`, and `-r region` for indexed BAM; BGZF block-level fast path, CRAM, and `-p` remain.
 
 ### split
 
@@ -146,13 +146,13 @@ samtools-rs status legend:
 - **C source:** `bam_fastq.c` (~48k LOC)
 - **HTSlib APIs used:** record iteration, aux tag access for barcodes/QT/RX/QX
 - **htslib-rs coverage:** ⚠️ — `view_sam_as_fastq_text_from_path_with_limit` exists; full feature set (paired/single, barcode-aware) needs more
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** 🟡 — SAM/BAM FASTQ/FASTA conversion supports basic single-output and split-output paths, flag filters, read-name suffix controls, selected/all aux comments, aux-tag filtering, `-t`, FASTQ `-O` original-quality `OQ` tags, `-v INT` missing-quality defaults, `-U`/`--UMI-tag` UMI read-name suffixes, and `-i`/`--barcode-tag` CASAVA barcode fields; index FASTQ files, exact name-grouped routing, and CRAM remain.
 
 ### import
 
 - **C source:** `bam_import.c`
 - **HTSlib APIs used:** FASTA/FASTQ reading + SAM/BAM/CRAM writing
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** 🟡 — single FASTA/FASTQ, paired FASTQ, `-0` singleton input alongside paired `-1`/`-2`, positional interleaved FASTQ, index reads, CASAVA/SRA name parsing, UMI/barcode/comment aux tags, read-group header/tag support, and SAM/BAM output are implemented for the covered fixtures; full paired singleton/other grouping parity, full read-group parity, and CRAM output remain.
 
 ## Wave C — Editing / Mate-aware
 
@@ -161,14 +161,14 @@ samtools-rs status legend:
 - **C source:** `bam_mate.c` (~43k LOC)
 - **HTSlib APIs used:** record iteration, mate-flag/pos rewriting, MC/MQ tag updates
 - **htslib-rs coverage:** ⚠️ — basic mutable record rewriting works through `RecordBuf`; direct `bam_aux_*` parity is still useful for deeper aux-tag behavior.
-- **samtools-rs status:** 🟡 — basic adjacent name-sorted mate flag/reference/position fixup works for BAM and SAM inputs, including default MC/MQ mate tags and `-r`; `-c`/`-m`, mate rescore, and CRAM remain.
+- **samtools-rs status:** 🟡 — basic adjacent name-sorted mate flag/reference/position fixup works for BAM and SAM inputs, including coordinate-sort rejection, TLEN recalculation, default MC/MQ mate tags, `-m` mate-score tags, `-c` template-CIGAR `ct` tags, default sanitizer mutation matching the upstream `sanitize.sam` fixture, and `-r`; mate rescore, base-modification `-M` parity, and CRAM remain.
 
 ### markdup
 
 - **C source:** `bam_markdup.c` (~89k LOC)
 - **HTSlib APIs used:** name-sort grouping, position-sort grouping, barcode parsing, duplicate marking via flag updates
 - **htslib-rs coverage:** ⚠️ — mutable SAM/BAM `RecordBuf` paths cover current flag and aux-tag reads; indexed/streaming parity and CRAM remain.
-- **samtools-rs status:** 🟡 — single-end and paired-end duplicate marking for SAM/BAM exists with optional barcode-key grouping (`-b`/`--barcode-tag`), secondary/supplementary qname propagation, `-r`, `-s`, `-O`, `-o`, default `@PG`, and `--no-PG`; optical duplicate distance, full stats, and CRAM remain.
+- **samtools-rs status:** 🟡 — single-end and paired-end duplicate marking for SAM/BAM exists with optional barcode-key grouping (`-b`/`--barcode-tag`), duplicate flag/tag clearing (`-c`), `-S` compatibility for supplementary propagation, `-t` duplicate-origin `do` tags, `-d` optical-distance duplicate classification with `dt:Z:SQ`/`dt:Z:LB` tags, default QCFAIL exclusion with `--include-fails` override, validated `-m t|s`/`--mode t|s` compatibility, optical-aware estimated library size in `-s` stats, secondary/supplementary qname propagation, `-r`, upstream-shaped `-s` summary fields, `-O`, `-o`, default `@PG`, and `--no-PG`; exact stats/count parity and CRAM remain.
 
 ### rmdup
 
@@ -226,7 +226,7 @@ samtools-rs status legend:
 
 - **C source:** `stats.c` (~123k LOC) + `stats_isize.c`
 - **HTSlib APIs used:** record iteration, CIGAR analysis, base/qual histograms, GC bias, insert-size distribution
-- **samtools-rs status:** 🟡 — `SN` summary numbers, FFQ/LFQ quality histograms, GCF/GCL GC histograms, and approximate CIGAR-walk COV coverage histograms with `-c`/`--coverage` bin ranges are implemented for SAM, BAM, reference-backed CRAM, SAM/indexed BAM/reference-backed CRAM positional regions, and SAM/indexed BAM/reference-backed CRAM `-t` target files, with overlapping BAM/CRAM regions de-duplicated. `-d` / `--remove-dups` filters duplicate-marked primary records from the summary and record-level histograms; exact pileup-backed COV parity, per-cycle metrics, and CRAM without explicit reference remain.
+- **samtools-rs status:** 🟡 — `SN` summary numbers, runtime `is sorted` for record-backed paths, record-backed `-I`/`--id` read-group/sample filtering, `-f`/`--required-flag`, `-F`/`--filtering-flag`, `-i`/`--insert-size` insert-size capping, `-m`/`--most-inserts` insert-size bulk selection, record-backed `-l`/`--read-length`, `-q`/`--trim-quality` BWA trim counting, FFQ/LFQ quality histograms, GCF/GCL GC histograms, and approximate CIGAR-walk COV coverage histograms with `-c`/`--coverage` bin ranges and `-g`/`--cov-threshold` target percentage lines with target-region validation are implemented for SAM, BAM, reference-backed CRAM, SAM/indexed BAM/reference-backed CRAM positional regions, and SAM/indexed BAM/reference-backed CRAM `-t` target files, with overlapping BAM/CRAM regions de-duplicated. `-d` / `--remove-dups` filters duplicate-marked primary records from the summary and record-level histograms; exact pileup-backed COV parity, per-cycle metrics, and CRAM without explicit reference remain.
 
 ### mpileup
 
@@ -248,7 +248,7 @@ samtools-rs status legend:
 ### depad / pad2unpad
 
 - **C source:** `padding.c`
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** 🟡 — SAM input with `-T` padded FASTA reference and `-s` SAM output converts padded reference columns to unpadded coordinates/CIGAR and matches the upstream `depad.001` fixture with `--no-PG`; BAM input/output, CRAM, binary output modes, and full harness parity remain.
 
 ### ampliconstats
 
@@ -267,19 +267,19 @@ samtools-rs status legend:
 - **C source:** `bam_checksum.c` (~47k LOC)
 - **HTSlib APIs used:** `sam_open_format`, `sam_hdr_read`, `sam_read1`, `bam_aux_*`, `bam_sanitize`, `hts_crc32`, `hts_set_threads`
 - **htslib-rs coverage:** ⚠️ — SAM/BAM record iteration is available; whole-CRAM record iteration and lower-level raw aux/CIGAR byte access still need coverage for full parity.
-- **samtools-rs status:** 🟡 — default SAM/BAM checksum output works with read-group grouping, flag filters/masks, reverse-complement handling, selected and wildcard/exclusion scalar/string/array aux tags with canonical integer encoding, `-N`, `-o`, `-q`, `-v`, `-T`, `-O`, `-P` position columns, `-C` CIGAR columns, `-M` mate columns, `-B` bamseqchksum-compatible formatting, and `-m` merging for default/position/CIGAR/mate-column checksum reports; CRAM, all-field mode, and sanitizer mutation remain.
+- **samtools-rs status:** 🟡 — default SAM/BAM checksum output works with read-group grouping, flag filters/masks, reverse-complement handling, selected and wildcard/exclusion scalar/string/array aux tags with canonical integer encoding, `-N`, `-o`, `-q`, `-v`, `-T`, `-O`, `-P` position columns, `-C` CIGAR columns, `-M` mate columns, `-B` bamseqchksum-compatible formatting, `-a` all-field shorthand with upstream-style sanitizer defaults, `-z`/`--sanitize` record mutation, and `-m` merging for default/position/CIGAR/mate-column checksum reports; CRAM and full harness parity remain.
 
 ### samples
 
 - **C source:** `bam_samples.c`
 - **HTSlib APIs used:** `sam_hdr_*` to list `@RG` SM values
 - **htslib-rs coverage:** ✅
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** ✅ — lists `@RG SM:` samples across inputs with header-driven de-duplication, `-T`, `-o`, `-h`, `-i`, `-f`/`-F`, stdin path lists, `-X` custom index pairs, and CRAM headers.
 
 ### reference
 
 - **C source:** `reference.c`
-- **samtools-rs status:** 🟡 — SAM/BAM MD-tag reconstruction to FASTA works with `-o`, `-q`, and basic `-r` region output; CRAM input, embedded-reference extraction (`-e`), indexed region iteration, and full upstream parity remain.
+- **samtools-rs status:** 🟡 — SAM/BAM MD-tag reconstruction to FASTA works with `-o`, `-q`, basic `-r` region output, and indexed BAM region iteration when an associated BAI/CSI is present; CRAM input, embedded-reference extraction (`-e`), and full upstream parity remain.
 
 ### flags
 

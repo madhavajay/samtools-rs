@@ -5,8 +5,7 @@
 //! paired up and their `FMUNMAP`/`FMREVERSE` flags + `mate_reference_sequence_id`
 //! + `mate_alignment_start` are made consistent.
 //!
-//! **Not yet supported:** record-level sanitizer mutation, `-c` (calculate CT),
-//! `-m` (add ms score), CRAM input/output.
+//! **Not yet supported:** CRAM input/output.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -29,7 +28,7 @@ use htslib_rs::sam::{
 
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
-use crate::sanitize::{SanitizeFlags, parse_sanitize_options};
+use crate::sanitize::{SanitizeFlags, parse_sanitize_options, sanitize_record};
 
 /// Entry point for `samtools fixmate`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -44,8 +43,6 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-
-    let _ = opts.sanitize_flags; // Parsed for parity; record mutation is still TODO.
 
     let Some(input) = opts.input else {
         let _ = print_usage();
@@ -68,12 +65,18 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     let pg_argv = if opts.no_pg { None } else { Some(args) };
+    let settings = FixmateSettings {
+        remove_reads: opts.remove_reads,
+        mate_score: opts.mate_score,
+        add_template_cigar: opts.add_template_cigar,
+        sanitize_flags: opts.sanitize_flags.unwrap_or(SanitizeFlags::ALL),
+    };
     match run_fixmate(
         &input,
         opts.output.as_deref(),
         opts.output_fmt,
         pg_argv,
-        opts.remove_reads,
+        settings,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -94,6 +97,10 @@ struct Opts {
     /// clear `PROPER_PAIR` / `MATE_REVERSE` on a pair where one mate is
     /// unmapped (mirrors upstream's `remove_reads`).
     remove_reads: bool,
+    /// `-m`: add `ms:i` mate score tags for duplicate marking.
+    mate_score: bool,
+    /// `-c`: add lowercase `ct:Z` template CIGAR tag.
+    add_template_cigar: bool,
 }
 
 impl Default for Opts {
@@ -105,6 +112,8 @@ impl Default for Opts {
             sanitize_flags: None,
             no_pg: false,
             remove_reads: false,
+            mate_score: false,
+            add_template_cigar: false,
         }
     }
 }
@@ -124,11 +133,7 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
         match s {
             "-O" | "--output-fmt" => {
                 let v = next_value(&mut iter, s)?;
-                opts.output_fmt = match v.to_lowercase().as_str() {
-                    "sam" => OutFmt::Sam,
-                    "bam" => OutFmt::Bam,
-                    _ => OutFmt::Bam,
-                };
+                opts.output_fmt = parse_output_fmt(&v);
             }
             "-@" | "--threads" | "-l" => {
                 let _ = next_value(&mut iter, s)?;
@@ -143,7 +148,22 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
             "-r" => {
                 opts.remove_reads = true;
             }
-            "-c" | "-m" | "-p" => {
+            "-m" => {
+                opts.mate_score = true;
+            }
+            "-c" => {
+                opts.add_template_cigar = true;
+            }
+            _ if s.starts_with("-cO") => {
+                opts.add_template_cigar = true;
+                let v = if s.len() > 3 {
+                    s[3..].to_owned()
+                } else {
+                    next_value(&mut iter, "-O")?
+                };
+                opts.output_fmt = parse_output_fmt(&v);
+            }
+            "-p" => {
                 // Accepted but not yet implemented.
             }
             "--help" => return Err(ParseError::Usage),
@@ -163,6 +183,14 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
     Ok(opts)
 }
 
+fn parse_output_fmt(raw: &str) -> OutFmt {
+    match raw.to_lowercase().as_str() {
+        "sam" => OutFmt::Sam,
+        "bam" => OutFmt::Bam,
+        _ => OutFmt::Bam,
+    }
+}
+
 fn next_value<'a, I>(iter: &mut I, option: &str) -> Result<String, ParseError>
 where
     I: Iterator<Item = &'a OsString>,
@@ -178,17 +206,25 @@ enum OutFmt {
     Bam,
 }
 
+#[derive(Clone, Copy)]
+struct FixmateSettings {
+    remove_reads: bool,
+    mate_score: bool,
+    add_template_cigar: bool,
+    sanitize_flags: SanitizeFlags,
+}
+
 fn run_fixmate(
     input: &Path,
     output: Option<&Path>,
     fmt: OutFmt,
     pg_argv: Option<&[OsString]>,
-    remove_reads: bool,
+    settings: FixmateSettings,
 ) -> io::Result<()> {
     let format = sam_io::sam_open_format(input)?;
     match format.exact {
-        Exact::Sam => run_fixmate_sam(input, output, fmt, pg_argv, remove_reads),
-        Exact::Bam => run_fixmate_bam(input, output, fmt, pg_argv, remove_reads),
+        Exact::Sam => run_fixmate_sam(input, output, fmt, pg_argv, settings),
+        Exact::Bam => run_fixmate_bam(input, output, fmt, pg_argv, settings),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "only SAM and BAM input are currently supported (CRAM TODO)",
@@ -201,10 +237,11 @@ fn run_fixmate_bam(
     output: Option<&Path>,
     fmt: OutFmt,
     pg_argv: Option<&[OsString]>,
-    remove_reads: bool,
+    settings: FixmateSettings,
 ) -> io::Result<()> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let mut header = reader.read_header()?;
+    reject_coordinate_sorted(&header)?;
     if let Some(argv) = pg_argv {
         header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
     }
@@ -216,16 +253,19 @@ fn run_fixmate_bam(
         if n == 0 {
             break;
         }
+        sanitize_record(&header, &mut next, settings.sanitize_flags);
         write_fixed_record(
             &header,
             sink.as_mut(),
             &mut pending,
             next.clone(),
-            remove_reads,
+            settings.remove_reads,
+            settings.mate_score,
+            settings.add_template_cigar,
         )?;
     }
     if let Some(rec) = pending
-        && !skip_for_remove_reads(&rec, remove_reads)
+        && !skip_for_remove_reads(&rec, settings.remove_reads)
     {
         sink.write_record(&header, &rec)?;
     }
@@ -237,10 +277,11 @@ fn run_fixmate_sam(
     output: Option<&Path>,
     fmt: OutFmt,
     pg_argv: Option<&[OsString]>,
-    remove_reads: bool,
+    settings: FixmateSettings,
 ) -> io::Result<()> {
     let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
     let mut header = reader.read_header()?;
+    reject_coordinate_sorted(&header)?;
     if let Some(argv) = pg_argv {
         header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
     }
@@ -252,20 +293,46 @@ fn run_fixmate_sam(
         if n == 0 {
             break;
         }
+        sanitize_record(&header, &mut next, settings.sanitize_flags);
         write_fixed_record(
             &header,
             sink.as_mut(),
             &mut pending,
             next.clone(),
-            remove_reads,
+            settings.remove_reads,
+            settings.mate_score,
+            settings.add_template_cigar,
         )?;
     }
     if let Some(rec) = pending
-        && !skip_for_remove_reads(&rec, remove_reads)
+        && !skip_for_remove_reads(&rec, settings.remove_reads)
     {
         sink.write_record(&header, &rec)?;
     }
     Ok(())
+}
+
+fn reject_coordinate_sorted(header: &sam::Header) -> io::Result<()> {
+    let is_coordinate_sorted = header
+        .header()
+        .as_ref()
+        .and_then(|hd| {
+            hd.other_fields()
+                .get(&sam::header::record::value::map::header::tag::SORT_ORDER)
+        })
+        .is_some_and(|value| {
+            let bytes: &[u8] = value.as_ref();
+            bytes.eq_ignore_ascii_case(b"coordinate")
+        });
+
+    if is_coordinate_sorted {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Coordinate sorted, require grouped/sorted by queryname.",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// `-r` skips secondary and unmapped alignments from the output.
@@ -283,6 +350,8 @@ fn write_fixed_record(
     pending: &mut Option<RecordBuf>,
     next: RecordBuf,
     remove_reads: bool,
+    mate_score: bool,
+    add_template_cigar: bool,
 ) -> io::Result<()> {
     match pending.take() {
         None => *pending = Some(next),
@@ -290,7 +359,7 @@ fn write_fixed_record(
             let prev_name = prev.name().map(|n| n.to_vec());
             let next_name = next.name().map(|n| n.to_vec());
             if prev_name == next_name && next_name.is_some() {
-                let (a, b) = pair_fixmate(prev, next, remove_reads);
+                let (a, b) = pair_fixmate(prev, next, remove_reads, mate_score, add_template_cigar);
                 if !skip_for_remove_reads(&a, remove_reads) {
                     sink.write_record(header, &a)?;
                 }
@@ -309,7 +378,13 @@ fn write_fixed_record(
     Ok(())
 }
 
-fn pair_fixmate(mut a: RecordBuf, mut b: RecordBuf, remove_reads: bool) -> (RecordBuf, RecordBuf) {
+fn pair_fixmate(
+    mut a: RecordBuf,
+    mut b: RecordBuf,
+    remove_reads: bool,
+    mate_score: bool,
+    add_template_cigar: bool,
+) -> (RecordBuf, RecordBuf) {
     let a_tid = a.reference_sequence_id();
     let b_tid = b.reference_sequence_id();
     let a_pos = a.alignment_start();
@@ -318,6 +393,14 @@ fn pair_fixmate(mut a: RecordBuf, mut b: RecordBuf, remove_reads: bool) -> (Reco
     apply_mate_flags(&mut b, &a);
     update_mate_aux_tags(&mut a, &b);
     update_mate_aux_tags(&mut b, &a);
+    update_template_lengths(&mut a, &mut b);
+    if add_template_cigar {
+        update_template_cigar_tag(&mut a, &mut b);
+    }
+    if mate_score {
+        update_mate_score_tag(&mut a, &b);
+        update_mate_score_tag(&mut b, &a);
+    }
     *a.mate_reference_sequence_id_mut() = b_tid;
     *b.mate_reference_sequence_id_mut() = a_tid;
     *a.mate_alignment_start_mut() = b_pos;
@@ -343,6 +426,98 @@ fn pair_fixmate(mut a: RecordBuf, mut b: RecordBuf, remove_reads: bool) -> (Reco
     (a, b)
 }
 
+fn update_template_lengths(a: &mut RecordBuf, b: &mut RecordBuf) {
+    let tlen = if a.flags().is_unmapped()
+        || b.flags().is_unmapped()
+        || a.reference_sequence_id().is_none()
+        || a.reference_sequence_id() != b.reference_sequence_id()
+    {
+        None
+    } else {
+        match (five_prime_position(a), five_prime_position(b)) {
+            (Some(a5), Some(b5)) => Some((b5 - a5, a5 - b5)),
+            _ => None,
+        }
+    };
+
+    match tlen {
+        Some((a_tlen, b_tlen)) => {
+            *a.template_length_mut() = i32::try_from(a_tlen).unwrap_or(0);
+            *b.template_length_mut() = i32::try_from(b_tlen).unwrap_or(0);
+        }
+        None => {
+            *a.template_length_mut() = 0;
+            *b.template_length_mut() = 0;
+        }
+    }
+}
+
+fn five_prime_position(record: &RecordBuf) -> Option<i64> {
+    if record.flags().is_reverse_complemented() {
+        record.alignment_end().map(|pos| pos.get() as i64)
+    } else {
+        record.alignment_start().map(|pos| pos.get() as i64 - 1)
+    }
+}
+
+fn update_template_cigar_tag(a: &mut RecordBuf, b: &mut RecordBuf) {
+    let ct_tag = Tag::from([b'c', b't']);
+    a.data_mut().remove(&ct_tag);
+    b.data_mut().remove(&ct_tag);
+
+    if a.flags().is_unmapped()
+        || b.flags().is_unmapped()
+        || a.reference_sequence_id().is_none()
+        || a.reference_sequence_id() != b.reference_sequence_id()
+    {
+        return;
+    }
+
+    let (Some(a_start), Some(b_start)) = (a.alignment_start(), b.alignment_start()) else {
+        return;
+    };
+    let (Some(a_end), Some(b_end)) = (a.alignment_end(), b.alignment_end()) else {
+        return;
+    };
+
+    let (left, left_start, left_end, right, right_start) = if a_start > b_start {
+        (b, b_start, b_end, a, a_start)
+    } else {
+        (a, a_start, a_end, b, b_start)
+    };
+
+    let gap = right_start.get() as isize - left_end.get() as isize - 1;
+    let ct = format!(
+        "{}{}{}{}T{}{}{}",
+        segment_index(left),
+        strand(left),
+        format_cigar(left.cigar()),
+        gap,
+        segment_index(right),
+        strand(right),
+        format_cigar(right.cigar())
+    );
+    debug_assert!(left_start <= right_start);
+    left.data_mut()
+        .insert(ct_tag, Value::String(BString::from(ct)));
+}
+
+fn segment_index(record: &RecordBuf) -> char {
+    if record.flags().is_first_segment() {
+        '1'
+    } else {
+        '2'
+    }
+}
+
+fn strand(record: &RecordBuf) -> char {
+    if record.flags().is_reverse_complemented() {
+        'R'
+    } else {
+        'F'
+    }
+}
+
 fn apply_mate_flags(target: &mut RecordBuf, mate: &RecordBuf) {
     let mut flags = target.flags();
     flags.insert(Flags::SEGMENTED);
@@ -357,6 +532,21 @@ fn apply_mate_flags(target: &mut RecordBuf, mate: &RecordBuf) {
         flags.remove(Flags::MATE_REVERSE_COMPLEMENTED);
     }
     *target.flags_mut() = flags;
+}
+
+fn update_mate_score_tag(target: &mut RecordBuf, mate: &RecordBuf) {
+    target
+        .data_mut()
+        .insert(Tag::from([b'm', b's']), Value::from(mate_score(mate)));
+}
+
+fn mate_score(record: &RecordBuf) -> u32 {
+    record
+        .quality_scores()
+        .iter()
+        .filter(|&quality| quality >= 15)
+        .map(u32::from)
+        .sum()
 }
 
 fn update_mate_aux_tags(target: &mut RecordBuf, mate: &RecordBuf) {
@@ -469,6 +659,8 @@ fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
     writeln!(w, "Usage: samtools fixmate [options] <in.bam> [<out.bam>]")?;
     writeln!(w, "  -O sam|bam   output format (default: bam)")?;
+    writeln!(w, "  -m           add mate score tags")?;
+    writeln!(w, "  -c           add template CIGAR ct tag")?;
     writeln!(w, "  -z, --sanitize FLAG[,FLAG]")?;
     Ok(())
 }

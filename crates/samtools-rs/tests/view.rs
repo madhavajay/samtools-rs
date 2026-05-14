@@ -384,6 +384,39 @@ fn view_sam_to_bam_output_strips_tags_with_expr() {
 }
 
 #[test]
+fn view_sanitize_mutates_sam_output_records() {
+    let tmp = tmp_dir("sanitize-sam");
+    let input = tmp.join("input.sam");
+    let out = tmp.join("out.sam");
+
+    std::fs::write(
+        &input,
+        b"@HD\tVN:1.6\n@SQ\tSN:ref\tLN:100\nr1\t4\tref\t1\t20\t2M\t*\t0\t0\tAC\t!!\tNM:i:1\tMD:Z:1A\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        run(&[
+            "-z",
+            "all",
+            "-o",
+            out.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let record = text.lines().find(|line| !line.starts_with('@')).unwrap();
+    let fields: Vec<&str> = record.split('\t').collect();
+    assert_eq!(fields[0], "r1");
+    assert_eq!(fields[4], "0");
+    assert_eq!(fields[5], "*");
+    assert!(!record.contains("\tNM:i:"));
+    assert!(!record.contains("\tMD:Z:"));
+}
+
+#[test]
 fn view_sam_to_cram_output_honors_mapq_filter() {
     let tmp = tmp_dir("sam-cram-line-filter");
     let out = tmp.join("out.cram");

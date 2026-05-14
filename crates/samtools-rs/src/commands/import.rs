@@ -5,8 +5,8 @@
 //! SAM records are unmapped, with paired FASTQ records using the standard
 //! unmapped read1/read2 flags.
 //!
-//! **Not yet supported:** paired singleton/other grouping (`-0` with paired
-//! inputs), full read group validation, CRAM output.
+//! **Not yet supported:** paired singleton/other grouping beyond `-0` with
+//! paired inputs, full read group validation, CRAM output.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -209,13 +209,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let explicit_input_count = usize::from(single_input.is_some())
-        + usize::from(interleaved_input.is_some())
-        + usize::from(read1_input.is_some() || read2_input.is_some());
-    if explicit_input_count > 1 {
+    if interleaved_input.is_some()
+        && (single_input.is_some() || read1_input.is_some() || read2_input.is_some())
+    {
         print_error(
             "import",
-            "single-end, interleaved, and paired -1/-2 inputs are mutually exclusive",
+            "interleaved input cannot be combined with -0 or paired -1/-2 inputs",
         );
         return ExitCode::from(1);
     }
@@ -267,6 +266,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         let inputs = PairedFastqInputs {
             read1: &read1,
             read2: &read2,
+            single: single_input.as_deref(),
             index1: index1_input.as_deref(),
             index2: index2_input.as_deref(),
             index_on_both_reads,
@@ -465,6 +465,7 @@ fn stream_fastx_as_sam(
 struct PairedFastqInputs<'a> {
     read1: &'a std::path::Path,
     read2: &'a std::path::Path,
+    single: Option<&'a std::path::Path>,
     index1: Option<&'a std::path::Path>,
     index2: Option<&'a std::path::Path>,
     index_on_both_reads: bool,
@@ -502,6 +503,11 @@ fn stream_paired_fastq_as_sam(
         )?;
     }
 
+    if let Some(single) = inputs.single {
+        let single_reader = open_text_reader(single)?;
+        htslib_rs::fastq_compat::write_sam_from_fastq(single_reader, &mut buf, options)?;
+    }
+
     let reverse_comment = if inputs.index1.is_some() || inputs.index2.is_some() {
         let mut comment = String::from("Reverse with: samtools fastq");
         let mut index_format = String::new();
@@ -514,6 +520,9 @@ fn stream_paired_fastq_as_sam(
             index_format.push_str("i*");
         }
         comment.push_str(" -1 R1.fastq -2 R2.fastq");
+        if inputs.single.is_some() {
+            comment.push_str(" -0 unpaired.fastq");
+        }
         if !index_format.is_empty() {
             comment.push_str(" --index-format=\"");
             comment.push_str(&index_format);
@@ -521,8 +530,15 @@ fn stream_paired_fastq_as_sam(
         }
         Some(comment)
     } else {
-        read_group_header
-            .map(|_| String::from("Reverse with: samtools fastq -1 R1.fastq -2 R2.fastq"))
+        read_group_header.map(|_| {
+            if inputs.single.is_some() {
+                String::from(
+                    "Reverse with: samtools fastq -1 R1.fastq -2 R2.fastq -0 unpaired.fastq",
+                )
+            } else {
+                String::from("Reverse with: samtools fastq -1 R1.fastq -2 R2.fastq")
+            }
+        })
     };
 
     write_import_output(

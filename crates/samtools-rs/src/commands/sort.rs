@@ -6,7 +6,7 @@
 //! and many auxiliary flags.
 //!
 //! This initial Rust port supports **in-memory coordinate, name, or tag sort
-//! for BAM/SAM**, which is sufficient for small/medium inputs. Records are
+//! for BAM/SAM/reference-backed CRAM**, which is sufficient for small/medium inputs. Records are
 //! sorted by `(reference_sequence_id, alignment_start)` for coordinate mode,
 //! by `qname` for name mode, or by `TAG` with coordinate/name secondary keys
 //! for tag mode, then written to the output.
@@ -21,12 +21,12 @@
 //!  - `--write-index` — write a BAI next to coordinate-sorted BAM output.
 //!
 //! Not yet supported: external merge (large inputs spill to disk),
-//! template-coordinate sort (`-M`), minimiser sort (`-N`), CRAM I/O.
+//! template-coordinate sort (`-M`), minimiser sort (`-N`), CRAM output.
 
 use std::cmp::Ordering;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -136,10 +136,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if !matches!(format.exact, Exact::Sam | Exact::Bam) {
+    if !matches!(format.exact, Exact::Sam | Exact::Bam | Exact::Cram) {
         print_error(
             "sort",
-            "only SAM and BAM input are currently supported (CRAM TODO)",
+            "only SAM, BAM, and reference-backed CRAM input are currently supported",
         );
         return ExitCode::from(1);
     }
@@ -213,10 +213,11 @@ pub(crate) fn run_sort(
     let (mut header, mut records) = match format.exact {
         Exact::Sam => read_sam_records(input)?,
         Exact::Bam => read_bam_records(input)?,
+        Exact::Cram => read_cram_records(input)?,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "only SAM and BAM input are currently supported (CRAM TODO)",
+                "only SAM, BAM, and reference-backed CRAM input are currently supported",
             ));
         }
     };
@@ -301,6 +302,30 @@ fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
 
 fn read_sam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
     let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
+    read_sam_records_from_reader(&mut reader)
+}
+
+fn read_cram_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+    let reference = current_global_args().reference.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CRAM input requires top-level --reference FILE",
+        )
+    })?;
+    let text =
+        htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+            input, reference, None,
+        )?;
+    let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(text)));
+    read_sam_records_from_reader(&mut reader)
+}
+
+fn read_sam_records_from_reader<R>(
+    reader: &mut sam::io::Reader<R>,
+) -> io::Result<(sam::Header, Vec<RecordBuf>)>
+where
+    R: BufRead,
+{
     let header = reader.read_header()?;
     let mut records = Vec::new();
     loop {
@@ -521,7 +546,7 @@ fn append_extension(path: &Path, ext: &str) -> PathBuf {
 
 fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
-    writeln!(w, "Usage: samtools sort [options] <in.bam|in.sam>")?;
+    writeln!(w, "Usage: samtools sort [options] <in.bam|in.sam|in.cram>")?;
     writeln!(
         w,
         "  -n              sort by read name (default: coordinate)"
