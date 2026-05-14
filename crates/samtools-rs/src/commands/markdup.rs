@@ -762,6 +762,11 @@ fn barcode_value(record: &RecordBuf, tag: Option<Tag>) -> Option<Vec<u8>> {
 fn write_markdup_stats(mut w: impl Write, stats: &MarkdupStats) -> io::Result<()> {
     let duplicate_primary_total = stats.duplicate_pair + stats.duplicate_single;
     let duplicate_total = duplicate_primary_total + stats.duplicate_non_primary;
+    let estimated_library_size = estimate_library_size(
+        stats.paired,
+        stats.duplicate_pair,
+        stats.duplicate_pair_optical,
+    );
     writeln!(w, "READ: {}", stats.read)?;
     writeln!(w, "WRITTEN: {}", stats.written)?;
     writeln!(w, "EXCLUDED: {}", stats.excluded)?;
@@ -788,8 +793,57 @@ fn write_markdup_stats(mut w: impl Write, stats: &MarkdupStats) -> io::Result<()
     )?;
     writeln!(w, "DUPLICATE PRIMARY TOTAL: {duplicate_primary_total}")?;
     writeln!(w, "DUPLICATE TOTAL: {duplicate_total}")?;
-    writeln!(w, "ESTIMATED_LIBRARY_SIZE: 0")?;
+    writeln!(w, "ESTIMATED_LIBRARY_SIZE: {estimated_library_size}")?;
     Ok(())
+}
+
+fn estimate_library_size(paired_reads: u64, paired_duplicate_reads: u64, optical: u64) -> u64 {
+    let non_optical_pairs = paired_reads.saturating_sub(optical) / 2;
+    let unique_pairs = paired_reads.saturating_sub(paired_duplicate_reads) / 2;
+    let duplicate_pairs = paired_duplicate_reads.saturating_sub(optical) / 2;
+
+    if non_optical_pairs == 0
+        || duplicate_pairs == 0
+        || unique_pairs == 0
+        || non_optical_pairs <= duplicate_pairs
+    {
+        return 0;
+    }
+
+    let unique_pairs_f = unique_pairs as f64;
+    let non_optical_pairs_f = non_optical_pairs as f64;
+    let mut lower = 1.0;
+    let mut upper = 100.0;
+
+    if coverage_equation(lower * unique_pairs_f, unique_pairs_f, non_optical_pairs_f) < 0.0 {
+        return 0;
+    }
+
+    while coverage_equation(upper * unique_pairs_f, unique_pairs_f, non_optical_pairs_f) > 0.0 {
+        upper *= 10.0;
+    }
+
+    for _ in 0..40 {
+        let midpoint = (lower + upper) / 2.0;
+        let value = coverage_equation(
+            midpoint * unique_pairs_f,
+            unique_pairs_f,
+            non_optical_pairs_f,
+        );
+        if value > 0.0 {
+            lower = midpoint;
+        } else if value < 0.0 {
+            upper = midpoint;
+        } else {
+            break;
+        }
+    }
+
+    (unique_pairs_f * (lower + upper) / 2.0) as u64
+}
+
+fn coverage_equation(x: f64, unique_pairs: f64, non_optical_pairs: f64) -> f64 {
+    unique_pairs / x - 1.0 + (-non_optical_pairs / x).exp()
 }
 
 trait Sink {
@@ -876,13 +930,13 @@ mod tests {
     #[test]
     fn markdup_stats_text_uses_upstream_field_names() {
         let stats = MarkdupStats {
-            read: 5,
-            written: 3,
+            read: 200,
+            written: 180,
             excluded: 0,
-            examined: 4,
-            paired: 2,
+            examined: 200,
+            paired: 200,
             single: 2,
-            duplicate_pair: 2,
+            duplicate_pair: 20,
             duplicate_single: 1,
             duplicate_pair_optical: 0,
             duplicate_single_optical: 0,
@@ -892,13 +946,20 @@ mod tests {
         let mut out = Vec::new();
         write_markdup_stats(&mut out, &stats).unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("READ: 5\n"));
-        assert!(text.contains("WRITTEN: 3\n"));
-        assert!(text.contains("DUPLICATE PAIR: 2\n"));
+        assert!(text.contains("READ: 200\n"));
+        assert!(text.contains("WRITTEN: 180\n"));
+        assert!(text.contains("DUPLICATE PAIR: 20\n"));
         assert!(text.contains("DUPLICATE SINGLE: 1\n"));
         assert!(text.contains("DUPLICATE NON PRIMARY: 1\n"));
-        assert!(text.contains("DUPLICATE PRIMARY TOTAL: 3\n"));
-        assert!(text.contains("DUPLICATE TOTAL: 4\n"));
-        assert!(text.contains("ESTIMATED_LIBRARY_SIZE: 0\n"));
+        assert!(text.contains("DUPLICATE PRIMARY TOTAL: 21\n"));
+        assert!(text.contains("DUPLICATE TOTAL: 22\n"));
+        assert!(text.contains("ESTIMATED_LIBRARY_SIZE: 466\n"));
+    }
+
+    #[test]
+    fn estimate_library_size_subtracts_optical_pairs() {
+        assert_eq!(estimate_library_size(200, 20, 0), 466);
+        assert_eq!(estimate_library_size(200, 20, 2), 510);
+        assert_eq!(estimate_library_size(20, 0, 0), 0);
     }
 }
