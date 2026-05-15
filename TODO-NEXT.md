@@ -62,7 +62,22 @@ quick fix — verified by probing):
   port the deterministic gen_unique_id call ORDER through
   `finish_merged_header`/`trans_tbl_add_{rg,pg}` (per-file, @RG then
   @PG-chain, bare-prefix-first) — multi-hundred-LOC but no longer any
-  PRNG unknowns.
+  PRNG unknowns. **Primitive DONE:** `crate::rand48` (`Rand48` +
+  `gen_unique_id`) is implemented, tested, and fixture-verified.
+  **Turn-key remaining steps:** (a) capture the `-s` seed in
+  `merge.rs` (line ~105, currently discarded) → `Rand48::new(seed)`;
+  (b) two-pass over each input's *raw* header (per file: @RG lines then
+  @PG lines, header order) — pass 1 builds per-file
+  `rg_trans`/`pg_trans` via `gen_unique_id` against shared seen-sets;
+  (c) emit raw merged header: input[0] @HD verbatim (NO forced
+  `SO:coordinate`), @SQ unioned by SN, @RG/@PG lines with ID/PG:/PP:
+  fields rewritten through the trans maps, @CO appended; (d) remap each
+  record's `RG:Z:`/`PG:Z:` via its source file's trans maps *before*
+  the global sort/append; (e) SAM output writes that raw text + records
+  via `sam_render::write_record` (keep BAM on the noodles path for now,
+  untested by fixtures); (f) update the `sort_merge` merge_* tests that
+  encode the old union/reject behavior to the upstream-correct
+  suffixed/raw expectations (cf. the sort SS test updates).
 - `markdup` → duplicate-selection / optical / stats algorithm parity
   (now *reads* the test_input_1_* fixtures via sam_compat). Key
   actionable detail: upstream keeps the read/pair with the highest
