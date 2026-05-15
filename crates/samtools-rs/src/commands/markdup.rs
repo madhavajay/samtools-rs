@@ -351,12 +351,35 @@ fn run_bam_markdup(
     let rg_of = compute_rg_of(&header, &records, options.use_read_groups);
     let mut stats = mark_duplicates(&mut records, options, &rg_of);
     stats.written = output_record_count(&records, options.remove_dups);
-    let mut sink = open_output(output, fmt, &header)?;
-    for rec in &records {
-        if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
-            continue;
+    if matches!(fmt, OutFmt::Sam) {
+        // Byte-faithful: emit the raw input header (preserving @RG/@SQ
+        // order) + the samtools @PG, then records via the float-correct
+        // renderer (mirrors merge/sort/ampliconclip).
+        let mut header_text = crate::header_text::read_raw_header_text(input)?;
+        if let Some(argv) = pg_argv {
+            header_text =
+                crate::pg::add_samtools_pg(&header_text, argv).map_err(io::Error::other)?;
         }
-        sink.write_record(&header, rec)?;
+        let mut out: Box<dyn Write> = match output {
+            Some(p) => Box::new(io::BufWriter::new(File::create(p)?)),
+            None => Box::new(io::BufWriter::new(io::stdout().lock())),
+        };
+        out.write_all(header_text.as_bytes())?;
+        for rec in &records {
+            if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
+                continue;
+            }
+            crate::sam_render::write_record(&mut out, &header, rec)?;
+        }
+        out.flush()?;
+    } else {
+        let mut sink = open_output(output, fmt, &header)?;
+        for rec in &records {
+            if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
+                continue;
+            }
+            sink.write_record(&header, rec)?;
+        }
     }
     if options.emit_stats {
         write_markdup_stats(&mut io::stderr().lock(), &stats)?;
@@ -390,12 +413,35 @@ fn run_sam_markdup(
     let rg_of = compute_rg_of(&header, &records, options.use_read_groups);
     let mut stats = mark_duplicates(&mut records, options, &rg_of);
     stats.written = output_record_count(&records, options.remove_dups);
-    let mut sink = open_output(output, fmt, &header)?;
-    for rec in &records {
-        if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
-            continue;
+    if matches!(fmt, OutFmt::Sam) {
+        // Byte-faithful: emit the raw input header (preserving @RG/@SQ
+        // order) + the samtools @PG, then records via the float-correct
+        // renderer (mirrors merge/sort/ampliconclip).
+        let mut header_text = crate::header_text::read_raw_header_text(input)?;
+        if let Some(argv) = pg_argv {
+            header_text =
+                crate::pg::add_samtools_pg(&header_text, argv).map_err(io::Error::other)?;
         }
-        sink.write_record(&header, rec)?;
+        let mut out: Box<dyn Write> = match output {
+            Some(p) => Box::new(io::BufWriter::new(File::create(p)?)),
+            None => Box::new(io::BufWriter::new(io::stdout().lock())),
+        };
+        out.write_all(header_text.as_bytes())?;
+        for rec in &records {
+            if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
+                continue;
+            }
+            crate::sam_render::write_record(&mut out, &header, rec)?;
+        }
+        out.flush()?;
+    } else {
+        let mut sink = open_output(output, fmt, &header)?;
+        for rec in &records {
+            if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
+                continue;
+            }
+            sink.write_record(&header, rec)?;
+        }
     }
     if options.emit_stats {
         write_markdup_stats(&mut io::stderr().lock(), &stats)?;

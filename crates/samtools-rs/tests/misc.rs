@@ -6405,6 +6405,11 @@ fn markdup_matches_upstream_test_markdup_fixtures() {
             "18_primary_duplicate_count",
             "18_primary_duplicate_count.expected.sam",
         ),
+        (
+            &["-d", "100", "--mode", "s", "-t", "--use-read-groups"],
+            "17_read_group",
+            "17_read_group.expected.sam",
+        ),
     ];
     for (flags, stem, expected) in cases {
         let inp = d.join("markdup").join(format!("{stem}.sam"));
