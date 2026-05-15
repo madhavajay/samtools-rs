@@ -48,6 +48,8 @@ struct Config {
     min_qual: u8,
     min_mqual: u8,
     all_bases: u8, // 0 none, 1 `-a`, 2 `-aa`
+    /// `-r`/`--region`: (ref name, 1-based beg, 1-based end).
+    region: Option<(String, usize, usize)>,
     ambig: bool,
     show_del: bool,
     show_ins: bool,
@@ -76,6 +78,7 @@ impl Default for Config {
             min_qual: 0,
             min_mqual: 0,
             all_bases: 0,
+            region: None,
             ambig: false,
             show_del: false,
             show_ins: true,
@@ -94,6 +97,32 @@ impl Default for Config {
 
 fn yes(v: Option<&str>) -> bool {
     matches!(v, Some(s) if s.starts_with('y') || s.starts_with('Y'))
+}
+
+/// Parse a `name`, `name:beg`, or `name:beg-end` region (1-based,
+/// inclusive); bare name spans the whole contig.
+fn parse_region_spec(spec: &str) -> Option<(String, usize, usize)> {
+    match spec.split_once(':') {
+        None => Some((spec.to_string(), 1, usize::MAX)),
+        Some((name, range)) => {
+            let range = range.replace(',', "");
+            let (b, e) = match range.split_once('-') {
+                Some((b, e)) => (
+                    b.parse().ok()?,
+                    if e.is_empty() {
+                        usize::MAX
+                    } else {
+                        e.parse().ok()?
+                    },
+                ),
+                None => {
+                    let b: usize = range.parse().ok()?;
+                    (b, b)
+                }
+            };
+            Some((name.to_string(), b.max(1), e))
+        }
+    }
 }
 
 /// Entry point for `samtools consensus`.
@@ -203,7 +232,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 }
             }
             "--no-PG" => {}
-            "-@" | "--threads" | "-r" | "--region" | "-T" | "--reference" => {
+            "-r" | "--region" => {
+                if let Some(spec) = iter.next().and_then(|a| a.to_str()) {
+                    cfg.region = parse_region_spec(spec);
+                }
+            }
+            "-@" | "--threads" | "-T" | "--reference" => {
                 let _ = iter.next();
             }
             _ if s.starts_with('-') && s != "-" => { /* tolerate */ }
@@ -505,6 +539,12 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
     let mut pileup_rows: Vec<u8> = Vec::new();
 
     for col in &columns {
+        // `-r region`: restrict to the named ref + [beg,end] (1-based).
+        if let Some((rn, rb, re)) = &cfg.region
+            && (&col.reference_name != rn || col.position < *rb || col.position > *re)
+        {
+            continue;
+        }
         let reads = &col.reads_by_input[0];
         if !by_ref.contains_key(&col.reference_name) {
             order.push(col.reference_name.clone());
@@ -550,7 +590,8 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
             // fill).
             if !rs.initialised {
                 rs.last_pos = if cfg.all_bases > 0 {
-                    0
+                    // Upstream: all_bases ? (iter ? iter.beg : 0) : pos-1.
+                    cfg.region.as_ref().map_or(0, |(_, b, _)| b - 1)
                 } else {
                     col.position - 1
                 };
@@ -624,7 +665,9 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
     };
     // Emit order: `-aa` walks every header @SQ; otherwise the
     // first-seen covered contigs.
-    let emit_names: Vec<String> = if cfg.all_bases >= 2 {
+    let emit_names: Vec<String> = if let Some((rn, _, _)) = &cfg.region {
+        vec![rn.clone()]
+    } else if cfg.all_bases >= 2 {
         ref_lens.iter().map(|(n, _)| n.clone()).collect()
     } else {
         order.clone()
@@ -646,19 +689,26 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
             }
         };
         let (seq, qual): (Vec<u8>, Vec<u32>) = if cfg.all_bases > 0 {
-            // Pad to the full reference length, no leading/trailing
-            // trim (leading + interior already filled during the
-            // column pass).
-            let len = ref_lens
+            // Pad to the full span, no leading/trailing trim (leading
+            // + interior already filled during the column pass). With
+            // `-r`, the span is the region (clamped to contig length);
+            // otherwise the whole contig.
+            let contig_len = ref_lens
                 .iter()
                 .find(|(n, _)| n == name)
                 .map_or(rs.seq.len(), |(_, l)| *l);
+            let len = match &cfg.region {
+                Some((_, b, e)) => e.min(&contig_len).saturating_sub(b - 1),
+                None => contig_len,
+            };
             let mut s = rs.seq.clone();
             let mut q = rs.qual.clone();
             while s.len() < len {
                 s.push(b'N');
                 q.push(0);
             }
+            s.truncate(len);
+            q.truncate(len);
             (s, q)
         } else {
             // Trim leading/trailing all-N (HTSlib un-padded output).
