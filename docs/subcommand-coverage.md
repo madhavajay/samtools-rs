@@ -238,7 +238,11 @@ samtools-rs status legend:
 ### consensus
 
 - **C source:** `bam_consensus.c` (~126k LOC) + `consensus_pileup.c`
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** ✅ — byte-exact vs all 77 upstream
+  `test/consensus/consensus.reg` cases: simple + bayesian/recall
+  (Gap5) modes, fasta/fastq/pileup, `-a`/`-aa`, `-r`, `-T`/`--ref-qual`,
+  `--min-MQ`/`--min-BQ`, show-del/ins, glued short options. Locked by
+  `consensus_matches_upstream_consensus_reg`.
 
 ### phase
 

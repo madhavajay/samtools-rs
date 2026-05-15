@@ -14,10 +14,12 @@
 //! **Modes:** `--mode simple` (frequency counting) and the default
 //! `bayesian`/`recall` Gap5 model (`calculate_consensus_gap5` ported in
 //! the `bayes` submodule, fed by the htslib-rs pileup `nm_init`
-//! precompute via `PileupRead::bayes_poly`/`bayes_nm_local`). 52/77
-//! `test/consensus/consensus.reg` cases byte-exact; the remaining 25
-//! (pileup-format, `--ref-qual`+`-T` reference, `-a`/all-bases,
-//! `--min-MQ`, the 30/31/32 show-del bayesian series) are WIP.
+//! precompute via `PileupRead::bayes_poly`/`bayes_nm_local`).
+//!
+//! **Parity:** all 77 `test/consensus/consensus.reg` cases are
+//! byte-exact (simple + bayesian/recall, fasta/fastq/pileup, `-a`/`-aa`,
+//! `-r`, `-T`/`--ref-qual`, `--min-MQ`/`--min-BQ`, show-del/ins, glued
+//! short options), locked by `consensus_matches_upstream_consensus_reg`.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

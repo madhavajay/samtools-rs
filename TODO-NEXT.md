@@ -20,8 +20,9 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
   BAQ quals differ → #11), `consensus --mode simple` (every
   `test/consensus/expected` in `consensus.reg`), `coverage`
   (`coverage/{1..5}`), `bedcov` (all four `test_bedcov`), `depth`
-  (`large_pos/depth{,_bed}`). *Remaining:* `targetcut`, `phase`,
-  `ampliconstats`, consensus `recall`/Bayesian modes.
+  (`large_pos/depth{,_bed}`), and **consensus `recall`/Bayesian modes**
+  (all 77 `consensus.reg`). *Remaining:* `targetcut`, `phase`,
+  `ampliconstats`.
 - **#2** ✅ core + wiring — whole-CRAM all-record iterator; `stats` and
   `checksum` no-region CRAM byte-identical to BAM (bar NM-derived lines).
   *Remaining:* `reference` CRAM MD path (needs MD recompute); optional
@@ -182,32 +183,27 @@ quick fix — verified by probing):
      default_qual=10, use_mqual=1, nm_adjust=1, scale_mqual=1,
      low/high_mqual=1/60, line_len=70, show_ins=1, show_del=0
      (bam_consensus.c:2985+).
-     Fixtures: `samtools/test/consensus/consensus.reg`. **Status:
-     52/77 byte-exact** (engine wired end-to-end; `4ff63fa`,
-     `a0d4d53`). Remaining 25, by feature (each a bounded fix):
-     • **`-a`/`-aa` all-bases** (13q/13p/14*/15p/16*/17q/31/32/41/42,
-       ~12) — emit every reference position (uncovered = `N`/qual 0);
-       `-a` spans the covered range, `-aa` the whole contig. Needs the
-       reference length + region span, NOT a naive interior gap-fill
-       (an unconditional fill regressed 19 fixtures 52→33 — reverted;
-       upstream only fills under all-bases / within the pileup span,
-       not between separate read clusters in plain FASTA).
-     • **`-r region`** (14q/14p/15p/16q/16p) — restrict to `c2:beg-end`
-       (currently `-r` is ignored).
-     • **`--min-MQ <n>`** (22p/23p/24p) — filter reads by mapping
-       quality (parse + apply in both paths; not yet parsed).
-     • **`--min-BQ`/pileup-format nuances** (26p and the `*p` set) —
-       simple-mode pileup output details.
-     • **30/31/32 bayesian `--show-del yes --show-ins no -C0`** on
-       consen1c — show-del interaction in the bayesian path.
-     • **`--ref-qual`/`-T` reference** (30T/31T/32T/40T/41T/42T) —
-       reference-aware quality (`-T fa` + `--ref-qual`).
-     Verify byte-exact per fixture; gate + workspace green per commit,
-     as the `stats` port was done. (12q showed the gap-fill subtlety:
-     `consen2 c2` s2a@3 ACG + s2b@10 → expected `ACGNNNNCGT`, i.e. the
-     gap *is* filled there but not in the 19 regressed cases — the
-     correct rule is tied to the pileup span / all-bases, to be
-     derived from upstream `basic_pileup`/`empty_pileup2`.)
+     Fixtures: `samtools/test/consensus/consensus.reg`. ✅ **DONE —
+     all 77 cases byte-exact** (`4dfef81`; engine wired end-to-end
+     from `4ff63fa`/`a0d4d53`). Delivered, by feature:
+     • **`-a`/`-aa` all-bases** — faithful `basic_fasta`/`empty_pileup2`
+       gap rule: per-contig `last_pos` init, advance even on skipped
+       `*`, fill `[last_pos+1,pos)` only when
+       `pos>last_pos && (last_pos>0 || all_bases)`; `-a` pads the
+       covered span, `-aa` the whole @SQ contig; `-aa` pileup re-emits
+       every header @SQ in header order (uncovered → full-length
+       empty-row block).
+     • **`-r region`** — `parse_region_spec` + column-loop region clip.
+     • **`--min-MQ <n>`** — `min_mqual` into `PileupOptions`.
+     • **`--min-BQ`/pileup-format nuances** — `empty_pileup2` row format
+       + non-refskip depth.
+     • **30/31/32 bayesian `--show-del yes --show-ins no -C0`** — glued
+       short-opt parse + show-del in the bayesian path.
+     • **`--ref-qual`/`-T` reference** — `load_ref_seqs` + `gap_base`
+       (reference base + `--ref-qual` for uncovered positions).
+     Locked by integration test
+     `consensus_matches_upstream_consensus_reg` (in-process INIT+P
+     harness, 77/77); clippy + full workspace test suite green.
 - TODO-NEXT #3/#4/#5 (CRAM internals / binary-`@PG` / CRAM index meta).
 
 **Honest remaining scope:** the library-blocked *foundations* are all
@@ -269,8 +265,9 @@ single-session work.
 > ordering — `coverage/{1..5}`), bedcov (all four `test_bedcov` incl.
 > attached `-g512`), depth (`large_pos/depth{,_bed}.expected.out` — sparse
 > storage fixes the `LN:10001009800` OOM; bedidx now whitespace-tolerant).
-> Remaining pileup-dependent ports: `targetcut`, `phase`,
-> `ampliconstats`, and consensus `recall`/Bayesian modes.
+> **consensus `recall`/Bayesian modes DONE** (all 77 `consensus.reg`
+> byte-exact). Remaining pileup-dependent ports: `targetcut`, `phase`,
+> `ampliconstats`.
 
 ### 1. Pileup iterator — highest leverage
 
