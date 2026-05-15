@@ -174,6 +174,20 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
             }
+            // Glued short option, e.g. `-C0`, `-c0.6`, `-d6`.
+            _ if s.len() > 2 && s.starts_with('-') && !s.starts_with("--") => {
+                let (flag, val) = s.split_at(2);
+                match flag {
+                    "-C" => cfg.cons_cutoff = val.parse().unwrap_or(10),
+                    "-c" => cfg.call_fract = val.parse().unwrap_or(0.75),
+                    "-H" => cfg.het_fract = val.parse().unwrap_or(0.5),
+                    "-d" => cfg.min_depth = val.parse().unwrap_or(1),
+                    "-l" => {
+                        cfg.line_len = val.parse().ok().filter(|&n| n > 0).unwrap_or(usize::MAX)
+                    }
+                    _ => { /* tolerate other glued short opts */ }
+                }
+            }
             "--no-PG" | "-a" | "-aa" => {}
             "-@" | "--threads" | "-r" | "--region" | "-T" | "--reference" => {
                 let _ = iter.next();
