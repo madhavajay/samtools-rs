@@ -6344,13 +6344,17 @@ fn stats_matches_upstream_stat_fixtures() {
     let p = |b: &std::path::Path| b.to_str().unwrap().to_string();
     // `tail -n+4`: drop the produced-by / contains / command-line lines.
     let strip = |s: &str| -> String { s.lines().skip(3).map(|l| format!("{l}\n")).collect() };
-    // (sam, extra args, expected)
-    let cases: [(&str, &[&str], &str); 6] = [
+    // (sam, extra args, expected). Covers plain map, equal/full-seq,
+    // X-cigar (MPC reference mismatch), insertion (ID/IC + bases-cigar),
+    // `-i 0`, supplementary (MPC + supp aux), and secondary fixtures.
+    let cases: [(&str, &[&str], &str); 8] = [
         ("1_map_cigar.sam", &[], "1.stats.expected"),
         ("2_equal_cigar_full_seq.sam", &[], "2.stats.expected"),
         ("3_map_cigar_equal_seq.sam", &[], "3.stats.expected"),
+        ("4_X_cigar_full_seq.sam", &[], "4.stats.expected"),
         ("5_insert_cigar.sam", &[], "5.stats.expected"),
         ("5_insert_cigar.sam", &["-i", "0"], "6.stats.expected"),
+        ("7_supp.sam", &[], "7.stats.expected"),
         ("8_secondary.sam", &[], "8.stats.expected"),
     ];
     for (sam, extra, expected) in cases {

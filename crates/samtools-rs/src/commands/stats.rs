@@ -9,7 +9,7 @@
 //! histograms, per-cycle stats, BAQ adjustments, and deeper reference-based
 //! mismatch parity.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -51,6 +51,9 @@ struct StatsConfig {
     // True when a reference (`-r`) was supplied; upstream only allocates
     // `mpc_buf` (and therefore prints the MPC section) in that case.
     has_reference: bool,
+    // Reference sequences (upper-cased bases) keyed by name, loaded when
+    // a reference is supplied. Drives the MPC reference-mismatch engine.
+    reference_seqs: Option<HashMap<String, Vec<u8>>>,
 }
 
 impl Default for StatsConfig {
@@ -69,6 +72,7 @@ impl Default for StatsConfig {
             coverage_step: 1,
             cov_threshold: 0,
             has_reference: false,
+            reference_seqs: None,
         }
     }
 }
@@ -295,7 +299,23 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     };
 
-    config.has_reference = reference_arg.is_some() || current_global_args().reference.is_some();
+    let resolved_reference = reference_arg
+        .clone()
+        .or_else(|| current_global_args().reference);
+    config.has_reference = resolved_reference.is_some();
+    if let Some(ref_path) = resolved_reference.as_ref() {
+        match load_reference_seqs(ref_path) {
+            Ok(map) => config.reference_seqs = Some(map),
+            Err(e) => {
+                print_error_errno(
+                    "stats",
+                    format!("failed to read reference \"{}\"", ref_path.display()),
+                    &e,
+                );
+                return ExitCode::from(1);
+            }
+        }
+    }
 
     let stats_input = match format.exact {
         Exact::Sam if parsed_regions.is_empty() => collect_sam_full_stats(&input, &config)
@@ -637,6 +657,25 @@ fn record_read_group(rec: &(impl sam::alignment::Record + ?Sized)) -> io::Result
     }
 }
 
+/// Loads every reference sequence (upper-cased) keyed by name. Used by
+/// the MPC reference-mismatch engine; small test references fit easily
+/// in memory and a full read yields results identical to upstream's
+/// windowed `rseq_buf`.
+fn load_reference_seqs(path: &std::path::Path) -> io::Result<HashMap<String, Vec<u8>>> {
+    use htslib_rs::fasta;
+    let reader = File::open(path).map(BufReader::new)?;
+    let mut reader = fasta::io::Reader::new(reader);
+    let mut map = HashMap::new();
+    for result in reader.records() {
+        let record = result?;
+        let name = String::from_utf8_lossy(record.name()).into_owned();
+        let mut seq = record.sequence().as_ref().to_vec();
+        seq.make_ascii_uppercase();
+        map.insert(name, seq);
+    }
+    Ok(map)
+}
+
 /// Iterates all SAM records to build a `StatsCounts` with sequence-length
 /// and quality accumulators populated (which the `summarize_*` path can
 /// not provide because `AlignmentRecordSummary` discards sequence and
@@ -928,6 +967,10 @@ struct StatsCounts {
     ins_cycles_2nd: Vec<u64>,
     del_cycles_1st: Vec<u64>,
     del_cycles_2nd: Vec<u64>,
+    // Mismatches per cycle and quality (MPC): `mpc_buf[cycle][qual]`.
+    // Column 0 doubles as the N-base count, exactly as upstream
+    // `count_mismatches_per_cycle` (qual byte + 1, u8-wrapping).
+    mpc_buf: Vec<[u64; 256]>,
     // Sum of sequence lengths for records carrying the duplicate flag.
     bases_dup: u64,
     bases_trimmed: u64,
@@ -1252,6 +1295,22 @@ impl StatsCounts {
             }
             self.update_coverage_depths(header, rec, targets);
         }
+
+        // MPC reference-mismatch engine. Upstream calls
+        // `count_mismatches_per_cycle` for every mapped read reaching it
+        // (primary or supplementary, not secondary) when a reference is
+        // loaded.
+        let counted = self.total > pre_total || self.supplementary > pre_supp;
+        if counted
+            && flag & BAM_FUNMAP == 0
+            && let Some(refmap) = config.reference_seqs.as_ref()
+            && let Some(rsid) = reference_sequence_id
+            && let Some(p) = pos
+            && let Some((name, _)) = header.reference_sequences().get_index(rsid)
+            && let Some(refseq) = refmap.get(String::from_utf8_lossy(name.as_ref()).as_ref())
+        {
+            self.count_mismatches_per_cycle(rec, flag, seq_len, refseq, p - 1, &chk_seq, &chk_qual);
+        }
     }
 
     /// Faithful port of upstream `count_indels`: per-CIGAR insertion /
@@ -1320,6 +1379,97 @@ impl StatsCounts {
                 }
                 Kind::Skip | Kind::HardClip | Kind::Pad => {}
                 _ => icycle += ncig_i,
+            }
+        }
+    }
+
+    /// Faithful port of upstream `count_mismatches_per_cycle`. For each
+    /// aligned base it increments `mpc_buf[cycle][col]` where `col` is 0
+    /// for an N read base, otherwise `(qual + 1) as u8` (note the u8 wrap
+    /// that maps the 0xFF missing-quality byte to column 0). `pos0` is
+    /// the read's 0-based reference start; `refseq` the upper-cased
+    /// reference bases. N (ref-skip)/H/P CIGARs are ignored as upstream.
+    #[allow(clippy::too_many_arguments)]
+    fn count_mismatches_per_cycle(
+        &mut self,
+        rec: &(impl sam::alignment::Record + ?Sized),
+        flag: u32,
+        read_len: usize,
+        refseq: &[u8],
+        pos0: usize,
+        seq_ascii: &[u8],
+        quals: &[u8],
+    ) {
+        use sam::alignment::record::cigar::op::Kind;
+        fn nt16(b: u8) -> u8 {
+            match b.to_ascii_uppercase() {
+                b'=' => 0,
+                b'A' => 1,
+                b'C' => 2,
+                b'M' => 3,
+                b'G' => 4,
+                b'R' => 5,
+                b'S' => 6,
+                b'V' => 7,
+                b'T' => 8,
+                b'W' => 9,
+                b'Y' => 10,
+                b'H' => 11,
+                b'K' => 12,
+                b'D' => 13,
+                b'B' => 14,
+                _ => 15,
+            }
+        }
+        let is_fwd = flag & BAM_FREVERSE == 0;
+        let mut iread: usize = 0;
+        let mut icycle: isize = 0;
+        let mut iref: usize = 0;
+        for op in rec.cigar().iter().flatten() {
+            let ncig = op.len();
+            match op.kind() {
+                Kind::Insertion => {
+                    iread += ncig;
+                    icycle += ncig as isize;
+                }
+                Kind::Deletion => {
+                    iref += ncig;
+                }
+                Kind::SoftClip => {
+                    icycle += ncig as isize;
+                    iread += ncig;
+                }
+                Kind::HardClip => {
+                    icycle += ncig as isize;
+                }
+                Kind::Skip | Kind::Pad => {}
+                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                    for _ in 0..ncig {
+                        let cread = seq_ascii.get(iread).copied().map(nt16).unwrap_or(0);
+                        let cref = refseq.get(pos0 + iref).copied().map(nt16).unwrap_or(0);
+                        let idx = if is_fwd {
+                            icycle
+                        } else {
+                            read_len as isize - icycle - 1
+                        };
+                        if idx >= 0 {
+                            let cyc = idx as usize;
+                            if self.mpc_buf.len() <= cyc {
+                                self.mpc_buf.resize(cyc + 1, [0; 256]);
+                            }
+                            if cread == 15 {
+                                self.mpc_buf[cyc][0] += 1;
+                            } else if cref != 0 && cread != 0 && cref != cread {
+                                let qbyte = quals.get(iread).copied().unwrap_or(0xFF);
+                                let col = qbyte.wrapping_add(1) as usize;
+                                self.mpc_buf[cyc][col] += 1;
+                            }
+                        }
+                        iref += 1;
+                        iread += 1;
+                        icycle += 1;
+                    }
+                }
             }
         }
     }
@@ -1971,8 +2121,20 @@ fn write_mpc(out: &mut dyn Write, counts: &StatsCounts, config: &StatsConfig) ->
     // lengths, so the bump always applies.
     let rows = counts.max_len as usize + 1;
     let zeros = "\t0".repeat(256);
+    let mut line = String::new();
     for cycle in 1..=rows {
-        writeln!(out, "MPC\t{cycle}{zeros}")?;
+        match counts.mpc_buf.get(cycle - 1) {
+            Some(row) if row.iter().any(|&v| v != 0) => {
+                line.clear();
+                use std::fmt::Write as _;
+                let _ = write!(line, "MPC\t{cycle}");
+                for v in row {
+                    let _ = write!(line, "\t{v}");
+                }
+                writeln!(out, "{line}")?;
+            }
+            _ => writeln!(out, "MPC\t{cycle}{zeros}")?,
+        }
     }
     Ok(())
 }
