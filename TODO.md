@@ -409,7 +409,7 @@ underlying-library work.
 ## Submodule Pinning
 
 - [x] Pin `samtools/` to a specific upstream release tag once Phase 0 lands (record tag + commit in `README.md` and `version.rs`). Current pin: upstream tag `1.23.1`, commit `6efb9b6da35224cf804921dedecf9fb8f411365d`.
-- [x] Pin `htslib-rs/` to a known-green commit when Phase 0 lands. Current pin: `88bd29f5f0d5e87d3f5d28da1f106a4b518e3926`.
+- [x] Pin `htslib-rs/` to a known-green commit when Phase 0 lands. Current pin: `da4d33192256f731aa942967449a50e76b91b24c` (adds the public multi-input pileup iterator API for TODO-NEXT #1; prior pins: `6bd6fb0` post-PR-#5, `88bd29f` at Phase 0).
 
 ## Repository Map (target end state)
 
