@@ -6377,6 +6377,21 @@ fn markdup_matches_upstream_test_markdup_fixtures() {
             "13_optical_barcode_tag",
             "13_optical_barcode_tag.expected.sam",
         ),
+        (
+            &["-S", "-d", "100", "--mode", "s", "-t"],
+            "8_optical_dup",
+            "8_optical_dup.expected.sam",
+        ),
+        (
+            &["-S", "-d", "2500", "--mode", "s", "-t", "--include-fails"],
+            "9_optical_dup_qcfail",
+            "9_optical_dup_qcfail.expected.sam",
+        ),
+        (
+            &["-S", "-d", "2500", "--mode", "s", "-t", "-S"],
+            "10_optical_chain",
+            "10_optical_chain.expected.sam",
+        ),
     ];
     for (flags, stem, expected) in cases {
         let inp = d.join("markdup").join(format!("{stem}.sam"));

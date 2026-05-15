@@ -757,6 +757,12 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
 
     let opt = options.optical_distance;
     let do_tag = options.duplicate_origin_tag;
+    // Upstream `check_chain` is on when `-t`(tag) or `-d`(opt_dist).
+    let check_chain = do_tag || opt.is_some();
+    let n_rec = records.len();
+    // `dup_next[x]` == upstream `x->duplicate`; `orig_link[x]` == `x->original`.
+    let mut dup_next: Vec<Option<usize>> = vec![None; n_rec];
+    let mut orig_link: Vec<Option<usize>> = vec![None; n_rec];
 
     let supp = options.supp;
     // Marks `dup_idx` as a duplicate of `orig_idx`, recording origin/type.
@@ -826,6 +832,9 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
                         if dtype.is_some_and(DuplicateType::is_optical) {
                             stats.duplicate_single_optical += 1;
                         }
+                        if check_chain {
+                            chain_new_wins(&mut dup_next, &mut orig_link, i, j);
+                        }
                         single_hash.insert(single_key.clone(), i);
                     }
                 }
@@ -859,6 +868,13 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
                         dup_idx,
                         orig_idx,
                     );
+                    if check_chain {
+                        if swap {
+                            chain_new_wins(&mut dup_next, &mut orig_link, i, j);
+                        } else {
+                            chain_keep_wins(&mut dup_next, &mut orig_link, j, i);
+                        }
+                    }
                     if swap {
                         pair_hash.insert(pair_key, i);
                     }
@@ -889,6 +905,9 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
                         if dtype.is_some_and(DuplicateType::is_optical) {
                             stats.duplicate_single_optical += 1;
                         }
+                        if check_chain {
+                            chain_keep_wins(&mut dup_next, &mut orig_link, j, i);
+                        }
                     } else {
                         let old_s = calc_score(&records[j]);
                         let new_s = calc_score(&records[i]);
@@ -904,6 +923,13 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
                             dup_idx,
                             orig_idx,
                         );
+                        if check_chain {
+                            if swap {
+                                chain_new_wins(&mut dup_next, &mut orig_link, i, j);
+                            } else {
+                                chain_keep_wins(&mut dup_next, &mut orig_link, j, i);
+                            }
+                        }
                         if swap {
                             single_hash.insert(single_key, i);
                         }
@@ -912,6 +938,203 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
                             stats.duplicate_single_optical += 1;
                         }
                     }
+                }
+            }
+        }
+    }
+
+    // Optical-duplicate chain pass (`find_duplicate_chains`): for each
+    // chain root (no `->original`, has a `->duplicate`), rewrite each
+    // dup's `do` tag to the root name and re-tag `dt:Z:SQ` where the
+    // chain shows the read is an optical duplicate of the root or of a
+    // close-by sibling.
+    if check_chain {
+        struct Chk {
+            idx: usize,
+            x: i64,
+            y: i64,
+            opt: bool,
+            len: usize,
+            score: i64,
+            mate_score: i64,
+            paired: bool,
+            qcfail: bool,
+        }
+        let dt_tag = Tag::from([b'd', b't']);
+        let do_tag_t = Tag::from([b'd', b'o']);
+        for root in 0..n_rec {
+            if orig_link[root].is_some() || dup_next[root].is_none() {
+                continue;
+            }
+            let ori_name = rec_name(&records[root]);
+            let root_coord = get_coordinates_colons(&ori_name);
+            let mut list: Vec<Chk> = Vec::new();
+            let mut cur = dup_next[root];
+            while let Some(c) = cur {
+                if do_tag {
+                    let cur_do = match records[c].data().get(&do_tag_t) {
+                        Some(Value::String(s)) => Some(s.to_vec()),
+                        _ => None,
+                    };
+                    if cur_do.is_some_and(|v| v != ori_name) {
+                        records[c]
+                            .data_mut()
+                            .insert(do_tag_t, Value::String(BString::from(ori_name.clone())));
+                    }
+                }
+                let mut chk = Chk {
+                    idx: c,
+                    x: -1,
+                    y: -1,
+                    opt: false,
+                    len: 0,
+                    score: 0,
+                    mate_score: 0,
+                    paired: has_mate(&records[c]),
+                    qcfail: rec_flags(&records[c]) & BAM_FQCFAIL != 0,
+                };
+                if let Some(dist) = opt
+                    && let Some((ob, oe, ox, oy)) = root_coord
+                {
+                    let already_sq = matches!(
+                        records[c].data().get(&dt_tag),
+                        Some(Value::String(s)) if String::from_utf8_lossy(s) == "SQ"
+                    );
+                    chk.opt = already_sq;
+                    let cn = rec_name(&records[c]);
+                    if let Some((db, de, dx, dy)) = get_coordinates_colons(&cn) {
+                        chk.x = dx;
+                        chk.y = dy;
+                        chk.len = de - db;
+                        let o_len = oe - ob;
+                        let is_opt = o_len == (de - db)
+                            && ori_name[ob..oe] == cn[db..de]
+                            && ox.abs_diff(dx) <= dist as u64
+                            && oy.abs_diff(dy) <= dist as u64;
+                        if !chk.opt && is_opt {
+                            optical_retag(
+                                &mut records[c],
+                                chk.paired,
+                                supp,
+                                &mut supp_dups,
+                                &mut stats,
+                            );
+                            chk.opt = true;
+                        }
+                    }
+                    chk.score = calc_score(&records[c]);
+                    if chk.paired {
+                        chk.mate_score = mate_score(&records[c]);
+                    }
+                }
+                list.push(chk);
+                cur = dup_next[c];
+            }
+
+            if root_coord.is_none() || opt.is_none() {
+                continue;
+            }
+            // check_duplicate_chain: sort by (len, prefix bytes, x).
+            list.sort_by(|a, b| {
+                a.len
+                    .cmp(&b.len)
+                    .then_with(|| {
+                        let an = rec_name(&records[a.idx]);
+                        let bn = rec_name(&records[b.idx]);
+                        an[..a.len].cmp(&bn[..b.len])
+                    })
+                    .then_with(|| a.x.cmp(&b.x))
+            });
+            let dist = opt.unwrap() as i64;
+            let llen = list.len();
+            if llen == 0 {
+                continue;
+            }
+            let mut curr = 0usize;
+            while curr + 1 < llen {
+                let base_name = rec_name(&records[list[curr].idx]);
+                let base_len = list[curr].len;
+                let mut end_name_match = curr;
+                loop {
+                    end_name_match += 1;
+                    if end_name_match >= llen {
+                        break;
+                    }
+                    let cn = rec_name(&records[list[end_name_match].idx]);
+                    if base_len == list[end_name_match].len
+                        && base_name[..base_len] != cn[..base_len]
+                    {
+                        break;
+                    }
+                }
+                while curr < end_name_match {
+                    let mut count = curr;
+                    loop {
+                        count += 1;
+                        if count >= end_name_match || list[count].x - list[curr].x > dist {
+                            break;
+                        }
+                        if list[curr].opt && list[count].opt {
+                            continue;
+                        }
+                        let ydiff = (list[curr].y - list[count].y).abs();
+                        if ydiff > dist {
+                            continue;
+                        }
+                        let cur_p = list[curr].paired;
+                        let chk_p = list[count].paired;
+                        let chk_dup = if cur_p != chk_p {
+                            !chk_p
+                        } else {
+                            let (cs, mut ks) = if list[curr].qcfail != list[count].qcfail {
+                                if list[curr].qcfail {
+                                    (0i64, 1i64)
+                                } else {
+                                    (1, 0)
+                                }
+                            } else {
+                                let mut a = list[curr].score;
+                                let mut b = list[count].score;
+                                if cur_p {
+                                    a += list[curr].mate_score;
+                                    b += list[count].mate_score;
+                                }
+                                (a, b)
+                            };
+                            if cs == ks {
+                                let cn = rec_name(&records[list[curr].idx]);
+                                let kn = rec_name(&records[list[count].idx]);
+                                if kn < cn {
+                                    ks += 1;
+                                } else {
+                                    ks -= 1;
+                                }
+                            }
+                            cs > ks
+                        };
+                        if chk_dup {
+                            if !list[count].opt {
+                                optical_retag(
+                                    &mut records[list[count].idx],
+                                    chk_p,
+                                    supp,
+                                    &mut supp_dups,
+                                    &mut stats,
+                                );
+                                list[count].opt = true;
+                            }
+                        } else if !list[curr].opt {
+                            optical_retag(
+                                &mut records[list[curr].idx],
+                                cur_p,
+                                supp,
+                                &mut supp_dups,
+                                &mut stats,
+                            );
+                            list[curr].opt = true;
+                        }
+                    }
+                    curr += 1;
                 }
             }
         }
@@ -983,6 +1206,78 @@ fn remember_duplicate_metadata(
                 duplicate_type,
             },
         );
+    }
+}
+
+/// `i` wins, `j` becomes its duplicate: append `j` to the tail of `i`'s
+/// `->duplicate` chain (mirrors `bam_markdup.c` swap branch).
+fn chain_new_wins(
+    dup_next: &mut [Option<usize>],
+    orig_link: &mut [Option<usize>],
+    i: usize,
+    j: usize,
+) {
+    if dup_next[i].is_some() {
+        let mut t = dup_next[i].unwrap();
+        while let Some(nx) = dup_next[t] {
+            t = nx;
+        }
+        dup_next[t] = Some(j);
+    } else {
+        dup_next[i] = Some(j);
+    }
+    orig_link[j] = Some(i);
+}
+
+/// `j` stays, `i` becomes its duplicate, splicing any existing `i` chain
+/// onto `j`'s (mirrors the non-swap branch).
+fn chain_keep_wins(
+    dup_next: &mut [Option<usize>],
+    orig_link: &mut [Option<usize>],
+    j: usize,
+    i: usize,
+) {
+    if let Some(jh) = dup_next[j] {
+        if let Some(ih) = dup_next[i] {
+            let mut t = jh;
+            while let Some(nx) = dup_next[t] {
+                t = nx;
+            }
+            dup_next[t] = Some(ih);
+        }
+        dup_next[i] = Some(jh);
+    }
+    dup_next[j] = Some(i);
+    orig_link[i] = Some(j);
+}
+
+/// `optical_retag`: flip a duplicate's `dt` tag to `SQ`, bump the optical
+/// stat, and (with `-S`) upgrade its `dup_hash` entry to optical.
+fn optical_retag(
+    record: &mut RecordBuf,
+    paired: bool,
+    supp: bool,
+    supp_dups: &mut HashMap<Vec<u8>, DuplicateMetadata>,
+    stats: &mut MarkdupStats,
+) {
+    record.data_mut().insert(
+        Tag::from([b'd', b't']),
+        Value::String(BString::from(&b"SQ"[..])),
+    );
+    if paired {
+        stats.duplicate_pair_optical += 1;
+    } else {
+        stats.duplicate_single_optical += 1;
+    }
+    if supp {
+        let mate_unmapped = rec_flags(record) & BAM_FMUNMAP != 0;
+        let has_sa = record.data().get(&Tag::from([b'S', b'A'])).is_some();
+        let has_xa = record.data().get(&Tag::from([b'X', b'A'])).is_some();
+        if (mate_unmapped || has_sa || has_xa)
+            && let Some(m) = supp_dups.get_mut(&rec_name(record))
+        {
+            m.duplicate_type = Some(DuplicateType::Optical);
+        }
     }
 }
 
