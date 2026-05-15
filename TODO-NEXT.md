@@ -80,20 +80,23 @@ quick fix — verified by probing):
   `nindels`=300 cap, COV, single-bin GCD; supplementary handling;
   `-S RG`/`-P` per-tag `.bamstat`; `-I` read-group filter; streaming
   `-t` BAM path; upstream unpaired-read `order`; `--ref-stats` RFS
-  with/without reference incl. region-merged targets). **Remaining —
-  only stat/12 (paired-overlap):** the overlap variant is 2 SN lines
-  from exact — `insert size average`/`standard deviation` under `-t`
-  must exclude pairs whose mate falls outside the target (ours counts
-  the in-region read B's isize 323; upstream's region path defers
-  isize via the per-pair `read_pairs`/`pair_t` chunk machinery so only
-  the fully-in-region A-C pair's 180 is counted). The `-p`/
-  `--remove-overlaps` `nooverlap` variants additionally need the
-  paired-overlap chunk subtraction (`is_in_regions` chunks
-  stats.c:2030, the round-buffer pair finalisation + the
-  `nbases_mapped_cigar -= (pmax-pmin)` correction at stats.c:1140-1170).
-  Plus (non-fixture-blocking): multi-bin (>20 kbp) GC-depth, exact
-  pileup-backed COV, CRAM without explicit reference (blocked on the
-  htslib-rs CRAM all-record iterator).
+  with/without reference incl. region-merged targets; insert-size
+  avg/sd from the integer-halved per-size arrays so a lone in-region
+  read whose mate was filtered drops out; stat/12 `3reads.overlap` +
+  `2reads.overlap` byte-exact). **Remaining — only the two stat/12
+  `-p`/`--remove-overlaps` `nooverlap` variants:** the paired-overlap
+  chunk subtraction. Port `remove_overlaps` (stats.c:1057-1170) and
+  `cleanup_overlaps` (stats.c:1023): a `qname -> pair_t` map keyed by
+  template, storing the first mate's mapped-ref `[pmin,pmax]` chunks
+  by `order`; when the other mate arrives, subtract the overlap from
+  `nbases_mapped_cigar` and the coverage round-buffer
+  (`nbases_mapped_cigar -= (pmax-pmin)` etc. at stats.c:1140-1170),
+  gated by the `-p` flag (currently a no-op in our arg parser).
+  Touches `bases mapped (cigar)`, `error rate`, and `COV` (both are
+  byte-exact across the other 19 fixture groups, so the change must be
+  `-p`-only). Plus (non-fixture-blocking): multi-bin (>20 kbp)
+  GC-depth, exact pileup-backed COV, CRAM without explicit reference
+  (blocked on the htslib-rs CRAM all-record iterator).
 - `ampliconclip` → ✅ **DONE**: full port, byte-exact vs the entire
   upstream `test_ampliconclip` harness (10 SAM + 3 primer-count TSVs).
 - `ampliconstats` (`amplicon_stats.c`, 1776 LOC) → ✅ **DONE**:
