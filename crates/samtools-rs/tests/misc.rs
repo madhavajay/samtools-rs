@@ -6679,3 +6679,69 @@ fn consensus_simple_matches_upstream_fixtures() {
         );
     }
 }
+
+#[test]
+fn coverage_matches_upstream_tabular_fixtures() {
+    // TODO-NEXT #1: exact coverage — `%g`/`%.3g` formatting, min_depth
+    // gating of meandepth/meanbaseq, and pileup-arrival row ordering.
+    use samtools_rs::commands::coverage;
+    let d = fixtures_dir();
+    let sample = d.join("dat").join("sample.sam");
+    let tmp = tmp_dir("coverage-fix");
+    let sample1 = tmp.join("sample1.sam");
+    let text = std::fs::read_to_string(&sample).unwrap();
+    let filtered: String = text
+        .lines()
+        .filter(|l| !l.contains("A1"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&sample1, filtered).unwrap();
+
+    let cases: &[(&[&str], &str)] = &[
+        (&[], "1.expected"),
+        (&["--min-depth", "1"], "1.expected"),
+        (&["--min-depth", "2"], "2.expected"),
+        (&["--min-depth", "2", "-Q", "8", "-q", "45"], "3.expected"),
+    ];
+    for (args, exp) in cases {
+        let out = tmp.join(exp);
+        let mut a: Vec<&str> = args.to_vec();
+        a.push("-o");
+        a.push(out.to_str().unwrap());
+        a.push(sample.to_str().unwrap());
+        assert_eq!(
+            exit_to_u8(coverage::main(&argv("coverage", &a))),
+            0,
+            "{exp}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(d.join("coverage").join(exp)).unwrap(),
+            "coverage {exp} args={args:?}"
+        );
+    }
+
+    // Multi-input (sample.sam + sample1.sam).
+    for (md, exp) in [("1", "4.expected"), ("4", "5.expected")] {
+        let out = tmp.join(exp);
+        assert_eq!(
+            exit_to_u8(coverage::main(&argv(
+                "coverage",
+                &[
+                    "--min-depth",
+                    md,
+                    "-o",
+                    out.to_str().unwrap(),
+                    sample.to_str().unwrap(),
+                    sample1.to_str().unwrap(),
+                ]
+            ))),
+            0
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(d.join("coverage").join(exp)).unwrap(),
+            "coverage {exp}"
+        );
+    }
+}
