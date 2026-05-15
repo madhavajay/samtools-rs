@@ -1714,6 +1714,58 @@ fn fastq_i_adds_casava_fields_from_barcode_tags() {
 }
 
 #[test]
+fn fastq_index_files_extract_from_barcode_tag() {
+    let tmp = tmp_dir("fastq-index-files");
+    let sam = tmp.join("in.sam");
+    let bam = tmp.join("in.bam");
+    let single_out = tmp.join("0.fq");
+    let i1_out = tmp.join("i1.fq");
+    let i2_out = tmp.join("i2.fq");
+    let text = concat!(
+        "@HD\tVN:1.6\n",
+        "foo\t4\t*\t0\t0\t*\t*\t0\t0\tACCCCCCCCCCCCCCCCCCCCT\txYYYYYYYYYYYYYYYYYYYYz\tBC:Z:AGGGGGGT-CGGGGGGT\tQT:Z:Xyyy1yyZ-Pqq1qqqR\n",
+    );
+    std::fs::write(&sam, text).unwrap();
+    write_bam_from_sam_text(&bam, text);
+
+    for input in [&sam, &bam] {
+        std::fs::write(&single_out, "").unwrap();
+        std::fs::write(&i1_out, "").unwrap();
+        std::fs::write(&i2_out, "").unwrap();
+        assert_eq!(
+            exit_to_u8(fastq::main(&argv(
+                "fastq",
+                &[
+                    "--index-format",
+                    "i8n1i8",
+                    "--i1",
+                    i1_out.to_str().unwrap(),
+                    "--i2",
+                    i2_out.to_str().unwrap(),
+                    "-0",
+                    single_out.to_str().unwrap(),
+                    input.to_str().unwrap(),
+                ]
+            ))),
+            0
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&single_out).unwrap(),
+            "@foo\nACCCCCCCCCCCCCCCCCCCCT\n+\nxYYYYYYYYYYYYYYYYYYYYz\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&i1_out).unwrap(),
+            "@foo\nAGGGGGGT\n+\nXyyy1yyZ\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&i2_out).unwrap(),
+            "@foo\nCGGGGGGT\n+\nPqq1qqqR\n"
+        );
+    }
+}
+
+#[test]
 fn fastq_single_sam_path_filters_by_aux_tag_value() {
     let tmp = tmp_dir("fastq-aux-filter-value");
     let sam = tmp.join("in.sam");
