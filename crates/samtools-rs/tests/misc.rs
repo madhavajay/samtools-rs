@@ -6376,6 +6376,54 @@ fn stats_matches_upstream_stat_fixtures() {
             "stats {expected} byte-exact",
         );
     }
+
+    // `-S RG` split cases: stdout matches `<n>.stats.expected` and each
+    // per-RG `<input>_<rg>.bamstat` matches its `.expected.bamstat`
+    // (both modulo the three stripped header lines). The input is copied
+    // into the temp dir so the side files land there.
+    let split_cases: [(&str, &str, &[&str]); 2] = [
+        ("1_map_cigar.sam", "9.stats.expected", &["s1_a_1"]),
+        (
+            "10_map_cigar.sam",
+            "10.stats.expected",
+            &["s1_a_1", "s1_b_1"],
+        ),
+    ];
+    for (sam, expected, rgs) in split_cases {
+        let local_sam = tmp.join(sam);
+        std::fs::copy(stat.join(sam), &local_sam).unwrap();
+        let out = tmp.join(expected);
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &[
+                    "-S",
+                    "RG",
+                    "-r",
+                    &p(&reference),
+                    "-o",
+                    &p(&out),
+                    &p(&local_sam),
+                ]
+            ))),
+            0,
+            "stats -S RG {expected}"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            std::fs::read_to_string(stat.join(expected)).unwrap(),
+            "stats -S RG {expected} stdout byte-exact",
+        );
+        for rg in rgs {
+            let bamstat = tmp.join(format!("{sam}_{rg}.bamstat"));
+            let exp = stat.join(format!("{sam}_{rg}.expected.bamstat"));
+            assert_eq!(
+                strip(&std::fs::read_to_string(&bamstat).unwrap()),
+                std::fs::read_to_string(&exp).unwrap(),
+                "stats -S RG {sam}_{rg}.bamstat byte-exact",
+            );
+        }
+    }
 }
 
 #[test]

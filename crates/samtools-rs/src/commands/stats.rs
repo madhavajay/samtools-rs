@@ -54,6 +54,10 @@ struct StatsConfig {
     // Reference sequences (upper-cased bases) keyed by name, loaded when
     // a reference is supplied. Drives the MPC reference-mismatch engine.
     reference_seqs: Option<HashMap<String, Vec<u8>>>,
+    // `-S`/`--split <tag>`: also write per-tag-value `.bamstat` files.
+    // `-P`/`--split-prefix`: filename prefix (default = input path).
+    split_tag: Option<String>,
+    split_prefix: Option<String>,
 }
 
 impl Default for StatsConfig {
@@ -73,6 +77,8 @@ impl Default for StatsConfig {
             cov_threshold: 0,
             has_reference: false,
             reference_seqs: None,
+            split_tag: None,
+            split_prefix: None,
         }
     }
 }
@@ -207,7 +213,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-r" | "--reference" | "--ref-seq" => {
                 reference_arg = iter.next().map(PathBuf::from);
             }
-            "-@" | "--threads" | "-S" | "--split" | "-P" | "--split-prefix" | "-G" => {
+            "-S" | "--split" => {
+                config.split_tag = iter.next().and_then(|s| s.to_str().map(str::to_owned));
+            }
+            "-P" | "--split-prefix" => {
+                config.split_prefix = iter.next().and_then(|s| s.to_str().map(str::to_owned));
+            }
+            "-@" | "--threads" | "-G" => {
                 let _ = iter.next();
             }
             "-d" | "--remove-dups" => {
@@ -378,11 +390,30 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 .as_deref()
                 .map(|so| so == "coordinate")
                 .unwrap_or(false);
-            write_stats(&mut writer, &summaries, config, is_sorted)
+            write_stats(&mut writer, &summaries, &config, is_sorted)
         }
         StatsInput::Counts(counts) => {
             let is_sorted = counts.is_coordinate_sorted();
-            write_stats_counts(&mut writer, &counts, config, is_sorted)
+            let combined = write_stats_counts(&mut writer, &counts, &config, is_sorted);
+            // `-S`/`--split`: one `<prefix|input>_<value>.bamstat` per
+            // tag value, prefix defaulting to the input path.
+            combined.and_then(|()| {
+                if config.split_tag.is_none() {
+                    return Ok(());
+                }
+                let prefix = config
+                    .split_prefix
+                    .clone()
+                    .unwrap_or_else(|| input.to_string_lossy().into_owned());
+                for (value, sub) in &counts.splits {
+                    let path = format!("{prefix}_{value}.bamstat");
+                    let file = File::create(&path)?;
+                    let mut w = std::io::BufWriter::new(file);
+                    write_stats_counts(&mut w, sub, &config, sub.is_coordinate_sorted())?;
+                    w.flush()?;
+                }
+                Ok(())
+            })
         }
     };
     if let Err(e) = write_result {
@@ -657,6 +688,29 @@ fn record_read_group(rec: &(impl sam::alignment::Record + ?Sized)) -> io::Result
     }
 }
 
+/// Reads an arbitrary aux tag as a string (upstream `bam_aux2Z`), used
+/// by `-S`/`--split` to bucket records by tag value.
+fn record_aux_string(
+    rec: &(impl sam::alignment::Record + ?Sized),
+    tag: &str,
+) -> io::Result<Option<String>> {
+    use sam::alignment::record::data::field::{Tag, Value};
+    let bytes = tag.as_bytes();
+    if bytes.len() != 2 {
+        return Ok(None);
+    }
+    let t = Tag::from([bytes[0], bytes[1]]);
+    let data = rec.data();
+    let Some(value) = data.get(&t).transpose()? else {
+        return Ok(None);
+    };
+    match value {
+        Value::String(s) => Ok(Some(s.to_string())),
+        Value::Character(c) => Ok(Some((c as char).to_string())),
+        _ => Ok(None),
+    }
+}
+
 /// Loads every reference sequence (upper-cased) keyed by name. Used by
 /// the MPC reference-mismatch engine; small test references fit easily
 /// in memory and a full read yields results identical to upstream's
@@ -690,6 +744,7 @@ fn collect_sam_full_stats(input: &PathBuf, config: &StatsConfig) -> io::Result<S
     for result in reader.records() {
         let record = result?;
         counts.update_record(&header, &record, config, read_group_filter.as_ref());
+        counts.feed_split(&header, &record, config, read_group_filter.as_ref());
     }
     Ok(counts)
 }
@@ -707,6 +762,7 @@ fn collect_bam_full_stats(input: &PathBuf, config: &StatsConfig) -> io::Result<S
             break;
         }
         counts.update_record(&header, &record, config, read_group_filter.as_ref());
+        counts.feed_split(&header, &record, config, read_group_filter.as_ref());
     }
     Ok(counts)
 }
@@ -971,6 +1027,10 @@ struct StatsCounts {
     // Column 0 doubles as the N-base count, exactly as upstream
     // `count_mismatches_per_cycle` (qual byte + 1, u8-wrapping).
     mpc_buf: Vec<[u64; 256]>,
+    // `-S`/`--split`: this run's tag value (drives the "statistics only
+    // for reads with tag" header line), and the per-tag-value sub-stats.
+    split_name: Option<String>,
+    splits: BTreeMap<String, StatsCounts>,
     // Sum of sequence lengths for records carrying the duplicate flag.
     bases_dup: u64,
     bases_trimmed: u64,
@@ -1006,6 +1066,38 @@ impl StatsCounts {
         read_group_filter: Option<&HashSet<String>>,
     ) {
         self.update_record_with_targets(header, rec, config, read_group_filter, None);
+    }
+
+    /// `-S`/`--split`: also accumulate this record into its tag-value's
+    /// sub-`StatsCounts` (created on first sight with `split_name` set so
+    /// the per-tag `.bamstat` header line is correct). The sub-counts
+    /// never split further, so no recursion.
+    fn feed_split(
+        &mut self,
+        header: &sam::Header,
+        rec: &(impl sam::alignment::Record + ?Sized),
+        config: &StatsConfig,
+        read_group_filter: Option<&HashSet<String>>,
+    ) {
+        let Some(tag) = config.split_tag.as_deref() else {
+            return;
+        };
+        let value = if tag == "RG" {
+            record_read_group(rec).ok().flatten()
+        } else {
+            record_aux_string(rec, tag).ok().flatten()
+        };
+        let Some(value) = value else {
+            return;
+        };
+        let sub = self
+            .splits
+            .entry(value.clone())
+            .or_insert_with(|| StatsCounts {
+                split_name: Some(value),
+                ..Default::default()
+            });
+        sub.update_record_with_targets(header, rec, config, read_group_filter, None);
     }
 
     fn update_record_with_targets(
@@ -1867,12 +1959,12 @@ fn c_e6(x: f64) -> String {
 fn write_stats(
     out: &mut dyn Write,
     recs: &[AlignmentRecordSummary],
-    config: StatsConfig,
+    config: &StatsConfig,
     is_sorted: bool,
 ) -> io::Result<()> {
     let mut counts = StatsCounts::default();
     for rec in recs {
-        counts.update_summary(rec, &config);
+        counts.update_summary(rec, config);
     }
     write_stats_counts(out, &counts, config, is_sorted)
 }
@@ -1880,7 +1972,7 @@ fn write_stats(
 fn write_stats_counts(
     out: &mut dyn Write,
     counts: &StatsCounts,
-    config: StatsConfig,
+    config: &StatsConfig,
     is_sorted: bool,
 ) -> io::Result<()> {
     writeln!(
@@ -1888,7 +1980,13 @@ fn write_stats_counts(
         "# This file was produced by samtools-rs stats (samtools-{}+htslib-rs)",
         SAMTOOLS_VERSION
     )?;
-    writeln!(out, "# This file contains statistics for all reads.")?;
+    match (&counts.split_name, &config.split_tag) {
+        (Some(name), Some(tag)) => writeln!(
+            out,
+            "# This file contains statistics only for reads with tag: {tag}={name}"
+        )?,
+        _ => writeln!(out, "# This file contains statistics for all reads.")?,
+    }
     writeln!(out, "# The command line was:  samtools-rs stats")?;
     writeln!(
         out,
@@ -2086,10 +2184,10 @@ fn write_stats_counts(
         )?;
     }
     write_quality_histograms(out, counts)?;
-    write_mpc(out, counts, &config)?;
+    write_mpc(out, counts, config)?;
     write_gc_histograms(out, counts)?;
-    write_acgt_rl_mapq_sections(out, counts, &config)?;
-    write_indel_cov_gcd(out, counts, &config, is_sorted)?;
+    write_acgt_rl_mapq_sections(out, counts, config)?;
+    write_indel_cov_gcd(out, counts, config, is_sorted)?;
     Ok(())
 }
 
