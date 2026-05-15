@@ -139,7 +139,7 @@ samtools-rs status legend:
 - **C source:** `bam_addrprg.c`
 - **HTSlib APIs used:** `sam_hdr_add_line`, `bam_aux_update_str`, record iteration
 - **htslib-rs coverage:** ⚠️ — mutable SAM/BAM `RecordBuf` paths cover current RG string replacement; direct `bam_aux_update_str` parity and CRAM remain unavailable
-- **samtools-rs status:** 🟡 — SAM/BAM add/replace exists with `-O sam|bam`, default `@PG` insertion, and `--no-PG`; CRAM, mate-aware updates, and full orphan-first semantics remain.
+- **samtools-rs status:** 🟡 — SAM/BAM add/replace exists with `-O sam|bam|cram` (`cram` requires `-T`/`--reference`; SAM/BAM input only), default `@PG` insertion, and `--no-PG`; CRAM *input*, mate-aware updates, and full orphan-first semantics remain.
 
 ### fastq / fasta / bam2fq
 

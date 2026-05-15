@@ -14,12 +14,15 @@
 //!    Matches upstream's two modes; `overwrite_all` is the default. In
 //!    `overwrite_all` with `-r`, all other `@RG` header lines are removed
 //!    so only the new one remains (mirrors `sam_hdr_remove_except`).
-//!  - `-O sam|bam` — output format (default: sam).
+//!  - `-O sam|bam|cram` / `--output-fmt[=]FMT` — output format
+//!    (default: sam). `cram` requires `-T`/`--reference FILE`; SAM/BAM
+//!    input is spooled to a temp BAM and converted through the shared
+//!    reference-backed CRAM writer.
 //!  - `--no-PG` — silently accepted (no `@PG` is added by this port).
 //!  - `-w` — overwrite an existing `@RG` header line with the same ID
 //!    instead of erroring.
 //!
-//! **Pending:** CRAM input/output, paired-end mate update, full `orphan_first`
+//! **Pending:** CRAM input, paired-end mate update, full `orphan_first`
 //! semantics.
 
 use bstr::BString;
@@ -62,6 +65,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut output: Option<PathBuf> = None;
     let mut input: Option<PathBuf> = None;
     let mut output_fmt = OutFmt::Sam;
+    let mut reference: Option<PathBuf> = None;
     let mut no_pg = false;
     let mut overwrite_hdr_rg = false;
     let mut iter = args.iter().skip(1).peekable();
@@ -95,7 +99,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-o" | "--output" => {
                 output = iter.next().map(PathBuf::from);
             }
-            "-O" => {
+            "-O" | "--output-fmt" => {
                 let value = iter.next().and_then(|a| a.to_str()).unwrap_or("sam");
                 output_fmt = match parse_output_format(value) {
                     Ok(fmt) => fmt,
@@ -104,6 +108,22 @@ pub fn main(args: &[OsString]) -> ExitCode {
                         return ExitCode::from(1);
                     }
                 };
+            }
+            _ if s.starts_with("--output-fmt=") => {
+                let value = &s["--output-fmt=".len()..];
+                output_fmt = match parse_output_format(value) {
+                    Ok(fmt) => fmt,
+                    Err(e) => {
+                        print_error("addreplacerg", e);
+                        return ExitCode::from(1);
+                    }
+                };
+            }
+            "-T" | "--reference" => {
+                reference = iter.next().map(PathBuf::from);
+            }
+            _ if s.starts_with("--reference=") => {
+                reference = Some(PathBuf::from(&s["--reference=".len()..]));
             }
             "--no-PG" => {
                 no_pg = true;
@@ -225,7 +245,20 @@ pub fn main(args: &[OsString]) -> ExitCode {
             let result = rewrite_sam(&input, &mut writer, &rewrite);
             result.and_then(|()| sam_io::check_sam_close(&mut writer))
         }
-        _ => rewrite_records(&input, output.as_deref(), output_fmt, &rewrite),
+        (_, OutFmt::Cram) if reference.is_none() => {
+            print_error(
+                "addreplacerg",
+                "CRAM output requires a reference (use -T/--reference FILE)",
+            );
+            return ExitCode::from(1);
+        }
+        _ => rewrite_records(
+            &input,
+            output.as_deref(),
+            output_fmt,
+            reference.as_deref(),
+            &rewrite,
+        ),
     };
 
     if let Err(e) = result {
@@ -238,16 +271,20 @@ pub fn main(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum OutFmt {
     Sam,
     Bam,
+    Cram,
 }
 
 fn parse_output_format(raw: &str) -> Result<OutFmt, String> {
-    match raw.to_ascii_lowercase().as_str() {
+    // Accept `cram,opt=val` style suffixes; only the head format matters.
+    let head = raw.split(',').next().unwrap_or("").to_ascii_lowercase();
+    match head.as_str() {
         "sam" => Ok(OutFmt::Sam),
         "bam" => Ok(OutFmt::Bam),
+        "cram" => Ok(OutFmt::Cram),
         _ => Err(format!("unsupported output format \"{}\"", raw)),
     }
 }
@@ -444,6 +481,7 @@ fn rewrite_records(
     input: &Path,
     output: Option<&Path>,
     output_fmt: OutFmt,
+    reference: Option<&Path>,
     rw: &RgRewrite<'_>,
 ) -> io::Result<()> {
     let format = sam_io::sam_open_format(input)?;
@@ -472,11 +510,57 @@ fn rewrite_records(
         rewrite_record_buf(record, rg_id, mode);
     }
 
+    if output_fmt == OutFmt::Cram {
+        let reference = reference.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "CRAM output requires -T")
+        })?;
+        return write_cram_records(&header, &records, output, reference);
+    }
+
     let mut writer = open_record_output(output, output_fmt, &header)?;
     for record in &records {
         writer.write_record(&header, record)?;
     }
     Ok(())
+}
+
+/// Writes rewritten records as CRAM by spooling them to a temp BAM and
+/// converting through the shared reference-backed BAM→CRAM writer (the
+/// same path `view` uses for CRAM output).
+fn write_cram_records(
+    header: &sam::Header,
+    records: &[RecordBuf],
+    output: Option<&Path>,
+    reference: &Path,
+) -> io::Result<()> {
+    use htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference;
+
+    // The reference-backed CRAM writer needs a `.fai`; build it if absent
+    // (mirrors `view`'s reference handling).
+    crate::reference::ensure_fai_index(reference, None)?;
+
+    let (tmp_file, tmp_path) = crate::tmp_file::create_temp_file("addrprg", Some("bam"))?;
+    {
+        use sam::alignment::io::Write as _;
+        let mut bam_writer = bam::io::Writer::new(tmp_file);
+        bam_writer.write_header(header)?;
+        for record in records {
+            bam_writer.write_alignment_record(header, record)?;
+        }
+    }
+
+    let result = match output {
+        Some(path) => {
+            let out = File::create(path)?;
+            write_cram_from_bam_path_with_reference(tmp_path.path(), reference, out).map(|_| ())
+        }
+        None => {
+            let out = io::stdout().lock();
+            write_cram_from_bam_path_with_reference(tmp_path.path(), reference, out).map(|_| ())
+        }
+    };
+    tmp_path.close().ok();
+    result
 }
 
 fn read_sam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
@@ -632,6 +716,11 @@ fn open_record_output(
             writer.write_header(header)?;
             Ok(Box::new(BamStdout(writer)))
         }
+        // CRAM is handled by `write_cram_records` before this is called.
+        (_, OutFmt::Cram) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CRAM output is routed through write_cram_records",
+        )),
     }
 }
 

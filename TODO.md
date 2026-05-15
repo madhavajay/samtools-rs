@@ -64,6 +64,10 @@ Landed slices on this branch:
   resolves an exact file, a directory holding the index, or a prefix
   (matching `sam_index_load3`). New test:
   `samples_custom_index_directory_reports_index_presence`.
+- **`addreplacerg` CRAM output:** `-O cram` / `--output-fmt[=]cram`
+  with `-T`/`--reference` writes reference-backed CRAM (SAM/BAM input)
+  via a temp-BAM → shared CRAM-writer path. New test:
+  `addreplacerg_writes_cram_output_with_reference`.
 
 Latest known validation (on `main` at `b312c99`, post-merge):
 - Rust tests: 416 `samtools-rs` passing, 0 failing (`cargo test --workspace`: 2587 passing).
@@ -96,7 +100,7 @@ Remaining tractable samtools-rs-only items (no htslib-rs / noodles changes requi
 - ~~**`view -X` legacy custom-index synopsis**~~ **Done.** `view -X` / `--customized-index` accepts the legacy synopsis where the second positional is the explicit index path (`view -X in.bam in.bam.bai [region…]`); accepted as a no-op (our region queries build/find the index themselves), matching `idxstats -X`. Regression: `view_dash_cap_x_accepts_legacy_custom_index_synopsis`.
 - **`merge -s SEED`** — *deferred (not a bounded slice).* The option is already parsed and its value consumed. Upstream's only use of the seed is `hts_srand48` feeding `lrand48()` for random `@RG`/`@PG`-ID collision suffixes during header merge (`bam_sort.c:408`). Our merge reconciles headers by *rejecting* ID conflicts rather than random-suffixing, so the seed has no observable effect until that suffixing path is implemented — a header-reconciliation rework, larger than a bounded slice.
 - ~~**`samples` BAM index path verification**~~ **Done.** `samples -i` with a custom `-X` index path now mirrors `sam_index_load3`: an exact index file, a *directory* holding the index (`<dir>/<data-name>.bai`), or a suffix-less prefix all resolve via the shared `locate_associated_index` resolver, so index files at non-default locations register `Y`. Regression: `samples_custom_index_directory_reports_index_presence` (and the existing exact-file/pair test still passes).
-- **`addreplacerg --output-fmt=cram`** with a `-T` reference — needs reference-backed CRAM writer path (already used in `view`).
+- ~~**`addreplacerg --output-fmt=cram`** with a `-T` reference~~ **Done.** `addreplacerg` accepts `-O cram` / `--output-fmt cram` / `--output-fmt=cram` and `-T`/`--reference[=]FILE`; SAM/BAM input → CRAM output spools rewritten records to a temp BAM and converts via the shared `write_cram_from_bam_path_with_reference` (the `.fai` is built if missing). CRAM output without `-T` errors. Regression: `addreplacerg_writes_cram_output_with_reference`.
 - **`stats -d` / `--remove-dups` edge cases**: ensure histogram contributions are excluded for primary duplicates across CRAM record paths.
 
 Items blocked on htslib-rs / noodles extensions (see the rolling list at the end of this file):

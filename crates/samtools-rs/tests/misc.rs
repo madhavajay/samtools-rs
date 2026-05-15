@@ -5027,6 +5027,56 @@ fn addreplacerg_writes_bam_output_with_rg_header_and_tag() {
 }
 
 #[test]
+fn addreplacerg_writes_cram_output_with_reference() {
+    let tmp = tmp_dir("addreplacerg-cram-output");
+    let sam = tmp.join("in.sam");
+    let reference = tmp.join("ref.fa");
+    let out = tmp.join("out.cram");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(&reference, ">chr1\nACGTACGT\n").unwrap();
+
+    assert_eq!(
+        exit_to_u8(addreplacerg::main(&argv(
+            "addreplacerg",
+            &[
+                "--no-PG",
+                "-r",
+                "ID:g1",
+                "-r",
+                "SM:s1",
+                "--output-fmt",
+                "cram",
+                "-T",
+                reference.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    // Read the CRAM back through the shared reference-backed decoder and
+    // confirm the new @RG header and per-record RG:Z: tag are present.
+    let text = htslib_rs::alignment_compat::view_cram_as_sam_text_with_reference(
+        std::io::Cursor::new(std::fs::read(&out).unwrap()),
+        &reference,
+        None,
+    )
+    .unwrap();
+    assert!(text.contains("@RG\t") && text.contains("ID:g1"));
+    assert!(text.contains("RG:Z:g1"));
+}
+
+#[test]
 fn addreplacerg_bam_input_to_sam_honors_orphan_only_mode() {
     let tmp = tmp_dir("addreplacerg-bam-input");
     let sam = tmp.join("in.sam");
