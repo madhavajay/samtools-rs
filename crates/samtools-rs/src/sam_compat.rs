@@ -72,3 +72,31 @@ pub fn open_sam_reader_tolerant(
         normalized,
     ))))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_sam_aux_int_types;
+
+    #[test]
+    fn rewrites_scalar_int_synonyms_only() {
+        let input = b"@HD\tVN:1.6\tSO:coordinate\n\
+                      r1\t0\tc1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tAS:I:50\tXB:i:-10\tXX:B:S,1,2\tZZ:Z:keep:S:me\n";
+        let out = normalize_sam_aux_int_types(input);
+        let s = String::from_utf8(out).unwrap();
+        // I → i (scalar), i untouched, B-array subtype untouched,
+        // Z string value containing ":S:" untouched, header untouched.
+        assert!(s.contains("\tAS:i:50\t"));
+        assert!(s.contains("\tXB:i:-10\t"));
+        assert!(s.contains("\tXX:B:S,1,2\t"));
+        assert!(s.contains("\tZZ:Z:keep:S:me\n"));
+        assert!(s.starts_with("@HD\tVN:1.6\tSO:coordinate\n"));
+    }
+
+    #[test]
+    fn handles_c_s_synonyms_and_missing_trailing_newline() {
+        let input = b"x\t0\tc\t1\t0\t1M\t*\t0\t0\tA\t!\tNM:C:3\tH0:s:1";
+        let s = String::from_utf8(normalize_sam_aux_int_types(input)).unwrap();
+        assert!(s.contains("\tNM:i:3\t"));
+        assert!(s.ends_with("\tH0:i:1"));
+    }
+}
