@@ -1568,7 +1568,13 @@ impl StatsCounts {
                     }
                 }
             } else {
-                for (cycle, q) in quals.iter().copied().enumerate() {
+                // Upstream `collect_orig_read_stats` indexes cycle `i`
+                // but samples `bam_quals[reverse ? len-1-i : i]`, i.e.
+                // reverse-strand reads contribute in 5'->3' read order.
+                let reverse = flag & BAM_FREVERSE != 0;
+                let len = quals.len();
+                for cycle in 0..len {
+                    let q = quals[if reverse { len - 1 - cycle } else { cycle }];
                     self.qual_sum += u64::from(q);
                     self.qual_count += 1;
                     if q > self.max_qual {
