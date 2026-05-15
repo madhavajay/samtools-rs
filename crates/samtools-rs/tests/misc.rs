@@ -6129,6 +6129,78 @@ fn markdup_propagates_duplicate_flag_to_supplementary_records() {
 }
 
 #[test]
+fn ampliconstats_matches_upstream_test_ampliconstats_fixtures() {
+    use samtools_rs::commands::ampliconstats;
+    // Byte-exact (modulo the harness-stripped version/command-line lines)
+    // vs the entire upstream test_ampliconstats harness: single-ref
+    // multi-file (-S -t 50 -d 1,20,100), and the multi-ref/partial
+    // single-file -c 0 cases.
+    let astats = fixtures_dir().join("ampliconstats");
+    let aclip = fixtures_dir().join("ampliconclip");
+    let tmp = tmp_dir("ampliconstats-fixtures");
+    let strip = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.contains("Samtools version") && !l.contains("Command line"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    let p = |b: &std::path::Path| b.to_str().unwrap().to_string();
+    let cases: Vec<(Vec<String>, &str)> = vec![
+        (
+            vec![
+                "-S".into(),
+                "-t".into(),
+                "50".into(),
+                "-d".into(),
+                "1,20,100".into(),
+                p(&aclip.join("ac_test.bed")),
+                p(&aclip.join("1_hard_clipped.expected.sam")),
+                p(&aclip.join("1_soft_clipped.expected.sam")),
+                p(&aclip.join("1_soft_clipped_strand.expected.sam")),
+                p(&aclip.join("2_both_clipped.expected.sam")),
+            ],
+            "stats.expected.txt",
+        ),
+        (
+            vec![
+                "-c".into(),
+                "0".into(),
+                p(&aclip.join("multi_ref.bed")),
+                p(&astats.join("mixed_clipped.sam")),
+            ],
+            "stats_mixed.expected.txt",
+        ),
+        (
+            vec![
+                "-c".into(),
+                "0".into(),
+                p(&aclip.join("ac_test.bed")),
+                p(&astats.join("mixed_clipped.sam")),
+            ],
+            "stats_partial.expected.txt",
+        ),
+    ];
+    for (rest, expected) in cases {
+        let out = tmp.join(expected);
+        let mut v: Vec<String> = vec!["-o".into(), p(&out)];
+        v.extend(rest);
+        assert_eq!(
+            exit_to_u8(ampliconstats::main(&argv(
+                "ampliconstats",
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
+            ))),
+            0,
+            "ampliconstats {expected}"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            strip(&std::fs::read_to_string(astats.join(expected)).unwrap()),
+            "ampliconstats {expected} byte-exact",
+        );
+    }
+}
+
+#[test]
 fn ampliconclip_matches_upstream_test_ampliconclip_fixtures() {
     use samtools_rs::commands::ampliconclip;
     // Byte-exact vs the entire upstream `test/ampliconclip` harness:
