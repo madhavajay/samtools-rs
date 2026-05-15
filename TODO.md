@@ -21,19 +21,21 @@ Merged baseline:
 
 In-flight PRs (samtools-rs-only, ready for review/merge):
 - PR #8, https://github.com/madhavajay/samtools-rs/pull/8, branch `fastq-index-files` — `fastq --i1 FILE` / `--i2 FILE` per-record index FASTQ extraction with `--index-format` (default `i*i*`), `--quality-tag` (default `QT`), and `--barcode-tag`. Emits one index record per primary non-READ2 record; exact upstream name-grouped one-record-per-qname-pair emission remains pending.
-- PR #9, https://github.com/madhavajay/samtools-rs/pull/9, branch `fastq-index-paired-grouping` — three stacked commits:
+- PR #9, https://github.com/madhavajay/samtools-rs/pull/9, branch `fastq-index-paired-grouping` — five stacked commits:
   1. Upstream-style name-grouped fastq split routing (paired R1+R2 → `-1`/`-2`; R1-only / R2-only singleton → `-s` with fallback to `-1`/`-2`; READ_OTHER → `-0` with fallback to `-s`).
   2. Accumulating `-t` / `-T` aux-tag selections (union rather than override).
   3. Per-record interleaved output when `-1` and `-2` paths alias to the same file.
-  Brings `bam2fq/{1,2,3,4,6,7,9,11}.{1,2,s}.fq.expected` upstream fixtures to byte parity for SAM input.
+  4. Repeated `-d` / `-D` value-union for the same tag with mismatched-tag rejection.
+  5. Route all FASTA paths through the local renderer so reverse-strand records are reverse-complemented (the htslib-rs FASTA fast paths skipped that step).
+  Brings `bam2fq/{1,2,3,4,6,7,9,11,13,15,16,17,18,19,20}.{1,2,s}.fq.expected` and `bam2fq/11.fa.expected` upstream fixtures to byte parity for SAM input.
 - PR #10, https://github.com/madhavajay/samtools-rs/pull/10, branch `view-n-qname-filter` — `view -N FILE` / `--qname-file FILE` allow/deny qname list with `^FILE` negation; wired into the shared `line_passes` filter pass.
 - PR #11, https://github.com/madhavajay/samtools-rs/pull/11, branch `view-r-rg-filter` (stacked on PR #10) — `view -r STR` / `-R FILE` accumulating read-group ID filter plus `-n` exclude-no-RG.
 - PR #13, https://github.com/madhavajay/samtools-rs/pull/13, branch `view-d-aux-tag-filter` (stacked on PR #11) — `view -d TAG[:VAL]` / `-D TAG:FILE` aux-tag presence/value filtering with shared-tag validation.
 
-Latest known validation (against the tip of PR #13):
-- Rust tests: 407 passing.
+Latest known validation (against the tip of PR #13 / latest fastq-index-paired-grouping):
+- Rust tests: 408 passing (407 on PR #13, plus the FASTA revcomp test on PR #9 tip).
 - Full gate: `cargo fmt --all --check`, `cargo clippy -p samtools-rs --all-targets -- -D warnings`, `cargo test -p samtools-rs`, and `cargo test -p samtools-rs -- --list | rg ': test$' | wc -l` all green.
-- New focused tests added across PRs: `fastq_index_files_extract_from_barcode_tag`, `fastq_routes_r1_only_singletons_to_singleton_output`, `fastq_dash_t_and_dash_cap_t_combine_aux_tags`, `fastq_interleaves_read1_read2_when_paths_alias`, `view_qname_file_filters_records_by_name`, `view_r_and_dash_cap_r_filter_by_read_group`, and `view_d_and_dash_cap_d_filter_by_aux_tag`.
+- New focused tests added across PRs: `fastq_index_files_extract_from_barcode_tag`, `fastq_routes_r1_only_singletons_to_singleton_output`, `fastq_dash_t_and_dash_cap_t_combine_aux_tags`, `fastq_interleaves_read1_read2_when_paths_alias`, `fastq_repeated_dash_d_unions_same_tag_values`, `fasta_reverse_strand_record_reverse_complemented_in_output`, `view_qname_file_filters_records_by_name`, `view_r_and_dash_cap_r_filter_by_read_group`, and `view_d_and_dash_cap_d_filter_by_aux_tag`.
 
 Estimated whole-project completion:
 - Roughly 60–65% complete toward the full `samtools` replacement goal once the five in-flight PRs land.
