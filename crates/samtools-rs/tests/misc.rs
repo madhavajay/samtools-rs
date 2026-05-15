@@ -6237,3 +6237,18 @@ fn mpileup_overlap_removal_matches_upstream_out5() {
         .to_string();
     assert_eq!(line + "\n", std::fs::read_to_string(expected).unwrap());
 }
+
+#[test]
+fn index_bam_without_so_coordinate_header() {
+    // Upstream `samtools index` indexes coordinate-ordered BAMs whose
+    // header omits `@HD SO:coordinate` (TODO-NEXT #6).
+    let tmp = tmp_dir("index-no-so");
+    let bam = tmp.join("test_input_1_a.bam");
+    std::fs::copy(fixtures_dir().join("dat").join("test_input_1_a.bam"), &bam).unwrap();
+
+    assert_eq!(
+        exit_to_u8(index::main(&argv("index", &[bam.to_str().unwrap()]))),
+        0
+    );
+    assert!(bam.with_extension("bam.bai").exists());
+}
