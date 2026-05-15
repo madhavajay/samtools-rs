@@ -125,7 +125,12 @@ re-scoped for the next pass where the samtools-only constraint is lifted.
 - **samtools-rs tests:** `flagstat`/`idxstats` CRAM-no-reference integration
   tests + upstream fixtures.
 
-### 6. Index BAMs lacking `@HD SO:coordinate`
+### 6. Index BAMs lacking `@HD SO:coordinate` — ✅ DONE
+
+> Completed: htslib-rs `530b27c` (`build_bai` no longer requires the SO
+> header tag; `range.bam.bai` byte regression preserved; new no-SO test),
+> samtools-rs `index` works on `test_input_1_{a,b}.bam` with integration
+> test `index_bam_without_so_coordinate_header`. No noodles patch.
 
 - **htslib-rs:** allow BAI/CSI creation for coordinate-ordered data whose
   header has no `SO:coordinate` tag (currently rejected with
