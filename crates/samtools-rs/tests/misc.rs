@@ -4762,13 +4762,16 @@ fn addreplacerg_bam_input_to_sam_honors_orphan_only_mode() {
         ))),
         0
     );
+    // orphan_only must not overwrite records that already carry an RG:Z
+    // tag. We add a *new* @RG via -r (so the header entry exists) and
+    // confirm the existing RG:Z:old tags survive untouched.
     assert_eq!(
         exit_to_u8(addreplacerg::main(&argv(
             "addreplacerg",
             &[
                 "--no-PG",
-                "-R",
-                "new",
+                "-r",
+                "@RG\tID:new",
                 "-m",
                 "orphan_only",
                 "-O",
@@ -4784,6 +4787,41 @@ fn addreplacerg_bam_input_to_sam_honors_orphan_only_mode() {
     let text = std::fs::read_to_string(out).unwrap();
     assert!(text.contains("RG:Z:old"));
     assert!(!text.contains("RG:Z:new"));
+}
+
+#[test]
+fn addreplacerg_dash_cap_r_unknown_id_is_rejected() {
+    let tmp = tmp_dir("addreplacerg-unknown-rg");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.4\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:present\tCN:SC\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    // -R with an ID not present in the header must fail (upstream parity).
+    assert_ne!(
+        exit_to_u8(addreplacerg::main(&argv(
+            "addreplacerg",
+            &[
+                "--no-PG",
+                "-R",
+                "absent",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
 }
 
 #[test]

@@ -5,7 +5,9 @@
 //!  - `-r '@RG\tID:foo\tSM:bar'` — full `@RG` line spec; merged into header.
 //!  - `-r 'ID:foo'` — incremental tag form (one tag per `-r`); combined into
 //!    a single `@RG` line.
-//!  - `-R ID` — set every record's `RG:Z` to this existing ID.
+//!  - `-R ID` — set every record's `RG:Z` to this existing ID. The ID
+//!    must already be present in the input header (upstream rejects an
+//!    unknown ID with "RG ID supplied does not exist in header").
 //!  - no `-r` / `-R` — default to the first `@RG` ID in the input header
 //!    (matching upstream); error only if the input has no `@RG` line.
 //!  - `-m overwrite_all|orphan_only` — how to handle existing `RG:Z` tags.
@@ -180,6 +182,29 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
+    // `-R ID` (no `-r`) requires the ID to already exist in the header,
+    // matching upstream's "RG ID supplied does not exist in header" check.
+    if replace_id.is_some() && rg_line.is_none() {
+        match header_has_rg_id(&input, format.exact, &rg_id) {
+            Ok(true) => {}
+            Ok(false) => {
+                print_error(
+                    "addreplacerg",
+                    "RG ID supplied does not exist in header. Supply full @RG line with -r instead?",
+                );
+                return ExitCode::from(1);
+            }
+            Err(e) => {
+                print_error_errno(
+                    "addreplacerg",
+                    format!("failed to read header from \"{}\"", input.display()),
+                    &e,
+                );
+                return ExitCode::from(1);
+            }
+        }
+    }
+
     let pg_argv = if no_pg { None } else { Some(args) };
     let rewrite = RgRewrite {
         rg_line: rg_line.as_deref(),
@@ -250,6 +275,18 @@ fn build_rg_line(pieces: &[String]) -> Result<Option<String>, String> {
         return Err("missing ID: field in -r tag pieces".into());
     }
     Ok(Some(out))
+}
+
+/// Returns whether the input header contains an `@RG` line with `rg_id`.
+fn header_has_rg_id(input: &Path, exact: Exact, rg_id: &str) -> io::Result<bool> {
+    let header_text = crate::header_text::read_raw_header_text_with_format(input, exact)?;
+    Ok(header_text.lines().any(|line| {
+        line.starts_with("@RG\t")
+            && line
+                .split('\t')
+                .skip(1)
+                .any(|field| field.strip_prefix("ID:") == Some(rg_id))
+    }))
 }
 
 /// Read the input header and return the ID of the first `@RG` line, if any.
