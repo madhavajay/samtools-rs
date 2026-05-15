@@ -239,14 +239,16 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
 - **samtools-rs tests:** `--write-index` integration tests across
   `view`/`sort`/`merge`.
 
-### 10. Region-string grammar coverage (`htslib-rs::region`) — 🟡 PARTIAL
+### 10. Region-string grammar coverage (`htslib-rs::region`) — ✅ core DONE
 
-> `.` (everything) **done**: `view` normalizes a lone `.` positional to a
-> whole-file pass (test `view_dot_region_means_whole_file`).
-> **Remaining:** `*` (unplaced-unmapped only) — needs an unplaced filter
-> threaded through `view`'s count/SAM/BAM/CRAM output matrix (and
-> `stats`/etc.); currently still routed through noodles region parsing and
-> errors. Bounded follow-up.
+> `.` (everything) and `*` (unplaced/no-coordinate, RNAME `*`) both
+> implemented in `view`: normalized out of the region list, `*` adds an
+> `only_unplaced` filter via `line_passes`/`has_filters`. Tests
+> `view_dot_region_means_whole_file`,
+> `view_star_region_selects_unplaced_reads` (matches upstream
+> `reg_unmapped1`). **Minor remaining:** binary BAM/CRAM-output of `*`
+> isn't filtered (shares view's other binary-output filter limitation);
+> upstream `reg_unmapped1` compares SAM, which passes.
 
 - **htslib-rs:** confirm/extend coverage of HTSlib's full region grammar,
   notably `*` (unmapped) and `.` (everything else).
