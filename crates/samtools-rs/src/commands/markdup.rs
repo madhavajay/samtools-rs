@@ -1022,46 +1022,76 @@ fn duplicate_type(
 }
 
 fn is_optical_duplicate(duplicate: &RecordBuf, original: &RecordBuf, distance: u32) -> bool {
-    let Some(duplicate_location) = duplicate
-        .name()
-        .and_then(|name| optical_location(name.as_ref()))
-    else {
+    let (Some(dn), Some(on)) = (duplicate.name(), original.name()) else {
         return false;
     };
-    let Some(original_location) = original
-        .name()
-        .and_then(|name| optical_location(name.as_ref()))
-    else {
+    let dn = dn.as_ref();
+    let on = on.as_ref();
+    let Some((d_beg, d_end, dx, dy)) = get_coordinates_colons(dn) else {
         return false;
     };
-    duplicate_location.is_within_distance(original_location, distance)
+    let Some((o_beg, o_end, ox, oy)) = get_coordinates_colons(on) else {
+        return false;
+    };
+    let o_len = o_end - o_beg;
+    let d_len = d_end - d_beg;
+    o_len == d_len
+        && on[o_beg..o_end] == dn[d_beg..d_end]
+        && ox.abs_diff(dx) <= distance as u64
+        && oy.abs_diff(dy) <= distance as u64
 }
 
-#[derive(Clone, Copy)]
-struct OpticalLocation {
-    tile: i64,
-    x: i64,
-    y: i64,
-}
-
-impl OpticalLocation {
-    fn is_within_distance(self, other: Self, distance: u32) -> bool {
-        self.tile == other.tile
-            && self.x.abs_diff(other.x) <= distance as u64
-            && self.y.abs_diff(other.y) <= distance as u64
+/// Port of `get_coordinates_colons`: from an Illumina-style read name,
+/// pick x/y by colon-separator count and return
+/// `(tile_beg, tile_end, x, y)` where `name[tile_beg..tile_end]` is the
+/// prefix compared for string equality. `None` if undecipherable.
+fn get_coordinates_colons(qname: &[u8]) -> Option<(usize, usize, i64, i64)> {
+    let mut sep = 0;
+    let mut xpos = 0usize;
+    let mut ypos = 0usize;
+    for (pos, &c) in qname.iter().enumerate() {
+        if c == b':' {
+            sep += 1;
+            match sep {
+                2 => xpos = pos + 1,
+                3 => ypos = pos + 1,
+                4 => {
+                    xpos = ypos;
+                    ypos = pos + 1;
+                }
+                5 => xpos = pos + 1,
+                6 => ypos = pos + 1,
+                _ => {}
+            }
+        }
     }
+    if !(sep == 3 || sep == 4 || sep == 6 || sep == 7) {
+        return None;
+    }
+    let x = parse_strtol(qname, xpos)?;
+    let y = parse_strtol(qname, ypos)?;
+    Some((0, xpos, x, y))
 }
 
-fn optical_location(name: &[u8]) -> Option<OpticalLocation> {
-    let mut fields = name.rsplit(|&b| b == b':');
-    let y = parse_i64_ascii(fields.next()?)?;
-    let x = parse_i64_ascii(fields.next()?)?;
-    let tile = parse_i64_ascii(fields.next()?)?;
-    Some(OpticalLocation { tile, x, y })
-}
-
-fn parse_i64_ascii(bytes: &[u8]) -> Option<i64> {
-    std::str::from_utf8(bytes).ok()?.parse().ok()
+/// `strtol`-style: parse a base-10 integer at `start`; `None` if no
+/// digits are consumed (mirrors `(qname+pos) == end`).
+fn parse_strtol(bytes: &[u8], start: usize) -> Option<i64> {
+    let mut i = start;
+    let mut neg = false;
+    if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
+        neg = bytes[i] == b'-';
+        i += 1;
+    }
+    let digit_start = i;
+    let mut v: i64 = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        v = v * 10 + (bytes[i] - b'0') as i64;
+        i += 1;
+    }
+    if i == digit_start {
+        return None;
+    }
+    Some(if neg { -v } else { v })
 }
 
 fn set_dup(record: &mut RecordBuf) -> bool {
