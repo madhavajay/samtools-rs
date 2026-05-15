@@ -33,7 +33,7 @@ samtools-rs status legend:
   - `hts_expr_*` filter evaluation — ✅ via `htslib_rs::expr` (audit needed)
   - Aux-tag filter / remove (`-x`, `--keep-tag`) — implemented for SAM output and SAM-input BAM/CRAM output; BAM/CRAM-input binary aux mutation still needs deeper mutable-record support — ⚠️
   - Shared sanitizer mutation (`-z`/`--sanitize`) — implemented through text-record rewrites / text roundtrips for supported view output paths — ⚠️
-- **samtools-rs status:** 🟡 (SAM/BAM/reference-backed CRAM count/text/BAM/CRAM paths, stdin paths, region/BED queries, simple filters, expression filters, SAM-output `-U`/`-p`, SAM-input aux stripping, and `-z` sanitizer mutation work; BAM/CRAM-input binary aux mutation, binary `-U`/`-p`, multi-file inputs, paired filters, and full CRAM parity remain)
+- **samtools-rs status:** 🟡 (SAM/BAM/reference-backed CRAM count/text/BAM/CRAM paths, stdin paths, region/BED queries, simple filters, expression filters, SAM-output `-U`/`-p`, SAM-input aux stripping, `-z` sanitizer mutation, `-N`/`--qname-file FILE` qname filter with `^FILE` negation, accumulating `-r STR` / `-R FILE` read-group filtering, `-n` exclude-no-read-group filtering, and `-d TAG[:VAL]` / `-D TAG:FILE` aux-tag presence/value filtering work; BAM/CRAM-input binary aux mutation, binary `-U`/`-p`, multi-file inputs, paired filters, and full CRAM parity remain)
 
 ### head
 
@@ -146,7 +146,7 @@ samtools-rs status legend:
 - **C source:** `bam_fastq.c` (~48k LOC)
 - **HTSlib APIs used:** record iteration, aux tag access for barcodes/QT/RX/QX
 - **htslib-rs coverage:** ⚠️ — `view_sam_as_fastq_text_from_path_with_limit` exists; full feature set (paired/single, barcode-aware) needs more
-- **samtools-rs status:** 🟡 — SAM/BAM FASTQ/FASTA conversion supports basic single-output and split-output paths, flag filters, read-name suffix controls, selected/all aux comments, aux-tag filtering, `-t`, FASTQ `-O` original-quality `OQ` tags, `-v INT` missing-quality defaults, `-U`/`--UMI-tag` UMI read-name suffixes, and `-i`/`--barcode-tag` CASAVA barcode fields; index FASTQ files, exact name-grouped routing, and CRAM remain.
+- **samtools-rs status:** 🟡 — SAM/BAM FASTQ/FASTA conversion supports single-output and upstream-style name-grouped split-output paths (paired R1+R2 to `-1`/`-2`, R1-only or R2-only singletons to `-s` with fallback to `-1`/`-2`, READ_OTHER to `-0` with fallback to `-s`), per-record interleaved output when `-1`/`-2` paths alias, flag filters, read-name suffix controls, selected/all aux comments, accumulating `-t`/`-T` aux-tag selections, `-d`/`-D` value-union aux-tag filtering, FASTQ `-O` original-quality `OQ` tags, `-v INT` missing-quality defaults, `-U`/`--UMI-tag` UMI read-name suffixes, `-i`/`--barcode-tag` CASAVA barcode fields, FASTA reverse-complement of reverse-strand records, and per-record `--i1`/`--i2` index FASTQ extraction with `--index-format` (default `i*i*`), `--quality-tag` (default `QT`), and `-n`/`-N` plus UMI suffix support; exact upstream name-grouped index emission (one record per qname-pair), index emission for stdin input, CASAVA paired-end barcode propagation, and CRAM remain.
 
 ### import
 

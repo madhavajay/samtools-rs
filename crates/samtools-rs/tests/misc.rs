@@ -1180,8 +1180,12 @@ fn cat_adds_pg_by_default() {
     );
 
     let header = header_text::read_raw_header_text(&out).unwrap();
-    assert!(header.contains("\tPN:samtools\tVN:"));
-    assert!(header.contains("\tCL:cat "));
+    let pg_line = header
+        .lines()
+        .find(|l| l.starts_with("@PG\t") && l.contains("\tCL:cat "))
+        .expect("samtools cat @PG line present");
+    assert!(pg_line.contains("\tPN:samtools"));
+    assert!(pg_line.contains("\tVN:"));
 }
 
 #[test]
@@ -1714,6 +1718,58 @@ fn fastq_i_adds_casava_fields_from_barcode_tags() {
 }
 
 #[test]
+fn fastq_index_files_extract_from_barcode_tag() {
+    let tmp = tmp_dir("fastq-index-files");
+    let sam = tmp.join("in.sam");
+    let bam = tmp.join("in.bam");
+    let single_out = tmp.join("0.fq");
+    let i1_out = tmp.join("i1.fq");
+    let i2_out = tmp.join("i2.fq");
+    let text = concat!(
+        "@HD\tVN:1.6\n",
+        "foo\t4\t*\t0\t0\t*\t*\t0\t0\tACCCCCCCCCCCCCCCCCCCCT\txYYYYYYYYYYYYYYYYYYYYz\tBC:Z:AGGGGGGT-CGGGGGGT\tQT:Z:Xyyy1yyZ-Pqq1qqqR\n",
+    );
+    std::fs::write(&sam, text).unwrap();
+    write_bam_from_sam_text(&bam, text);
+
+    for input in [&sam, &bam] {
+        std::fs::write(&single_out, "").unwrap();
+        std::fs::write(&i1_out, "").unwrap();
+        std::fs::write(&i2_out, "").unwrap();
+        assert_eq!(
+            exit_to_u8(fastq::main(&argv(
+                "fastq",
+                &[
+                    "--index-format",
+                    "i8n1i8",
+                    "--i1",
+                    i1_out.to_str().unwrap(),
+                    "--i2",
+                    i2_out.to_str().unwrap(),
+                    "-0",
+                    single_out.to_str().unwrap(),
+                    input.to_str().unwrap(),
+                ]
+            ))),
+            0
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(&single_out).unwrap(),
+            "@foo\nACCCCCCCCCCCCCCCCCCCCT\n+\nxYYYYYYYYYYYYYYYYYYYYz\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&i1_out).unwrap(),
+            "@foo\nAGGGGGGT\n+\nXyyy1yyZ\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&i2_out).unwrap(),
+            "@foo\nCGGGGGGT\n+\nPqq1qqqR\n"
+        );
+    }
+}
+
+#[test]
 fn fastq_single_sam_path_filters_by_aux_tag_value() {
     let tmp = tmp_dir("fastq-aux-filter-value");
     let sam = tmp.join("in.sam");
@@ -2014,6 +2070,209 @@ fn fastq_splits_read1_read2_and_singleton_outputs() {
     assert_eq!(
         std::fs::read_to_string(singleton).unwrap(),
         "@solo\nNNNN\n+\n$$$$\n"
+    );
+}
+
+#[test]
+fn fastq_dash_t_and_dash_cap_t_combine_aux_tags() {
+    let tmp = tmp_dir("fastq-t-T-combine");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:4\n",
+            "read1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:rg1\tBC:Z:AAAA\tMD:Z:4\tNM:i:0\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-n",
+                "-t",
+                "-T",
+                "MD",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.starts_with("@read1"));
+    assert!(text.contains("RG:Z:rg1"));
+    assert!(text.contains("BC:Z:AAAA"));
+    assert!(text.contains("MD:Z:4"));
+    assert!(!text.contains("NM:i:0"));
+}
+
+#[test]
+fn fastq_interleaves_read1_read2_when_paths_alias() {
+    let tmp = tmp_dir("fastq-interleave");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("o.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:queryname\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "pair1\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\n",
+            "pair1\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\n",
+            "pair2\t65\tchr1\t1\t60\t4M\t=\t5\t8\tAAAA\t****\n",
+            "pair2\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tCCCC\t&&&&\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-N",
+                "-1",
+                out.to_str().unwrap(),
+                "-2",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        concat!(
+            "@pair1/1\nACGT\n+\n!!!!\n",
+            "@pair1/2\nTGCA\n+\n####\n",
+            "@pair2/1\nAAAA\n+\n****\n",
+            "@pair2/2\nCCCC\n+\n&&&&\n",
+        )
+    );
+}
+
+#[test]
+fn fasta_reverse_strand_record_reverse_complemented_in_output() {
+    let tmp = tmp_dir("fasta-revcomp");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.fa");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "fwd\t0\tchr1\t1\t60\t8M\t*\t0\t0\tACGTAATT\t!!!!!!!!\n",
+            "rev\t16\tchr1\t1\t60\t8M\t*\t0\t0\tACGTAATT\t!!!!!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fasta",
+            &["-n", "-o", out.to_str().unwrap(), sam.to_str().unwrap(),]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    // Forward strand: as-stored.
+    assert!(text.contains(">fwd\nACGTAATT\n"));
+    // Reverse strand: reverse-complemented to AATTACGT.
+    assert!(text.contains(">rev\nAATTACGT\n"));
+}
+
+#[test]
+fn fastq_repeated_dash_d_unions_same_tag_values() {
+    let tmp = tmp_dir("fastq-d-union");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:4\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tNM:i:13\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\tNM:i:14\n",
+            "c\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\t****\tNM:i:0\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-n",
+                "-d",
+                "NM:13",
+                "-d",
+                "NM:14",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("@a\n"));
+    assert!(text.contains("@b\n"));
+    assert!(!text.contains("@c\n"));
+}
+
+#[test]
+fn fastq_routes_r1_only_singletons_to_singleton_output() {
+    let tmp = tmp_dir("fastq-r1-singleton");
+    let sam = tmp.join("in.sam");
+    let r1 = tmp.join("r1.fq");
+    let r2 = tmp.join("r2.fq");
+    let singleton = tmp.join("s.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:queryname\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "pair\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\n",
+            "pair\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\n",
+            "solo_r1\t73\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\t****\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-1",
+                r1.to_str().unwrap(),
+                "-2",
+                r2.to_str().unwrap(),
+                "-s",
+                singleton.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&r1).unwrap(),
+        "@pair\nACGT\n+\n!!!!\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&r2).unwrap(),
+        "@pair\nTGCA\n+\n####\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&singleton).unwrap(),
+        "@solo_r1\nAAAA\n+\n****\n"
     );
 }
 
@@ -4762,13 +5021,16 @@ fn addreplacerg_bam_input_to_sam_honors_orphan_only_mode() {
         ))),
         0
     );
+    // orphan_only must not overwrite records that already carry an RG:Z
+    // tag. We add a *new* @RG via -r (so the header entry exists) and
+    // confirm the existing RG:Z:old tags survive untouched.
     assert_eq!(
         exit_to_u8(addreplacerg::main(&argv(
             "addreplacerg",
             &[
                 "--no-PG",
-                "-R",
-                "new",
+                "-r",
+                "@RG\tID:new",
                 "-m",
                 "orphan_only",
                 "-O",
@@ -4784,6 +5046,120 @@ fn addreplacerg_bam_input_to_sam_honors_orphan_only_mode() {
     let text = std::fs::read_to_string(out).unwrap();
     assert!(text.contains("RG:Z:old"));
     assert!(!text.contains("RG:Z:new"));
+}
+
+#[test]
+fn addreplacerg_dash_cap_r_unknown_id_is_rejected() {
+    let tmp = tmp_dir("addreplacerg-unknown-rg");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.4\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:present\tCN:SC\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    // -R with an ID not present in the header must fail (upstream parity).
+    assert_ne!(
+        exit_to_u8(addreplacerg::main(&argv(
+            "addreplacerg",
+            &[
+                "--no-PG",
+                "-R",
+                "absent",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+}
+
+#[test]
+fn addreplacerg_defaults_to_first_header_rg_and_preserves_lines() {
+    let tmp = tmp_dir("addreplacerg-default-rg");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.4\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:first\tCN:SC\n",
+            "@RG\tID:second\tCN:SC\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "r2\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\tRG:Z:second\n",
+        ),
+    )
+    .unwrap();
+
+    // No -r / -R: default to the first @RG ID, keep both @RG header lines,
+    // overwrite all record RG tags with the first ID.
+    assert_eq!(
+        exit_to_u8(addreplacerg::main(&argv(
+            "addreplacerg",
+            &[
+                "--no-PG",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("@RG\tID:first\tCN:SC"));
+    assert!(text.contains("@RG\tID:second\tCN:SC"));
+    assert!(text.contains("r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:first"));
+    assert!(text.contains("r2\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\tRG:Z:first"));
+}
+
+#[test]
+fn addreplacerg_r_overwrite_all_removes_other_header_rg_lines() {
+    let tmp = tmp_dir("addreplacerg-overwrite-rg");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.4\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:old\tCN:SC\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(addreplacerg::main(&argv(
+            "addreplacerg",
+            &[
+                "--no-PG",
+                "-O",
+                "sam",
+                "-r",
+                "@RG\tID:new\tCN:SC",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("@RG\tID:new\tCN:SC"));
+    assert!(!text.contains("@RG\tID:old"));
+    assert!(text.contains("r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:new"));
 }
 
 #[test]
