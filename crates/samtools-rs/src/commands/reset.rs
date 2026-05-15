@@ -229,14 +229,48 @@ fn run_reset(
     }
 }
 
+/// Upstream `reset` output header: keep `@HD`, **drop `@SQ`** (all reads
+/// become unmapped), keep `@RG` (verbatim — raw field order) unless
+/// `--no-RG`, keep `@CO`/other lines, then add the samtools `@PG`
+/// (unless `--no-PG`). Returns `None` if the raw header is unavailable.
+fn reset_raw_header(path: &Path, settings: &ResetSettings<'_>) -> Option<String> {
+    let raw = crate::header_text::read_raw_header_text(path).ok()?;
+    let mut lines: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        if line.starts_with("@SQ") || line.starts_with("@CO") {
+            continue;
+        }
+        if line.starts_with("@RG") && settings.remove_read_groups {
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+    let mut text = lines.join("\n");
+    text.push('\n');
+    if !settings.no_pg
+        && let Some(argv) = settings.pg_argv
+    {
+        text = crate::pg::add_samtools_pg(&text, argv).ok()?;
+    }
+    Some(text)
+}
+
 fn run_reset_bam(
     input: &Path,
     output: Option<&Path>,
     fmt: OutFmt,
     settings: &ResetSettings<'_>,
 ) -> io::Result<()> {
+    let raw = if matches!(fmt, OutFmt::Sam) {
+        reset_raw_header(input, settings)
+    } else {
+        None
+    };
     let mut reader = bam::io::Reader::new(File::open(input)?);
-    run_reset_bam_reader(&mut reader, output, fmt, settings)
+    run_reset_bam_reader(&mut reader, output, fmt, settings, raw.as_deref())
 }
 
 fn run_reset_bam_reader<R>(
@@ -244,13 +278,14 @@ fn run_reset_bam_reader<R>(
     output: Option<&Path>,
     fmt: OutFmt,
     settings: &ResetSettings<'_>,
+    raw_header: Option<&str>,
 ) -> io::Result<()>
 where
     R: Read,
 {
     let mut header = reader.read_header()?;
     reset_header(&mut header, settings)?;
-    let mut sink = open_output(output, fmt, &header)?;
+    let mut sink = open_output(output, fmt, &header, raw_header)?;
 
     let mut record = RecordBuf::default();
     loop {
@@ -270,10 +305,15 @@ fn run_reset_sam(
     fmt: OutFmt,
     settings: &ResetSettings<'_>,
 ) -> io::Result<()> {
-    let input = normalize_legacy_sam_header_version(std::fs::read(input)?);
-    let input = crate::sam_compat::normalize_sam_aux_int_types(&input);
-    let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(input)));
-    run_reset_sam_reader(&mut reader, output, fmt, settings)
+    let raw = if matches!(fmt, OutFmt::Sam) {
+        reset_raw_header(input, settings)
+    } else {
+        None
+    };
+    let bytes = normalize_legacy_sam_header_version(std::fs::read(input)?);
+    let bytes = crate::sam_compat::normalize_sam_aux_int_types(&bytes);
+    let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(bytes)));
+    run_reset_sam_reader(&mut reader, output, fmt, settings, raw.as_deref())
 }
 
 fn run_reset_stdin(
@@ -287,13 +327,13 @@ fn run_reset_stdin(
 
     if !looks_like_sam(&input) {
         let mut reader = bam::io::Reader::new(Cursor::new(input));
-        return run_reset_bam_reader(&mut reader, output, fmt, settings);
+        return run_reset_bam_reader(&mut reader, output, fmt, settings, None);
     }
 
     let input = normalize_legacy_sam_header_version(input);
     let input = crate::sam_compat::normalize_sam_aux_int_types(&input);
     let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(input)));
-    run_reset_sam_reader(&mut reader, output, fmt, settings)
+    run_reset_sam_reader(&mut reader, output, fmt, settings, None)
 }
 
 fn looks_like_sam(input: &[u8]) -> bool {
@@ -309,13 +349,14 @@ fn run_reset_sam_reader<R>(
     output: Option<&Path>,
     fmt: OutFmt,
     settings: &ResetSettings<'_>,
+    raw_header: Option<&str>,
 ) -> io::Result<()>
 where
     R: BufRead,
 {
     let mut header = reader.read_header()?;
     reset_header(&mut header, settings)?;
-    let mut sink = open_output(output, fmt, &header)?;
+    let mut sink = open_output(output, fmt, &header, raw_header)?;
 
     loop {
         let mut record = RecordBuf::default();
@@ -453,19 +494,22 @@ fn reset_record(record: &mut RecordBuf, settings: &ResetSettings<'_>) {
     if settings.remove_read_groups {
         to_drop.insert(*b"RG");
     }
-    let mut keys: Vec<sam::alignment::record::data::field::Tag> =
-        data.iter().map(|(t, _)| t).collect();
-    for k in keys.drain(..) {
-        let bytes: [u8; 2] = k.into();
-        let should_drop = (settings.remove_read_groups && bytes == *b"RG")
-            || match settings.keep_only {
-                Some(keep) => !keep.contains(&bytes),
-                None => to_drop.contains(&bytes),
-            };
-        if should_drop {
-            data.remove(&k);
-        }
-    }
+    // noodles `Data::remove` is a swap-remove (order-breaking); rebuild
+    // the field list preserving the original aux order (matches HTSlib).
+    let kept: Vec<_> = data
+        .iter()
+        .filter(|(t, _)| {
+            let bytes: [u8; 2] = (*t).into();
+            let drop = (settings.remove_read_groups && bytes == *b"RG")
+                || match settings.keep_only {
+                    Some(keep) => !keep.contains(&bytes),
+                    None => to_drop.contains(&bytes),
+                };
+            !drop
+        })
+        .map(|(t, v)| (t, v.clone()))
+        .collect();
+    *data = kept.into_iter().collect();
 }
 
 fn reverse_complement_record_sequence(record: &mut RecordBuf) {
@@ -545,11 +589,20 @@ impl Sink for SamStdout {
     }
 }
 
-fn open_output(out: Option<&Path>, fmt: OutFmt, header: &sam::Header) -> io::Result<Box<dyn Sink>> {
+fn open_output(
+    out: Option<&Path>,
+    fmt: OutFmt,
+    header: &sam::Header,
+    raw_header: Option<&str>,
+) -> io::Result<Box<dyn Sink>> {
     match (out, fmt) {
         (Some(p), OutFmt::Sam) => {
             let mut w = File::create(p)?;
-            crate::sam_render::write_header(&mut w, header)?;
+            if let Some(raw) = raw_header {
+                w.write_all(raw.as_bytes())?;
+            } else {
+                crate::sam_render::write_header(&mut w, header)?;
+            }
             Ok(Box::new(SamFile(w)))
         }
         (Some(p), OutFmt::Bam) => {
@@ -559,7 +612,11 @@ fn open_output(out: Option<&Path>, fmt: OutFmt, header: &sam::Header) -> io::Res
         }
         (None, OutFmt::Sam) => {
             let mut w = io::stdout();
-            crate::sam_render::write_header(&mut w, header)?;
+            if let Some(raw) = raw_header {
+                w.write_all(raw.as_bytes())?;
+            } else {
+                crate::sam_render::write_header(&mut w, header)?;
+            }
             Ok(Box::new(SamStdout(w)))
         }
         (None, OutFmt::Bam) => {
@@ -621,7 +678,7 @@ mod tests {
         };
         let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(input.as_bytes())));
 
-        run_reset_sam_reader(&mut reader, Some(&tmp), OutFmt::Sam, &settings).unwrap();
+        run_reset_sam_reader(&mut reader, Some(&tmp), OutFmt::Sam, &settings, None).unwrap();
 
         let text = std::fs::read_to_string(&tmp).unwrap();
         let _ = std::fs::remove_file(&tmp);
@@ -674,7 +731,7 @@ mod tests {
         };
         let mut reader = bam::io::Reader::new(Cursor::new(bam_bytes));
 
-        run_reset_bam_reader(&mut reader, Some(&tmp), OutFmt::Sam, &settings).unwrap();
+        run_reset_bam_reader(&mut reader, Some(&tmp), OutFmt::Sam, &settings, None).unwrap();
 
         let text = std::fs::read_to_string(&tmp).unwrap();
         let _ = std::fs::remove_file(&tmp);
