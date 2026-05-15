@@ -809,6 +809,58 @@ fn view_bam_region_expr_count_succeeds() {
 }
 
 #[test]
+fn view_dash_cap_x_accepts_legacy_custom_index_synopsis() {
+    // `view -X in.bam in.bam.bai region` — the second positional is the
+    // explicit index path. We accept it as a no-op (our region query
+    // builds/finds the index itself) and the region still applies, so
+    // the count must match the non-`-X` invocation.
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("view-x-index");
+    let bam = htslib_fixtures_dir().join("range.bam");
+    let bai = htslib_fixtures_dir().join("range.bam.bai");
+    let region = "CHROMOSOME_II:2980-2980";
+
+    let plain = tmp.join("plain.txt");
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "view",
+                "-c",
+                "-o",
+                plain.to_str().unwrap(),
+                bam.to_str().unwrap(),
+                region,
+            ],
+        ))),
+        0
+    );
+
+    let xed = tmp.join("xed.txt");
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "view",
+                "-X",
+                "-c",
+                "-o",
+                xed.to_str().unwrap(),
+                bam.to_str().unwrap(),
+                bai.to_str().unwrap(),
+                region,
+            ],
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&plain).unwrap(),
+        std::fs::read_to_string(&xed).unwrap()
+    );
+}
+
+#[test]
 fn view_bam_region_expr_sam_output_succeeds() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let tmp = tmp_dir("bam-region-expr-sam");

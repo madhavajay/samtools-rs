@@ -172,6 +172,15 @@ struct Opts {
     read_groups: HashSet<Vec<u8>>,
     /// `-n` — exclude records that have no `RG:Z:` aux tag at all.
     exclude_no_rg: bool,
+    /// `-X` / `--customized-index` — legacy synopsis where the second
+    /// positional is an explicit index path
+    /// (`view -X in.bam in.bam.bai [region…]`).
+    customized_index: bool,
+    /// Explicit index path captured under `-X`. Accepted for synopsis
+    /// compatibility; our region queries build/find the index
+    /// themselves, so this is currently informational (a no-op, matching
+    /// `idxstats -X`).
+    index_path: Option<PathBuf>,
     /// `-d TAG[:VAL]` / `-D TAG:FILE` — aux-tag presence (or value-set)
     /// filter. All `-d` / `-D` invocations must share the same TAG, and
     /// values accumulate into the same `AuxTagFilter`. `None` means the
@@ -318,6 +327,11 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
         let Some(s) = arg.to_str() else {
             if opts.input.is_none() {
                 opts.input = Some(PathBuf::from(arg));
+                i += 1;
+                continue;
+            }
+            if opts.customized_index && opts.index_path.is_none() {
+                opts.index_path = Some(PathBuf::from(arg));
                 i += 1;
                 continue;
             }
@@ -649,6 +663,10 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
                 };
                 i += 1;
             }
+            "-X" | "--customized-index" => {
+                opts.customized_index = true;
+                i += 1;
+            }
             "--help" => return Err(ParseError::Usage),
             _ if s.starts_with('-') && s != "-" => {
                 return Err(ParseError::Err(format!(
@@ -659,6 +677,10 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
             _ => {
                 if opts.input.is_none() {
                     opts.input = Some(PathBuf::from(arg));
+                } else if opts.customized_index && opts.index_path.is_none() {
+                    // Legacy `-X` synopsis: the second positional is the
+                    // explicit index path. Accepted as a no-op.
+                    opts.index_path = Some(PathBuf::from(arg));
                 } else {
                     opts.regions.push(s.to_string());
                 }

@@ -48,6 +48,10 @@ Landed slices on this branch:
   passing, 0 failing; `cargo test --workspace`: 2593 passing; fmt + clippy
   `-D warnings` clean). New test:
   `sort_sam_output_uses_htslib_float_aux_spelling`.
+- **`view -X` legacy custom-index synopsis:** `view -X` /
+  `--customized-index` accepts `in.bam in.bam.bai [region…]` (index
+  positional accepted as a no-op). New test:
+  `view_dash_cap_x_accepts_legacy_custom_index_synopsis`.
 
 Latest known validation (on `main` at `b312c99`, post-merge):
 - Rust tests: 416 `samtools-rs` passing, 0 failing (`cargo test --workspace`: 2587 passing).
@@ -77,7 +81,7 @@ Remaining tractable samtools-rs-only items (no htslib-rs / noodles changes requi
 - ~~**SAM aux float formatting — remaining commands.**~~ **Done.** The shared `samtools_rs::sam_render` module (`format_aux_float`, `format_htslib_exponent`, `fix_sam_aux_floats`, `fix_sam_text`, `write_record`, `write_header`) now backs every noodles-`sam::io::Writer` SAM-output path: `view`, `split`, plus `reheader` SAM→SAM, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, `markdup`, and `cat` (their `SamFile`/`SamStdout`/`Sam*Sink` sinks now wrap a plain `File`/`Stdout` and render through `sam_render`). So every SAM-text output path emits htslib `%g`-style float aux spelling. Regression covered by `sort_sam_output_uses_htslib_float_aux_spelling` plus the existing `view`/`split` fixtures.
 - **`fastq` index extraction × name-grouping interaction.** Fold the per-record index emission into the name-grouped flush so each qname-group emits at most one index record per `--i1` / `--i2`, matching upstream's `flush_rec` → `output_index` (required for `bam2fq/{5,8,10,12}` parity).
 - **`view --library` (`-l`)** library filter via `@RG LB:` aux lookup. Builds on the merged read-group filter infrastructure.
-- **`view -X` legacy custom-index synopsis** for BAM/CRAM; the second positional becomes the index path. Already supported as a no-op in `idxstats`.
+- ~~**`view -X` legacy custom-index synopsis**~~ **Done.** `view -X` / `--customized-index` accepts the legacy synopsis where the second positional is the explicit index path (`view -X in.bam in.bam.bai [region…]`); accepted as a no-op (our region queries build/find the index themselves), matching `idxstats -X`. Regression: `view_dash_cap_x_accepts_legacy_custom_index_synopsis`.
 - **`merge -s SEED`** random-seed acceptance for `-n` mode (currently the option is parsed but the seed is unused).
 - **`samples` BAM index path verification** for the `-i` index-presence column when index files are at non-default locations.
 - **`addreplacerg --output-fmt=cram`** with a `-T` reference — needs reference-backed CRAM writer path (already used in `view`).
