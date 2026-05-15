@@ -47,6 +47,7 @@ struct Config {
     use_qual: bool,
     min_qual: u8,
     min_mqual: u8,
+    all_bases: u8, // 0 none, 1 `-a`, 2 `-aa`
     ambig: bool,
     show_del: bool,
     show_ins: bool,
@@ -74,6 +75,7 @@ impl Default for Config {
             use_qual: false,
             min_qual: 0,
             min_mqual: 0,
+            all_bases: 0,
             ambig: false,
             show_del: false,
             show_ins: true,
@@ -184,6 +186,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
             }
+            "-a" => cfg.all_bases = cfg.all_bases.max(1),
+            "-aa" | "--all" => cfg.all_bases = 2,
             // Glued short option, e.g. `-C0`, `-c0.6`, `-d6`.
             _ if s.len() > 2 && s.starts_with('-') && !s.starts_with("--") => {
                 let (flag, val) = s.split_at(2);
@@ -198,7 +202,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     _ => { /* tolerate other glued short opts */ }
                 }
             }
-            "--no-PG" | "-a" | "-aa" => {}
+            "--no-PG" => {}
             "-@" | "--threads" | "-r" | "--region" | "-T" | "--reference" => {
                 let _ = iter.next();
             }
@@ -447,6 +451,11 @@ struct RefSeq {
     name: String,
     seq: Vec<u8>,
     qual: Vec<u32>,
+    /// Upstream `c->last_pos`: last 1-based reference position
+    /// processed (advanced even for skipped `*` columns) so interior
+    /// gaps fill with `N` per `basic_fasta`.
+    last_pos: usize,
+    initialised: bool,
 }
 
 fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
@@ -483,6 +492,8 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
                     name: col.reference_name.clone(),
                     seq: Vec::new(),
                     qual: Vec::new(),
+                    last_pos: 0,
+                    initialised: false,
                 },
             );
         }
@@ -510,9 +521,36 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
                     None,
                 );
             }
-        } else if cb != b'*' || cfg.show_del {
+        } else {
+            // FASTA/FASTQ: faithful `basic_fasta` gap handling.
+            // Init `last_pos` on the contig's first column: all-bases
+            // spans from 0 (whole contig), else from pos-1 (no leading
+            // fill).
+            if !rs.initialised {
+                rs.last_pos = if cfg.all_bases > 0 {
+                    0
+                } else {
+                    col.position - 1
+                };
+                rs.initialised = true;
+            }
+            // `*` (deletion) without --show-del: advance last_pos but
+            // emit nothing (and skip insertion handling for it).
+            if !cfg.show_del && cb == b'*' {
+                rs.last_pos = col.position;
+                continue;
+            }
+            // Fill an interior gap [last_pos+1, pos) with N/qual0 when
+            // `pos > last_pos && (last_pos > 0 || all_bases)`.
+            if col.position > rs.last_pos && (rs.last_pos > 0 || cfg.all_bases > 0) {
+                for _ in (rs.last_pos + 1)..col.position {
+                    rs.seq.push(b'N');
+                    rs.qual.push(0);
+                }
+            }
             rs.seq.push(cb);
             rs.qual.push(cq);
+            rs.last_pos = col.position;
         }
 
         if !cfg.show_ins {
