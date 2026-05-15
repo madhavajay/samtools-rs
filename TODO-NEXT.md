@@ -182,7 +182,15 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
 - **samtools-rs tests:** `index` integration test + the `test_index`
   fixtures that currently can't be indexed.
 
-### 7. `bam_aux_update_*` (string / int / array, with resize)
+### 7. `bam_aux_update_*` (string / int / array, with resize) — 🟡 unblocked
+
+> Assessed: htslib-rs already exposes `sam_aux_get` / `sam_aux_insert` /
+> `sam_aux_remove` on `RecordBuf`, and `addreplacerg` already rewrites
+> aux via mutable `RecordBuf::data_mut()` (its upstream fixture group
+> passes). So aux mutation is **functionally unblocked**; the remaining
+> work is per-subcommand wiring (`calmd` BAM MD/NM recompute,
+> `ampliconclip`) and, optionally, true in-place binary-resize primitives
+> for performance — not a blocking library gap.
 
 - **htslib-rs:** binary aux update primitives with re-sizing semantics
   (the proper path; today partially worked around via mutable `RecordBuf`).
