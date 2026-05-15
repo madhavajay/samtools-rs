@@ -6299,3 +6299,51 @@ fn view_dot_region_means_whole_file() {
         std::fs::read_to_string(no_region).unwrap()
     );
 }
+
+#[test]
+fn view_large_chrom_csi_region_matches_upstream() {
+    // TODO-NEXT #12: ref2 is 541556283 bp (> 2^29). With a header-aware
+    // CSI, `view large_chrom.bam ref2` and `ref2:1-541556283` must both
+    // produce dat/large_chrom.out without panicking.
+    let tmp = tmp_dir("large-chrom");
+    let bam = tmp.join("large_chrom.bam");
+    let sam = fixtures_dir().join("dat").join("large_chrom.sam");
+    let expected =
+        std::fs::read_to_string(fixtures_dir().join("dat").join("large_chrom.out")).unwrap();
+
+    // SAM -> BAM
+    let bam_out = tmp.join("lc.tmp");
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &["-b", "-o", bam.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+    // CSI index
+    assert_eq!(
+        exit_to_u8(index::main(&argv("index", &["-c", bam.to_str().unwrap()]))),
+        0
+    );
+
+    for region in ["ref2", "ref2:1-541556283"] {
+        assert_eq!(
+            exit_to_u8(view::main(&argv(
+                "view",
+                &[
+                    "-o",
+                    bam_out.to_str().unwrap(),
+                    bam.to_str().unwrap(),
+                    region,
+                ]
+            ))),
+            0,
+            "region {region}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&bam_out).unwrap(),
+            expected,
+            "region {region}"
+        );
+    }
+}
