@@ -48,6 +48,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut output: Option<PathBuf> = None;
     let mut input: Option<PathBuf> = None;
     let mut output_fmt = OutFmt::Bam;
+    let mut fmt_explicit = false;
     let mut extra_drop: Vec<AuxTag> = Vec::new();
     let mut keep_only: Option<HashSet<AuxTag>> = None;
     let mut preserve_duplicate = false;
@@ -66,6 +67,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     "bam" => OutFmt::Bam,
                     _ => OutFmt::Bam,
                 };
+                fmt_explicit = true;
             }
             "-o" | "--output" => {
                 output = iter.next().map(PathBuf::from);
@@ -149,6 +151,16 @@ pub fn main(args: &[OsString]) -> ExitCode {
         reject_programs: &reject_programs,
         pg_argv: Some(args),
     };
+
+    // Upstream `sam_open_mode`: infer the format from the `-o` filename
+    // extension when `--output-fmt` was not given.
+    if !fmt_explicit && let Some(p) = output.as_deref().and_then(|p| p.to_str()) {
+        if p.ends_with(".sam") {
+            output_fmt = OutFmt::Sam;
+        } else if p.ends_with(".bam") {
+            output_fmt = OutFmt::Bam;
+        }
+    }
 
     let result = match input {
         Some(input) if input != Path::new("-") => {
