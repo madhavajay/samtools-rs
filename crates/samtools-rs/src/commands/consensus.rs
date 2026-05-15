@@ -471,3 +471,202 @@ fn emit_pileup_row(
     out.extend_from_slice(&quals);
     out.push(b'\n');
 }
+
+/// Bayesian (`--mode bayesian`/default `recall`) consensus probability
+/// tables — a faithful port of `consensus_init` in
+/// `samtools/bam_consensus.c` (the Gap5-derived model). This is the
+/// foundational table-construction step of the Bayesian engine; the
+/// `calculate_consensus_gap5` accumulation/call is wired on top of it.
+///
+/// Not yet reachable from the CLI (only `--mode simple` is dispatched),
+/// so this is regression-safe scaffolding verified by its own tests.
+pub mod bayes {
+    /// `samtools/bam_consensus.c` defaults: `P_HET`, `P_INDEL`,
+    /// `P_HET_SCALE`, and `homopoly_redux` (poly_mul) for `MODE_RECALL`.
+    pub const P_HET: f64 = 1e-3;
+    pub const P_INDEL: f64 = 2e-4;
+    pub const P_HET_SCALE: f64 = 1.0;
+    pub const POLY_MUL_RECALL: f64 = 0.01;
+
+    /// Quality calibration maps (`qcal_t`). The default / `:flat`
+    /// profile is the identity `smap[i] = omap[i] = umap[i] = i`.
+    #[derive(Clone)]
+    pub struct Qcal {
+        pub smap: [i32; 101],
+        pub omap: [i32; 101],
+        pub umap: [i32; 101],
+    }
+
+    impl Qcal {
+        /// `QCAL_FLAT` / `set_qcal(_, QCAL_FLAT)`.
+        pub fn flat() -> Self {
+            let mut m = [0i32; 101];
+            for (i, v) in m.iter_mut().enumerate() {
+                *v = i as i32;
+            }
+            Qcal {
+                smap: m,
+                omap: m,
+                umap: m,
+            }
+        }
+    }
+
+    /// Ported `cons_probs` (the subset used by `calculate_consensus_gap5`:
+    /// the 15-combination log-priors and the per-quality log-likelihood
+    /// tables). `e_tab`/`e_log` accel tables live with the accumulator.
+    #[derive(Clone)]
+    pub struct ConsProbs {
+        pub poly_mul: f64,
+        pub prior: [f64; 25],
+        pub lprior15: [f64; 15],
+        pub p_mm: [f64; 101],
+        pub p_xx: [f64; 101],
+        pub p_xm: [f64; 101],
+        pub p_oo: [f64; 101],
+        pub p_om: [f64; 101],
+        pub p_ox: [f64; 101],
+        pub p_uu: [f64; 101],
+        pub p_um: [f64; 101],
+        pub p_mm_lower: [f64; 101], // upstream `pmm` (undercall match)
+    }
+
+    /// Faithful port of `consensus_init` for any non-`MODE_BAYES_116`
+    /// mode (i.e. `MODE_RECALL`/`MODE_PRECISE`/`MODE_MIXED`).
+    pub fn cons_probs_init(
+        p_het: f64,
+        p_indel: f64,
+        het_scale: f64,
+        poly_mul: f64,
+        qcal: &Qcal,
+    ) -> ConsProbs {
+        let mut prior = [p_het / 6.0; 25];
+        // Flat "it is what we observe": homozygous priors = 1.
+        for &i in &[0usize, 6, 12, 18, 24] {
+            prior[i] = 1.0;
+        }
+        // Heterozygous deletion (i = 4, 9, 14, 19).
+        let mut i = 4;
+        while i < 24 {
+            prior[i] = p_indel / 6.0;
+            i += 5;
+        }
+        // Heterozygous insertion (i = 20..=23).
+        for v in prior.iter_mut().take(24).skip(20) {
+            *v = p_indel / 6.0;
+        }
+
+        let pri_idx = [0usize, 1, 2, 3, 4, 6, 7, 8, 9, 12, 13, 14, 18, 19, 24];
+        let mut lprior15 = [0.0f64; 15];
+        for (k, &idx) in pri_idx.iter().enumerate() {
+            lprior15[k] = prior[idx].ln();
+        }
+
+        let mut cp = ConsProbs {
+            poly_mul,
+            prior,
+            lprior15,
+            p_mm: [0.0; 101],
+            p_xx: [0.0; 101],
+            p_xm: [0.0; 101],
+            p_oo: [0.0; 101],
+            p_om: [0.0; 101],
+            p_ox: [0.0; 101],
+            p_uu: [0.0; 101],
+            p_um: [0.0; 101],
+            p_mm_lower: [0.0; 101],
+        };
+
+        for q in 1..101usize {
+            let prob = 1.0 - 10f64.powf(-(qcal.smap[q] as f64) / 10.0);
+            cp.p_mm[q] = prob.ln();
+            cp.p_xx[q] = ((1.0 - prob) / 3.0).ln();
+            cp.p_xm[q] = ((cp.p_mm[q].exp() + cp.p_xx[q].exp()) / 2.0).ln() + het_scale.ln();
+
+            // overcall (insertion-leaning)
+            let prob_o = 1.0 - 10f64.powf(-(qcal.omap[q] as f64) / 10.0);
+            cp.p_oo[q] = ((1.0 - prob_o) / 3.0).ln();
+            if cp.p_oo[q] > cp.p_mm[q] - 0.5 {
+                cp.p_oo[q] = cp.p_mm[q] - 0.5;
+            }
+            cp.p_ox[q] = ((cp.p_oo[q].exp() + cp.p_xx[q].exp()) / 2.0).ln();
+            cp.p_om[q] = ((cp.p_oo[q].exp() + cp.p_mm[q].exp()) / 2.0).ln();
+            if cp.p_om[q] > cp.p_xm[q] + 0.5 {
+                cp.p_om[q] = cp.p_xm[q] + 0.5;
+            }
+
+            // undercall (deletion-leaning)
+            let prob_u = 1.0 - 10f64.powf(-(qcal.umap[q] as f64) / 10.0);
+            cp.p_mm_lower[q] = prob_u.ln();
+            cp.p_uu[q] = ((1.0 - prob_u) / 3.0).ln();
+            if cp.p_uu[q] > cp.p_mm[q] - 0.5 {
+                cp.p_uu[q] = cp.p_mm[q] - 0.5;
+            }
+            cp.p_um[q] = ((cp.p_uu[q].exp() + cp.p_mm_lower[q].exp()) / 2.0).ln();
+        }
+
+        // Index 0 mirrors index 1.
+        cp.p_mm[0] = cp.p_mm[1];
+        cp.p_xx[0] = cp.p_xx[1];
+        cp.p_xm[0] = cp.p_xm[1];
+        cp.p_mm_lower[0] = cp.p_mm_lower[1];
+        cp.p_oo[0] = cp.p_oo[1];
+        cp.p_ox[0] = cp.p_ox[1];
+        cp.p_om[0] = cp.p_om[1];
+        cp.p_uu[0] = cp.p_uu[1];
+        cp.p_um[0] = cp.p_um[1];
+
+        cp
+    }
+
+    /// Default (`MODE_RECALL`) probability table, as built by upstream
+    /// `main_consensus` for `cons_prob_recall`.
+    pub fn default_recall() -> ConsProbs {
+        cons_probs_init(P_HET, P_INDEL, P_HET_SCALE, POLY_MUL_RECALL, &Qcal::flat())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn priors_match_upstream_consensus_init() {
+            let cp = default_recall();
+            // Homozygous priors are 1 -> log 0.
+            for &k in &[0usize, 5, 9, 12, 14] {
+                assert_eq!(cp.lprior15[k], 0.0, "lprior15[{k}] should be ln(1)=0");
+            }
+            // Substitution het prior P_HET/6 -> lprior15[1] (AC).
+            assert!((cp.lprior15[1] - (P_HET / 6.0).ln()).abs() < 1e-12);
+            // Het-deletion prior P_INDEL/6 -> lprior15[4] (prior[4]).
+            assert!((cp.lprior15[4] - (P_INDEL / 6.0).ln()).abs() < 1e-12);
+            // Het-insertion prior P_INDEL/6 -> lprior15[13] (prior[19]).
+            assert!((cp.lprior15[13] - (P_INDEL / 6.0).ln()).abs() < 1e-12);
+        }
+
+        #[test]
+        fn likelihoods_match_upstream_formulas() {
+            let cp = default_recall();
+            // q=20, flat qcal: prob = 1 - 10^-2 = 0.99.
+            let prob = 0.99_f64;
+            assert!((cp.p_mm[20] - prob.ln()).abs() < 1e-12);
+            assert!((cp.p_xx[20] - ((1.0 - prob) / 3.0).ln()).abs() < 1e-12);
+            let xm = ((cp.p_mm[20].exp() + cp.p_xx[20].exp()) / 2.0).ln() + P_HET_SCALE.ln();
+            assert!((cp.p_xm[20] - xm).abs() < 1e-12);
+            // Index 0 mirrors index 1.
+            assert_eq!(cp.p_mm[0], cp.p_mm[1]);
+            assert_eq!(cp.p_um[0], cp.p_um[1]);
+            // pMM is monotonically increasing toward 0 (higher qual ->
+            // more confident match), and always negative.
+            for q in 2..101 {
+                assert!(cp.p_mm[q] < 0.0);
+                assert!(cp.p_mm[q] >= cp.p_mm[q - 1]);
+            }
+            // The MM clamps hold: poo/puu never exceed pMM-0.5.
+            for q in 1..101 {
+                assert!(cp.p_oo[q] <= cp.p_mm[q] - 0.5 + 1e-12);
+                assert!(cp.p_uu[q] <= cp.p_mm[q] - 0.5 + 1e-12);
+            }
+        }
+    }
+}
