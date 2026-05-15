@@ -51,22 +51,14 @@ fixed in `fixmate`/`markdup`/`rmdup`). So upstream byte-exact now:
 
 **Precisely-characterized remaining blockers** (each a large port, not a
 quick fix — verified by probing):
-- `merge` → ✅ **DONE**: @RG/@PG `-s SEED` reconciliation implemented (crate::rand48 + raw-header), byte-exact vs upstream merge/{2,4,7}. Remaining: `-r`/`-cp` options only. **Primitive DONE:** `crate::rand48` (`Rand48` +
-  `gen_unique_id`) is implemented, tested, and fixture-verified.
-  **Turn-key remaining steps:** (a) capture the `-s` seed in
-  `merge.rs` (line ~105, currently discarded) → `Rand48::new(seed)`;
-  (b) two-pass over each input's *raw* header (per file: @RG lines then
-  @PG lines, header order) — pass 1 builds per-file
-  `rg_trans`/`pg_trans` via `gen_unique_id` against shared seen-sets;
-  (c) emit raw merged header: input[0] @HD verbatim (NO forced
-  `SO:coordinate`), @SQ unioned by SN, @RG/@PG lines with ID/PG:/PP:
-  fields rewritten through the trans maps, @CO appended; (d) remap each
-  record's `RG:Z:`/`PG:Z:` via its source file's trans maps *before*
-  the global sort/append; (e) SAM output writes that raw text + records
-  via `sam_render::write_record` (keep BAM on the noodles path for now,
-  untested by fixtures); (f) update the `sort_merge` merge_* tests that
-  encode the old union/reject behavior to the upstream-correct
-  suffixed/raw expectations (cf. the sort SS test updates).
+- `merge` → ✅ **DONE (fully)**: @RG/@PG `-s SEED` reconciliation
+  (crate::rand48 + raw-header), plus `-r` (filename-stem @RG attached to
+  every record, order-preserving RG:Z delete-then-append) and `-c`/`-p`
+  (combine identical @RG/@PG IDs; grouped short opts `-cp`/`-rp`).
+  **Byte-exact vs ALL upstream test_merge fixtures merge/{2,4,5,6,7}**
+  (modulo @PG); integration test `merge_reconciles_rg_pg_byte_exact_vs_upstream`
+  covers all five. Remaining (not fixture-covered): k-way streaming
+  merge, CRAM output, `--template-coordinate`.
 - `markdup` → duplicate-selection / optical / stats algorithm parity
   (now *reads* the test_input_1_* fixtures via sam_compat). Key
   actionable detail: upstream keeps the read/pair with the highest
