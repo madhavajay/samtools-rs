@@ -593,7 +593,7 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
                         _ => clen,
                     };
                     for p in (last + 1)..=span_end {
-                        let _ = write!(pileup_rows, "{prev}\t{p}\t0\t0\tN\t0\t*\t*\n");
+                        let _ = writeln!(pileup_rows, "{prev}\t{p}\t0\t0\tN\t0\t*\t*");
                     }
                 }
                 pp_cur_ref = Some(col.reference_name.clone());
@@ -601,11 +601,7 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
                     .entry(col.reference_name.clone())
                     .or_insert_with(|| cfg.region.as_ref().map_or(0, |(_, b, _)| b - 1));
                 for p in (*last + 1)..col.position {
-                    let _ = write!(
-                        pileup_rows,
-                        "{}\t{p}\t0\t0\tN\t0\t*\t*\n",
-                        col.reference_name
-                    );
+                    let _ = writeln!(pileup_rows, "{}\t{p}\t0\t0\tN\t0\t*\t*", col.reference_name);
                 }
                 *last = col.position;
             }
@@ -707,7 +703,7 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
             _ => clen,
         };
         for p in (last + 1)..=span_end {
-            let _ = write!(pileup_rows, "{prev}\t{p}\t0\t0\tN\t0\t*\t*\n");
+            let _ = writeln!(pileup_rows, "{prev}\t{p}\t0\t0\tN\t0\t*\t*");
         }
     }
 
@@ -723,7 +719,7 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
             .find(|(n, _)| n == rn)
             .map_or(*re, |(_, l)| *l);
         for p in *rb..=(*re).min(clen) {
-            let _ = write!(pileup_rows, "{rn}\t{p}\t0\t0\tN\t0\t*\t*\n");
+            let _ = writeln!(pileup_rows, "{rn}\t{p}\t0\t0\tN\t0\t*\t*");
         }
     }
 
