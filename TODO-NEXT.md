@@ -71,13 +71,25 @@ quick fix — verified by probing):
   exact `-s` stats counts, CRAM, the `1..4` expect-fail cases.
 - `reset` → tested only via pipes into `sort -M -K10` (minimiser).
 - `sort` `name2` / `reset` → minimiser (`-N`/`-K`) + external merge.
-- `stats` → ✅ **core fixtures DONE**: byte-exact end to end vs
-  upstream `stat/{1..8}.stats.expected` (CHK checksum, all SN lines +
-  comments, FFQ/LFQ, full MPC reference-mismatch engine, GCF/GCL,
-  GCC/GCT/FBC/FTC/LBC/LTC, IS, RL/FRL/LRL, MAPQ, ID/IC indel engine,
-  COV, single-bin GCD; supplementary handling). Remaining: `-S RG`
-  split (stat/9,10), `-t`/region paths (stat/11+), multi-bin GCD,
-  exact pileup-backed COV, CRAM without explicit reference.
+- `stats` → ✅ **17/20 fixtures DONE**: byte-exact end to end vs
+  upstream `stat/{1..10,14,15,16,17}` (CHK checksum, all SN lines +
+  comments, FFQ/LFQ with `max_qual` width, full MPC reference-mismatch
+  engine, GCF/GCL, GCC/GCT/FBC/FTC/LBC/LTC, IS, RL/FRL/LRL, MAPQ, ID/IC
+  indel engine + `nindels`=300 cap, COV, single-bin GCD; supplementary
+  handling; `-S RG`/`-P` per-tag `.bamstat`; `-I` read-group filter;
+  upstream unpaired-read `order`; `--ref-stats` RFS with and without a
+  reference). **Remaining (region/target subsystem — the next entry
+  point):** stat/11,12 region-restricted `bases mapped (cigar)` +
+  coverage (upstream `collect_stats` `if(stats->regions)` branch at
+  stats.c:1308-1331 with the `chunks`/`reg_from`/`reg_to` overlap
+  correction from `is_in_regions` stats.c:2030 and the chunk
+  subtraction at stats.c:1150-1170); stat/18,19 region-restricted RFS
+  (the `else` branch of `collect_refstats` stats.c:2536-2596:
+  `name:start-end`, `reflen=min(end-start+1, seqlen)`, GC over the
+  clipped interval); stat/13 barcode BCC/QTQ sections (`-g`/barcode
+  tags, `collect_barcode_stats` stats.c:1189+); multi-bin (>20 kbp)
+  GC-depth; exact pileup-backed COV; CRAM without explicit reference
+  (blocked on the htslib-rs CRAM all-record iterator).
 - `ampliconclip` → ✅ **DONE**: full port, byte-exact vs the entire
   upstream `test_ampliconclip` harness (10 SAM + 3 primer-count TSVs).
 - `ampliconstats` (`amplicon_stats.c`, 1776 LOC) → ✅ **DONE**:
