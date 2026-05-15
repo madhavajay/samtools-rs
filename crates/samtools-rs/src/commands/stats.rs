@@ -429,9 +429,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     };
     let write_result = write_result.and_then(|()| {
-        if config.ref_stats {
-            let dims = read_input_ref_dims(&input, format.exact)?;
-            write_ref_stats(&mut writer, &dims, config.reference_seqs.as_ref())?;
+        if config.ref_stats
+            && let Some(header) = read_input_header(&input, format.exact)?
+        {
+            let dims = ref_dims(&header);
+            let merged = merge_ref_regions(&header, &parsed_regions)?;
+            write_ref_stats(&mut writer, &dims, &merged, config.reference_seqs.as_ref())?;
         }
         Ok(())
     });
@@ -497,16 +500,19 @@ fn read_input_header_sort_order(
     Ok(so)
 }
 
-/// Header `@SQ` (name, length) pairs in order, for the `--ref-stats`
-/// RFS section.
-fn read_input_ref_dims(input: &std::path::Path, exact: Exact) -> io::Result<Vec<(String, u64)>> {
-    let header = match exact {
+/// Reads just the header (for the `--ref-stats` RFS section).
+fn read_input_header(input: &std::path::Path, exact: Exact) -> io::Result<Option<sam::Header>> {
+    Ok(Some(match exact {
         Exact::Sam => htslib_rs::alignment_compat::read_sam_header_from_path(input)?,
         Exact::Bam => htslib_rs::alignment_compat::read_bam_header_from_path(input)?,
         Exact::Cram => htslib_rs::alignment_compat::read_cram_header_from_path(input)?,
-        _ => return Ok(Vec::new()),
-    };
-    Ok(header
+        _ => return Ok(None),
+    }))
+}
+
+/// Header `@SQ` (name, length) pairs in order.
+fn ref_dims(header: &sam::Header) -> Vec<(String, u64)> {
+    header
         .reference_sequences()
         .iter()
         .map(|(name, def)| {
@@ -515,7 +521,7 @@ fn read_input_ref_dims(input: &std::path::Path, exact: Exact) -> io::Result<Vec<
                 usize::from(def.length()) as u64,
             )
         })
-        .collect())
+        .collect()
 }
 
 /// Writes the RFS reference-statistics section (`--ref-stats`). Without
@@ -525,6 +531,7 @@ fn read_input_ref_dims(input: &std::path::Path, exact: Exact) -> io::Result<Vec<
 fn write_ref_stats(
     out: &mut dyn Write,
     dims: &[(String, u64)],
+    regions: &[(String, i64, i64, i64)],
     refmap: Option<&HashMap<String, Vec<u8>>>,
 ) -> io::Result<()> {
     writeln!(
@@ -539,61 +546,134 @@ fn write_ref_stats(
         out,
         "# Sequence name, Length, GC content, Unknown count in following rows."
     )?;
+    // refseq_total_count is always the number of header @SQ entries.
     let total = dims.len() as i64;
-    let combined: i64 = dims.iter().map(|(_, l)| *l as i64).sum();
-    let minlen = dims.iter().map(|(_, l)| *l as i64).min().unwrap_or(0);
-    let maxlen = dims.iter().map(|(_, l)| *l as i64).max().unwrap_or(0);
-    let avglen = if total > 0 {
-        combined as f64 / total as f64
+
+    // GC/N over the upper-cased reference bases [beg, end) (0-based).
+    let gc_n = |name: &str, beg0: usize, end0: usize| -> Option<(f64, i64)> {
+        let seq = refmap?.get(name);
+        match seq {
+            Some(seq) => {
+                let hi = end0.min(seq.len());
+                let (mut gc, mut at, mut n) = (0i64, 0i64, 0i64);
+                if beg0 < hi {
+                    for &b in &seq[beg0..hi] {
+                        match b {
+                            b'G' | b'C' => gc += 1,
+                            b'A' | b'T' => at += 1,
+                            b'N' => n += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                let refgc = if gc + at > 0 {
+                    gc as f64 / (gc + at) as f64
+                } else {
+                    0.0
+                };
+                Some((refgc, n))
+            }
+            // Reference supplied but sequence absent -> zero bases.
+            None => Some((0.0, 0)),
+        }
+    };
+
+    // (display name, reflen, refgc, refN)
+    let mut rows: Vec<(String, i64, f64, i64)> = Vec::new();
+    if regions.is_empty() {
+        // All-@SQ path: full sequence, header length.
+        for (name, len) in dims {
+            let l = *len as i64;
+            match gc_n(name, 0, *len as usize) {
+                Some((gc, n)) => rows.push((name.clone(), l, gc, n)),
+                None => rows.push((name.clone(), l, -1.0, -1)),
+            }
+        }
+    } else {
+        // Region path: name:beg-end, reflen clamped to the sequence.
+        for (name, beg, end, seqlen) in regions {
+            let reflen = (end - beg + 1).min(*seqlen);
+            match gc_n(name, (*beg - 1) as usize, *end as usize) {
+                Some((gc, n)) => rows.push((format!("{name}:{beg}-{end}"), reflen, gc, n)),
+                None => rows.push((format!("{name}:{beg}-{end}"), reflen, -1.0, -1)),
+            }
+        }
+    }
+
+    let have_ref = refmap.is_some();
+    let count = rows.len() as i64;
+    let combined: i64 = rows.iter().map(|(_, l, _, _)| *l).sum();
+    let minlen = rows.iter().map(|(_, l, _, _)| *l).min().unwrap_or(0);
+    let maxlen = rows.iter().map(|(_, l, _, _)| *l).max().unwrap_or(0);
+    let avglen = if count > 0 {
+        combined as f64 / count as f64
     } else {
         -1.0
     };
-    // Per-sequence GC fraction / N count over the header-length prefix.
-    let mut rows: Vec<(String, u64, f64, i64)> = Vec::with_capacity(dims.len());
-    let mut gcsum = 0.0_f64;
-    let mut have_ref = false;
-    for (name, len) in dims {
-        if let Some(seq) = refmap.and_then(|m| m.get(name)) {
-            have_ref = true;
-            let take = (*len as usize).min(seq.len());
-            let (mut gc, mut at, mut n) = (0i64, 0i64, 0i64);
-            for &b in &seq[..take] {
-                match b {
-                    b'G' | b'C' => gc += 1,
-                    b'A' | b'T' => at += 1,
-                    b'N' => n += 1,
-                    _ => {}
-                }
-            }
-            let refgc = if gc + at > 0 {
-                gc as f64 / (gc + at) as f64
-            } else {
-                0.0
-            };
-            gcsum += refgc;
-            rows.push((name.clone(), *len, refgc, n));
-        } else if refmap.is_some() {
-            // Reference supplied but sequence absent: upstream ends with
-            // zero bases -> GC 0, N 0.
-            have_ref = true;
-            rows.push((name.clone(), *len, 0.0, 0));
-        } else {
-            rows.push((name.clone(), *len, -1.0, -1));
-        }
-    }
-    let avggc = if !have_ref || total == 0 {
+    let gcsum: f64 = rows.iter().map(|(_, _, gc, _)| *gc).sum();
+    let avggc = if !have_ref || count == 0 {
         -1.0
     } else {
-        gcsum / total as f64
+        gcsum / count as f64
     };
     writeln!(
         out,
-        "RFS\t{total}\t{total}\t{avggc:.2}\t{minlen}\t{maxlen}\t{avglen:.2}\t{combined}"
+        "RFS\t{total}\t{count}\t{avggc:.2}\t{minlen}\t{maxlen}\t{avglen:.2}\t{combined}"
     )?;
     for (name, len, gc, n) in rows {
         writeln!(out, "RFS\t{name}\t{len}\t{gc:.2}\t{n}")?;
     }
     Ok(())
+}
+
+/// Upstream `init_regions` per-reference interval merge: sort by start,
+/// then coalesce overlapping/adjacent intervals (gap => new interval,
+/// otherwise extend the end). Returns `(name, beg, end, seqlen)` 1-based
+/// inclusive, in header order.
+fn merge_ref_regions(
+    header: &sam::Header,
+    regions: &[Region],
+) -> io::Result<Vec<(String, i64, i64, i64)>> {
+    let targets = region_targets(header, regions)?;
+    // tid -> (seqlen, sorted intervals)
+    let mut by_tid: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
+    let mut seqlens: BTreeMap<usize, (String, i64)> = BTreeMap::new();
+    for t in &targets {
+        by_tid
+            .entry(t.tid)
+            .or_default()
+            .push((t.start as i64, t.end as i64));
+        if let std::collections::btree_map::Entry::Vacant(e) = seqlens.entry(t.tid)
+            && let Some((name, def)) = header.reference_sequences().get_index(t.tid)
+        {
+            e.insert((
+                String::from_utf8_lossy(name.as_ref()).into_owned(),
+                usize::from(def.length()) as i64,
+            ));
+        }
+    }
+    let mut out = Vec::new();
+    for (tid, mut iv) in by_tid {
+        iv.sort_by_key(|&(b, _)| b);
+        let Some((name, seqlen)) = seqlens.get(&tid).cloned() else {
+            continue;
+        };
+        let mut merged: Vec<(i64, i64)> = Vec::new();
+        for (b, e) in iv {
+            match merged.last_mut() {
+                Some(last) if last.1 >= b => {
+                    if last.1 < e {
+                        last.1 = e;
+                    }
+                }
+                _ => merged.push((b, e)),
+            }
+        }
+        for (b, e) in merged {
+            out.push((name.clone(), b, e, seqlen));
+        }
+    }
+    Ok(out)
 }
 
 fn parse_region(s: &str) -> io::Result<Region> {

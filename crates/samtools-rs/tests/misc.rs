@@ -6406,26 +6406,52 @@ fn stats_matches_upstream_stat_fixtures() {
 
     // `--ref-stats` RFS section (upstream compares only `grep ^RFS`):
     // stat/16 no reference (GC/N = -1), stat/17 reference-backed GC/N
-    // (plain and `--ref-stats-chunk -1`, which is a no-op for us).
-    let test1_fa = stat.join("test1.fa");
-    let rfs_cases: [(Vec<String>, &str); 3] = [
-        (vec![], "16.stats.expected"),
-        (vec!["-r".into(), p(&test1_fa)], "17.stats.expected"),
+    // (plain and `--ref-stats-chunk -1` no-op), stat/18 positional
+    // region, stat/19 `-t` target file (overlapping intervals merged).
+    let test1_fa = p(&stat.join("test1.fa"));
+    let sam = p(&stat.join("11_target.sam"));
+    let bam = p(&stat.join("11_target.bam"));
+    let targets = p(&stat.join("11.stats.targets"));
+    let rfs_cases: [(Vec<String>, &str); 5] = [
+        (vec![sam.clone()], "16.stats.expected"),
+        (
+            vec!["-r".into(), test1_fa.clone(), sam.clone()],
+            "17.stats.expected",
+        ),
         (
             vec![
                 "--ref-stats-chunk".into(),
                 "-1".into(),
                 "-r".into(),
-                p(&test1_fa),
+                test1_fa.clone(),
+                sam.clone(),
             ],
             "17.stats.expected",
         ),
+        (
+            vec![
+                "-r".into(),
+                test1_fa.clone(),
+                bam.clone(),
+                "alpha:10-20".into(),
+            ],
+            "18.stats.expected",
+        ),
+        (
+            vec![
+                "-r".into(),
+                test1_fa.clone(),
+                "-t".into(),
+                targets.clone(),
+                sam.clone(),
+            ],
+            "19.stats.expected",
+        ),
     ];
-    for (extra, expected) in rfs_cases {
+    for (rest, expected) in rfs_cases {
         let out = tmp.join(expected);
         let mut v: Vec<String> = vec!["--ref-stats".into(), "-o".into(), p(&out)];
-        v.extend(extra);
-        v.push(p(&stat.join("11_target.sam")));
+        v.extend(rest);
         assert_eq!(
             exit_to_u8(stats::main(&argv(
                 "stats",
