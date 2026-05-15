@@ -2018,6 +2018,55 @@ fn fastq_splits_read1_read2_and_singleton_outputs() {
 }
 
 #[test]
+fn fastq_routes_r1_only_singletons_to_singleton_output() {
+    let tmp = tmp_dir("fastq-r1-singleton");
+    let sam = tmp.join("in.sam");
+    let r1 = tmp.join("r1.fq");
+    let r2 = tmp.join("r2.fq");
+    let singleton = tmp.join("s.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:queryname\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "pair\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\n",
+            "pair\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\n",
+            "solo_r1\t73\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\t****\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-1",
+                r1.to_str().unwrap(),
+                "-2",
+                r2.to_str().unwrap(),
+                "-s",
+                singleton.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&r1).unwrap(),
+        "@pair\nACGT\n+\n!!!!\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&r2).unwrap(),
+        "@pair\nTGCA\n+\n####\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&singleton).unwrap(),
+        "@solo_r1\nAAAA\n+\n****\n"
+    );
+}
+
+#[test]
 fn fastq_zero_routes_unpaired_reads_in_split_mode() {
     let tmp = tmp_dir("fastq-split-zero");
     let sam = tmp.join("in.sam");
