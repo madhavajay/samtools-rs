@@ -431,7 +431,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let write_result = write_result.and_then(|()| {
         if config.ref_stats {
             let dims = read_input_ref_dims(&input, format.exact)?;
-            write_ref_stats(&mut writer, &dims)?;
+            write_ref_stats(&mut writer, &dims, config.reference_seqs.as_ref())?;
         }
         Ok(())
     });
@@ -519,9 +519,14 @@ fn read_input_ref_dims(input: &std::path::Path, exact: Exact) -> io::Result<Vec<
 }
 
 /// Writes the RFS reference-statistics section (`--ref-stats`). Without
-/// a reference / regions this is derived purely from the header `@SQ`
-/// dimensions (GC and N reported as -1, matching upstream `gcsum=-1`).
-fn write_ref_stats(out: &mut dyn Write, dims: &[(String, u64)]) -> io::Result<()> {
+/// a reference the GC/N columns are -1 (upstream `gcsum=-1`); with one,
+/// GC = G+C / (A+C+G+T) and N = count of N over the header-length
+/// prefix of each sequence, mirroring `collect_refstats`.
+fn write_ref_stats(
+    out: &mut dyn Write,
+    dims: &[(String, u64)],
+    refmap: Option<&HashMap<String, Vec<u8>>>,
+) -> io::Result<()> {
     writeln!(
         out,
         "# Reference statistics. Use `grep ^RFS | cut -f 2-` to extract this part."
@@ -543,13 +548,50 @@ fn write_ref_stats(out: &mut dyn Write, dims: &[(String, u64)]) -> io::Result<()
     } else {
         -1.0
     };
+    // Per-sequence GC fraction / N count over the header-length prefix.
+    let mut rows: Vec<(String, u64, f64, i64)> = Vec::with_capacity(dims.len());
+    let mut gcsum = 0.0_f64;
+    let mut have_ref = false;
+    for (name, len) in dims {
+        if let Some(seq) = refmap.and_then(|m| m.get(name)) {
+            have_ref = true;
+            let take = (*len as usize).min(seq.len());
+            let (mut gc, mut at, mut n) = (0i64, 0i64, 0i64);
+            for &b in &seq[..take] {
+                match b {
+                    b'G' | b'C' => gc += 1,
+                    b'A' | b'T' => at += 1,
+                    b'N' => n += 1,
+                    _ => {}
+                }
+            }
+            let refgc = if gc + at > 0 {
+                gc as f64 / (gc + at) as f64
+            } else {
+                0.0
+            };
+            gcsum += refgc;
+            rows.push((name.clone(), *len, refgc, n));
+        } else if refmap.is_some() {
+            // Reference supplied but sequence absent: upstream ends with
+            // zero bases -> GC 0, N 0.
+            have_ref = true;
+            rows.push((name.clone(), *len, 0.0, 0));
+        } else {
+            rows.push((name.clone(), *len, -1.0, -1));
+        }
+    }
+    let avggc = if !have_ref || total == 0 {
+        -1.0
+    } else {
+        gcsum / total as f64
+    };
     writeln!(
         out,
-        "RFS\t{total}\t{total}\t{:.2}\t{minlen}\t{maxlen}\t{avglen:.2}\t{combined}",
-        -1.0
+        "RFS\t{total}\t{total}\t{avggc:.2}\t{minlen}\t{maxlen}\t{avglen:.2}\t{combined}"
     )?;
-    for (name, len) in dims {
-        writeln!(out, "RFS\t{name}\t{len}\t{:.2}\t{}", -1.0, -1)?;
+    for (name, len, gc, n) in rows {
+        writeln!(out, "RFS\t{name}\t{len}\t{gc:.2}\t{n}")?;
     }
     Ok(())
 }

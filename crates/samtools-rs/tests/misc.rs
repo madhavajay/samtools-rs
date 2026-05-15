@@ -6404,23 +6404,35 @@ fn stats_matches_upstream_stat_fixtures() {
         );
     }
 
-    // stat/16: `--ref-stats` with no reference — the RFS section is
-    // derived from the header @SQ dims (GC/N = -1). The upstream test
-    // compares only `grep ^RFS`.
-    {
-        let out = tmp.join("16.stats.expected");
+    // `--ref-stats` RFS section (upstream compares only `grep ^RFS`):
+    // stat/16 no reference (GC/N = -1), stat/17 reference-backed GC/N
+    // (plain and `--ref-stats-chunk -1`, which is a no-op for us).
+    let test1_fa = stat.join("test1.fa");
+    let rfs_cases: [(Vec<String>, &str); 3] = [
+        (vec![], "16.stats.expected"),
+        (vec!["-r".into(), p(&test1_fa)], "17.stats.expected"),
+        (
+            vec![
+                "--ref-stats-chunk".into(),
+                "-1".into(),
+                "-r".into(),
+                p(&test1_fa),
+            ],
+            "17.stats.expected",
+        ),
+    ];
+    for (extra, expected) in rfs_cases {
+        let out = tmp.join(expected);
+        let mut v: Vec<String> = vec!["--ref-stats".into(), "-o".into(), p(&out)];
+        v.extend(extra);
+        v.push(p(&stat.join("11_target.sam")));
         assert_eq!(
             exit_to_u8(stats::main(&argv(
                 "stats",
-                &[
-                    "--ref-stats",
-                    "-o",
-                    &p(&out),
-                    &p(&stat.join("11_target.sam")),
-                ]
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
             ))),
             0,
-            "stats --ref-stats"
+            "stats --ref-stats {expected}"
         );
         let rfs: String = std::fs::read_to_string(&out)
             .unwrap()
@@ -6430,8 +6442,8 @@ fn stats_matches_upstream_stat_fixtures() {
             .collect();
         assert_eq!(
             rfs,
-            std::fs::read_to_string(stat.join("16.stats.expected")).unwrap(),
-            "stats --ref-stats RFS byte-exact",
+            std::fs::read_to_string(stat.join(expected)).unwrap(),
+            "stats --ref-stats {expected} RFS byte-exact",
         );
     }
 
