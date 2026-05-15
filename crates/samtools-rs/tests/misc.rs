@@ -6129,6 +6129,228 @@ fn markdup_propagates_duplicate_flag_to_supplementary_records() {
 }
 
 #[test]
+fn ampliconclip_matches_upstream_test_ampliconclip_fixtures() {
+    use samtools_rs::commands::ampliconclip;
+    // Byte-exact vs the entire upstream `test/ampliconclip` harness:
+    // soft/hard clip, NM/MD deletion, OA tag, strand, filter-len,
+    // fail-len, both-ends, multi-ref, total-hard-clip + unmap, and the
+    // three primer-counts TSVs.
+    let d = fixtures_dir().join("ampliconclip");
+    let tmp = tmp_dir("ampliconclip-fixtures");
+    let acb = d.join("ac_test.bed");
+    let acb = acb.to_str().unwrap();
+    let td = d.join("1_test_data.sam");
+    let td = td.to_str().unwrap();
+    let sam_cases: &[(&[&str], &str)] = &[
+        (
+            &["--no-PG", "--keep-tag", "--output-fmt=sam", "-b", acb, td],
+            "1_soft_clipped",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--output-fmt=sam",
+                "--hard-clip",
+                "-b",
+                acb,
+                td,
+            ],
+            "1_hard_clipped",
+        ),
+        (
+            &["--no-PG", "--output-fmt=sam", "-b", acb, td],
+            "1_delete_tag",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--output-fmt=sam",
+                "--original",
+                "-b",
+                acb,
+                td,
+            ],
+            "1_original_tag",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--output-fmt=sam",
+                "--strand",
+                "-b",
+                acb,
+                td,
+            ],
+            "1_soft_clipped_strand",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--output-fmt=sam",
+                "--strand",
+                "--filter-len",
+                "185",
+                "-b",
+                acb,
+                td,
+            ],
+            "1_filter",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--output-fmt=sam",
+                "--strand",
+                "--fail-len",
+                "185",
+                "-b",
+                acb,
+                td,
+            ],
+            "1_fail",
+        ),
+    ];
+    for (rest, expected) in sam_cases {
+        let out = tmp.join(format!("{expected}.sam"));
+        let mut v: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
+        v.extend(["-o".into(), out.to_str().unwrap().into()]);
+        assert_eq!(
+            exit_to_u8(ampliconclip::main(&argv(
+                "ampliconclip",
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
+            ))),
+            0,
+            "ampliconclip {expected}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(d.join(format!("{expected}.expected.sam"))).unwrap(),
+            "ampliconclip {expected} byte-exact",
+        );
+    }
+
+    // --both-ends, multi-ref, total-hard-clip.
+    let extra: &[(&[&str], &str)] = &[
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--output-fmt=sam",
+                "--strand",
+                "--both-ends",
+                "-b",
+                "ac_test.bed",
+                "2_both_test_data.sam",
+            ],
+            "2_both_clipped",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--output-fmt=sam",
+                "--keep-tag",
+                "-b",
+                "multi_ref.bed",
+                "3_multi_ref_data.sam",
+            ],
+            "3_multi_ref_clip",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--output-fmt=sam",
+                "--hard-clip",
+                "-b",
+                "ac_test2.bed",
+                "4_total_hc_data.sam",
+            ],
+            "4_total_hc_data",
+        ),
+    ];
+    for (rest, expected) in extra {
+        let out = tmp.join(format!("{expected}.sam"));
+        let mut v: Vec<String> = Vec::new();
+        for tok in *rest {
+            if tok.ends_with(".bed") || tok.ends_with(".sam") {
+                v.push(d.join(tok).to_str().unwrap().to_string());
+            } else {
+                v.push((*tok).to_string());
+            }
+        }
+        v.extend(["-o".into(), out.to_str().unwrap().into()]);
+        assert_eq!(
+            exit_to_u8(ampliconclip::main(&argv(
+                "ampliconclip",
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
+            ))),
+            0,
+            "ampliconclip {expected}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(d.join(format!("{expected}.expected.sam"))).unwrap(),
+            "ampliconclip {expected} byte-exact",
+        );
+    }
+
+    // primer-counts TSV outputs.
+    let pc = tmp.join("pc.tsv");
+    let pcs = pc.to_str().unwrap();
+    let pc_cases: &[(&[&str], &str)] = &[
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--primer-counts",
+                pcs,
+                "--output-fmt=sam",
+                "-b",
+                acb,
+                td,
+            ],
+            "1_soft_clipped_primer_counts",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--output-fmt=sam",
+                "--strand",
+                "--primer-counts",
+                pcs,
+                "-b",
+                acb,
+                td,
+            ],
+            "1_soft_clipped_strand_primer_counts",
+        ),
+    ];
+    for (rest, expected) in pc_cases {
+        let out = tmp.join("oc.sam");
+        let mut v: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
+        v.extend(["-o".into(), out.to_str().unwrap().into()]);
+        assert_eq!(
+            exit_to_u8(ampliconclip::main(&argv(
+                "ampliconclip",
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
+            ))),
+            0,
+            "ampliconclip {expected}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pc).unwrap(),
+            std::fs::read_to_string(d.join(format!("{expected}.expected.tsv"))).unwrap(),
+            "ampliconclip {expected} byte-exact",
+        );
+    }
+}
+
+#[test]
 fn markdup_matches_upstream_test_markdup_fixtures() {
     use samtools_rs::commands::markdup;
     // Byte-exact vs upstream `samtools/test/markdup` expected SAMs
