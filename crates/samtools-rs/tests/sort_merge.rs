@@ -1836,7 +1836,11 @@ fn merge_reconciles_rg_pg_byte_exact_vs_upstream() {
             ],
             "merge/2.merge.expected.sam",
         ),
-        (&[], &["dat/test_input_1_b.bam"], "merge/4.merge.expected.sam"),
+        (
+            &[],
+            &["dat/test_input_1_b.bam"],
+            "merge/4.merge.expected.sam",
+        ),
         (
             &["-r"],
             &[

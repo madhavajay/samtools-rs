@@ -5598,18 +5598,21 @@ fn calmd_drop_baq_removes_bq_tags() {
 }
 
 #[test]
-fn markdup_sam_input_flags_duplicates_keeping_highest_mapq() {
+fn markdup_sam_input_flags_duplicates_keeping_highest_score() {
     use samtools_rs::commands::markdup;
     let tmp = tmp_dir("markdup-sam");
     let sam = tmp.join("in.sam");
     let out = tmp.join("out.sam");
+    // Upstream keeps the read with the higher `calc_score` (sum of base
+    // quals >= 15), not the higher MAPQ. `low` quals are all phred 0;
+    // `high` quals are all phred 40, so `high` wins regardless of MAPQ.
     std::fs::write(
         &sam,
         concat!(
             "@HD\tVN:1.6\tSO:coordinate\n",
             "@SQ\tSN:chr1\tLN:100\n",
             "low\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
-            "high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\tIIII\n",
             "reverse\t16\tchr1\t1\t30\t4M\t*\t0\t0\tCCCC\t$$$$\n",
             "unique\t0\tchr1\t2\t30\t4M\t*\t0\t0\tGGGG\t....\n",
         ),
@@ -5641,9 +5644,9 @@ fn markdup_sam_input_flags_duplicates_keeping_highest_mapq() {
     assert_eq!(
         flag_of(high) & 0x400,
         0,
-        "highest MAPQ in group keeps primary"
+        "highest calc_score in group keeps primary"
     );
-    assert_eq!(flag_of(low) & 0x400, 0x400, "low MAPQ duplicate flagged");
+    assert_eq!(flag_of(low) & 0x400, 0x400, "low-score duplicate flagged");
     assert_eq!(
         flag_of(reverse) & 0x400,
         0,
@@ -5668,7 +5671,7 @@ fn markdup_barcode_tag_separates_duplicate_groups() {
             "@HD\tVN:1.6\tSO:coordinate\n",
             "@SQ\tSN:chr1\tLN:100\n",
             "aa_low\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\tBC:Z:AA\n",
-            "aa_high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\tBC:Z:AA\n",
+            "aa_high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\tIIII\tBC:Z:AA\n",
             "bb\t0\tchr1\t1\t20\t4M\t*\t0\t0\tCCCC\t$$$$\tBC:Z:BB\n",
         ),
     )
@@ -6054,18 +6057,22 @@ fn markdup_propagates_duplicate_flag_to_supplementary_records() {
         concat!(
             "@HD\tVN:1.6\tSO:coordinate\n",
             "@SQ\tSN:chr1\tLN:1000\n",
-            "keep\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
-            "dup\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "keep\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\tIIII\n",
+            "dup\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\tSA:Z:chr1,20,+,4M,10,0;\n",
             "dup\t2048\tchr1\t20\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
-            "keep\t2048\tchr1\t30\t10\t4M\t*\t0\t0\tTGCA\t####\n",
+            "keep\t2048\tchr1\t30\t10\t4M\t*\t0\t0\tTGCA\tIIII\n",
         ),
     )
     .unwrap();
 
+    // Upstream only propagates to supplementary/secondary records with
+    // `-S`, and only when the marked-duplicate read carries `SA`/`XA` or
+    // an unmapped mate (here `dup` has an `SA` tag).
     assert_eq!(
         exit_to_u8(markdup::main(&argv(
             "markdup",
             &[
+                "-S",
                 "-O",
                 "sam",
                 "-o",
@@ -6096,6 +6103,7 @@ fn markdup_propagates_duplicate_flag_to_supplementary_records() {
         exit_to_u8(markdup::main(&argv(
             "markdup",
             &[
+                "-S",
                 "-r",
                 "-O",
                 "sam",
@@ -6118,6 +6126,55 @@ fn markdup_propagates_duplicate_flag_to_supplementary_records() {
             .lines()
             .any(|line| line.starts_with("keep\t2048\t"))
     );
+}
+
+#[test]
+fn markdup_matches_upstream_test_markdup_fixtures() {
+    use samtools_rs::commands::markdup;
+    // Byte-exact vs upstream `samtools/test/markdup` expected SAMs
+    // (modulo @PG, suppressed by --no-PG): default template mode,
+    // `-r` removal, `-S` supplementary propagation, and `--mode s`
+    // sequence mode with optical-distance + barcode-tag keying.
+    let d = fixtures_dir();
+    let tmp = tmp_dir("markdup-fixtures");
+    let cases: &[(&[&str], &str, &str)] = &[
+        (&[], "5_markdup", "5_markdup.expected.sam"),
+        (&["-r"], "6_remove_dups", "6_remove_dups.expected.sam"),
+        (&["-S"], "7_mark_supp_dup", "7_mark_supp_dup.expected.sam"),
+        (
+            &[
+                "-S",
+                "-d",
+                "100",
+                "--mode",
+                "s",
+                "-t",
+                "--barcode-tag",
+                "BX",
+            ],
+            "13_optical_barcode_tag",
+            "13_optical_barcode_tag.expected.sam",
+        ),
+    ];
+    for (flags, stem, expected) in cases {
+        let inp = d.join("markdup").join(format!("{stem}.sam"));
+        let out = tmp.join(format!("{stem}.out.sam"));
+        let mut rest: Vec<&str> = flags.to_vec();
+        rest.extend(["-O", "sam", "--no-PG"]);
+        let inp_s = inp.to_str().unwrap();
+        let out_s = out.to_str().unwrap();
+        rest.extend(["-o", out_s, inp_s]);
+        assert_eq!(
+            exit_to_u8(markdup::main(&argv("markdup", &rest))),
+            0,
+            "markdup {stem}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(d.join("markdup").join(expected)).unwrap(),
+            "markdup {stem} byte-exact vs upstream"
+        );
+    }
 }
 
 #[test]
