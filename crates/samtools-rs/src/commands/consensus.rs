@@ -704,6 +704,269 @@ pub mod bayes {
         -TENLOG2OVERLOG10 * fast_log2(x)
     }
 
+    // ---- S[15] accumulation + call (calculate_consensus_gap5) ----
+
+    /// SAM 4-bit base code -> {A=0,C=1,G=2,T=3,*=4,N/other=5}, the
+    /// `L[32]` map. `*` (pad) arrives as code >= 16.
+    pub const L: [u8; 32] = [
+        5, 0, 1, 5, 2, 5, 5, 5, 3, 5, 5, 5, 5, 5, 5, 5, // 0..15
+        4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, // 16..31 (pad)
+    ];
+    const MAP_SING: [usize; 15] = [0, 5, 5, 5, 5, 1, 5, 5, 5, 2, 5, 5, 3, 5, 4];
+    const MAP_HET: [usize; 15] = [0, 1, 2, 3, 4, 6, 7, 8, 9, 12, 13, 14, 18, 19, 24];
+
+    /// One filtered pileup observation feeding the Bayesian model.
+    pub struct Gap5Obs {
+        /// SAM 4-bit sequence code (`bam_seqi`), or `>=16` for `*`/pad.
+        pub base4: u8,
+        /// Per-base quality after the `255 -> default_qual` rule.
+        pub qual: u8,
+        /// Read mapping quality (`b->core.qual`).
+        pub mqual: f64,
+        /// Local NM within the halo (`nm_local`); used by `--NM-adjust`.
+        pub nm_local: i32,
+        /// Homopolymer run length (`poly_len`) at this position.
+        pub poly: f64,
+    }
+
+    pub struct Gap5Opts {
+        pub use_mqual: bool,
+        pub nm_adjust: bool,
+        pub scale_mqual: f64,
+        pub low_mqual: f64,
+        pub high_mqual: f64,
+    }
+
+    pub struct Gap5Cons {
+        /// 0=A 1=C 2=G 3=T 4=* 5=N (`map_sing[call]`).
+        pub call: usize,
+        pub phred: i32,
+        pub het_call: usize,
+        pub het_logodd: i32,
+        pub depth: i32,
+    }
+
+    /// Faithful port of `calculate_consensus_gap5` (default build: no
+    /// K2 / DO_FRACT / DO_HDW / DO_POLY_DIST / CONS_DISCREP). `obs` is
+    /// pre-filtered (min-qual / ref-skip done by the caller). `td` is
+    /// the original (pre-filter) depth used by the MQUAL depth fudge.
+    #[allow(clippy::needless_range_loop)]
+    pub fn gap5_call(
+        obs: &[Gap5Obs],
+        td: i32,
+        cp: &ConsProbs,
+        et: &ETab,
+        q2p: &[f64; 101],
+        mpow: &[f64; 256],
+        opts: &Gap5Opts,
+    ) -> Gap5Cons {
+        let min_e_exp = (f64::MIN_EXP as f64 - 1.0) * std::f64::consts::LN_2 + 1.0;
+        let mut s = [0.0f64; 15];
+        let mut counts = [0i32; 6];
+        let mut depth = 0i32;
+
+        for p in obs {
+            let mut qual = p.qual as f64;
+            let base = L[(p.base4 as usize) & 31] as usize;
+
+            if opts.use_mqual {
+                let mut mqual = p.mqual;
+                if opts.nm_adjust {
+                    mqual /= (p.nm_local + 1) as f64;
+                    let d = if td > 30 { 30 } else { td };
+                    mqual *= 1.0 + 2.0 * (0.5 - d as f64 / 60.0);
+                }
+                mqual *= opts.scale_mqual;
+                if mqual < opts.low_mqual {
+                    mqual = opts.low_mqual;
+                }
+                if mqual > opts.high_mqual {
+                    mqual = opts.high_mqual;
+                }
+                let pq = q2p[(qual as usize).min(100)];
+                let m = mpow[(mqual as i64).clamp(0, 255) as usize];
+                qual = ph_log(pq + 0.75 * m - pq * m);
+            }
+            if qual < 1.0 {
+                qual = 1.0;
+            }
+
+            let q = (qual as i64).clamp(0, 100) as usize;
+            let q2 = (qual - (p.poly - 2.0) * cp.poly_mul).max(1.0);
+            let q2 = (q2 as i64).clamp(0, 100) as usize;
+
+            let xx = cp.p_xx[q];
+            let mm_ = cp.p_mm[q] - xx;
+            let xm = cp.p_xm[q] - xx;
+            let oo = cp.p_oo[q2] - xx;
+            let om = cp.p_om[q2] - xx;
+            let ox = cp.p_ox[q2] - xx;
+            let uu = cp.p_uu[q2] - xx;
+            let um = cp.p_um[q2] - xx;
+            let mm = cp.p_mm_lower[q2] - xx;
+
+            counts[base] += 1;
+            match base {
+                0 => {
+                    s[0] += mm_;
+                    s[1] += xm;
+                    s[2] += xm;
+                    s[3] += xm;
+                    s[4] += om;
+                    s[8] += ox;
+                    s[11] += ox;
+                    s[13] += ox;
+                    s[14] += oo;
+                }
+                1 => {
+                    s[1] += xm;
+                    s[5] += mm_;
+                    s[6] += xm;
+                    s[7] += xm;
+                    s[8] += om;
+                    s[4] += ox;
+                    s[11] += ox;
+                    s[13] += ox;
+                    s[14] += oo;
+                }
+                2 => {
+                    s[2] += xm;
+                    s[6] += xm;
+                    s[9] += mm_;
+                    s[10] += xm;
+                    s[11] += om;
+                    s[4] += ox;
+                    s[8] += ox;
+                    s[13] += ox;
+                    s[14] += oo;
+                }
+                3 => {
+                    s[3] += xm;
+                    s[7] += xm;
+                    s[10] += xm;
+                    s[12] += mm_;
+                    s[13] += om;
+                    s[4] += ox;
+                    s[8] += ox;
+                    s[11] += ox;
+                    s[14] += oo;
+                }
+                4 => {
+                    s[0] += uu;
+                    s[1] += uu;
+                    s[2] += uu;
+                    s[3] += uu;
+                    s[4] += um;
+                    s[5] += uu;
+                    s[6] += uu;
+                    s[7] += uu;
+                    s[8] += um;
+                    s[9] += uu;
+                    s[10] += uu;
+                    s[11] += um;
+                    s[12] += uu;
+                    s[13] += um;
+                    s[14] += mm;
+                }
+                _ => {
+                    // 5 => N: equal weight to A,C,G,T (not a pad).
+                    s[0] += mm_;
+                    s[1] += mm_;
+                    s[2] += mm_;
+                    s[3] += mm_;
+                    s[4] += om;
+                    s[5] += mm_;
+                    s[6] += mm_;
+                    s[7] += mm_;
+                    s[8] += om;
+                    s[9] += mm_;
+                    s[10] += mm_;
+                    s[11] += om;
+                    s[12] += mm_;
+                    s[13] += om;
+                    s[14] += oo;
+                }
+            }
+            depth += 1;
+        }
+
+        // Add priors; split pure (homozygous) vs het argmax.
+        let mut shift = f64::MIN;
+        let mut max = f64::MIN;
+        let mut max_het = f64::MIN;
+        let mut call = 0usize;
+        let mut het_call = 0usize;
+        for j in 0..15 {
+            s[j] += cp.lprior15[j];
+            if shift < s[j] {
+                shift = s[j];
+            }
+            if j != 0 && j != 5 && j != 9 && j != 12 && j != 14 {
+                if max_het < s[j] {
+                    max_het = s[j];
+                    het_call = j;
+                }
+                continue;
+            }
+            if max < s[j] {
+                max = s[j];
+                call = j;
+            }
+        }
+
+        for j in 0..15 {
+            s[j] -= shift;
+            let e = et.fast_exp(s[j]);
+            s[j] = if s[j] > min_e_exp {
+                e
+            } else {
+                f64::MIN_POSITIVE
+            };
+        }
+        let mut norm = [0.0f64; 15];
+        let mut tot1 = 0.0f64;
+        let mut tot2 = 0.0f64;
+        for j in 0..15 {
+            norm[j] += tot1;
+            norm[14 - j] += tot2;
+            tot1 += s[j];
+            tot2 += s[14 - j];
+        }
+
+        if depth == 0 || depth == counts[5] {
+            return Gap5Cons {
+                call: 4,
+                phred: 0,
+                het_call: 0,
+                het_logodd: 0,
+                depth: 0,
+            };
+        }
+
+        if norm[call] == 0.0 {
+            norm[call] = f64::MIN_POSITIVE;
+        }
+        let ph = if s[call] == 1.0 && norm[call] < 0.01 {
+            ph_log(norm[call]) + 0.5
+        } else {
+            ph_log(1.0 - s[call] / (norm[call] + s[call])) + 0.5
+        };
+        let phred = if (ph as i32) < 0 { 0 } else { ph as i32 };
+
+        if norm[het_call] == 0.0 {
+            norm[het_call] = f64::MIN_POSITIVE;
+        }
+        let het_ph = TENLOG2OVERLOG10 * (fast_log2(s[het_call]) - fast_log2(norm[het_call])) + 0.5;
+
+        Gap5Cons {
+            call: MAP_SING[call],
+            phred,
+            het_call: MAP_HET[het_call],
+            het_logodd: het_ph as i32,
+            depth,
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -784,6 +1047,55 @@ pub mod bayes {
             // ph_log(x) = -3.0103 * fast_log2(x); ph_log(1) == 0.
             assert!((ph_log(1.0)).abs() < 1e-9);
             assert!(ph_log(0.001) > 0.0);
+        }
+
+        fn obs(base4: u8, qual: u8, n: usize) -> Vec<Gap5Obs> {
+            (0..n)
+                .map(|_| Gap5Obs {
+                    base4,
+                    qual,
+                    mqual: 60.0,
+                    nm_local: 0,
+                    poly: 1.0,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn gap5_call_basic_homozygous_and_het() {
+            let cp = default_recall();
+            let et = ETab::new();
+            let q2p = q2p_table();
+            let mpow = mqual_pow_1m_table();
+            let opts = Gap5Opts {
+                use_mqual: true,
+                nm_adjust: true,
+                scale_mqual: 1.0,
+                low_mqual: 1.0,
+                high_mqual: 60.0,
+            };
+
+            // 20x high-qual A (SAM code 1) -> call A (0), confident.
+            let c = gap5_call(&obs(1, 40, 20), 20, &cp, &et, &q2p, &mpow, &opts);
+            assert_eq!(c.call, 0, "pure A column should call A");
+            assert_eq!(c.depth, 20);
+            assert!(c.phred > 0, "confident A call should have phred>0");
+
+            // 20x high-qual G (SAM code 4) -> call G (2).
+            let g = gap5_call(&obs(4, 40, 20), 20, &cp, &et, &q2p, &mpow, &opts);
+            assert_eq!(g.call, 2, "pure G column should call G");
+
+            // Empty column -> N call, depth 0.
+            let n = gap5_call(&[], 0, &cp, &et, &q2p, &mpow, &opts);
+            assert_eq!(n.call, 4);
+            assert_eq!(n.depth, 0);
+
+            // Balanced A/C -> heterozygous A,C (map_het index 1).
+            let mut mix = obs(1, 40, 15);
+            mix.extend(obs(2, 40, 15));
+            let h = gap5_call(&mix, 30, &cp, &et, &q2p, &mpow, &opts);
+            assert_eq!(h.het_call, 1, "balanced A/C -> AC het (map_het[1])");
+            assert!(h.het_logodd > 0, "clear het should have positive logodd");
         }
     }
 }
