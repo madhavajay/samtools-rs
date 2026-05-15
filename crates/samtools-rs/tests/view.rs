@@ -90,6 +90,63 @@ fn view_cram_header_only_succeeds() {
 }
 
 #[test]
+fn view_qname_file_filters_records_by_name() {
+    let tmp = tmp_dir("qname-filter");
+    let input = tmp.join("in.sam");
+    let names_keep = tmp.join("keep.txt");
+    let names_drop = tmp.join("drop.txt");
+    let out_keep = tmp.join("keep.sam");
+    let out_drop = tmp.join("drop.sam");
+
+    std::fs::write(
+        &input,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "alpha\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "beta\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "gamma\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\t****\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(&names_keep, "alpha\ngamma\n").unwrap();
+    std::fs::write(&names_drop, "beta\n").unwrap();
+
+    assert_eq!(
+        run(&[
+            "-h",
+            "-N",
+            names_keep.to_str().unwrap(),
+            "-o",
+            out_keep.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+    let kept = std::fs::read_to_string(&out_keep).unwrap();
+    assert!(kept.contains("\nalpha\t"));
+    assert!(!kept.contains("\nbeta\t"));
+    assert!(kept.contains("\ngamma\t"));
+
+    let neg_arg = format!("^{}", names_drop.display());
+    assert_eq!(
+        run(&[
+            "-h",
+            "-N",
+            &neg_arg,
+            "-o",
+            out_drop.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+    let kept_neg = std::fs::read_to_string(&out_drop).unwrap();
+    assert!(kept_neg.contains("\nalpha\t"));
+    assert!(!kept_neg.contains("\nbeta\t"));
+    assert!(kept_neg.contains("\ngamma\t"));
+}
+
+#[test]
 fn view_filter_unmapped_succeeds() {
     let p = fixtures_dir().join("view.001.sam");
     // -f 4 (require unmapped) should succeed; output may be empty or contain

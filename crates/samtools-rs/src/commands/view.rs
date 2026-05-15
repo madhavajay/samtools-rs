@@ -26,6 +26,7 @@
 //! Anything else returns a "not yet supported" error so that test failures
 //! are loud rather than silent.
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -162,6 +163,23 @@ struct Opts {
     keep_tags: Vec<AuxTag>,
     /// `-z FLAGS` / `--sanitize FLAGS` — upstream-style record sanitizer.
     sanitize_flags: SanitizeFlags,
+    /// `-N FILE` / `--qname-file FILE` — read names listed in FILE (or
+    /// `^FILE` to negate). Records whose qname appears in the set pass;
+    /// `^FILE` flips to exclude. `None` means the filter is disabled.
+    qname_filter: Option<QnameFilter>,
+}
+
+#[derive(Clone, Debug)]
+struct QnameFilter {
+    negate: bool,
+    names: HashSet<Vec<u8>>,
+}
+
+impl QnameFilter {
+    fn matches(&self, qname: &[u8]) -> bool {
+        let contained = self.names.contains(qname);
+        if self.negate { !contained } else { contained }
+    }
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -367,6 +385,28 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
                 opts.min_mapq = v
                     .parse()
                     .map_err(|_| ParseError::Err(format!("invalid -q value \"{}\"", v)))?;
+                i += 1;
+            }
+            "-N" | "--qname-file" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .and_then(|a| a.to_str())
+                    .ok_or_else(|| ParseError::Err("missing value for -N".into()))?;
+                let (path, negate) = match v.strip_prefix('^') {
+                    Some(rest) => (rest, true),
+                    None => (v, false),
+                };
+                let text = std::fs::read_to_string(path).map_err(|e| {
+                    ParseError::Err(format!("failed to read -N value \"{}\": {}", path, e))
+                })?;
+                let names: HashSet<Vec<u8>> = text
+                    .lines()
+                    .map(|line| line.split_ascii_whitespace().next().unwrap_or(line))
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.as_bytes().to_vec())
+                    .collect();
+                opts.qname_filter = Some(QnameFilter { negate, names });
                 i += 1;
             }
             "-e" | "--expr" => {
@@ -1644,6 +1684,7 @@ fn has_filters(opts: &Opts) -> bool {
         || opts.exclude_flags != 0
         || opts.exclude_all_flags != 0
         || opts.min_mapq != 0
+        || opts.qname_filter.is_some()
 }
 
 fn has_sanitizer(opts: &Opts) -> bool {
@@ -1866,7 +1907,7 @@ fn extend_aux_tags(dst: &mut Vec<AuxTag>, raw: &str, option: &str) -> Result<(),
 /// be emitted. Parses the flag (column 2) and MAPQ (column 5).
 fn line_passes(line: &[u8], opts: &Opts) -> bool {
     let mut fields = line.split(|&b| b == b'\t');
-    let _qname = fields.next();
+    let qname = fields.next().unwrap_or(b"");
     let flag = fields
         .next()
         .and_then(|f| std::str::from_utf8(f).ok())
@@ -1879,6 +1920,11 @@ fn line_passes(line: &[u8], opts: &Opts) -> bool {
         .and_then(|f| std::str::from_utf8(f).ok())
         .and_then(|s| s.parse::<u8>().ok())
         .unwrap_or(0);
+    if let Some(qfilter) = opts.qname_filter.as_ref()
+        && !qfilter.matches(qname)
+    {
+        return false;
+    }
     record_passes(flag, mapq, opts)
 }
 
