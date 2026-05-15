@@ -33,7 +33,7 @@ samtools-rs status legend:
   - `hts_expr_*` filter evaluation — ✅ via `htslib_rs::expr` (audit needed)
   - Aux-tag filter / remove (`-x`, `--keep-tag`) — implemented for SAM output and SAM-input BAM/CRAM output; BAM/CRAM-input binary aux mutation still needs deeper mutable-record support — ⚠️
   - Shared sanitizer mutation (`-z`/`--sanitize`) — implemented through text-record rewrites / text roundtrips for supported view output paths — ⚠️
-- **samtools-rs status:** 🟡 (SAM/BAM/reference-backed CRAM count/text/BAM/CRAM paths, stdin paths, region/BED queries, simple filters, expression filters, SAM-output `-U`/`-p`, SAM-input aux stripping, `-z` sanitizer mutation, `-N`/`--qname-file FILE` qname filter with `^FILE` negation, accumulating `-r STR` / `-R FILE` read-group filtering, `-n` exclude-no-read-group filtering, and `-d TAG[:VAL]` / `-D TAG:FILE` aux-tag presence/value filtering work; BAM/CRAM-input binary aux mutation, binary `-U`/`-p`, multi-file inputs, paired filters, and full CRAM parity remain)
+- **samtools-rs status:** 🟡 (SAM/BAM/reference-backed CRAM count/text/BAM/CRAM paths, stdin paths, region/BED queries, simple filters, expression filters, SAM-output `-U`/`-p`, SAM-input aux stripping, `-z` sanitizer mutation, `-N`/`--qname-file FILE` qname filter with `^FILE` negation, accumulating `-r STR` / `-R FILE` read-group filtering, `-n` exclude-no-read-group filtering, `-d TAG[:VAL]` / `-D TAG:FILE` aux-tag presence/value filtering, and htslib-style aux float spelling for binary→SAM output via `sam_render` work; BAM/CRAM-input binary aux mutation, binary `-U`/`-p`, multi-file inputs, paired filters, and full CRAM parity remain)
 
 ### head
 
