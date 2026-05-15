@@ -1717,3 +1717,64 @@ fn merge_l_bed_restricts_to_indexed_records_and_deduplicates_overlaps() {
     let unique: std::collections::HashSet<_> = bed_records.iter().copied().collect();
     assert_eq!(unique.len(), bed_records.len());
 }
+
+#[test]
+fn sort_matches_upstream_test_sort_fixtures() {
+    // TODO.md §13: basic test_sort group byte-exact (modulo @PG, which
+    // the harness strips via ignore_pg_header). Covers coordinate, `-n`
+    // natural name, `-t TAG`, and `-n -t TAG` orders + raw @HD SO/SS.
+    let d = fixtures_dir();
+    let tmp = tmp_dir("sort-fixtures");
+    let np = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.starts_with("@PG\t"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    let cases: &[(&[&str], &str, &str)] = &[
+        (
+            &["-m", "10M"],
+            "dat/test_input_1_a.bam",
+            "sort/pos.sort.expected.sam",
+        ),
+        (
+            &["-n", "-m", "10M"],
+            "dat/test_input_1_a.bam",
+            "sort/name.sort.expected.sam",
+        ),
+        (
+            &["-n", "-m", "10M"],
+            "dat/sort_name_input_1.sam",
+            "sort/name3.sort.expected.sam",
+        ),
+        (
+            &["-t", "RG", "-m", "10M"],
+            "dat/test_input_1_a.bam",
+            "sort/tag.rg.sort.expected.sam",
+        ),
+        (
+            &["-n", "-t", "RG", "-m", "10M"],
+            "dat/test_input_1_a.bam",
+            "sort/tag.rg.n.sort.expected.sam",
+        ),
+    ];
+    for (args, input, expected) in cases {
+        let out = tmp.join(expected.replace('/', "_"));
+        let mut v: Vec<String> = vec!["sort".into()];
+        v.extend(args.iter().map(|s| s.to_string()));
+        v.push("-O".into());
+        v.push("SAM".into());
+        v.push("-o".into());
+        v.push(out.to_str().unwrap().into());
+        v.push(d.join(input).to_str().unwrap().into());
+        let refs: Vec<&OsString> = Vec::new();
+        let _ = refs;
+        let argv: Vec<OsString> = v.iter().map(OsString::from).collect();
+        assert_eq!(exit_to_u8(sort::main(&argv)), 0, "{expected}");
+        assert_eq!(
+            np(&std::fs::read_to_string(&out).unwrap()),
+            np(&std::fs::read_to_string(d.join(expected)).unwrap()),
+            "sort {expected} args={args:?}"
+        );
+    }
+}
