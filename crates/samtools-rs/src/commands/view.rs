@@ -172,6 +172,19 @@ struct Opts {
     read_groups: HashSet<Vec<u8>>,
     /// `-n` — exclude records that have no `RG:Z:` aux tag at all.
     exclude_no_rg: bool,
+    /// `-d TAG[:VAL]` / `-D TAG:FILE` — aux-tag presence (or value-set)
+    /// filter. All `-d` / `-D` invocations must share the same TAG, and
+    /// values accumulate into the same `AuxTagFilter`. `None` means the
+    /// filter is off.
+    aux_tag_filter: Option<AuxTagFilter>,
+}
+
+#[derive(Clone, Debug)]
+struct AuxTagFilter {
+    tag: [u8; 2],
+    /// If `None`, any record carrying `tag` passes (presence-only).
+    /// Otherwise the record's value for that tag must appear in the set.
+    values: Option<HashSet<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -456,6 +469,102 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
             }
             "-n" => {
                 opts.exclude_no_rg = true;
+                i += 1;
+            }
+            "-d" | "--tag" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .and_then(|a| a.to_str())
+                    .ok_or_else(|| ParseError::Err("missing value for -d".into()))?;
+                if v.len() < 2 {
+                    return Err(ParseError::Err(format!(
+                        "invalid -d value \"{}\": expected TAG[:VALUE]",
+                        v
+                    )));
+                }
+                let tag = [v.as_bytes()[0], v.as_bytes()[1]];
+                let value = if v.len() > 2 {
+                    if v.as_bytes()[2] != b':' {
+                        return Err(ParseError::Err(format!(
+                            "invalid -d value \"{}\": expected TAG:VALUE separator",
+                            v
+                        )));
+                    }
+                    Some(v.as_bytes()[3..].to_vec())
+                } else {
+                    None
+                };
+                if let Some(existing) = opts.aux_tag_filter.as_mut() {
+                    if existing.tag != tag {
+                        return Err(ParseError::Err(format!(
+                            "different tag \"{}{}\" specified after \"{}{}\"",
+                            char::from(tag[0]),
+                            char::from(tag[1]),
+                            char::from(existing.tag[0]),
+                            char::from(existing.tag[1]),
+                        )));
+                    }
+                    if let Some(value) = value {
+                        existing
+                            .values
+                            .get_or_insert_with(HashSet::new)
+                            .insert(value);
+                    }
+                } else {
+                    opts.aux_tag_filter = Some(AuxTagFilter {
+                        tag,
+                        values: value.map(|v| {
+                            let mut set = HashSet::new();
+                            set.insert(v);
+                            set
+                        }),
+                    });
+                }
+                i += 1;
+            }
+            "-D" | "--tag-file" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .and_then(|a| a.to_str())
+                    .ok_or_else(|| ParseError::Err("missing value for -D".into()))?;
+                if v.len() < 4 || (v.as_bytes()[2] != b':' && v.as_bytes()[2] != b';') {
+                    return Err(ParseError::Err(format!(
+                        "invalid -D value \"{}\": expected TAG:FILE",
+                        v
+                    )));
+                }
+                let tag = [v.as_bytes()[0], v.as_bytes()[1]];
+                let path = &v[3..];
+                let text = std::fs::read_to_string(path).map_err(|e| {
+                    ParseError::Err(format!("failed to read -D value \"{}\": {}", path, e))
+                })?;
+                let new_values: HashSet<Vec<u8>> = text
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(|line| line.as_bytes().to_vec())
+                    .collect();
+                if let Some(existing) = opts.aux_tag_filter.as_mut() {
+                    if existing.tag != tag {
+                        return Err(ParseError::Err(format!(
+                            "different tag \"{}{}\" specified after \"{}{}\"",
+                            char::from(tag[0]),
+                            char::from(tag[1]),
+                            char::from(existing.tag[0]),
+                            char::from(existing.tag[1]),
+                        )));
+                    }
+                    existing
+                        .values
+                        .get_or_insert_with(HashSet::new)
+                        .extend(new_values);
+                } else {
+                    opts.aux_tag_filter = Some(AuxTagFilter {
+                        tag,
+                        values: Some(new_values),
+                    });
+                }
                 i += 1;
             }
             "-e" | "--expr" => {
@@ -1736,6 +1845,7 @@ fn has_filters(opts: &Opts) -> bool {
         || opts.qname_filter.is_some()
         || !opts.read_groups.is_empty()
         || opts.exclude_no_rg
+        || opts.aux_tag_filter.is_some()
 }
 
 fn has_sanitizer(opts: &Opts) -> bool {
@@ -1992,7 +2102,36 @@ fn line_passes(line: &[u8], opts: &Opts) -> bool {
             }
         }
     }
+    if let Some(filter) = opts.aux_tag_filter.as_ref() {
+        let aux_value = extract_aux_value(line, filter.tag);
+        match (&filter.values, aux_value) {
+            (_, None) => return false,
+            (Some(values), Some(value)) => {
+                if !values.contains(value) {
+                    return false;
+                }
+            }
+            (None, Some(_)) => {}
+        }
+    }
     record_passes(flag, mapq, opts)
+}
+
+/// Walk a SAM record line and return the value of the aux tag `tag`, or
+/// `None` if not present. Skips the first 11 mandatory fields. The raw
+/// value bytes follow the `TAG:T:` prefix (5 bytes); for `B` array tags
+/// the entire post-prefix portion (subtype prefix included) is returned.
+fn extract_aux_value(line: &[u8], tag: [u8; 2]) -> Option<&[u8]> {
+    for (i, field) in line.split(|&b| b == b'\t').enumerate() {
+        if i < 11 {
+            continue;
+        }
+        if field.len() < 5 || field[0] != tag[0] || field[1] != tag[1] || field[2] != b':' {
+            continue;
+        }
+        return Some(&field[5..]);
+    }
+    None
 }
 
 fn line_selected(

@@ -221,6 +221,79 @@ fn view_r_and_dash_cap_r_filter_by_read_group() {
 }
 
 #[test]
+fn view_d_and_dash_cap_d_filter_by_aux_tag() {
+    let tmp = tmp_dir("aux-tag-filter");
+    let input = tmp.join("in.sam");
+    let tag_file = tmp.join("nm.txt");
+    let out_present = tmp.join("present.sam");
+    let out_value = tmp.join("value.sam");
+    let out_file = tmp.join("file.sam");
+
+    std::fs::write(
+        &input,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tNM:i:0\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\tNM:i:1\n",
+            "c\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\t****\tNM:i:2\n",
+            "d\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t&&&&\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(&tag_file, "0\n2\n").unwrap();
+
+    assert_eq!(
+        run(&[
+            "-d",
+            "NM",
+            "-o",
+            out_present.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+    let present = std::fs::read_to_string(&out_present).unwrap();
+    assert!(present.contains("a\t"));
+    assert!(present.contains("b\t"));
+    assert!(present.contains("c\t"));
+    assert!(!present.contains("\nd\t") && !present.starts_with("d\t"));
+
+    assert_eq!(
+        run(&[
+            "-d",
+            "NM:1",
+            "-o",
+            out_value.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+    let value_filter = std::fs::read_to_string(&out_value).unwrap();
+    assert!(value_filter.contains("b\t"));
+    assert!(!value_filter.contains("\na\t") && !value_filter.starts_with("a\t"));
+    assert!(!value_filter.contains("\nc\t") && !value_filter.starts_with("c\t"));
+    assert!(!value_filter.contains("\nd\t") && !value_filter.starts_with("d\t"));
+
+    let tag_file_arg = format!("NM:{}", tag_file.display());
+    assert_eq!(
+        run(&[
+            "-D",
+            &tag_file_arg,
+            "-o",
+            out_file.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+    let file_filter = std::fs::read_to_string(&out_file).unwrap();
+    assert!(file_filter.contains("a\t"));
+    assert!(!file_filter.contains("\nb\t") && !file_filter.starts_with("b\t"));
+    assert!(file_filter.contains("c\t"));
+    assert!(!file_filter.contains("\nd\t") && !file_filter.starts_with("d\t"));
+}
+
+#[test]
 fn view_filter_unmapped_succeeds() {
     let p = fixtures_dir().join("view.001.sam");
     // -f 4 (require unmapped) should succeed; output may be empty or contain
