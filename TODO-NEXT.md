@@ -54,7 +54,11 @@ quick fix — verified by probing):
 - `merge` → the deferred `@RG`/`@PG` header-reconciliation rework
   (we reject ID conflicts; upstream `-s SEED` random-suffixes).
 - `markdup` → duplicate-selection / optical / stats algorithm parity
-  (now *reads* the test_input_1_* fixtures via sam_compat).
+  (now *reads* the test_input_1_* fixtures via sam_compat). Key
+  actionable detail: upstream keeps the read/pair with the highest
+  `calc_score` = sum of base quals >= MD_MIN_QUALITY (bam_markdup.c:276),
+  **not** MAPQ as our port does; pair key uses unclipped start/end +
+  orientation (`make_pair_key`).
 - `reset` → tested only via pipes into `sort -M -K10` (minimiser).
 - `sort` `name2` / `reset` → minimiser (`-N`/`-K`) + external merge.
 - `stats` → ~123k LOC C, deep structural gaps (CHK, per-SN comments,
