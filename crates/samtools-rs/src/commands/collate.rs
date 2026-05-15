@@ -364,11 +364,16 @@ fn fast_collate_records(records: Vec<RecordBuf>, reads_store: usize) -> Vec<Reco
             paired.push(r1);
             paired.push(r2);
         } else {
+            // Mirror `bamshuf.c`: store the new read, then — if the ring
+            // is now full — evict the oldest to the deferred (bin) set.
+            // The eviction happens *after* the insert and *before* the
+            // next read's mate lookup, so a read whose mate is further
+            // than `-r` away is deferred rather than paired early.
+            order.push_back(name.clone());
+            stored.insert(name, record);
             if stored.len() >= reads_store {
                 flush_oldest_stored_record(&mut stored, &mut order, &mut deferred);
             }
-            order.push_back(name.clone());
-            stored.insert(name, record);
         }
     }
 
