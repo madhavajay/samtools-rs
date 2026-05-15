@@ -6449,6 +6449,22 @@ fn markdup_matches_upstream_test_markdup_fixtures() {
             "15_optical_barcode_rgx_name",
             "15_optical_barcode_rgx_name.expected.sam",
         ),
+        (
+            &[
+                "-S",
+                "-d",
+                "100",
+                "--mode",
+                "s",
+                "-t",
+                "--read-coords",
+                "^([0-9]+):([0-9]+):([[:print:]]+)",
+                "--coords-order",
+                "xyt",
+            ],
+            "11_optical_dup_regex",
+            "11_optical_dup_regex.expected.sam",
+        ),
     ];
     for (flags, stem, expected) in cases {
         let inp = d.join("markdup").join(format!("{stem}.sam"));

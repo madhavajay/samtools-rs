@@ -18,9 +18,9 @@
 //! `--coords-order` / `--barcode-rgx` / `--barcode-name` supported (via
 //! the `regex` crate). Raw-header SAM output preserves input `@RG`/`@SQ`
 //! order. **Byte-exact vs upstream
-//! `markdup/{5,6,7,8,9,10,12,13,14,15,17,18}`** (12 of 14 fixtures).
-//! **Not yet:** fixtures 11 / 16 (residual regex-coords optical-chain
-//! edge), exact `-s` stats counts, CRAM.
+//! `markdup/{5,6,7,8,9,10,11,12,13,14,15,17,18}`** (13 of 14 fixtures).
+//! **Not yet:** fixture 16 (a subtle optical-chain pairwise-traversal
+//! edge with empty-prefix regex coords), exact `-s` stats counts, CRAM.
 //!
 //! Supported flags:
 //!  - `-r` — remove duplicates from the output (rather than just flagging).
@@ -1199,6 +1199,7 @@ fn mark_duplicates(
             x: i64,
             y: i64,
             opt: bool,
+            beg: usize,
             len: usize,
             score: i64,
             mate_score: i64,
@@ -1232,6 +1233,7 @@ fn mark_duplicates(
                     x: -1,
                     y: -1,
                     opt: false,
+                    beg: 0,
                     len: 0,
                     score: 0,
                     mate_score: 0,
@@ -1250,6 +1252,7 @@ fn mark_duplicates(
                     if let Some((db, de, dx, dy)) = get_coords(&cn, &cfg.coord) {
                         chk.x = dx;
                         chk.y = dy;
+                        chk.beg = db;
                         chk.len = de - db;
                         let o_len = oe - ob;
                         let is_opt = o_len == (de - db)
@@ -1286,7 +1289,7 @@ fn mark_duplicates(
                     .then_with(|| {
                         let an = rec_name(&records[a.idx]);
                         let bn = rec_name(&records[b.idx]);
-                        an[..a.len].cmp(&bn[..b.len])
+                        an[a.beg..a.beg + a.len].cmp(&bn[b.beg..b.beg + b.len])
                     })
                     .then_with(|| a.x.cmp(&b.x))
             });
@@ -1298,6 +1301,7 @@ fn mark_duplicates(
             let mut curr = 0usize;
             while curr + 1 < llen {
                 let base_name = rec_name(&records[list[curr].idx]);
+                let base_beg = list[curr].beg;
                 let base_len = list[curr].len;
                 let mut end_name_match = curr;
                 loop {
@@ -1306,8 +1310,9 @@ fn mark_duplicates(
                         break;
                     }
                     let cn = rec_name(&records[list[end_name_match].idx]);
+                    let cb = list[end_name_match].beg;
                     if base_len == list[end_name_match].len
-                        && base_name[..base_len] != cn[..base_len]
+                        && base_name[base_beg..base_beg + base_len] != cn[cb..cb + base_len]
                     {
                         break;
                     }
