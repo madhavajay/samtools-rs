@@ -71,8 +71,13 @@ quick fix — verified by probing):
   exact `-s` stats counts, CRAM, the `1..4` expect-fail cases.
 - `reset` → tested only via pipes into `sort -M -K10` (minimiser).
 - `sort` `name2` / `reset` → minimiser (`-N`/`-K`) + external merge.
-- `stats` → ~123k LOC C, deep structural gaps (CHK, per-SN comments,
-  many histograms).
+- `stats` → ✅ **core fixtures DONE**: byte-exact end to end vs
+  upstream `stat/{1..8}.stats.expected` (CHK checksum, all SN lines +
+  comments, FFQ/LFQ, full MPC reference-mismatch engine, GCF/GCL,
+  GCC/GCT/FBC/FTC/LBC/LTC, IS, RL/FRL/LRL, MAPQ, ID/IC indel engine,
+  COV, single-bin GCD; supplementary handling). Remaining: `-S RG`
+  split (stat/9,10), `-t`/region paths (stat/11+), multi-bin GCD,
+  exact pileup-backed COV, CRAM without explicit reference.
 - `ampliconclip` → ✅ **DONE**: full port, byte-exact vs the entire
   upstream `test_ampliconclip` harness (10 SAM + 3 primer-count TSVs).
 - `ampliconstats` (`amplicon_stats.c`, 1776 LOC) → ✅ **DONE**:
