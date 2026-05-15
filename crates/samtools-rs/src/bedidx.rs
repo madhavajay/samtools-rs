@@ -121,7 +121,10 @@ pub fn parse_bed_line(line: &str) -> Option<BedInterval> {
         return None;
     }
 
-    let mut fields = s.split('\t');
+    // samtools' BED reader treats any run of whitespace (tabs or spaces)
+    // as a column separator for the first three columns (some fixtures,
+    // e.g. large_pos/test.bed, are space-delimited).
+    let mut fields = s.split_whitespace();
     let chrom = fields.next().unwrap_or("");
     let start: u64 = fields.next().and_then(|t| t.parse().ok()).unwrap_or(0);
     let end: u64 = fields.next().and_then(|t| t.parse().ok()).unwrap_or(0);

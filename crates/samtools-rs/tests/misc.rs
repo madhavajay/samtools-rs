@@ -6745,3 +6745,48 @@ fn coverage_matches_upstream_tabular_fixtures() {
         );
     }
 }
+
+#[test]
+fn depth_large_pos_matches_upstream() {
+    // TODO-NEXT #1: sparse depth (no OOM on LN:10001009800) + whitespace
+    // BED parsing — upstream large_pos depth fixtures byte-exact.
+    use samtools_rs::commands::depth;
+    let d = fixtures_dir().join("large_pos");
+    let tmp = tmp_dir("depth-largepos");
+
+    let o1 = tmp.join("depth.out");
+    assert_eq!(
+        exit_to_u8(depth::main(&argv(
+            "depth",
+            &[
+                "-o",
+                o1.to_str().unwrap(),
+                d.join("longref.sam").to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(&o1).unwrap(),
+        std::fs::read_to_string(d.join("depth.expected.out")).unwrap()
+    );
+
+    let o2 = tmp.join("depth_bed.out");
+    assert_eq!(
+        exit_to_u8(depth::main(&argv(
+            "depth",
+            &[
+                "-b",
+                d.join("test.bed").to_str().unwrap(),
+                "-o",
+                o2.to_str().unwrap(),
+                d.join("longref.sam").to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(&o2).unwrap(),
+        std::fs::read_to_string(d.join("depth_bed.expected.out")).unwrap()
+    );
+}
