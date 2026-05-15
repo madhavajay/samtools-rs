@@ -123,35 +123,43 @@ quick fix — verified by probing):
      default_recall}`, unit-tested. Defaults: P_HET=1e-3,
      P_INDEL=2e-4, het_scale=1.0, poly_mul=0.01, flat qcal,
      MODE_RECALL.
-  2. **Next:** the math accel helpers — `fast_exp` (bam_consensus.c
-     :883, `e_tab`/`e_tab2` from `consensus_init`'s `exp(i)`/
-     `exp(i/10.)` loops), `fast_log2` (:896, the bit-twiddling Taylor
-     deg-3), `ph_log` (:914 `-TENLOG2OVERLOG10*fast_log2`), plus the
-     `q2p[256]` (`pow(10,-q/10)`) and `mqual_pow_1m[256]` tables and
-     `TENLOG2OVERLOG10`=3.0103. Unit-test fast_exp/fast_log2 vs libm
-     within the documented tolerance.
-  3. The S[15] accumulation + call: pure fn over a per-position
-     observation list `{base4, qual, mqual, is_rev, seq_offset, ...}`
-     — the `L[32]`/base→0-5 map, the qual==255/default_qual rule, the
-     `CONS_MQUAL` mqual correction (`ph_log(P+.75*M-P*M)`), `poly_len`
-     + `qual2 = max(1, qual-(poly-2)*poly_mul)`, the MM/xM/oM/oo/oM/
-     ox/uu/um/mm assembly, the 6-case S[] switch
-     (bam_consensus.c:1452-1522), then +lprior15, max/max_het split
-     (pure j∈{0,5,9,12,14}), shift-normalise + tot1/tot2 prefix-sum
-     norm, phred = `ph_log(1-S[call]/(norm[call]+S[call]))+.5`,
-     het_logodd, `map_sing`/`map_het`. (`nm_local` only under
-     `--NM-adjust`; `poly_len` is the homopolymer run length.)
-  4. `calculate_consensus_gap5m` wrapper (:1797) — for the default
-     non-MIXED path it is just step 3 with `cp_r`.
-  5. Wire into `consensus.rs`: dispatch `--mode bayesian`/default to
-     the new engine over the existing pileup loop, reuse the simple
-     path's FASTA/FASTQ/`-c`/`-H`/`-d`/`--show-ins`/`--show-del`/
-     ambiguity formatting (`consensus_base` thresholds at
-     bam_consensus.c:2135+).
-  Fixtures: `samtools/test/consensus/consensus.reg` ~38 cases (13
-  `-m bayesian` + 25 default) vs `consensus/expected/*`; 59 `simple`
-  already pass. Verify byte-exact per fixture; gate + workspace green
-  per commit, as the `stats` port was done.
+  2. ✅ **DONE** (`024d489`): math accel helpers —
+     `consensus.rs::bayes::{q2p_table, mqual_pow_1m_table, ETab
+     (fast_exp), fast_log2, ph_log, TENLOG2OVERLOG10}`, unit-tested
+     vs the `bam_consensus_tab.h` literals and libm.
+  3. ✅ **DONE** (`2a6d97d`): the S[15] accumulation + call —
+     `consensus.rs::bayes::{Gap5Obs, Gap5Opts, Gap5Cons, gap5_call,
+     L, MAP_SING, MAP_HET}`, the faithful default-build port (no K2/
+     DO_FRACT/DO_HDW/DO_POLY_DIST/DISCREP) incl. the `nm_adjust` /
+     (nm_local+1) + `td` depth fudge, `qual2` poly_mul, the 6-case
+     switch, +lprior15, pure/het argmax, shift-normalise, phred,
+     het_logodd. Unit-tested (pure A/G, empty→N, A/C het).
+  4. ✅ **resolved**: `calculate_consensus_gap5m` (:1797) — all
+     fixture cases are `MODE_RECALL` (`bayesian`/`bayesian_r`/
+     default; verified at bam_consensus.c:3124-3142). For non-MIXED
+     it is exactly `gap5_call` with `cp_recall`, so step 3 already
+     covers every fixture; the experimental MIXED combination
+     (`-m bayesian_m`, no fixtures) is deferred.
+  5. **Next — the integration:** wire into `consensus.rs`. Dispatch
+     `--mode bayesian`/default (currently rejected at consensus.rs
+     :150) to the new engine over the existing pileup loop. Per
+     column build `Vec<Gap5Obs>` (filter `qual >= min_qual`, skip
+     ref_skip; `base4`=`bam_seqi`/`*`→16; `qual` with the
+     255→`default_qual` rule; `mqual`=read MAPQ; `nm_local` via the
+     halo-NM count `nm_local()` bam_consensus.c:975 only when
+     `--NM-adjust`; `poly`=`poly_len()` homopolymer run). Then the
+     `consensus_base` thresholds (bam_consensus.c:2135+):
+     `min_depth`, `cons_cutoff`→N, het ambiguity from `het_call`/
+     `het_logodd` vs `het_fract`/`call_fract`, `all_bases`,
+     `--show-ins`/`--show-del`, then reuse the simple path's
+     FASTA/FASTQ/line-len writer. Defaults: min_depth=1,
+     call_fract=0.75, het_fract=0.5, cons_cutoff=10, default_qual=10,
+     use_mqual=1, nm_adjust=1, scale_mqual=1, low/high_mqual=1/60,
+     line_len=70, show_ins=1, show_del=0 (bam_consensus.c:2985+).
+     Fixtures: `samtools/test/consensus/consensus.reg` ~38 cases
+     (13 `-m bayesian` + 25 default) vs `consensus/expected/*`; the
+     59 `simple` already pass. Verify byte-exact per fixture; gate +
+     workspace green per commit, as the `stats` port was done.
 - TODO-NEXT #3/#4/#5 (CRAM internals / binary-`@PG` / CRAM index meta).
 
 **Honest remaining scope:** the library-blocked *foundations* are all
