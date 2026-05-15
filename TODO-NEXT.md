@@ -41,7 +41,7 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
 
 **§13 byte-parity also achieved this batch** (beyond the pileup family):
 `fixmate` (entire `test_fixmate` group), `addreplacerg` (entire
-`test_addrprg` group), and `sort` (`pos/name/name3/tag.rg/tag.rg.n`) are
+`test_addrprg` group), and `sort` (`pos/name/name3/tag.rg/tag.rg.n/tag.as`) are
 byte-exact modulo `@PG` (sort via raw-header preservation + the exact
 `strnum_cmp` natural comparator + `-o -`→stdout; the `-`→stdout bug also
 fixed in `fixmate`/`markdup`/`rmdup`). So upstream byte-exact now:
