@@ -4787,6 +4787,85 @@ fn addreplacerg_bam_input_to_sam_honors_orphan_only_mode() {
 }
 
 #[test]
+fn addreplacerg_defaults_to_first_header_rg_and_preserves_lines() {
+    let tmp = tmp_dir("addreplacerg-default-rg");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.4\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:first\tCN:SC\n",
+            "@RG\tID:second\tCN:SC\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "r2\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\tRG:Z:second\n",
+        ),
+    )
+    .unwrap();
+
+    // No -r / -R: default to the first @RG ID, keep both @RG header lines,
+    // overwrite all record RG tags with the first ID.
+    assert_eq!(
+        exit_to_u8(addreplacerg::main(&argv(
+            "addreplacerg",
+            &[
+                "--no-PG",
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("@RG\tID:first\tCN:SC"));
+    assert!(text.contains("@RG\tID:second\tCN:SC"));
+    assert!(text.contains("r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:first"));
+    assert!(text.contains("r2\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\tRG:Z:first"));
+}
+
+#[test]
+fn addreplacerg_r_overwrite_all_removes_other_header_rg_lines() {
+    let tmp = tmp_dir("addreplacerg-overwrite-rg");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.4\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:old\tCN:SC\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(addreplacerg::main(&argv(
+            "addreplacerg",
+            &[
+                "--no-PG",
+                "-O",
+                "sam",
+                "-r",
+                "@RG\tID:new\tCN:SC",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("@RG\tID:new\tCN:SC"));
+    assert!(!text.contains("@RG\tID:old"));
+    assert!(text.contains("r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:new"));
+}
+
+#[test]
 fn fixmate_r_removes_unmapped_and_secondary_records() {
     let tmp = tmp_dir("fixmate-r");
     let sam = tmp.join("in.sam");

@@ -6,11 +6,16 @@
 //!  - `-r 'ID:foo'` — incremental tag form (one tag per `-r`); combined into
 //!    a single `@RG` line.
 //!  - `-R ID` — set every record's `RG:Z` to this existing ID.
+//!  - no `-r` / `-R` — default to the first `@RG` ID in the input header
+//!    (matching upstream); error only if the input has no `@RG` line.
 //!  - `-m overwrite_all|orphan_only` — how to handle existing `RG:Z` tags.
-//!    Matches upstream's two modes; `overwrite_all` is the default.
+//!    Matches upstream's two modes; `overwrite_all` is the default. In
+//!    `overwrite_all` with `-r`, all other `@RG` header lines are removed
+//!    so only the new one remains (mirrors `sam_hdr_remove_except`).
 //!  - `-O sam|bam` — output format (default: sam).
 //!  - `--no-PG` — silently accepted (no `@PG` is added by this port).
-//!  - `-w` — accepted but currently a no-op (editing-only mode).
+//!  - `-w` — overwrite an existing `@RG` header line with the same ID
+//!    instead of erroring.
 //!
 //! **Pending:** CRAM input/output, paired-end mate update, full `orphan_first`
 //! semantics.
@@ -37,6 +42,16 @@ enum Mode {
     OverwriteAll,
 }
 
+/// Bundle of the resolved read-group rewrite parameters, threaded through
+/// the SAM and binary rewrite paths.
+struct RgRewrite<'a> {
+    rg_line: Option<&'a str>,
+    rg_id: &'a str,
+    mode: Mode,
+    overwrite_hdr_rg: bool,
+    pg_argv: Option<&'a [OsString]>,
+}
+
 /// Entry point for `samtools addreplacerg`.
 pub fn main(args: &[OsString]) -> ExitCode {
     let mut tag_pieces: Vec<String> = Vec::new();
@@ -46,6 +61,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut input: Option<PathBuf> = None;
     let mut output_fmt = OutFmt::Sam;
     let mut no_pg = false;
+    let mut overwrite_hdr_rg = false;
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
         let s = arg.to_str().unwrap_or("");
@@ -90,10 +106,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "--no-PG" => {
                 no_pg = true;
             }
-            "-w" | "-@" | "--threads" => {
-                if matches!(s, "-@" | "--threads") {
-                    let _ = iter.next();
-                }
+            "-w" => {
+                overwrite_hdr_rg = true;
+            }
+            "-@" | "--threads" => {
+                let _ = iter.next();
             }
             "--help" => {
                 let _ = print_usage();
@@ -142,18 +159,35 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let rg_id = match (replace_id.as_ref(), rg_line.as_ref()) {
         (Some(id), _) => Some(id.to_string()),
         (None, Some(line)) => extract_id(line),
-        _ => None,
+        _ => match read_first_rg_id_from_header(&input, format.exact) {
+            Ok(id) => id,
+            Err(e) => {
+                print_error_errno(
+                    "addreplacerg",
+                    format!("failed to read header from \"{}\"", input.display()),
+                    &e,
+                );
+                return ExitCode::from(1);
+            }
+        },
     };
 
     let Some(rg_id) = rg_id else {
         print_error(
             "addreplacerg",
-            "an @RG ID is required (use `-r 'ID:...'` or `-R ID`)",
+            "an @RG ID is required (use `-r 'ID:...'` or `-R ID`) when the input has no @RG header",
         );
         return ExitCode::from(1);
     };
 
     let pg_argv = if no_pg { None } else { Some(args) };
+    let rewrite = RgRewrite {
+        rg_line: rg_line.as_deref(),
+        rg_id: &rg_id,
+        mode,
+        overwrite_hdr_rg,
+        pg_argv,
+    };
     let result = match (format.exact, output_fmt) {
         (Exact::Sam, OutFmt::Sam) => {
             let mut writer = match sam_io::open_text_output(output.as_deref()) {
@@ -163,25 +197,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            let result = rewrite_sam(
-                &input,
-                &mut writer,
-                rg_line.as_deref(),
-                &rg_id,
-                mode,
-                pg_argv,
-            );
+            let result = rewrite_sam(&input, &mut writer, &rewrite);
             result.and_then(|()| sam_io::check_sam_close(&mut writer))
         }
-        _ => rewrite_records(
-            &input,
-            output.as_deref(),
-            output_fmt,
-            rg_line.as_deref(),
-            &rg_id,
-            mode,
-            pg_argv,
-        ),
+        _ => rewrite_records(&input, output.as_deref(), output_fmt, &rewrite),
     };
 
     if let Err(e) = result {
@@ -233,6 +252,23 @@ fn build_rg_line(pieces: &[String]) -> Result<Option<String>, String> {
     Ok(Some(out))
 }
 
+/// Read the input header and return the ID of the first `@RG` line, if any.
+/// Matches upstream's default behavior when neither `-r` nor `-R` is supplied.
+fn read_first_rg_id_from_header(input: &Path, exact: Exact) -> io::Result<Option<String>> {
+    let header_text = crate::header_text::read_raw_header_text_with_format(input, exact)?;
+    for line in header_text.lines() {
+        if !line.starts_with("@RG\t") {
+            continue;
+        }
+        for field in line.split('\t').skip(1) {
+            if let Some(id) = field.strip_prefix("ID:") {
+                return Ok(Some(id.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn extract_id(rg_line: &str) -> Option<String> {
     for field in rg_line.split('\t') {
         if let Some(rest) = field.strip_prefix("ID:") {
@@ -242,14 +278,14 @@ fn extract_id(rg_line: &str) -> Option<String> {
     None
 }
 
-fn rewrite_sam(
-    path: &Path,
-    out: &mut dyn Write,
-    rg_line: Option<&str>,
-    rg_id: &str,
-    mode: Mode,
-    pg_argv: Option<&[OsString]>,
-) -> io::Result<()> {
+fn rewrite_sam(path: &Path, out: &mut dyn Write, rw: &RgRewrite<'_>) -> io::Result<()> {
+    let RgRewrite {
+        rg_line,
+        rg_id,
+        mode,
+        overwrite_hdr_rg,
+        pg_argv,
+    } = *rw;
     let file = File::open(path)?;
     let mut probe = File::open(path)?;
     let mut hdr = [0u8; 2];
@@ -264,9 +300,9 @@ fn rewrite_sam(
     let mut reader = reader;
     let rg_tag = format!("RG:Z:{}", rg_id);
 
-    // Buffer header lines so we can inject the @RG and (optional) @PG
-    // entries via shared helpers before emitting any record bytes.
-    let mut header = String::new();
+    // Buffer header lines so we can apply upstream's @RG header semantics
+    // (mirrors `bam_addrprg.c` init_state) before emitting any record bytes.
+    let mut header_lines: Vec<String> = Vec::new();
     let mut first_record: Option<String> = None;
     let mut line = String::new();
     loop {
@@ -276,33 +312,44 @@ fn rewrite_sam(
             break;
         }
         if line.starts_with('@') {
-            // Suppress duplicate @RG lines with the same ID; otherwise keep.
-            if line.starts_with("@RG")
-                && let Some(existing_id) = extract_id(line.trim_end())
-                && existing_id == rg_id
-            {
-                continue;
-            }
-            header.push_str(&line);
+            header_lines.push(line.trim_end_matches(['\r', '\n']).to_string());
         } else {
             first_record = Some(line.clone());
             break;
         }
     }
 
-    // Ensure the header has a trailing newline before we append our entries.
-    if !header.is_empty() && !header.ends_with('\n') {
-        header.push('\n');
+    if let Some(rg) = rg_line {
+        let existing_rg_id = header_lines.iter().any(|l| {
+            l.starts_with("@RG") && extract_id(l).as_deref().is_some_and(|id| id == rg_id)
+        });
+        if existing_rg_id {
+            if !overwrite_hdr_rg {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "RG line with ID:{rg_id} already present in the header. Use -w to overwrite."
+                    ),
+                ));
+            }
+            header_lines.retain(|l| {
+                !(l.starts_with("@RG") && extract_id(l).as_deref().is_some_and(|id| id == rg_id))
+            });
+        }
+        header_lines.push(rg.trim_end_matches(['\r', '\n']).to_string());
+        if matches!(mode, Mode::OverwriteAll) {
+            header_lines
+                .retain(|l| !l.starts_with("@RG") || extract_id(l).as_deref() == Some(rg_id));
+        }
     }
 
-    if let Some(rg) = rg_line {
-        if header.is_empty() {
-            header.push_str("@HD\tVN:1.6\n");
-        }
-        header.push_str(rg);
-        if !rg.ends_with('\n') {
-            header.push('\n');
-        }
+    let mut header = String::new();
+    if header_lines.is_empty() && rg_line.is_some() {
+        header.push_str("@HD\tVN:1.6\n");
+    }
+    for l in &header_lines {
+        header.push_str(l);
+        header.push('\n');
     }
 
     if let Some(argv) = pg_argv {
@@ -360,10 +407,7 @@ fn rewrite_records(
     input: &Path,
     output: Option<&Path>,
     output_fmt: OutFmt,
-    rg_line: Option<&str>,
-    rg_id: &str,
-    mode: Mode,
-    pg_argv: Option<&[OsString]>,
+    rw: &RgRewrite<'_>,
 ) -> io::Result<()> {
     let format = sam_io::sam_open_format(input)?;
     let (mut header, mut records) = match format.exact {
@@ -377,7 +421,16 @@ fn rewrite_records(
         }
     };
 
-    header = update_header(header, rg_line, pg_argv)?;
+    header = update_header(
+        header,
+        rw.rg_line,
+        rw.rg_id,
+        rw.mode,
+        rw.overwrite_hdr_rg,
+        rw.pg_argv,
+    )?;
+    let rg_id = rw.rg_id;
+    let mode = rw.mode;
     for record in &mut records {
         rewrite_record_buf(record, rg_id, mode);
     }
@@ -420,9 +473,26 @@ fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
 fn update_header(
     mut header: sam::Header,
     rg_line: Option<&str>,
+    rg_id: &str,
+    mode: Mode,
+    overwrite_hdr_rg: bool,
     pg_argv: Option<&[OsString]>,
 ) -> io::Result<sam::Header> {
     if let Some(rg) = rg_line {
+        let rg_id_key = BString::from(rg_id);
+        let already_present = header.read_groups().contains_key(rg_id.as_bytes());
+        if already_present {
+            if !overwrite_hdr_rg {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "RG line with ID:{rg_id} already present in the header. Use -w to overwrite."
+                    ),
+                ));
+            }
+            header.read_groups_mut().shift_remove(&rg_id_key);
+        }
+
         let mut parser = sam::header::Parser::default();
         parser
             .parse_partial(rg.as_bytes())
@@ -432,6 +502,10 @@ fn update_header(
             header
                 .read_groups_mut()
                 .insert(id.clone(), read_group.clone());
+        }
+
+        if matches!(mode, Mode::OverwriteAll) {
+            header.read_groups_mut().retain(|k, _| *k == rg_id_key);
         }
     }
 
