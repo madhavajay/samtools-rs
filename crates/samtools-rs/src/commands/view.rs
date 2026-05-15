@@ -84,6 +84,34 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
 
+        if let Some(lib) = opts.library.clone() {
+            let header_text: io::Result<String> = match stdin_format(&data) {
+                StdinFormat::Sam => {
+                    Ok(String::from_utf8_lossy(sam_header_lines(&data)).into_owned())
+                }
+                StdinFormat::Bam => htslib_rs::alignment_compat::view_bam_as_sam_text(
+                    io::Cursor::new(&data),
+                    Some(0),
+                ),
+                StdinFormat::Cram => cram_reference(&opts).and_then(|reference| {
+                    htslib_rs::alignment_compat::view_cram_as_sam_text_with_reference(
+                        io::Cursor::new(&data),
+                        &reference,
+                        Some(0),
+                    )
+                }),
+            };
+            match header_text {
+                Ok(text) => {
+                    opts.library_rg_ids = library_rg_ids_from_header(&text, &lib);
+                }
+                Err(e) => {
+                    print_error_errno("view", "failed to read header for -l", &e);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+
         let result = match stdin_format(&data) {
             StdinFormat::Sam => run_sam_stdin(&opts, &data),
             StdinFormat::Bam => run_bam_stdin(&opts, &data),
@@ -114,6 +142,22 @@ pub fn main(args: &[OsString]) -> ExitCode {
     if format.category != Category::SequenceData {
         print_error("view", format!("{} is not sequence data", input.display()));
         return ExitCode::from(1);
+    }
+
+    if let Some(lib) = opts.library.clone() {
+        match read_raw_header_text_with_format(&input, format.exact) {
+            Ok(header_text) => {
+                opts.library_rg_ids = library_rg_ids_from_header(&header_text, &lib);
+            }
+            Err(e) => {
+                print_error_errno(
+                    "view",
+                    format!("failed to read header of \"{}\"", input.display()),
+                    &e,
+                );
+                return ExitCode::from(1);
+            }
+        }
     }
 
     match run(&opts, &input, format.exact) {
@@ -172,6 +216,14 @@ struct Opts {
     read_groups: HashSet<Vec<u8>>,
     /// `-n` — exclude records that have no `RG:Z:` aux tag at all.
     exclude_no_rg: bool,
+    /// `-l STR` / `--library STR` — only output records whose read group's
+    /// `@RG LB:` value equals STR. `None` means the filter is off.
+    library: Option<String>,
+    /// Resolved from the header once the input is known: the set of `@RG`
+    /// IDs whose `LB:` matches [`Opts::library`]. A record passes the
+    /// library filter iff its `RG:Z:` value is in this set (so a record
+    /// with no `RG` is excluded, matching upstream `bam_get_library`).
+    library_rg_ids: HashSet<Vec<u8>>,
     /// `-X` / `--customized-index` — legacy synopsis where the second
     /// positional is an explicit index path
     /// (`view -X in.bam in.bam.bai [region…]`).
@@ -207,6 +259,37 @@ impl QnameFilter {
         let contained = self.names.contains(qname);
         if self.negate { !contained } else { contained }
     }
+}
+
+/// Scans the `@RG` lines of a SAM header text and returns the set of
+/// read-group IDs whose `LB:` field equals `library` (upstream
+/// `bam_get_library`/`-l` semantics). Only the leading `@`-prefixed
+/// header block is inspected.
+fn library_rg_ids_from_header(header_text: &str, library: &str) -> HashSet<Vec<u8>> {
+    let mut ids = HashSet::new();
+    for line in header_text.lines() {
+        if !line.starts_with('@') {
+            break;
+        }
+        if !line.starts_with("@RG\t") {
+            continue;
+        }
+        let mut id = None;
+        let mut lb = None;
+        for field in line.split('\t').skip(1) {
+            if let Some(v) = field.strip_prefix("ID:") {
+                id = Some(v);
+            } else if let Some(v) = field.strip_prefix("LB:") {
+                lb = Some(v);
+            }
+        }
+        if lb == Some(library)
+            && let Some(id) = id
+        {
+            ids.insert(id.as_bytes().to_vec());
+        }
+    }
+    ids
 }
 
 /// Walk a SAM record line and return the `RG:Z:` value, or `None` if not
@@ -483,6 +566,15 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
             }
             "-n" => {
                 opts.exclude_no_rg = true;
+                i += 1;
+            }
+            "-l" | "--library" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .and_then(|a| a.to_str())
+                    .ok_or_else(|| ParseError::Err("missing value for -l".into()))?;
+                opts.library = Some(v.to_string());
                 i += 1;
             }
             "-d" | "--tag" => {
@@ -1874,6 +1966,7 @@ fn has_filters(opts: &Opts) -> bool {
         || opts.qname_filter.is_some()
         || !opts.read_groups.is_empty()
         || opts.exclude_no_rg
+        || opts.library.is_some()
         || opts.aux_tag_filter.is_some()
 }
 
@@ -2133,6 +2226,15 @@ fn line_passes(line: &[u8], opts: &Opts) -> bool {
                     return false;
                 }
             }
+        }
+    }
+    if opts.library.is_some() {
+        // A record passes iff its read group's LB matches; no RG (or an
+        // RG not in the resolved set) fails, like upstream's
+        // bam_get_library check.
+        match extract_rg_value(line) {
+            Some(rg) if opts.library_rg_ids.contains(rg) => {}
+            _ => return false,
         }
     }
     if let Some(filter) = opts.aux_tag_filter.as_ref() {
