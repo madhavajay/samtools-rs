@@ -6454,3 +6454,48 @@ fn stats_cram_without_region_matches_bam_seq_quality() {
     assert!(b.contains("SN\ttotal length:\t11200"));
     assert!(c.contains("SN\ttotal length:\t11200"));
 }
+
+#[test]
+fn checksum_cram_matches_bam_via_all_record_iterator() {
+    // TODO-NEXT #2: whole-CRAM checksum via the htslib-rs all-record
+    // iterator must equal the BAM checksum (checksum is order-agnostic).
+    let _g = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let bam = htslib_fixtures_dir().join("range.bam");
+    let cram = htslib_fixtures_dir().join("range.cram");
+    let reference = htslib_fixtures_dir().join("ce.fa");
+    let tmp = tmp_dir("checksum-cram");
+    let bo = tmp.join("b.txt");
+    let co = tmp.join("c.txt");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "checksum",
+                bam.to_str().unwrap(),
+                "-o",
+                bo.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "checksum",
+                cram.to_str().unwrap(),
+                "-o",
+                co.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        checksum_all_row(&std::fs::read_to_string(&bo).unwrap()),
+        checksum_all_row(&std::fs::read_to_string(&co).unwrap()),
+    );
+}
