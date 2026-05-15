@@ -74,12 +74,14 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
 > indel, head/tail, refskip) + `PileupOptions` (flag/mapq/`detect_overlaps`/
 > `discard_orphans`) + ported `tweak_overlap_quality`/`overlap_push` smart
 > overlap removal + `MPLP_NO_ORPHAN` filter; unit tests + CRAM==BAM equality.
-> samtools-rs side: **`mpileup`** default text output implemented and
-> byte-exact vs upstream `mpileup.out.3`/`out.5`/stderr (`out.1` matches on
-> depth+bases; quals differ only under BAQ → TODO-NEXT #11). Remaining
-> samtools-rs wiring (large per-subcommand ports, now unblocked by the
-> shipped pileup API): `consensus`, `targetcut`, `phase`, `ampliconstats`,
-> and the exact pileup-based `bedcov`/`coverage`/`depth` paths.
+> samtools-rs side: **`mpileup`** default text output byte-exact vs
+> upstream `mpileup.out.3`/`out.5`/stderr (`out.1` depth+bases match;
+> quals differ only under BAQ → #11). **`consensus --mode simple`**
+> implemented, byte-exact vs every `test/consensus/expected` fixture in
+> `consensus.reg` (FASTA/FASTQ/pileup, show-del/ins, call/het-fract).
+> Remaining pileup-dependent ports (now unblocked by the shipped API):
+> `targetcut`, `phase`, `ampliconstats`, consensus `recall`/Bayesian
+> modes, and the exact pileup-based `bedcov`/`coverage`/`depth` paths.
 
 ### 1. Pileup iterator — highest leverage
 
