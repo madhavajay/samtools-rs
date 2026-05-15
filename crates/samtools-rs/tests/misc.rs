@@ -1807,6 +1807,65 @@ fn fastq_index_files_extract_from_barcode_tag() {
 }
 
 #[test]
+fn fastq_index_emits_one_record_per_qname_group_with_casava_comment() {
+    // A qname with two non-last-segment records (primary + a
+    // supplementary that survives a relaxed -F) must yield exactly ONE
+    // index record (upstream `flush_rec` is one-per-template). With -i
+    // the index record gets the CASAVA comment, with the barcode
+    // separator normalized to '+' and lower-cased bases upper-cased.
+    let tmp = tmp_dir("fastq-index-group");
+    let sam = tmp.join("in.sam");
+    let i1_out = tmp.join("i1.fq");
+    let main_out = tmp.join("0.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:16\n",
+            // p1: primary R1 + supplementary R1 (same qname) — one index.
+            "p1\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\tBC:Z:ac-gt\n",
+            "p1\t2113\tchr1\t9\t60\t4M\t=\t5\t0\tACGT\t!!!!\tBC:Z:ac-gt\n",
+            "p1\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\n",
+            // p2: a separate template — its own single index record.
+            "p2\t65\tchr1\t1\t60\t4M\t=\t5\t8\tGGGG\t!!!!\tBC:Z:TT+AA\n",
+            "p2\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    // -F 0 so the supplementary record is not filtered, proving the
+    // dedup is by qname group (not by flag filtering).
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-i",
+                "-F",
+                "0",
+                "--index-format",
+                "i*",
+                "--i1",
+                i1_out.to_str().unwrap(),
+                "-0",
+                main_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    // Exactly one index record per template, CASAVA comment present,
+    // `ac-gt` → `AC+GT`, `TT+AA` stays `TT+AA`.
+    // Index sequence is the raw BC segment (`ac`, `TT`); only the CASAVA
+    // comment normalizes/upper-cases. Quality is the default (`"`) since
+    // no QT tag is present.
+    assert_eq!(
+        std::fs::read_to_string(&i1_out).unwrap(),
+        "@p1 1:N:0:AC+GT\nac\n+\n\"\"\n@p2 1:N:0:TT+AA\nTT\n+\n\"\"\n"
+    );
+}
+
+#[test]
 fn fastq_single_sam_path_filters_by_aux_tag_value() {
     let tmp = tmp_dir("fastq-aux-filter-value");
     let sam = tmp.join("in.sam");

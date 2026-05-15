@@ -8,13 +8,16 @@
 //! a unit (paired R1+R2 to `-1`/`-2`, R1-only or R2-only singletons to `-s`
 //! when set or falling back to `-1`/`-2`, and READ_OTHER to `-0`).
 //!
-//! Also supports per-record `--i1`/`--i2` index FASTQ extraction with
-//! `--index-format` (default `i*i*`), `--quality-tag`, and `--barcode-tag`.
+//! Also supports `--i1`/`--i2` index FASTQ extraction with
+//! `--index-format` (default `i*i*`), `--quality-tag`, and
+//! `--barcode-tag`, emitting one index record per adjacent qname-group
+//! (upstream `flush_rec` → `output_index`) with the htslib-exact CASAVA
+//! barcode normalization and, under `-i`, the CASAVA comment.
 //!
-//! **Not yet supported:** CRAM input, exact upstream name-grouped
-//! one-record-per-qname-pair index emission, and exact
-//! `score`-vs-`b_score` propagation through CASAVA barcode copying
-//! between paired ends.
+//! **Not yet supported:** CRAM input, and `score`-vs-`b_score`
+//! propagation of the CASAVA barcode from the R1 mate to the R2
+//! `*.2.fq` comment (the main `-1`/`-2` flush renders text before
+//! grouping; needs render-after-group restructuring).
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -598,6 +601,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     use_original_quality,
                     default_quality,
                     umi_tags: umi_tags.as_deref(),
+                    casava,
                     barcode_tag,
                     quality_tag,
                     index_format: &effective_index_format,
@@ -831,6 +835,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 use_original_quality,
                 default_quality,
                 umi_tags: umi_tags.as_deref(),
+                casava,
                 barcode_tag,
                 quality_tag,
                 index_format: &effective_index_format,
@@ -1583,9 +1588,32 @@ where
     let flags = record.flags()?;
     let read_number = if flags.is_last_segment() { 2 } else { 1 };
     let filter = if flags.is_qc_fail() { "Y" } else { "N" };
-    let barcode = fastq_string_tag(record, barcode_tag)?.unwrap_or_else(|| "0".to_string());
+    let barcode = casava_barcode_field(fastq_string_tag(record, barcode_tag)?.as_deref());
 
     Ok(format!("{read_number}:{filter}:0:{barcode}"))
+}
+
+/// Renders the barcode portion of a CASAVA comment exactly as htslib's
+/// `fastq_format1` does: `0` when absent or when the first character is
+/// not a sequence base; otherwise every non-alphabetic byte becomes `+`
+/// and lowercase is upper-cased (so `ac-gt` → `AC+GT`).
+fn casava_barcode_field(bc: Option<&str>) -> String {
+    let Some(bc) = bc.filter(|b| !b.is_empty()) else {
+        return "0".to_string();
+    };
+    let first = bc.as_bytes()[0];
+    if !first.is_ascii_alphabetic() {
+        return "0".to_string();
+    }
+    bc.chars()
+        .map(|c| {
+            if c.is_ascii_alphabetic() {
+                c.to_ascii_uppercase()
+            } else {
+                '+'
+            }
+        })
+        .collect()
 }
 
 fn fastq_string_tag<R>(record: &R, tag: [u8; 2]) -> io::Result<Option<String>>
@@ -2041,6 +2069,7 @@ struct IndexEmitOptions<'a> {
     use_original_quality: bool,
     default_quality: Option<u8>,
     umi_tags: Option<&'a [[u8; 2]]>,
+    casava: bool,
     barcode_tag: [u8; 2],
     quality_tag: [u8; 2],
     index_format: &'a [IndexFormatItem],
@@ -2068,9 +2097,16 @@ fn emit_index_files(
     let render = |out_i1: &mut Option<File>,
                   out_i2: &mut Option<File>,
                   record: &dyn IndexRecord|
-     -> io::Result<()> {
+     -> io::Result<bool> {
         emit_index_for_record(out_i1.as_mut(), out_i2.as_mut(), record, options)
     };
+
+    // Upstream `bam_fastq.c::flush_rec` emits at most ONE index record
+    // per qname group (template), not per alignment record. Records
+    // arrive name-grouped; emit for the first barcode-bearing record in
+    // each group and skip the rest of that group.
+    let mut group_qname: Option<String> = None;
+    let mut group_emitted = false;
 
     if stdin_input {
         // For stdin we cannot re-iterate; skip index emission.
@@ -2092,7 +2128,15 @@ fn emit_index_files(
                 if record_passes_flag_filter(&record, flag_filters)?
                     && record_index_eligible(&record)?
                 {
-                    render(&mut i1_writer, &mut i2_writer, &SamIndexRecord(&record))?;
+                    let wrapped = SamIndexRecord(&record);
+                    let qname = wrapped.name()?;
+                    if group_qname.as_deref() != Some(qname.as_str()) {
+                        group_qname = Some(qname);
+                        group_emitted = false;
+                    }
+                    if !group_emitted && render(&mut i1_writer, &mut i2_writer, &wrapped)? {
+                        group_emitted = true;
+                    }
                 }
             }
         }
@@ -2108,11 +2152,15 @@ fn emit_index_files(
                 if record_passes_flag_filter(&record, flag_filters)?
                     && record_index_eligible(&record)?
                 {
-                    render(
-                        &mut i1_writer,
-                        &mut i2_writer,
-                        &RecordBufIndexRecord(&record),
-                    )?;
+                    let wrapped = RecordBufIndexRecord(&record);
+                    let qname = wrapped.name()?;
+                    if group_qname.as_deref() != Some(qname.as_str()) {
+                        group_qname = Some(qname);
+                        group_emitted = false;
+                    }
+                    if !group_emitted && render(&mut i1_writer, &mut i2_writer, &wrapped)? {
+                        group_emitted = true;
+                    }
                 }
             }
         }
@@ -2187,9 +2235,9 @@ fn emit_index_for_record(
     i2_writer: Option<&mut File>,
     record: &dyn IndexRecord,
     options: IndexEmitOptions<'_>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let Some(bc) = record.barcode(options.barcode_tag)? else {
-        return Ok(());
+        return Ok(false);
     };
 
     let qt_raw = record.quality_tag(options.quality_tag)?;
@@ -2204,6 +2252,18 @@ fn emit_index_for_record(
     let name = record.name()?;
     let name = append_fastq_umi_with_str(name, record, options.umi_tags)?;
     let name = append_fastq_read_number_with_record(name, record, options.append_read_number)?;
+    // With `-i` (CASAVA), the index record carries the same
+    // ` <rnum>:<filt>:0:<barcode>` comment as the main reads, using the
+    // representative record's normalized barcode (upstream `flush_rec`).
+    let name = if options.casava {
+        let flags = record.flags()?;
+        let read_number = if flags.is_last_segment() { 2 } else { 1 };
+        let filter = if flags.is_qc_fail() { "Y" } else { "N" };
+        let bc_field = casava_barcode_field(record.barcode(options.barcode_tag)?.as_deref());
+        format!("{name} {read_number}:{filter}:0:{bc_field}")
+    } else {
+        name
+    };
 
     let writers = [i1_writer, i2_writer];
     let mut writer_idx = 0usize;
@@ -2250,7 +2310,7 @@ fn emit_index_for_record(
         bc_cursor = segment_end + if advance_past_sep { 1 } else { 0 };
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn write_index_fastq_record(
