@@ -504,8 +504,8 @@ trait Sink {
 
 struct BamFile(bam::io::Writer<bgzf::io::Writer<File>>);
 struct BamStdout(bam::io::Writer<bgzf::io::Writer<io::Stdout>>);
-struct SamFile(sam::io::Writer<File>);
-struct SamStdout(sam::io::Writer<io::Stdout>);
+struct SamFile(File);
+struct SamStdout(io::Stdout);
 
 impl Sink for BamFile {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
@@ -521,22 +521,21 @@ impl Sink for BamStdout {
 }
 impl Sink for SamFile {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
-        use sam::alignment::io::Write as _;
-        self.0.write_alignment_record(header, record)
+        // Shared renderer: htslib `%g` float aux spelling.
+        crate::sam_render::write_record(&mut self.0, header, record)
     }
 }
 impl Sink for SamStdout {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
-        use sam::alignment::io::Write as _;
-        self.0.write_alignment_record(header, record)
+        crate::sam_render::write_record(&mut self.0, header, record)
     }
 }
 
 fn open_output(out: Option<&Path>, fmt: OutFmt, header: &sam::Header) -> io::Result<Box<dyn Sink>> {
     match (out, fmt) {
         (Some(p), OutFmt::Sam) => {
-            let mut w = sam::io::Writer::new(File::create(p)?);
-            w.write_header(header)?;
+            let mut w = File::create(p)?;
+            crate::sam_render::write_header(&mut w, header)?;
             Ok(Box::new(SamFile(w)))
         }
         (Some(p), OutFmt::Bam) => {
@@ -545,8 +544,8 @@ fn open_output(out: Option<&Path>, fmt: OutFmt, header: &sam::Header) -> io::Res
             Ok(Box::new(BamFile(w)))
         }
         (None, OutFmt::Sam) => {
-            let mut w = sam::io::Writer::new(io::stdout());
-            w.write_header(header)?;
+            let mut w = io::stdout();
+            crate::sam_render::write_header(&mut w, header)?;
             Ok(Box::new(SamStdout(w)))
         }
         (None, OutFmt::Bam) => {

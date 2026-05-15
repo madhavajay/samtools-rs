@@ -35,6 +35,20 @@ Merged PRs (samtools-rs-only, consolidated via PR #16 `integration-all-prs` → 
 - PR #14, https://github.com/madhavajay/samtools-rs/pull/14, branch `addreplacerg-default-rg` (from `main`, two commits) — `addreplacerg` defaults to the first header `@RG` ID when neither `-r`/`-R` is given, upstream `@RG` header reconciliation (`-r` + `overwrite_all` strips other `@RG` lines; `-w` overwrites a same-ID line), and `-R ID` rejection when the ID is absent from the header. Brings the whole upstream `test_addrprg` group (`addrprg/{1,2,3,4,5}`, #3 = expected failure) to parity modulo `@PG`.
 - PR #15, https://github.com/madhavajay/samtools-rs/pull/15, branch `reheader-parity` (from `main`) — reorders the shared `pg::push_pg_line` output to upstream's `@PG` field order `ID, PN, PP, VN, CL`. Benefits every command that inserts a samtools `@PG`; the upstream harness strips `\tVN:.*`, so `PP` must precede `VN`. Brings the `reheader/{1,4}` header section to parity after harness reordering.
 
+Active working branch (not yet merged): `work-sam-float-renderer` (off `main`).
+Landed slices on this branch:
+- Shared `sam_render` module with htslib-style aux float formatting.
+- `view` BAM/CRAM→SAM aux float spelling via `sam_render`.
+- `split` SAM output routed through `sam_render::write_record`.
+- **SAM aux float formatting — remaining commands (this slice):** `reheader`
+  SAM→SAM, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`,
+  `rmdup`, `markdup`, and `cat` SAM-output sinks now wrap a plain
+  `File`/`Stdout` and render through `sam_render::write_record` /
+  `write_header`. Full gate green after this slice (samtools-rs: 422
+  passing, 0 failing; `cargo test --workspace`: 2593 passing; fmt + clippy
+  `-D warnings` clean). New test:
+  `sort_sam_output_uses_htslib_float_aux_spelling`.
+
 Latest known validation (on `main` at `b312c99`, post-merge):
 - Rust tests: 416 `samtools-rs` passing, 0 failing (`cargo test --workspace`: 2587 passing).
 - Full gate green in CI on PR #16: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and the advisory parity gate.
@@ -60,7 +74,7 @@ What to do next:
 3. Open a single PR for the whole batch, get CI green, merge to `main`, then start the next working branch.
 
 Remaining tractable samtools-rs-only items (no htslib-rs / noodles changes required):
-- **SAM aux float formatting — remaining commands.** Done: the shared `samtools_rs::sam_render` module (`format_aux_float`, `format_htslib_exponent`, `fix_sam_aux_floats`, `fix_sam_text`, `write_record`, `write_header`) plus `view` (path + stdin BAM/CRAM→SAM, and the `-U`/`-p`/sanitize/tag-filter `record_to_sam_line` chokepoint) and `split` SAM output. This brought `reheader/1_view1.sam.expected` (via `reheader … | view -h`) and `split/split.expected.grp{1,2}.sam` to byte parity. Remaining: route the other noodles-`sam::io::Writer` SAM-output paths through `sam_render::write_record` / `write_header` — `reheader` SAM→SAM, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, `markdup`, `cat` (~30 call sites across 10 commands; mechanical but per-command writer plumbing differs). No currently-failing fixtures depend on these, so do it as its own bounded batch.
+- ~~**SAM aux float formatting — remaining commands.**~~ **Done.** The shared `samtools_rs::sam_render` module (`format_aux_float`, `format_htslib_exponent`, `fix_sam_aux_floats`, `fix_sam_text`, `write_record`, `write_header`) now backs every noodles-`sam::io::Writer` SAM-output path: `view`, `split`, plus `reheader` SAM→SAM, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, `markdup`, and `cat` (their `SamFile`/`SamStdout`/`Sam*Sink` sinks now wrap a plain `File`/`Stdout` and render through `sam_render`). So every SAM-text output path emits htslib `%g`-style float aux spelling. Regression covered by `sort_sam_output_uses_htslib_float_aux_spelling` plus the existing `view`/`split` fixtures.
 - **`fastq` index extraction × name-grouping interaction.** Fold the per-record index emission into the name-grouped flush so each qname-group emits at most one index record per `--i1` / `--i2`, matching upstream's `flush_rec` → `output_index` (required for `bam2fq/{5,8,10,12}` parity).
 - **`view --library` (`-l`)** library filter via `@RG LB:` aux lookup. Builds on the merged read-group filter infrastructure.
 - **`view -X` legacy custom-index synopsis** for BAM/CRAM; the second positional becomes the index path. Already supported as a no-op in `idxstats`.
@@ -239,7 +253,7 @@ These are used by nearly every subcommand and must exist before subcommands can 
 - [~] **Reference helpers** (`samtools-rs/src/reference.rs`): shared FASTA helper now derives associated `.fai` paths, builds missing FASTA indexes through `htslib-rs::faidx_compat`, loads `(SN, LN)` dictionaries, and matches candidate FASTA references against BAM/CRAM `@SQ` dictionaries for `samples -f/-F`. **Pending:** mmap/FASTA sequence cache, common `--reference` option plumbing, CRAM reference resolution, and integration into `calmd`, `consensus`, `mpileup`, `phase`, and `import`.
 - [~] **Temp file helper** (`samtools-rs/src/tmp_file.rs`): shared temp path helper now creates collision-resistant temp files, owns best-effort cleanup on drop, supports explicit persist/close, and is used by native name-sort FASTQ conversion instead of ad hoc temp names. **Pending:** BAM record temp spooling, compression support, and integration into external `sort` / `collate` algorithms.
 - [x] **Logging passthrough**: bridge to `htslib-rs::log_compat` so top-level `--verbosity` flows correctly.
-- [~] **SAM render helper** (`samtools-rs/src/sam_render.rs`): shared htslib-style aux float formatting (`format_aux_float`/`format_htslib_exponent`), SAM-line/SAM-text float fixers (`fix_sam_aux_floats`/`fix_sam_text`), and noodles `sam::io::Writer` drop-ins (`write_record`/`write_header`). Used by `fastq` (float helper) and `view`/`split` (binary→SAM float spelling). **Pending:** route the remaining noodles-`Writer` SAM-output commands (`reheader` SAM→SAM, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, `markdup`, `cat`) through it.
+- [x] **SAM render helper** (`samtools-rs/src/sam_render.rs`): shared htslib-style aux float formatting (`format_aux_float`/`format_htslib_exponent`), SAM-line/SAM-text float fixers (`fix_sam_aux_floats`/`fix_sam_text`), and noodles `sam::io::Writer` drop-ins (`write_record`/`write_header`). Used by `fastq` (float helper) and now every SAM-text output path: `view`, `split`, `reheader` SAM→SAM, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, `markdup`, and `cat` route through `write_record`/`write_header`, so binary→SAM and SAM→SAM both get htslib `%g` float spelling.
 
 ## Phase 2: Subcommand Surface Mapping
 
