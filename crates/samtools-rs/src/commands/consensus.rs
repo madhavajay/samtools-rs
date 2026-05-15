@@ -537,6 +537,10 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
     let mut order: Vec<String> = Vec::new();
     let mut by_ref: BTreeMap<String, RefSeq> = BTreeMap::new();
     let mut pileup_rows: Vec<u8> = Vec::new();
+    // Pileup `-a` empty-row fill state: last processed 1-based position
+    // per ref (advanced even for skipped `*` columns), like `c->last_pos`.
+    let mut pp_last: BTreeMap<String, usize> = BTreeMap::new();
+    let mut pp_cur_ref: Option<String> = None;
 
     for col in &columns {
         // `-r region`: restrict to the named ref + [beg,end] (1-based).
@@ -570,6 +574,41 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
         };
 
         if cfg.format == Format::Pileup {
+            // `-a`/`-aa` (optionally with `-r`): emit an empty row
+            // `name\tpos\t0\t0\tN\t0\t*\t*` for every uncovered
+            // position in the span (upstream `empty_pileup2`).
+            if cfg.all_bases > 0 {
+                // On ref change, trailing-fill the previous ref to its
+                // span end before starting the new one.
+                if let Some(prev) = &pp_cur_ref
+                    && prev != &col.reference_name
+                {
+                    let last = *pp_last.get(prev).unwrap_or(&0);
+                    let clen = ref_lens
+                        .iter()
+                        .find(|(n, _)| n == prev)
+                        .map_or(last, |(_, l)| *l);
+                    let span_end = match &cfg.region {
+                        Some((rn, _, re)) if rn == prev => (*re).min(clen),
+                        _ => clen,
+                    };
+                    for p in (last + 1)..=span_end {
+                        let _ = write!(pileup_rows, "{prev}\t{p}\t0\t0\tN\t0\t*\t*\n");
+                    }
+                }
+                pp_cur_ref = Some(col.reference_name.clone());
+                let last = pp_last
+                    .entry(col.reference_name.clone())
+                    .or_insert_with(|| cfg.region.as_ref().map_or(0, |(_, b, _)| b - 1));
+                for p in (*last + 1)..col.position {
+                    let _ = write!(
+                        pileup_rows,
+                        "{}\t{p}\t0\t0\tN\t0\t*\t*\n",
+                        col.reference_name
+                    );
+                }
+                *last = col.position;
+            }
             if cb != b'*' || cfg.show_del {
                 emit_pileup_row(
                     &mut pileup_rows,
@@ -650,6 +689,41 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
                 rs.seq.push(ib);
                 rs.qual.push(iq);
             }
+        }
+    }
+
+    // Trailing-fill the final ref for pileup `-a`.
+    if cfg.format == Format::Pileup
+        && cfg.all_bases > 0
+        && let Some(prev) = &pp_cur_ref
+    {
+        let last = *pp_last.get(prev).unwrap_or(&0);
+        let clen = ref_lens
+            .iter()
+            .find(|(n, _)| n == prev)
+            .map_or(last, |(_, l)| *l);
+        let span_end = match &cfg.region {
+            Some((rn, _, re)) if rn == prev => (*re).min(clen),
+            _ => clen,
+        };
+        for p in (last + 1)..=span_end {
+            let _ = write!(pileup_rows, "{prev}\t{p}\t0\t0\tN\t0\t*\t*\n");
+        }
+    }
+
+    // Pileup `-a -r` where the region has no covered columns at all:
+    // still emit the region span as empty rows.
+    if cfg.format == Format::Pileup
+        && cfg.all_bases > 0
+        && let Some((rn, rb, re)) = &cfg.region
+        && pp_cur_ref.as_deref() != Some(rn.as_str())
+    {
+        let clen = ref_lens
+            .iter()
+            .find(|(n, _)| n == rn)
+            .map_or(*re, |(_, l)| *l);
+        for p in *rb..=(*re).min(clen) {
+            let _ = write!(pileup_rows, "{rn}\t{p}\t0\t0\tN\t0\t*\t*\n");
         }
     }
 
