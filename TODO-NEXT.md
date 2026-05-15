@@ -153,7 +153,15 @@ re-scoped for the next pass where the samtools-only constraint is lifted.
 - **samtools-rs tests:** `addreplacerg`/`calmd` BAM aux integration tests +
   the relevant `test.pl` groups.
 
-### 8. `hts_set_threads` wiring to BGZF worker pools
+### 8. `hts_set_threads` wiring to BGZF worker pools — 🟡 correctness DONE
+
+> Correctness deliverable met: `-@`/`--threads` (incl. attached `-@4`,
+> `-m768M`, `--threads=4`, …) accepted by `view`/`sort` (`index` already
+> did); `-@ N` output is byte-identical to `-@ 1` — test
+> `threads_flag_is_byte_identical_for_view_and_sort` (`--no-PG` isolates
+> the @PG CL which legitimately embeds the arg). **Remaining (perf only,
+> explicitly out of correctness scope):** actually wire the thread count
+> into noodles BGZF worker pools so `-@` speeds up I/O.
 
 - **htslib-rs:** wire a thread-count option into the BGZF/noodles worker
   pools so `-@` is honored (currently an API-compatible no-op everywhere).
