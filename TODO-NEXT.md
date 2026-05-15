@@ -45,7 +45,9 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
 operand → stdout bug fixed in `fixmate`/`markdup`/`rmdup`. So
 `flags`/`quickcheck`/`dict`/`idxstats`(BAM/SAM)/`coverage`/`bedcov`/
 `depth`/`mpileup`/`consensus`/`fixmate`/`addreplacerg` are upstream
-byte-exact; `markdup` dup-selection, full `stats`, `ampliconstats`,
+byte-exact, and `split` matches `test_split` under the harness'
+`reorder_header` (only header line order differs, which the harness
+normalizes — allowed by the parity rules); `markdup` dup-selection, full `stats`, `ampliconstats`,
 `phase`, `targetcut`, `sort` minimiser/external, `reference` CRAM, and
 the rest of §13 remain the large outstanding ports.
 
