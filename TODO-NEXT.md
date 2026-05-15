@@ -35,7 +35,19 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
 - **#11** htslib-rs verified (probaln/BAQ + realn fixtures); samtools
   `calmd` BAM-output wiring remaining.
 - **#3, #4, #5, #7** assessed (large or possibly out-of-scope; #7 aux
-  mutation is functionally unblocked via `RecordBuf`).
+  mutation is functionally unblocked via `RecordBuf` — and an
+  order-preserving `aux_del`/`aux_set_append` now exists in `fixmate`,
+  the exact `bam_aux_del`+`bam_aux_append` semantics #7 wanted).
+
+**§13 byte-parity also achieved this batch** (beyond the pileup family):
+`fixmate` (entire `test_fixmate` group) and `addreplacerg` (entire
+`test_addrprg` group) are byte-exact modulo `@PG`; the `-` output
+operand → stdout bug fixed in `fixmate`/`markdup`/`rmdup`. So
+`flags`/`quickcheck`/`dict`/`idxstats`(BAM/SAM)/`coverage`/`bedcov`/
+`depth`/`mpileup`/`consensus`/`fixmate`/`addreplacerg` are upstream
+byte-exact; `markdup` dup-selection, full `stats`, `ampliconstats`,
+`phase`, `targetcut`, `sort` minimiser/external, `reference` CRAM, and
+the rest of §13 remain the large outstanding ports.
 
 **Honest remaining scope:** the library-blocked *foundations* are all
 shipped, tested and pinned, so the rest is ordinary (if large)
