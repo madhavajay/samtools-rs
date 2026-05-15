@@ -1,8 +1,9 @@
 //! `samtools checksum` — order-agnostic sequence-content checksums.
 //!
 //! This is a partial port of `bam_checksum.c`. It supports SAM/BAM input for
-//! the default checksum columns and common filters. CRAM input needs an
-//! all-record CRAM iterator, so that piece remains deferred.
+//! the default checksum columns and common filters, plus CRAM input via the
+//! htslib-rs whole-CRAM all-record iterator (TODO-NEXT #2; needs the global
+//! `--reference`).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

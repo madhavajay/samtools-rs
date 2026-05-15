@@ -82,9 +82,11 @@ re-scoped for the next pass where the samtools-only constraint is lifted.
 > SN lines match BAM except NM-derived `mismatches`/`error rate` (CRAM
 > stores no NM and noodles does not synthesize it — recompute-from-ref is
 > a separate follow-up). Test `stats_cram_without_region_matches_bam_*`.
-> **Remaining:** wire `checksum` whole-CRAM and `reference` CRAM-input MD
-> path onto the same iterator; optional CRAM NM recompute for exact
-> `stats` mismatch/error-rate parity.
+> **samtools-rs `checksum` DONE:** whole-CRAM via the iterator,
+> byte-identical to the BAM checksum (test
+> `checksum_cram_matches_bam_via_all_record_iterator`). **Remaining:**
+> `reference` CRAM-input MD path on the same iterator; optional CRAM NM
+> recompute for exact `stats` mismatch/error-rate parity.
 
 - **htslib-rs:** add a non-region streaming record iterator for CRAM
   (today only `iter_cram_records_from_path_with_reference` for indexed
