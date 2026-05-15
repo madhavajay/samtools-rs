@@ -2411,7 +2411,7 @@ secondary\t256\tchr1\t9\t60\t4M\t*\t0\t0\tTTTT\tIIII
         0
     );
     let required_text = std::fs::read_to_string(required_out).unwrap();
-    assert!(required_text.contains("SN\traw total sequences:\t4\n"));
+    assert_eq!(stats_sn_value(&required_text, "raw total sequences"), 4);
     assert!(required_text.contains("SN\tfiltered sequences:\t3\n"));
     assert!(required_text.contains("SN\tsequences:\t1\n"));
     assert!(required_text.contains("SN\t1st fragments:\t1\n"));
@@ -2431,7 +2431,7 @@ secondary\t256\tchr1\t9\t60\t4M\t*\t0\t0\tTTTT\tIIII
         0
     );
     let filtered_text = std::fs::read_to_string(filtered_out).unwrap();
-    assert!(filtered_text.contains("SN\traw total sequences:\t3\n"));
+    assert_eq!(stats_sn_value(&filtered_text, "raw total sequences"), 3);
     assert!(filtered_text.contains("SN\tfiltered sequences:\t1\n"));
     assert!(filtered_text.contains("SN\tsequences:\t2\n"));
     assert!(filtered_text.contains("SN\treads mapped:\t2\n"));
@@ -2468,10 +2468,10 @@ long\t0\tchr1\t5\t60\t5M\t*\t0\t0\tCCCCC\tIIIII
     );
 
     let text = std::fs::read_to_string(out).unwrap();
-    assert!(text.contains("SN\traw total sequences:\t1\n"));
+    assert_eq!(stats_sn_value(&text, "raw total sequences"), 1);
     assert!(text.contains("SN\tfiltered sequences:\t0\n"));
     assert!(text.contains("SN\tsequences:\t1\n"));
-    assert!(text.contains("SN\ttotal length:\t5\n"));
+    assert_eq!(stats_sn_value(&text, "total length"), 5);
     assert!(text.contains("SN\tmaximum length:\t5\n"));
 }
 

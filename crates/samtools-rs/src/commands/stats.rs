@@ -995,14 +995,29 @@ impl StatsCounts {
                     }
                 }
             }
-            for (cycle, q) in rec.quality_scores().iter().flatten().enumerate() {
-                self.qual_sum += u64::from(q);
-                self.qual_count += 1;
-                if flag & BAM_FREAD1 != 0 {
-                    increment_quality_hist(&mut self.first_qual_hist, cycle, q);
+            let quals: Vec<u8> = rec.quality_scores().iter().flatten().collect();
+            if quals.is_empty() && seq_len_u32 > 0 {
+                // `*` quality: HTSlib stores 0xFF per base.
+                for cycle in 0..seq_len_u32 as usize {
+                    self.qual_sum += 255;
+                    self.qual_count += 1;
+                    if flag & BAM_FREAD1 != 0 {
+                        increment_quality_hist(&mut self.first_qual_hist, cycle, 255);
+                    }
+                    if flag & BAM_FREAD2 != 0 {
+                        increment_quality_hist(&mut self.last_qual_hist, cycle, 255);
+                    }
                 }
-                if flag & BAM_FREAD2 != 0 {
-                    increment_quality_hist(&mut self.last_qual_hist, cycle, q);
+            } else {
+                for (cycle, q) in quals.iter().copied().enumerate() {
+                    self.qual_sum += u64::from(q);
+                    self.qual_count += 1;
+                    if flag & BAM_FREAD1 != 0 {
+                        increment_quality_hist(&mut self.first_qual_hist, cycle, q);
+                    }
+                    if flag & BAM_FREAD2 != 0 {
+                        increment_quality_hist(&mut self.last_qual_hist, cycle, q);
+                    }
                 }
             }
             if config.trim_quality > 0 {
@@ -1273,6 +1288,29 @@ fn bwa_trim_read(trim_quality: u8, qualities: impl IntoIterator<Item = u8>, reve
     max_l
 }
 
+/// C `printf("%e")`: 6-decimal mantissa, `e`, signed ≥2-digit exponent
+/// (e.g. `0.000000e+00`, `1.234560e-05`). Rust's `{:e}` differs.
+fn c_e6(x: f64) -> String {
+    if x == 0.0 || !x.is_finite() {
+        return "0.000000e+00".to_string();
+    }
+    let neg = x < 0.0;
+    let v = x.abs();
+    let mut e = v.log10().floor() as i32;
+    let mut ms = format!("{:.6}", v / 10f64.powi(e));
+    if ms.starts_with("10") {
+        e += 1;
+        ms = format!("{:.6}", v / 10f64.powi(e));
+    }
+    format!(
+        "{}{}e{}{:02}",
+        if neg { "-" } else { "" },
+        ms,
+        if e < 0 { "-" } else { "+" },
+        e.abs()
+    )
+}
+
 fn gc_percent_hundredths(bases: impl IntoIterator<Item = u8>) -> u16 {
     let mut len = 0u64;
     let mut gc = 0u64;
@@ -1314,23 +1352,44 @@ fn write_stats_counts(
         SAMTOOLS_VERSION
     )?;
     writeln!(out, "# This file contains statistics for all reads.")?;
-    writeln!(out, "SN\traw total sequences:\t{}", counts.raw_total)?;
+    writeln!(
+        out,
+        "SN\traw total sequences:\t{}\t# excluding supplementary and secondary reads",
+        counts.raw_total
+    )?;
     writeln!(out, "SN\tfiltered sequences:\t{}", counts.filtered)?;
     writeln!(out, "SN\tsequences:\t{}", counts.total)?;
-    writeln!(out, "SN\tis sorted:\t{}", if is_sorted { 1 } else { 0 })?;
+    writeln!(
+        out,
+        "SN\tis sorted:\t{}\t# {} by coordinate",
+        if is_sorted { 1 } else { 0 },
+        if is_sorted { "sorted" } else { "not sorted" }
+    )?;
     writeln!(out, "SN\t1st fragments:\t{}", counts.read1)?;
     writeln!(out, "SN\tlast fragments:\t{}", counts.read2)?;
     writeln!(out, "SN\treads mapped:\t{}", counts.mapped)?;
     writeln!(
         out,
-        "SN\treads mapped and paired:\t{}",
+        "SN\treads mapped and paired:\t{}\t# paired-end technology bit set + both mates mapped",
         counts.mapped_and_paired
     )?;
     writeln!(out, "SN\treads unmapped:\t{}", counts.unmapped)?;
-    writeln!(out, "SN\treads properly paired:\t{}", counts.proper_paired)?;
-    writeln!(out, "SN\treads paired:\t{}", counts.paired)?;
-    writeln!(out, "SN\treads duplicated:\t{}", counts.dup)?;
-    writeln!(out, "SN\treads MQ0:\t{}", counts.mq0)?;
+    writeln!(
+        out,
+        "SN\treads properly paired:\t{}\t# proper-pair bit set",
+        counts.proper_paired
+    )?;
+    writeln!(
+        out,
+        "SN\treads paired:\t{}\t# paired-end technology bit set",
+        counts.paired
+    )?;
+    writeln!(
+        out,
+        "SN\treads duplicated:\t{}\t# PCR or optical duplicate bit set",
+        counts.dup
+    )?;
+    writeln!(out, "SN\treads MQ0:\t{}\t# mapped and MQ=0", counts.mq0)?;
     writeln!(out, "SN\treads QC failed:\t{}", counts.qc_fail)?;
     writeln!(out, "SN\tnon-primary alignments:\t{}", counts.secondary)?;
     writeln!(
@@ -1338,32 +1397,48 @@ fn write_stats_counts(
         "SN\tsupplementary alignments:\t{}",
         counts.supplementary
     )?;
-    writeln!(out, "SN\ttotal length:\t{}", counts.total_len)?;
     writeln!(
         out,
-        "SN\ttotal first fragment length:\t{}",
+        "SN\ttotal length:\t{}\t# ignores clipping",
+        counts.total_len
+    )?;
+    writeln!(
+        out,
+        "SN\ttotal first fragment length:\t{}\t# ignores clipping",
         counts.total_len_1st
     )?;
     writeln!(
         out,
-        "SN\ttotal last fragment length:\t{}",
+        "SN\ttotal last fragment length:\t{}\t# ignores clipping",
         counts.total_len_2nd
     )?;
-    writeln!(out, "SN\tbases mapped:\t{}", counts.bases_mapped)?;
     writeln!(
         out,
-        "SN\tbases mapped (cigar):\t{}",
+        "SN\tbases mapped:\t{}\t# ignores clipping",
+        counts.bases_mapped
+    )?;
+    writeln!(
+        out,
+        "SN\tbases mapped (cigar):\t{}\t# more accurate",
         counts.bases_mapped_cigar
     )?;
     writeln!(out, "SN\tbases trimmed:\t{}", counts.bases_trimmed)?;
     writeln!(out, "SN\tbases duplicated:\t{}", counts.bases_dup)?;
-    writeln!(out, "SN\tmismatches:\t{}", counts.nmismatches)?;
+    writeln!(
+        out,
+        "SN\tmismatches:\t{}\t# from NM fields",
+        counts.nmismatches
+    )?;
     let error_rate = if counts.bases_mapped_cigar > 0 {
         counts.nmismatches as f64 / counts.bases_mapped_cigar as f64
     } else {
         0.0
     };
-    writeln!(out, "SN\terror rate:\t{:.6e}", error_rate)?;
+    writeln!(
+        out,
+        "SN\terror rate:\t{}\t# mismatches / bases mapped (cigar)",
+        c_e6(error_rate)
+    )?;
     let avg_len = if counts.raw_total > 0 {
         counts.total_len as f64 / counts.raw_total as f64
     } else {
@@ -1397,13 +1472,14 @@ fn write_stats_counts(
         "SN\tmaximum last fragment length:\t{}",
         counts.max_len_2nd
     )?;
-    let avg_quality = if counts.qual_count > 0 {
-        counts.qual_sum as f64 / counts.qual_count as f64
+    // Upstream: `total_len ? sum_qual/total_len : 0` (no `singletons`
+    // SN line in `samtools stats`).
+    let avg_quality = if counts.total_len > 0 {
+        counts.qual_sum as f64 / counts.total_len as f64
     } else {
         0.0
     };
     writeln!(out, "SN\taverage quality:\t{:.1}", avg_quality)?;
-    writeln!(out, "SN\tsingletons:\t{}", counts.singletons)?;
 
     let (avg_isize, sd_isize) =
         insert_size_mean_sd(&counts.isize_hist, config.insert_size_main_bulk);
