@@ -6790,3 +6790,43 @@ fn depth_large_pos_matches_upstream() {
         std::fs::read_to_string(d.join("depth_bed.expected.out")).unwrap()
     );
 }
+
+#[test]
+fn fixmate_matches_upstream_group() {
+    // TODO.md §13 / TODO-NEXT #7: full upstream test_fixmate group
+    // byte-exact (modulo @PG, which the harness strips). Exercises
+    // del-then-append aux ordering (MQ/MC/ct) and MC:Z:* semantics.
+    use samtools_rs::commands::fixmate;
+    let d = fixtures_dir().join("fixmate");
+    let tmp = tmp_dir("fixmate-group");
+    let cases: &[(&[&str], &str)] = &[
+        (&["-z", "off", "-O", "sam"], "2_isize_overflow"),
+        (&["-O", "sam"], "3_reverse_read_pp_lt"),
+        (&["-O", "sam"], "4_reverse_read_pp_equal"),
+        (&["-cO", "sam"], "5_ct"),
+        (&["-cO", "sam"], "6_ct_replace"),
+        (&["-z", "off", "-O", "sam"], "7_two_read_mapped"),
+        (&["-z", "off", "-O", "sam"], "8_isize_overflow_64bit"),
+        (&["-O", "sam"], "sanitize"),
+    ];
+    for (args, name) in cases {
+        let out = tmp.join(format!("{name}.out"));
+        let mut a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        a.push("--no-PG".into());
+        a.push(d.join(format!("{name}.sam")).to_str().unwrap().into());
+        a.push(out.to_str().unwrap().into());
+        let refs: Vec<&str> = a.iter().map(String::as_str).collect();
+        assert_eq!(
+            exit_to_u8(fixmate::main(&argv("fixmate", &refs))),
+            0,
+            "{name}"
+        );
+        assert_eq!(
+            without_pg_lines(&std::fs::read_to_string(&out).unwrap()),
+            without_pg_lines(
+                &std::fs::read_to_string(d.join(format!("{name}.sam.expected"))).unwrap()
+            ),
+            "fixmate {name}"
+        );
+    }
+}

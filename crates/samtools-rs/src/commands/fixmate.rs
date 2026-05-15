@@ -463,8 +463,10 @@ fn five_prime_position(record: &RecordBuf) -> Option<i64> {
 
 fn update_template_cigar_tag(a: &mut RecordBuf, b: &mut RecordBuf) {
     let ct_tag = Tag::from([b'c', b't']);
-    a.data_mut().remove(&ct_tag);
-    b.data_mut().remove(&ct_tag);
+    // Order-preserving (noodles' remove is a swap_remove that would
+    // reorder the surrounding MC/MQ tags).
+    aux_del(a, ct_tag);
+    aux_del(b, ct_tag);
 
     if a.flags().is_unmapped()
         || b.flags().is_unmapped()
@@ -550,18 +552,45 @@ fn mate_score(record: &RecordBuf) -> u32 {
         .sum()
 }
 
+/// Order-preserving `bam_aux_del`: drop `tag`, keep the rest in order
+/// (noodles' `Data::remove` is a `swap_remove` that reorders).
+fn aux_del(target: &mut RecordBuf, tag: Tag) {
+    let kept: Vec<_> = target
+        .data()
+        .iter()
+        .filter(|(t, _)| *t != tag)
+        .map(|(t, v)| (t, v.clone()))
+        .collect();
+    *target.data_mut() = kept.into_iter().collect();
+}
+
+/// Mirrors HTSlib's `bam_aux_del` + `bam_aux_append`: remove any existing
+/// `tag` (preserving the order of the others) then append the new value at
+/// the end — so an updated tag moves to the tail, like upstream.
+fn aux_set_append(target: &mut RecordBuf, tag: Tag, value: Value) {
+    let mut fields: Vec<_> = target
+        .data()
+        .iter()
+        .filter(|(t, _)| *t != tag)
+        .map(|(t, v)| (t, v.clone()))
+        .collect();
+    fields.push((tag, value));
+    *target.data_mut() = fields.into_iter().collect();
+}
+
 fn update_mate_aux_tags(target: &mut RecordBuf, mate: &RecordBuf) {
     let mc_tag = Tag::from([b'M', b'C']);
     let mq_tag = Tag::from([b'M', b'Q']);
 
     if mate.flags().is_unmapped() {
-        target.data_mut().remove(&mq_tag);
+        aux_del(target, mq_tag);
         if target.flags().is_unmapped() {
-            target.data_mut().remove(&mc_tag);
+            aux_del(target, mc_tag);
         } else {
             // bam_mate.c:197 — MC is added when *either* read is mapped;
             // an empty mate CIGAR formats as `*` (→ `MC:Z:*`).
-            target.data_mut().insert(
+            aux_set_append(
+                target,
                 mc_tag,
                 Value::String(BString::from(format_cigar(mate.cigar()))),
             );
@@ -569,16 +598,16 @@ fn update_mate_aux_tags(target: &mut RecordBuf, mate: &RecordBuf) {
         return;
     }
 
-    // Upstream `bam_mate.c` adds MQ before MC.
+    // bam_mate.c:188-207 — del-then-append (moves the tag to the tail),
+    // MQ before MC.
     if let Some(mapping_quality) = mate.mapping_quality() {
-        target
-            .data_mut()
-            .insert(mq_tag, Value::from(mapping_quality.get()));
+        aux_set_append(target, mq_tag, Value::from(mapping_quality.get()));
     } else {
-        target.data_mut().remove(&mq_tag);
+        aux_del(target, mq_tag);
     }
 
-    target.data_mut().insert(
+    aux_set_append(
+        target,
         mc_tag,
         Value::String(BString::from(format_cigar(mate.cigar()))),
     );
