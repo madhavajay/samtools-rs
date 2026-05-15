@@ -466,6 +466,28 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
     let columns =
         pileup_from_alignment_paths_with_options(std::slice::from_ref(input), &pileup_opts)?;
 
+    // Header @SQ (name, length) in order — needed by `-a`/`-aa` to pad
+    // each emitted contig to its full reference length.
+    let ref_lens: Vec<(String, usize)> = if cfg.all_bases > 0 {
+        let hdr = htslib_rs::alignment_compat::read_bam_header_from_path(input)
+            .or_else(|_| htslib_rs::alignment_compat::read_sam_header_from_path(input));
+        match hdr {
+            Ok(h) => h
+                .reference_sequences()
+                .iter()
+                .map(|(n, d)| {
+                    (
+                        String::from_utf8_lossy(n).into_owned(),
+                        usize::from(d.length()),
+                    )
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
     let bayes_ctx = if cfg.mode_simple {
         None
     } else {
@@ -595,27 +617,64 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
         return writer.flush();
     }
 
-    for name in &order {
-        let rs = &by_ref[name];
-        // Trim leading/trailing all-N as HTSlib does for un-padded output.
-        let start = rs
-            .seq
-            .iter()
-            .position(|&b| b != b'N')
-            .unwrap_or(rs.seq.len());
-        let end = rs.seq.iter().rposition(|&b| b != b'N').map_or(0, |i| i + 1);
-        if start >= end {
-            continue;
-        }
-        let seq = &rs.seq[start..end];
-        let qual = &rs.qual[start..end];
-        let lead = if cfg.format == Format::Fastq {
-            b'@'
+    let lead = if cfg.format == Format::Fastq {
+        b'@'
+    } else {
+        b'>'
+    };
+    // Emit order: `-aa` walks every header @SQ; otherwise the
+    // first-seen covered contigs.
+    let emit_names: Vec<String> = if cfg.all_bases >= 2 {
+        ref_lens.iter().map(|(n, _)| n.clone()).collect()
+    } else {
+        order.clone()
+    };
+    let mut empty = RefSeq {
+        name: String::new(),
+        seq: Vec::new(),
+        qual: Vec::new(),
+        last_pos: 0,
+        initialised: false,
+    };
+    for name in &emit_names {
+        let rs = match by_ref.get(name) {
+            Some(rs) => rs,
+            None => {
+                // `-aa`: contig with no reads -> all-N at full length.
+                empty.name.clone_from(name);
+                &empty
+            }
+        };
+        let (seq, qual): (Vec<u8>, Vec<u32>) = if cfg.all_bases > 0 {
+            // Pad to the full reference length, no leading/trailing
+            // trim (leading + interior already filled during the
+            // column pass).
+            let len = ref_lens
+                .iter()
+                .find(|(n, _)| n == name)
+                .map_or(rs.seq.len(), |(_, l)| *l);
+            let mut s = rs.seq.clone();
+            let mut q = rs.qual.clone();
+            while s.len() < len {
+                s.push(b'N');
+                q.push(0);
+            }
+            (s, q)
         } else {
-            b'>'
+            // Trim leading/trailing all-N (HTSlib un-padded output).
+            let start = rs
+                .seq
+                .iter()
+                .position(|&b| b != b'N')
+                .unwrap_or(rs.seq.len());
+            let end = rs.seq.iter().rposition(|&b| b != b'N').map_or(0, |i| i + 1);
+            if start >= end {
+                continue;
+            }
+            (rs.seq[start..end].to_vec(), rs.qual[start..end].to_vec())
         };
         writer.write_all(&[lead])?;
-        writer.write_all(rs.name.as_bytes())?;
+        writer.write_all(name.as_bytes())?;
         writer.write_all(b"\n")?;
         for chunk in seq.chunks(cfg.line_len) {
             writer.write_all(chunk)?;
@@ -623,8 +682,8 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
         }
         if cfg.format == Format::Fastq {
             writer.write_all(b"+\n")?;
-            let q: Vec<u8> = qual.iter().map(|&q| fastq_qual_char(q)).collect();
-            for chunk in q.chunks(cfg.line_len) {
+            let qc: Vec<u8> = qual.iter().map(|&q| fastq_qual_char(q)).collect();
+            for chunk in qc.chunks(cfg.line_len) {
                 writer.write_all(chunk)?;
                 writer.write_all(b"\n")?;
             }
