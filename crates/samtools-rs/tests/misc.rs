@@ -11,7 +11,7 @@ use htslib_rs::bam;
 use htslib_rs::sam;
 use samtools_rs::commands::{
     addreplacerg, bedcov, calmd, cat, checksum, depad, faidx, fastq, fixmate, flagstat, fqidx,
-    idxstats, import, index, reference, reheader, reset, rmdup, samples, split, view,
+    idxstats, import, index, mpileup, reference, reheader, reset, rmdup, samples, split, view,
 };
 use samtools_rs::header_text;
 use samtools_rs::run as samtools_run;
@@ -6180,4 +6180,60 @@ fn markdup_paired_end_groups_pairs_and_flags_duplicates() {
     // pair_c: NOT a duplicate (different coordinates)
     assert_eq!(flag_of("pair_c\t", 99) & 0x400, 0);
     assert_eq!(flag_of("pair_c\t", 147) & 0x400, 0);
+}
+
+#[test]
+fn mpileup_minus_b_ff_matches_upstream_out3() {
+    let tmp = tmp_dir("mpileup-out3");
+    let output = tmp.join("out.3");
+    let input = fixtures_dir().join("dat").join("mpileup.1.sam");
+    let reference = fixtures_dir().join("dat").join("mpileup.ref.fa");
+    let expected = fixtures_dir().join("dat").join("mpileup.out.3");
+
+    assert_eq!(
+        exit_to_u8(mpileup::main(&argv(
+            "mpileup",
+            &[
+                "-B",
+                "--ff",
+                "0x14",
+                "-f",
+                reference.to_str().unwrap(),
+                "-r17:1050-1060",
+                "-o",
+                output.to_str().unwrap(),
+                input.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(output).unwrap(),
+        std::fs::read_to_string(expected).unwrap()
+    );
+}
+
+#[test]
+fn mpileup_overlap_removal_matches_upstream_out5() {
+    let tmp = tmp_dir("mpileup-out5");
+    let output = tmp.join("out.5");
+    let input = fixtures_dir().join("mpileup").join("overlap.bam");
+    let expected = fixtures_dir().join("dat").join("mpileup.out.5");
+
+    assert_eq!(
+        exit_to_u8(mpileup::main(&argv(
+            "mpileup",
+            &[input.to_str().unwrap(), "-o", output.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let line = std::fs::read_to_string(output)
+        .unwrap()
+        .lines()
+        .find(|l| l.contains("128814202"))
+        .unwrap()
+        .to_string();
+    assert_eq!(line + "\n", std::fs::read_to_string(expected).unwrap());
 }
