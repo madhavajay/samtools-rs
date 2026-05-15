@@ -1,0 +1,211 @@
+# TODO-NEXT: Library-Blocked Work (htslib-rs first, then samtools-rs)
+
+This file tracks the remaining `samtools-rs` parity work that is **blocked on
+underlying-library extensions**. It is the successor to the "Items blocked on
+htslib-rs / noodles extensions" and "Extensions Needed" sections of `TODO.md`,
+re-scoped for the next pass where the samtools-only constraint is lifted.
+
+## Ground rules for this pass
+
+- **All library changes go in `htslib-rs`. Do not patch `noodles`.**
+  `noodles` is a third-party library we do not own; we only consume it (and
+  carry minimal patches) as the backing implementation for parts of
+  `htslib-rs`. Every gap below — *including the CSI large-reference issue that
+  surfaces in `noodles-csi`* — must be addressed inside `htslib-rs` (a guard,
+  clamp, fallback, or alternate code path in `htslib-rs`'s region/index layer),
+  **not** by editing the `noodles` submodule. If a fix genuinely cannot be done
+  without a `noodles` change, stop and raise it for a decision rather than
+  modifying `noodles`.
+
+- **Test-first, in `htslib-rs`.** For each item: add/extend the API in
+  `htslib-rs`, and write the htslib-rs-level tests there (unit/integration
+  under `htslib-rs/crates/htslib-rs`) proving the new surface works against
+  fixtures. Keep the `htslib-rs` gate green
+  (`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
+  warnings`, `cargo test --workspace`).
+
+- **Then wire `samtools-rs` and test here.** Once the `htslib-rs` API exists
+  and is tested, make the final consuming changes in `samtools-rs`, and add the
+  `samtools-rs` integration tests (per-subcommand `tests/`) plus the relevant
+  upstream `test.pl` fixtures. Keep the `samtools-rs` gate green.
+
+- **Workflow unchanged:** one long-lived working branch per batch, multiple
+  commits, one PR; gate green after every commit; update `TODO.md` /
+  `docs/test-status.md` / `docs/subcommand-coverage.md` as work lands. If an
+  `htslib-rs` change is needed, land it (with its tests) and pin the new
+  `htslib-rs` commit before the dependent `samtools-rs` commit.
+
+- **Pinning:** bump the `htslib-rs/` submodule pin in `TODO.md`
+  ("Submodule Pinning") to the known-green commit once each htslib-rs change
+  merges, so the dependent samtools-rs work builds reproducibly.
+
+---
+
+## Items (each: htslib-rs change + htslib-rs tests → samtools-rs wiring + samtools-rs tests)
+
+### 1. Pileup iterator — highest leverage
+
+- **htslib-rs:** expose a multi-input pileup iterator API surface
+  (`bam_plp_*` / `sam_pileup` shaped). `htslib-rs::alignment_compat` has
+  fixture-level pileup but no public iterator; audit and expose it.
+- **htslib-rs tests:** per-column pileup over known BAM/CRAM fixtures
+  (depth, base/qual, indel start/len, ref-skip) including multi-input merge.
+- **samtools-rs wiring:** `mpileup`, `consensus`, `targetcut`, `phase`,
+  `ampliconstats`, and the byte-exact pileup-based paths of `bedcov` /
+  `coverage` / `depth`.
+- **samtools-rs tests:** per-subcommand integration tests + the upstream
+  `test_mpileup` / `test_consensus` / `test_ampliconstats` / etc. fixtures.
+- **Unblocks:** ~5 whole subcommands plus exact `bedcov`/`coverage`/`depth`.
+  Do this first.
+
+### 2. CRAM all-record (non-region) streaming iterator
+
+- **htslib-rs:** add a non-region streaming record iterator for CRAM
+  (today only `iter_cram_records_from_path_with_reference` for indexed
+  *regions* exists; the non-region `summarize_*` path discards per-record
+  sequence/quality/NM).
+- **htslib-rs tests:** iterate a whole CRAM fixture and assert record
+  count + per-record sequence/quality/NM/flags match the BAM equivalent.
+- **samtools-rs wiring:** `stats` seq-length/quality/NM SN lines for CRAM
+  without a region; `stats -d` no-region CRAM dedup; `checksum` whole-CRAM
+  inputs; `reference` CRAM-input MD path.
+- **samtools-rs tests:** `stats`/`checksum` CRAM-without-region integration
+  tests + upstream `test_stats` / `test_checksum` CRAM fixtures.
+- **Unblocks:** several CRAM-without-region gaps at once. Do this second.
+
+### 3. CRAM container / block / codec inventory API
+
+- **htslib-rs:** expose a minimal CRAM container/block/codec inventory
+  (CRAM internals are currently out of scope in `htslib-rs/README.md`).
+- **htslib-rs tests:** per-Content-ID / Data-Series byte tallies on a
+  reference CRAM fixture.
+- **samtools-rs wiring:** `cram-size` (entirely); `reference -e`
+  embedded-reference mode.
+- **samtools-rs tests:** `cram-size` integration test + upstream
+  `test_cram_size` fixture.
+- **Note:** if exposing CRAM internals is judged too costly, the
+  alternative decision is to drop `cram-size` from samtools-rs scope —
+  flag for a decision rather than half-implementing.
+
+### 4. `sam_hdr_add_pg` through the binary header
+
+- **htslib-rs:** programmatic `@PG` chain insertion with `PP` linkage that
+  writes through the **binary** BAM/CRAM header path (SAM-text `@PG` is
+  already handled in `samtools-rs::pg`; binary writers are htslib-rs
+  internal, so the chain insert must live there).
+- **htslib-rs tests:** round-trip a header through a BAM and a CRAM writer
+  and assert the inserted `@PG` (ID/PN/PP/VN/CL order, PP chaining).
+- **samtools-rs wiring:** `view` default `@PG` / `--no-PG` for BAM/CRAM
+  binary output (and any other binary-output command relying on
+  htslib-rs-internal writers).
+- **samtools-rs tests:** `view -b`/`-C` `@PG` + `--no-PG` integration tests;
+  re-check `test.pl` groups that assert on binary `@PG`.
+
+### 5. CRAM index meta accessor (`index_compat`)
+
+- **htslib-rs:** accessor to read per-reference counts from the CRAM index
+  meta, without needing the reference or decoding records.
+- **htslib-rs tests:** counts from a CRAM index match the reference-backed
+  record iteration counts.
+- **samtools-rs wiring:** `flagstat` / `idxstats` for CRAM input **without**
+  an explicit reference.
+- **samtools-rs tests:** `flagstat`/`idxstats` CRAM-no-reference integration
+  tests + upstream fixtures.
+
+### 6. Index BAMs lacking `@HD SO:coordinate`
+
+- **htslib-rs:** allow BAI/CSI creation for coordinate-ordered data whose
+  header has no `SO:coordinate` tag (currently rejected with
+  `invalid sort order: expected coordinate, got None`); upstream
+  `samtools index` indexes such fixtures anyway.
+- **htslib-rs tests:** build an index for `test_input_1_a.bam` /
+  `test_input_1_b.bam`-shaped fixtures and query it.
+- **samtools-rs wiring:** `samtools index` on those fixtures.
+- **samtools-rs tests:** `index` integration test + the `test_index`
+  fixtures that currently can't be indexed.
+
+### 7. `bam_aux_update_*` (string / int / array, with resize)
+
+- **htslib-rs:** binary aux update primitives with re-sizing semantics
+  (the proper path; today partially worked around via mutable `RecordBuf`).
+- **htslib-rs tests:** update scalar/string/array aux on a `RecordBuf`,
+  re-serialize, and assert byte layout matches expectation.
+- **samtools-rs wiring:** byte-exact `addreplacerg` (`bam_aux_update_str`),
+  broader BAM aux rewrite in `calmd` BAM MD/NM recompute, `ampliconclip`.
+- **samtools-rs tests:** `addreplacerg`/`calmd` BAM aux integration tests +
+  the relevant `test.pl` groups.
+
+### 8. `hts_set_threads` wiring to BGZF worker pools
+
+- **htslib-rs:** wire a thread-count option into the BGZF/noodles worker
+  pools so `-@` is honored (currently an API-compatible no-op everywhere).
+- **htslib-rs tests:** functional test that multi-threaded and
+  single-threaded writes produce identical bytes.
+- **samtools-rs wiring:** propagate `-@` / `--threads` into `index`,
+  `sort`, `view`, native API, etc.
+- **samtools-rs tests:** assert `-@ N` output is byte-identical to `-@ 1`
+  (correctness, not perf).
+
+### 9. `auto_index` / index-save-during-write
+
+- **htslib-rs:** write BAI/CSI/CRAI alongside the writer (some samtools-rs
+  paths currently do a separate post-write index pass).
+- **htslib-rs tests:** writer-produced index matches a post-pass-built
+  index byte-for-byte.
+- **samtools-rs wiring:** `--write-index` for all writer paths.
+- **samtools-rs tests:** `--write-index` integration tests across
+  `view`/`sort`/`merge`.
+
+### 10. Region-string grammar coverage (`htslib-rs::region`)
+
+- **htslib-rs:** confirm/extend coverage of HTSlib's full region grammar,
+  notably `*` (unmapped) and `.` (everything else).
+- **htslib-rs tests:** parse + query tests for `*`, `.`, and edge spans.
+- **samtools-rs wiring:** region-query edge cases across `view`/`stats`/etc.
+- **samtools-rs tests:** region-grammar integration tests + `test.pl`
+  region cases.
+
+### 11. `probaln_glocal` / BAQ wiring verification
+
+- **htslib-rs:** verify `htslib-rs::probaln` (`probaln_glocal`) is wired and
+  correct for BAQ recalculation (likely verification, not new API).
+- **htslib-rs tests:** BAQ output on a known fixture matches expected.
+- **samtools-rs wiring:** `calmd` BAQ paths (and later `mpileup`).
+- **samtools-rs tests:** `calmd -b`/BAQ integration test + `test_calmd`
+  BAQ fixtures.
+
+### 12. CSI robustness for very large references/regions (handle in htslib-rs)
+
+- **htslib-rs:** make large-reference CSI queries robust **inside
+  `htslib-rs`'s region/index handling layer** — e.g. validate/clamp the
+  region end bound and guard the bin computation before it reaches
+  `noodles-csi`. **Do not patch `noodles`.** Symptoms today:
+  `samtools view large_chrom.bam ref2` panics `index out of bounds` in
+  `noodles-csi/.../reference_sequence.rs`, and `ref2:1-541556283` reports
+  `invalid end bound`.
+- **htslib-rs tests:** query `large_chrom.bam ref2` and a near-INT_MAX
+  span without panicking; assert correct (possibly empty) results.
+- **samtools-rs wiring:** none beyond consuming the fixed API.
+- **samtools-rs tests:** the upstream `test_index` `large_chrom.bam ref2`
+  case passes.
+- **Note:** if it provably cannot be fixed in `htslib-rs` without a
+  `noodles` change, stop and raise it for a decision.
+
+---
+
+## Suggested sequencing
+
+1. **#1 Pileup iterator** — by far the biggest unlock (≈5 subcommands).
+2. **#2 CRAM all-record iterator** — closes several CRAM-without-region gaps.
+3. **#4, #5, #6** — small, well-scoped htslib-rs additions that each finish a
+   specific parity gap.
+4. **#7–#12** — incremental hardening / correctness.
+
+## Out of scope here (NOT library-blocked — large samtools-rs ports)
+
+For context only — these need no library change, just substantial
+samtools-rs work, and are tracked in `TODO.md` proper: full `depad`
+(~623 LOC C), full `checksum` (~1324 LOC C), full `reference` (~598 LOC C),
+`markdup` full stats parity, `sort` external-merge / template-coordinate /
+minimiser sorts, full `import` read-group/CRAM parity, and the deferred
+`merge -s SEED` header-reconciliation rework.
