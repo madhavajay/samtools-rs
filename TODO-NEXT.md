@@ -174,7 +174,14 @@ re-scoped for the next pass where the samtools-only constraint is lifted.
 - **samtools-rs tests:** `--write-index` integration tests across
   `view`/`sort`/`merge`.
 
-### 10. Region-string grammar coverage (`htslib-rs::region`)
+### 10. Region-string grammar coverage (`htslib-rs::region`) — 🟡 PARTIAL
+
+> `.` (everything) **done**: `view` normalizes a lone `.` positional to a
+> whole-file pass (test `view_dot_region_means_whole_file`).
+> **Remaining:** `*` (unplaced-unmapped only) — needs an unplaced filter
+> threaded through `view`'s count/SAM/BAM/CRAM output matrix (and
+> `stats`/etc.); currently still routed through noodles region parsing and
+> errors. Bounded follow-up.
 
 - **htslib-rs:** confirm/extend coverage of HTSlib's full region grammar,
   notably `*` (unmapped) and `.` (everything else).
@@ -192,7 +199,16 @@ re-scoped for the next pass where the samtools-only constraint is lifted.
 - **samtools-rs tests:** `calmd -b`/BAQ integration test + `test_calmd`
   BAQ fixtures.
 
-### 12. CSI robustness for very large references/regions (handle in htslib-rs)
+### 12. CSI robustness for very large references/regions — ✅ DONE
+
+> Completed: htslib-rs `8372873`. `build_bam_csi_with_min_shift` was
+> using a fixed CSI depth of 5; it now auto-sizes depth from the largest
+> reference (`alignment_csi_depth_for_header`, as the SAM-CSI builder
+> already did). `view large_chrom.bam ref2` and `ref2:1-541556283` are
+> byte-exact vs `dat/large_chrom.out`, no panic / no `invalid end bound`.
+> **Fixed entirely in htslib-rs; noodles unpatched.** Tests:
+> `builds_csi_for_very_large_reference_and_queries_it`,
+> `view_large_chrom_csi_region_matches_upstream`.
 
 - **htslib-rs:** make large-reference CSI queries robust **inside
   `htslib-rs`'s region/index handling layer** — e.g. validate/clamp the
