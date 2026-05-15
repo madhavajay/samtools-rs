@@ -59,26 +59,16 @@ quick fix — verified by probing):
   (modulo @PG); integration test `merge_reconciles_rg_pg_byte_exact_vs_upstream`
   covers all five. Remaining (not fixture-covered): k-way streaming
   merge, CRAM output, `--template-coordinate`.
-- `markdup` → ✅ **9/14 fixtures byte-exact, DONE**: faithful
-  `make_pair_key` (template + sequence), `make_single_key`,
-  `calc_score`+`ms`, QCFAIL/qname tie-break, `-S` `dup_hash`
-  propagation, faithful `get_coordinates_colons` optical-name parse,
-  the full `find_duplicate_chains` optical-chain re-tagging
-  (`original`/`duplicate` links with the exact swap/splice semantics +
-  `check_chain_against_original` + `check_duplicate_chain`),
-  `--use-read-groups`, `--duplicate-count` (`dc:i`), raw-header SAM
-  output. **Byte-exact vs `markdup/{5,6,7,8,9,10,13,17,18}`.**
-  *Remaining (regex cluster, fixtures 11,12,14,15,16):* `--read-coords`
-  REGEX + `--coords-order` (`txy` default → t=1,x=2,y=3; `xyt` →
-  1,2,3; `xy` → x=1,y=2,t=0), `--barcode-rgx` REGEX, `--barcode-name`
-  (the 8-colon UMI regex `[0-9A-Za-z]+:…(7×):([!-?A-~]+)`). Plan: add a
-  `CoordCfg{ Option<regex::Regex>, rgx_x, rgx_y, rgx_t }` threaded
-  through `is_optical_duplicate`/`duplicate_type`/the chain pass
-  replacing the bare `get_coordinates_colons` (regexec → group spans;
-  `t` group → prefix, else empty prefix); extend `barcode_bytes` to a
-  barcode mode (tag | name-rgx group1 | custom-rgx group1). The Rust
-  `regex` crate (workspace dep) supports `[[:digit:]]`/`[[:print:]]`/
-  `[!-?A-~]`/`^`/`$`. Then exact `-s` stats counts, CRAM.
+- `markdup` → ✅ **DONE — all 14 `test_markdup` SAM fixtures
+  byte-exact** (`markdup/{5..18}`): faithful `make_pair_key`
+  (template + sequence), `make_single_key`, `calc_score`+`ms`,
+  QCFAIL/qname tie-break, `-S` `dup_hash` propagation,
+  `get_coordinates_colons` + regex `get_coordinates` optical-name
+  parse, the full `find_duplicate_chains` optical-chain re-tagging,
+  `--use-read-groups`, `--duplicate-count`, `--read-coords`/
+  `--coords-order`/`--barcode-rgx`/`--barcode-name` (regex crate;
+  capture-span-bounded coord parse), raw-header SAM output. Remaining:
+  exact `-s` stats counts, CRAM, the `1..4` expect-fail cases.
 - `reset` → tested only via pipes into `sort -M -K10` (minimiser).
 - `sort` `name2` / `reset` → minimiser (`-N`/`-K`) + external merge.
 - `stats` → ~123k LOC C, deep structural gaps (CHK, per-SN comments,
