@@ -68,6 +68,12 @@ Landed slices on this branch:
   with `-T`/`--reference` writes reference-backed CRAM (SAM/BAM input)
   via a temp-BAM → shared CRAM-writer path. New test:
   `addreplacerg_writes_cram_output_with_reference`.
+- **`stats -d` CRAM region path verified:** the CRAM region path
+  shares the SAM/BAM `update` chokepoint, so `--remove-dups` already
+  excludes `BAM_FDUP` records from histograms there. New test:
+  `stats_remove_dups_excludes_duplicates_on_cram_region_path`. The
+  no-region CRAM summarize path remains blocked on the htslib-rs CRAM
+  all-record iterator.
 
 Latest known validation (on `main` at `b312c99`, post-merge):
 - Rust tests: 416 `samtools-rs` passing, 0 failing (`cargo test --workspace`: 2587 passing).
@@ -101,7 +107,7 @@ Remaining tractable samtools-rs-only items (no htslib-rs / noodles changes requi
 - **`merge -s SEED`** — *deferred (not a bounded slice).* The option is already parsed and its value consumed. Upstream's only use of the seed is `hts_srand48` feeding `lrand48()` for random `@RG`/`@PG`-ID collision suffixes during header merge (`bam_sort.c:408`). Our merge reconciles headers by *rejecting* ID conflicts rather than random-suffixing, so the seed has no observable effect until that suffixing path is implemented — a header-reconciliation rework, larger than a bounded slice.
 - ~~**`samples` BAM index path verification**~~ **Done.** `samples -i` with a custom `-X` index path now mirrors `sam_index_load3`: an exact index file, a *directory* holding the index (`<dir>/<data-name>.bai`), or a suffix-less prefix all resolve via the shared `locate_associated_index` resolver, so index files at non-default locations register `Y`. Regression: `samples_custom_index_directory_reports_index_presence` (and the existing exact-file/pair test still passes).
 - ~~**`addreplacerg --output-fmt=cram`** with a `-T` reference~~ **Done.** `addreplacerg` accepts `-O cram` / `--output-fmt cram` / `--output-fmt=cram` and `-T`/`--reference[=]FILE`; SAM/BAM input → CRAM output spools rewritten records to a temp BAM and converts via the shared `write_cram_from_bam_path_with_reference` (the `.fai` is built if missing). CRAM output without `-T` errors. Regression: `addreplacerg_writes_cram_output_with_reference`.
-- **`stats -d` / `--remove-dups` edge cases**: ensure histogram contributions are excluded for primary duplicates across CRAM record paths.
+- ~~**`stats -d` / `--remove-dups` edge cases**~~ **Done (tractable part).** The CRAM *region* path iterates real records through the same `update_record_with_targets` → `update` chokepoint as SAM/BAM, which already gates all histogram/seq/quality accumulation on `self.total` increasing (and `--remove-dups` filters `BAM_FDUP` before `total` is bumped). Verified end-to-end by `stats_remove_dups_excludes_duplicates_on_cram_region_path` (SAM→CRAM→indexed→region stats with/without `-d`). The CRAM *no-region* path uses the `summarize_cram_records_from_path_with_reference` summary path, which discards per-record seq/quality — that remains **blocked on the htslib-rs CRAM all-record iterator** (already tracked in the blocked list).
 
 Items blocked on htslib-rs / noodles extensions (see the rolling list at the end of this file):
 - All pileup-dependent commands (`mpileup`, `consensus`, `targetcut`, `phase`, `ampliconstats`, exact pileup-based `bedcov`/`coverage`/`depth`).
