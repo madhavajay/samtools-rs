@@ -59,33 +59,26 @@ quick fix — verified by probing):
   (modulo @PG); integration test `merge_reconciles_rg_pg_byte_exact_vs_upstream`
   covers all five. Remaining (not fixture-covered): k-way streaming
   merge, CRAM output, `--template-coordinate`.
-- `markdup` → ✅ **core key/score DONE**: faithful `make_pair_key`
-  (template + sequence), `make_single_key`, `calc_score`+`ms`,
-  QCFAIL/qname tie-break, `-S` SA/XA/unmapped-mate `dup_hash`
-  propagation. Byte-exact vs upstream `markdup/{5,6,7,13}`.
-  Optical-name parse now faithful (`get_coordinates_colons`:
-  separator-count x/y selection, prefix-string equality + |x|/|y| ≤
-  dist). *Remaining: optical-chain re-tagging* — **de-risked spec:**
-  (a) in `mark()` maintain per-index `original[i]` and a `duplicate`
-  head/tail per kept read, mirroring `bam_markdup.c:1797-1845`/
-  `1855-1895` swap semantics (when the new read wins, the old `bp->p`'s
-  duplicate sub-chain is spliced under the new read; `original`
-  back-links); (b) after marking, for each chain root (read with no
-  `original` link and ≥1 duplicate) run `check_chain_against_original`:
-  `get_coordinates_colons(root)`; for each dup in `root.duplicate`
-  chain set `do`→root qname (if `-t`), `optical_duplicate_partial`
-  (sets `c.{x,y,beg,end,len}`, `is_opt` vs root prefix/x/y), `c.opt` if
-  existing `dt:Z:SQ` or is_opt (then `optical_retag` → `dt:Z:SQ` +
-  `optical`/`single_optical` stat + dup_hash type 'O'), `c.score` =
-  `calc_score`(+`ms` if paired); (c) `check_duplicate_chain`: qsort by
-  `(len, prefix-bytes, x)`, then within equal-prefix groups, for each
-  pair with `Δx ≤ opt_dist` and `Δy ≤ opt_dist`, pick the optical dup
-  by the same QCFAIL→score→qname-`strcmp` rule as the main pair
-  decision and `optical_retag` the loser (skip if both already
-  `c.opt`). Fixtures 8–12,15,16. Then `--read-coords`/`--coords-order`/
-  `--barcode-rgx`/`--barcode-name` (regex coord/barcode),
-  `--use-read-groups` (rg-keyed), `--duplicate-count` (`dc` tag),
-  exact `-s` stats counts, CRAM.
+- `markdup` → ✅ **9/14 fixtures byte-exact, DONE**: faithful
+  `make_pair_key` (template + sequence), `make_single_key`,
+  `calc_score`+`ms`, QCFAIL/qname tie-break, `-S` `dup_hash`
+  propagation, faithful `get_coordinates_colons` optical-name parse,
+  the full `find_duplicate_chains` optical-chain re-tagging
+  (`original`/`duplicate` links with the exact swap/splice semantics +
+  `check_chain_against_original` + `check_duplicate_chain`),
+  `--use-read-groups`, `--duplicate-count` (`dc:i`), raw-header SAM
+  output. **Byte-exact vs `markdup/{5,6,7,8,9,10,13,17,18}`.**
+  *Remaining (regex cluster, fixtures 11,12,14,15,16):* `--read-coords`
+  REGEX + `--coords-order` (`txy` default → t=1,x=2,y=3; `xyt` →
+  1,2,3; `xy` → x=1,y=2,t=0), `--barcode-rgx` REGEX, `--barcode-name`
+  (the 8-colon UMI regex `[0-9A-Za-z]+:…(7×):([!-?A-~]+)`). Plan: add a
+  `CoordCfg{ Option<regex::Regex>, rgx_x, rgx_y, rgx_t }` threaded
+  through `is_optical_duplicate`/`duplicate_type`/the chain pass
+  replacing the bare `get_coordinates_colons` (regexec → group spans;
+  `t` group → prefix, else empty prefix); extend `barcode_bytes` to a
+  barcode mode (tag | name-rgx group1 | custom-rgx group1). The Rust
+  `regex` crate (workspace dep) supports `[[:digit:]]`/`[[:print:]]`/
+  `[!-?A-~]`/`^`/`$`. Then exact `-s` stats counts, CRAM.
 - `reset` → tested only via pipes into `sort -M -K10` (minimiser).
 - `sort` `name2` / `reset` → minimiser (`-N`/`-K`) + external merge.
 - `stats` → ~123k LOC C, deep structural gaps (CHK, per-SN comments,
