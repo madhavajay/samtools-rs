@@ -82,6 +82,19 @@ Landed slices on this branch:
   tests: `fastq_index_emits_one_record_per_qname_group_with_casava_comment`,
   `fastq_casava_barcode_propagates_from_r1_to_r2_mate`.
 
+Batch status: **all "Remaining tractable samtools-rs-only items" are now
+done or explicitly deferred** (only `merge -s SEED`, whose sole upstream
+effect needs a merge header-reconciliation rework — a substantial
+samtools-rs effort, not a bounded slice). Per the **Active Goal**, the
+remaining actionable work requires htslib-rs / noodles changes (see
+*Items blocked …* below); this samtools-only pass stops here. Final
+validation on `work-sam-float-renderer`: `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace` (**2601 passing, 0 failing**) all green; the
+upstream `bam2fq/{5,8,10,12}` fixtures now match byte-for-byte. Next:
+open one PR for this branch, get CI green, merge to `main`, then a new
+working branch (the next batch is htslib-rs/noodles-blocked work).
+
 Latest known validation (on `main` at `b312c99`, post-merge):
 - Rust tests: 416 `samtools-rs` passing, 0 failing (`cargo test --workspace`: 2587 passing).
 - Full gate green in CI on PR #16: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and the advisory parity gate.
