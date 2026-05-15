@@ -326,7 +326,10 @@ mod tests {
         }
 
         let header_text = crate::header_text::read_raw_header_text(&output).unwrap();
-        assert!(header_text.contains("\tPN:samtools\tVN:"));
+        // Upstream `@PG` field order is ID, PN, PP, VN, CL — `hdr.sam`
+        // has `@PG ID:prog1`, so the new samtools entry chains `PP:prog1`
+        // before VN/CL.
+        assert!(header_text.contains("\tPN:samtools\tPP:prog1\tVN:"));
         assert!(header_text.contains("\tCL:reheader "));
         let _ = std::fs::remove_file(output);
     }

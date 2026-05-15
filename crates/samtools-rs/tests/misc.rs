@@ -1180,8 +1180,12 @@ fn cat_adds_pg_by_default() {
     );
 
     let header = header_text::read_raw_header_text(&out).unwrap();
-    assert!(header.contains("\tPN:samtools\tVN:"));
-    assert!(header.contains("\tCL:cat "));
+    let pg_line = header
+        .lines()
+        .find(|l| l.starts_with("@PG\t") && l.contains("\tCL:cat "))
+        .expect("samtools cat @PG line present");
+    assert!(pg_line.contains("\tPN:samtools"));
+    assert!(pg_line.contains("\tVN:"));
 }
 
 #[test]
