@@ -71,7 +71,14 @@ quick fix — verified by probing):
   exact `-s` stats counts, CRAM, the `1..4` expect-fail cases.
 - `reset` → tested only via pipes into `sort -M -K10` (minimiser).
 - `sort` `name2` / `reset` → minimiser (`-N`/`-K`) + external merge.
-- `stats` → ✅ **19/20 fixtures DONE**: byte-exact end to end vs
+- `stats` → ✅ **DONE — all 20 fixture groups byte-exact** (stat/1–19
+  plus the four stat/12 `-t`/`-p` variants), incl. the `-p`/
+  `--remove-overlaps` paired-overlap chunk subtraction and the f32
+  error-rate cast. Out of scope (no fixtures / library-blocked):
+  multi-bin (>20 kbp) GC-depth, exact pileup-backed COV, CRAM without
+  explicit reference (the htslib-rs CRAM all-record iterator). Original
+  detail retained below.
+  Byte-exact end to end vs
   upstream `stat/{1..11,13,14,15,16,17,18,19}` (CHK checksum, all SN
   lines + comments, FFQ/LFQ with `max_qual` width + reverse-strand
   quality orientation, full MPC reference-mismatch engine, GCF/GCL,

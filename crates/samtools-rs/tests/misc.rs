@@ -6425,34 +6425,43 @@ fn stats_matches_upstream_stat_fixtures() {
         );
     }
 
-    // stat/12 overlap variants: `-t` BED on an overlapping-pairs BAM.
-    // The insert-size avg/sd is computed from the integer-halved
-    // per-size arrays (a lone in-region read whose mate was filtered
-    // drops to zero). The `-p`/--remove-overlaps variants additionally
-    // need the paired-overlap chunk subtraction and are not yet exact.
-    for (bed, expected) in [
-        ("12_3reads.bed", "12.3reads.overlap.expected"),
-        ("12_2reads.bed", "12.2reads.overlap.expected"),
-    ] {
+    // stat/12: overlapping-pairs BAM with `-t` BED. The overlap
+    // variants exercise the integer-halved insert-size avg/sd; the
+    // `-p`/--remove-overlaps variants the paired-overlap chunk
+    // subtraction (bases-mapped-cigar + coverage) and the f32
+    // error-rate cast.
+    let cases12: [(&[&str], &str); 4] = [
+        (&["12_3reads.bed"], "12.3reads.overlap.expected"),
+        (&["-p", "12_3reads.bed"], "12.3reads.nooverlap.expected"),
+        (&["12_2reads.bed"], "12.2reads.overlap.expected"),
+        (&["-p", "12_2reads.bed"], "12.2reads.nooverlap.expected"),
+    ];
+    for (rest, expected) in cases12 {
+        let (opt, bed) = if rest.len() == 2 {
+            (Some("-p"), rest[1])
+        } else {
+            (None, rest[0])
+        };
         let out = tmp.join(expected);
+        let mut v: Vec<String> = vec!["-o".into(), p(&out)];
+        if let Some(o) = opt {
+            v.push(o.into());
+        }
+        v.push("-t".into());
+        v.push(p(&stat.join(bed)));
+        v.push(p(&stat.join("12_overlaps.bam")));
         assert_eq!(
             exit_to_u8(stats::main(&argv(
                 "stats",
-                &[
-                    "-o",
-                    &p(&out),
-                    "-t",
-                    &p(&stat.join(bed)),
-                    &p(&stat.join("12_overlaps.bam")),
-                ]
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
             ))),
             0,
-            "stats -t {bed}"
+            "stats {expected}"
         );
         assert_eq!(
             strip(&std::fs::read_to_string(&out).unwrap()),
             std::fs::read_to_string(stat.join(expected)).unwrap(),
-            "stats -t {bed} byte-exact",
+            "stats {expected} byte-exact",
         );
     }
 

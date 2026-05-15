@@ -40,6 +40,9 @@ const NINDELS: usize = 300;
 #[derive(Clone, Debug)]
 struct StatsConfig {
     remove_dups: bool,
+    // `-p`/`--remove-overlaps`: subtract overlapping mate-pair regions
+    // from `bases mapped (cigar)` and the coverage histogram.
+    remove_overlaps: bool,
     required_flags: u32,
     filter_flags: u32,
     id_filter: Option<String>,
@@ -69,6 +72,7 @@ impl Default for StatsConfig {
     fn default() -> Self {
         Self {
             remove_dups: false,
+            remove_overlaps: false,
             required_flags: 0,
             filter_flags: 0,
             id_filter: None,
@@ -237,7 +241,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-d" | "--remove-dups" => {
                 config.remove_dups = true;
             }
-            "-s" | "--sparse" | "-x" | "--sam" | "-p" | "--remove-overlaps" | "--no-PG" => {
+            "-p" | "--remove-overlaps" => {
+                config.remove_overlaps = true;
+            }
+            "-s" | "--sparse" | "-x" | "--sam" | "--no-PG" => {
                 // Accepted but not yet implemented.
             }
             "--help" | "-h" => {
@@ -920,6 +927,38 @@ fn cigar_mapped_bases(
     }
 }
 
+/// The read's M/=/X reference intervals (0-based half-open), each
+/// clipped to the target region `reg` (1-based inclusive) when given,
+/// matching the `pmin/pmax` chunks upstream feeds to `remove_overlaps`.
+fn clipped_m_chunks(
+    rec: &(impl sam::alignment::Record + ?Sized),
+    pos0: i64,
+    reg: Option<(i64, i64)>,
+) -> Vec<(i64, i64)> {
+    use sam::alignment::record::cigar::op::Kind;
+    let mut p = pos0;
+    let mut out = Vec::new();
+    for op in rec.cigar().iter().flatten() {
+        let len = op.len() as i64;
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                let (mut b, mut e) = (p, p + len);
+                if let Some((rf, rt)) = reg {
+                    b = b.max(rf - 1);
+                    e = e.min(rt);
+                }
+                if e > b {
+                    out.push((b, e));
+                }
+                p += len;
+            }
+            Kind::Deletion | Kind::Skip => p += len,
+            Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
+        }
+    }
+    out
+}
+
 /// Region-restricted `bases mapped (cigar)` count, faithfully porting
 /// the `if (stats->regions)` branch of upstream `collect_stats`: M/=/X
 /// runs are clipped to `[reg_from, reg_to]` (1-based inclusive) and an
@@ -1389,6 +1428,10 @@ struct StatsCounts {
     first_gc_hist: Vec<u64>,
     last_gc_hist: Vec<u64>,
     coverage_depths: BTreeMap<(usize, usize), u32>,
+    // `-p`/`--remove-overlaps`: first-seen mate's clipped M/=/X
+    // reference intervals (0-based half-open) per template qname, with
+    // its `order`, so the other mate can subtract the overlap.
+    pair_chunks: HashMap<String, (u32, Vec<(i64, i64)>)>,
     target_bases: u64,
     // Bases mapped (sum of sequence lengths for mapped reads, ignoring
     // clipping), bases mapped from CIGAR (sum of M/=/X ops), and total
@@ -1784,6 +1827,74 @@ impl StatsCounts {
             && let Some(refseq) = refmap.get(String::from_utf8_lossy(name.as_ref()).as_ref())
         {
             self.count_mismatches_per_cycle(rec, flag, seq_len, refseq, p - 1, &chk_seq, &chk_qual);
+        }
+
+        // `-p`/`--remove-overlaps`: faithful port of `remove_overlaps`.
+        // The first mate of a pair is counted in full (already done by
+        // the normal cigar/coverage path above); when the other mate
+        // arrives its overlap with the first mate's M/=/X chunks is
+        // subtracted from `bases mapped (cigar)` and the coverage
+        // histogram. Non-pairable reads keep the normal full count.
+        if config.remove_overlaps
+            && counted
+            && flag & BAM_FUNMAP == 0
+            && let Some(rsid) = reference_sequence_id
+            && let Some(p) = pos
+        {
+            let isize_abs = rec.template_length().ok().unwrap_or(0).unsigned_abs() as u64;
+            let order: u32 = (if flag & BAM_FREAD1 != 0 { 1 } else { 0 })
+                + (if flag & BAM_FREAD2 != 0 { 2 } else { 0 });
+            let pairable = flag & BAM_FPAIRED != 0
+                && flag & BAM_FMUNMAP == 0
+                && isize_abs < 2 * seq_len as u64
+                && (order == 1 || order == 2);
+            if pairable {
+                let reg = targets.and_then(|tg| {
+                    tg.iter()
+                        .filter(|t| t.tid == rsid && t.end as i64 >= p as i64)
+                        .min_by_key(|t| t.start)
+                        .map(|t| (t.start as i64, t.end as i64))
+                });
+                let chunks = clipped_m_chunks(rec, (p as i64) - 1, reg);
+                let qname = rec
+                    .name()
+                    .map(|n| String::from_utf8_lossy(n).into_owned())
+                    .unwrap_or_default();
+                match self.pair_chunks.get(&qname) {
+                    None => {
+                        self.pair_chunks.insert(qname, (order, chunks));
+                    }
+                    Some((first, _)) if *first == order => {
+                        if let Some(entry) = self.pair_chunks.get_mut(&qname) {
+                            entry.1.extend(chunks);
+                        }
+                    }
+                    Some((_, fc)) => {
+                        let fc = fc.clone();
+                        let mut overlap = 0i64;
+                        for &(b, e) in &chunks {
+                            for &(fb, fe) in &fc {
+                                let lo = b.max(fb);
+                                let hi = e.min(fe);
+                                if hi > lo {
+                                    overlap += hi - lo;
+                                    for pos0 in lo..hi {
+                                        if let Some(d) =
+                                            self.coverage_depths.get_mut(&(rsid, pos0 as usize))
+                                            && *d > 0
+                                        {
+                                            *d -= 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        self.bases_mapped_cigar =
+                            self.bases_mapped_cigar.saturating_sub(overlap as u64);
+                        self.pair_chunks.remove(&qname);
+                    }
+                }
+            }
         }
     }
 
@@ -2549,8 +2660,9 @@ fn write_stats_counts(
         "SN\tmismatches:\t{}\t# from NM fields",
         counts.nmismatches
     )?;
+    // Upstream casts to single precision: `(float)nmismatches / nbases`.
     let error_rate = if counts.bases_mapped_cigar > 0 {
-        counts.nmismatches as f64 / counts.bases_mapped_cigar as f64
+        (counts.nmismatches as f32 / counts.bases_mapped_cigar as f32) as f64
     } else {
         0.0
     };
