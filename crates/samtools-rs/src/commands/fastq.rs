@@ -1,12 +1,20 @@
 //! `samtools fastq` / `samtools fasta` / `samtools bam2fq` — convert
 //! SAM/BAM records to FASTQ or FASTA text.
 //!
-//! Mirrors `main_bam2fq` in `bam_fastq.c`. The initial Rust port supports
-//! single-output mode (all reads written to stdout, `-o FILE`, or `-0 FILE`) and
-//! basic paired-output split (`-1`/`-2`/`-s`).
+//! Mirrors `main_bam2fq` in `bam_fastq.c`. Supports single-output mode (all
+//! reads written to stdout, `-o FILE`, or `-0 FILE`), paired-output split
+//! (`-1`/`-2`/`-s`/`-0`) with upstream-style name-grouped routing where
+//! adjacent records sharing a qname pick the best per readpart and flush as
+//! a unit (paired R1+R2 to `-1`/`-2`, R1-only or R2-only singletons to `-s`
+//! when set or falling back to `-1`/`-2`, and READ_OTHER to `-0`).
 //!
-//! **Not yet supported:** exact name-grouped singleton/other routing for the
-//! full upstream grouping model.
+//! Also supports per-record `--i1`/`--i2` index FASTQ extraction with
+//! `--index-format` (default `i*i*`), `--quality-tag`, and `--barcode-tag`.
+//!
+//! **Not yet supported:** CRAM input, exact upstream name-grouped
+//! one-record-per-qname-pair index emission, and exact
+//! `score`-vs-`b_score` propagation through CASAVA barcode copying
+//! between paired ends.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -62,6 +70,54 @@ impl FlagFilters {
 impl AuxSelection {
     fn is_enabled(&self) -> bool {
         !matches!(self, Self::None)
+    }
+}
+
+/// Merge a new `-d` / `-D` filter into the existing list. Upstream rejects
+/// repeated invocations with different tag names; same-tag invocations
+/// union their value sets so `-d NM:13 -d NM:14` keeps records with
+/// `NM:i:{13,14}`. A presence-only filter (`-d TAG`) "wins" if combined
+/// with any value filter on the same tag (records pass on presence alone).
+fn merge_tag_filter(filters: &mut Vec<TagFilter>, new_filter: TagFilter) -> Result<(), String> {
+    if let Some(existing) = filters.iter_mut().find(|f| f.tag == new_filter.tag) {
+        match (&mut existing.values, new_filter.values) {
+            (Some(existing_set), Some(new_set)) => existing_set.extend(new_set),
+            (Some(_), None) => existing.values = None,
+            (None, _) => {}
+        }
+        return Ok(());
+    }
+    if let Some(other) = filters.iter().next()
+        && other.tag != new_filter.tag
+    {
+        return Err(format!(
+            "different tag \"{}{}\" specified after \"{}{}\"",
+            char::from(new_filter.tag[0]),
+            char::from(new_filter.tag[1]),
+            char::from(other.tag[0]),
+            char::from(other.tag[1]),
+        ));
+    }
+    filters.push(new_filter);
+    Ok(())
+}
+
+/// Union-merges `extra` into `selection`. `None` becomes `Tags(extra)`;
+/// `All` is unchanged; `Tags(existing)` extends with non-duplicate tags
+/// from `extra`. Matches upstream's accumulating `-t` / `-T` behavior.
+fn merge_aux_selection(selection: &mut AuxSelection, extra: &[[u8; 2]]) {
+    match selection {
+        AuxSelection::None => {
+            *selection = AuxSelection::Tags(extra.to_vec());
+        }
+        AuxSelection::All => {}
+        AuxSelection::Tags(existing) => {
+            for tag in extra {
+                if !existing.iter().any(|t| t == tag) {
+                    existing.push(*tag);
+                }
+            }
+        }
     }
 }
 
@@ -141,19 +197,22 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     print_error(sub_name, "missing value for -T");
                     return ExitCode::from(1);
                 };
-                aux_selection = match raw {
-                    "" | "*" => AuxSelection::All,
+                match raw {
+                    "" | "*" => aux_selection = AuxSelection::All,
                     _ => match parse_aux_list(raw) {
-                        Ok(tags) => AuxSelection::Tags(tags.into_iter().collect()),
+                        Ok(tags) => {
+                            let tags: Vec<[u8; 2]> = tags.into_iter().collect();
+                            merge_aux_selection(&mut aux_selection, &tags);
+                        }
                         Err(e) => {
                             print_error(sub_name, format!("invalid -T value \"{raw}\": {e}"));
                             return ExitCode::from(1);
                         }
                     },
-                };
+                }
             }
             "-t" => {
-                aux_selection = AuxSelection::Tags(vec![*b"RG", *b"BC", *b"QT"]);
+                merge_aux_selection(&mut aux_selection, &[*b"RG", *b"BC", *b"QT"]);
             }
             "-d" | "--tag" => {
                 let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
@@ -161,7 +220,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     return ExitCode::from(1);
                 };
                 match parse_tag_filter(raw) {
-                    Ok(filter) => tag_filters.push(filter),
+                    Ok(filter) => {
+                        if let Err(e) = merge_tag_filter(&mut tag_filters, filter) {
+                            print_error(sub_name, e);
+                            return ExitCode::from(1);
+                        }
+                    }
                     Err(e) => {
                         print_error(sub_name, e);
                         return ExitCode::from(1);
@@ -174,7 +238,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     return ExitCode::from(1);
                 };
                 match parse_tag_filter_file(raw) {
-                    Ok(filter) => tag_filters.push(filter),
+                    Ok(filter) => {
+                        if let Err(e) = merge_tag_filter(&mut tag_filters, filter) {
+                            print_error(sub_name, e);
+                            return ExitCode::from(1);
+                        }
+                    }
                     Err(e) => {
                         print_error(sub_name, e);
                         return ExitCode::from(1);
@@ -371,10 +440,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
 
+        let singleton_set = singleton_output.is_some();
         let split = if stdin_input {
             let stdin = io::stdin().lock();
             let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(stdin));
-            if fasta_mode && (flag_filters.include_any != 0 || umi_tags.is_some() || casava) {
+            if fasta_mode {
                 view_sam_reader_as_fasta_split(
                     &mut reader,
                     flag_filters,
@@ -382,14 +452,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     umi_tags.as_deref(),
                     casava,
                     barcode_tag,
-                )
-            } else if fasta_mode {
-                htslib_rs::alignment_compat::view_sam_as_fasta_split_text_from_reader_with_flag_filter_and_suffix(
-                    &mut reader,
-                    require_flags,
-                    exclude_flags,
-                    exclude_all_flags,
-                    append_read_number,
+                    singleton_set,
                 )
             } else {
                 view_sam_reader_as_fastq_split_with_aux(
@@ -397,60 +460,44 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     flag_filters,
                     render_options,
                     &tag_filters,
+                    singleton_set,
                 )
             }
         } else {
             let input = input.as_ref().expect("non-stdin input exists");
             match (format.expect("non-stdin format exists").exact, fasta_mode) {
-                (Exact::Sam, false) => {
-                    view_sam_path_as_fastq_split(input, flag_filters, render_options, &tag_filters)
-                }
-                (Exact::Sam, true) => {
-                    if flag_filters.include_any != 0 || umi_tags.is_some() || casava {
-                        view_sam_path_as_fasta_split(
-                            input,
-                            flag_filters,
-                            append_read_number,
-                            umi_tags.as_deref(),
-                            casava,
-                            barcode_tag,
-                        )
-                    } else {
-                        htslib_rs::alignment_compat::view_sam_as_fasta_split_text_from_path_with_flag_filter_and_suffix(
+                (Exact::Sam, false) => view_sam_path_as_fastq_split(
                     input,
-                    require_flags,
-                    exclude_flags,
-                    exclude_all_flags,
+                    flag_filters,
+                    render_options,
+                    &tag_filters,
+                    singleton_set,
+                ),
+                (Exact::Sam, true) => view_sam_path_as_fasta_split(
+                    input,
+                    flag_filters,
                     append_read_number,
-                )
-                    }
-                }
+                    umi_tags.as_deref(),
+                    casava,
+                    barcode_tag,
+                    singleton_set,
+                ),
                 (Exact::Bam, false) => view_bam_path_as_fastq_split_with_aux(
                     input,
                     flag_filters,
                     render_options,
                     &tag_filters,
+                    singleton_set,
                 ),
-                (Exact::Bam, true) => {
-                    if flag_filters.include_any != 0 || umi_tags.is_some() || casava {
-                        view_bam_path_as_fasta_split(
-                            input,
-                            flag_filters,
-                            append_read_number,
-                            umi_tags.as_deref(),
-                            casava,
-                            barcode_tag,
-                        )
-                    } else {
-                        htslib_rs::alignment_compat::view_bam_as_fasta_split_text_from_path_with_flag_filter_and_suffix(
+                (Exact::Bam, true) => view_bam_path_as_fasta_split(
                     input,
-                    require_flags,
-                    exclude_flags,
-                    exclude_all_flags,
+                    flag_filters,
                     append_read_number,
-                )
-                    }
-                }
+                    umi_tags.as_deref(),
+                    casava,
+                    barcode_tag,
+                    singleton_set,
+                ),
                 _ => {
                     print_error(
                         sub_name,
@@ -479,40 +526,64 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
         };
 
-        if let Some(path) = read1_output.as_ref()
-            && let Err(e) = write_text_file(path, split.read1.as_bytes())
-        {
-            print_error_errno(sub_name, format!("open/write {}", path.display()), &e);
-            return ExitCode::from(1);
-        }
-        if let Some(path) = read2_output.as_ref()
-            && let Err(e) = write_text_file(path, split.read2.as_bytes())
-        {
-            print_error_errno(sub_name, format!("open/write {}", path.display()), &e);
-            return ExitCode::from(1);
-        }
-        if let Some(path) = singleton_output.as_ref()
-            && singleton_only
-        {
-            let mut all_singletons = String::new();
-            all_singletons.push_str(&split.read1);
-            all_singletons.push_str(&split.read2);
-            all_singletons.push_str(&split.singleton);
-            if let Err(e) = write_text_file(path, all_singletons.as_bytes()) {
+        let paired_share_path = match (read1_output.as_ref(), read2_output.as_ref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        if paired_share_path && let Some(path) = read1_output.as_ref() {
+            let interleaved = interleave_paired_records(&split.read1, &split.read2);
+            if let Err(e) = write_text_file(path, &interleaved) {
                 print_error_errno(sub_name, format!("open/write {}", path.display()), &e);
                 return ExitCode::from(1);
             }
-        } else if let Some(path) = singleton_output.as_ref()
-            && let Err(e) = write_text_file(path, split.singleton.as_bytes())
-        {
-            print_error_errno(sub_name, format!("open/write {}", path.display()), &e);
-            return ExitCode::from(1);
+        } else {
+            if let Some(path) = read1_output.as_ref()
+                && let Err(e) = write_text_file(path, &split.read1)
+            {
+                print_error_errno(sub_name, format!("open/write {}", path.display()), &e);
+                return ExitCode::from(1);
+            }
+            if let Some(path) = read2_output.as_ref()
+                && let Err(e) = write_text_file(path, &split.read2)
+            {
+                print_error_errno(sub_name, format!("open/write {}", path.display()), &e);
+                return ExitCode::from(1);
+            }
         }
-        if let Some(path) = other_output.as_ref()
-            && let Err(e) = write_text_file(path, split.singleton.as_bytes())
-        {
-            print_error_errno(sub_name, format!("open/write {}", path.display()), &e);
-            return ExitCode::from(1);
+        if let Some(path) = singleton_output.as_ref() {
+            let payload = if singleton_only {
+                let mut all = Vec::new();
+                all.extend_from_slice(&split.read1);
+                all.extend_from_slice(&split.read2);
+                all.extend_from_slice(&split.singleton);
+                all.extend_from_slice(&split.other);
+                std::borrow::Cow::Owned(all)
+            } else if other_output.is_some() {
+                std::borrow::Cow::Borrowed(split.singleton.as_slice())
+            } else {
+                let mut merged = Vec::with_capacity(split.singleton.len() + split.other.len());
+                merged.extend_from_slice(&split.singleton);
+                merged.extend_from_slice(&split.other);
+                std::borrow::Cow::Owned(merged)
+            };
+            if let Err(e) = write_text_file(path, payload.as_ref()) {
+                print_error_errno(sub_name, format!("open/write {}", path.display()), &e);
+                return ExitCode::from(1);
+            }
+        }
+        if let Some(path) = other_output.as_ref() {
+            let payload = if singleton_output.is_some() {
+                std::borrow::Cow::Borrowed(split.other.as_slice())
+            } else {
+                let mut merged = Vec::with_capacity(split.singleton.len() + split.other.len());
+                merged.extend_from_slice(&split.singleton);
+                merged.extend_from_slice(&split.other);
+                std::borrow::Cow::Owned(merged)
+            };
+            if let Err(e) = write_text_file(path, payload.as_ref()) {
+                print_error_errno(sub_name, format!("open/write {}", path.display()), &e);
+                return ExitCode::from(1);
+            }
         }
 
         if (index_file_1.is_some() || index_file_2.is_some())
@@ -566,7 +637,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 render_options,
                 &tag_filters,
             )
-        } else if fasta_mode && (flag_filters.include_any != 0 || umi_tags.is_some() || casava) {
+        } else if fasta_mode {
             view_sam_reader_as_fasta_text(
                 &mut reader,
                 flag_filters,
@@ -574,14 +645,6 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 umi_tags.as_deref(),
                 casava,
                 barcode_tag,
-            )
-        } else if fasta_mode {
-            htslib_rs::alignment_compat::view_sam_as_fasta_text_from_reader_with_flag_filter_and_suffix(
-                &mut reader,
-                require_flags,
-                exclude_flags,
-                exclude_all_flags,
-                append_read_number,
             )
         } else {
             htslib_rs::alignment_compat::view_sam_as_fastq_text_from_reader_with_flag_filter_and_suffix(
@@ -667,33 +730,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 append_read_number,
             )
         }
-        (Exact::Sam, true, false, _) => {
-            htslib_rs::alignment_compat::view_sam_as_fasta_text_from_path_with_limit_and_suffix(
-                input,
-                None,
-                append_read_number,
-            )
-        }
-        (Exact::Sam, true, true, _) => {
-            if flag_filters.include_any != 0 {
-                view_sam_path_as_fasta_text(
-                    input,
-                    flag_filters,
-                    append_read_number,
-                    None,
-                    false,
-                    *b"BC",
-                )
-            } else {
-                htslib_rs::alignment_compat::view_sam_as_fasta_text_from_path_with_flag_filter_and_suffix(
-                input,
-                require_flags,
-                exclude_flags,
-                exclude_all_flags,
-                append_read_number,
-            )
-            }
-        }
+        (Exact::Sam, true, _, _) => view_sam_path_as_fasta_text(
+            input,
+            flag_filters,
+            append_read_number,
+            umi_tags.as_deref(),
+            casava,
+            barcode_tag,
+        ),
         (Exact::Bam, false, false, false) => {
             htslib_rs::alignment_compat::view_bam_as_fastq_text_from_path_with_limit_and_suffix(
                 input,
@@ -716,33 +760,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
             render_options,
             &tag_filters,
         ),
-        (Exact::Bam, true, false, _) => {
-            htslib_rs::alignment_compat::view_bam_as_fasta_text_from_path_with_limit_and_suffix(
-                input,
-                None,
-                append_read_number,
-            )
-        }
-        (Exact::Bam, true, true, _) => {
-            if flag_filters.include_any != 0 {
-                view_bam_path_as_fasta_text(
-                    input,
-                    flag_filters,
-                    append_read_number,
-                    None,
-                    false,
-                    *b"BC",
-                )
-            } else {
-                htslib_rs::alignment_compat::view_bam_as_fasta_text_from_path_with_flag_filter_and_suffix(
-                input,
-                require_flags,
-                exclude_flags,
-                exclude_all_flags,
-                append_read_number,
-            )
-            }
-        }
+        (Exact::Bam, true, _, _) => view_bam_path_as_fasta_text(
+            input,
+            flag_filters,
+            append_read_number,
+            umi_tags.as_deref(),
+            casava,
+            barcode_tag,
+        ),
         _ => {
             print_error(
                 sub_name,
@@ -831,10 +856,17 @@ fn view_sam_path_as_fastq_split(
     flag_filters: FlagFilters,
     options: FastqRenderOptions<'_>,
     tag_filters: &[TagFilter],
-) -> io::Result<htslib_rs::alignment_compat::FastxSplitText> {
+    singleton_set: bool,
+) -> io::Result<FastqSplitBuffers> {
     let file = File::open(input)?;
     let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(file));
-    view_sam_reader_as_fastq_split_with_aux(&mut reader, flag_filters, options, tag_filters)
+    view_sam_reader_as_fastq_split_with_aux(
+        &mut reader,
+        flag_filters,
+        options,
+        tag_filters,
+        singleton_set,
+    )
 }
 
 fn view_sam_path_as_fastq_text_with_aux(
@@ -855,7 +887,8 @@ fn view_sam_path_as_fasta_split(
     umi_tags: Option<&[[u8; 2]]>,
     casava: bool,
     barcode_tag: [u8; 2],
-) -> io::Result<htslib_rs::alignment_compat::FastxSplitText> {
+    singleton_set: bool,
+) -> io::Result<FastqSplitBuffers> {
     let file = File::open(input)?;
     let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(file));
     view_sam_reader_as_fasta_split(
@@ -865,6 +898,7 @@ fn view_sam_path_as_fasta_split(
         umi_tags,
         casava,
         barcode_tag,
+        singleton_set,
     )
 }
 
@@ -954,10 +988,12 @@ fn view_bam_path_as_fastq_split_with_aux(
     flag_filters: FlagFilters,
     options: FastqRenderOptions<'_>,
     tag_filters: &[TagFilter],
-) -> io::Result<htslib_rs::alignment_compat::FastxSplitText> {
+    singleton_set: bool,
+) -> io::Result<FastqSplitBuffers> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let header = reader.read_header()?;
     let mut split = FastqSplitBuffers::default();
+    let mut grouper = GroupedSplitWriter::new(singleton_set);
     let mut record = htslib_rs::sam::alignment::RecordBuf::default();
 
     loop {
@@ -969,11 +1005,13 @@ fn view_bam_path_as_fastq_split_with_aux(
         if record_passes_flag_filter(&record, flag_filters)?
             && record_passes_tag_filters(&record, tag_filters)?
         {
-            write_fastq_record_to_split(&mut split, &record, options)?;
+            let text = render_fastq_record_with_aux_to_vec(&record, options)?;
+            grouper.add_text(&record, text, &mut split)?;
         }
     }
+    grouper.flush(&mut split);
 
-    split.into_text()
+    Ok(split)
 }
 
 fn view_bam_path_as_fasta_split(
@@ -983,10 +1021,12 @@ fn view_bam_path_as_fasta_split(
     umi_tags: Option<&[[u8; 2]]>,
     casava: bool,
     barcode_tag: [u8; 2],
-) -> io::Result<htslib_rs::alignment_compat::FastxSplitText> {
+    singleton_set: bool,
+) -> io::Result<FastqSplitBuffers> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let header = reader.read_header()?;
     let mut split = FastqSplitBuffers::default();
+    let mut grouper = GroupedSplitWriter::new(singleton_set);
     let mut record = htslib_rs::sam::alignment::RecordBuf::default();
 
     loop {
@@ -996,18 +1036,19 @@ fn view_bam_path_as_fasta_split(
         }
 
         if record_passes_flag_filter(&record, flag_filters)? {
-            write_fasta_record_to_split(
-                &mut split,
+            let text = render_fasta_record_to_vec(
                 &record,
                 append_read_number,
                 umi_tags,
                 casava,
                 barcode_tag,
             )?;
+            grouper.add_text(&record, text, &mut split)?;
         }
     }
+    grouper.flush(&mut split);
 
-    split.into_text()
+    Ok(split)
 }
 
 fn view_sam_reader_as_fastq_text_with_aux<R>(
@@ -1070,23 +1111,27 @@ fn view_sam_reader_as_fastq_split_with_aux<R>(
     flag_filters: FlagFilters,
     options: FastqRenderOptions<'_>,
     tag_filters: &[TagFilter],
-) -> io::Result<htslib_rs::alignment_compat::FastxSplitText>
+    singleton_set: bool,
+) -> io::Result<FastqSplitBuffers>
 where
     R: io::BufRead,
 {
     let _header = reader.read_header()?;
     let mut split = FastqSplitBuffers::default();
+    let mut grouper = GroupedSplitWriter::new(singleton_set);
 
     for result in reader.records() {
         let record = result?;
         if record_passes_flag_filter(&record, flag_filters)?
             && record_passes_tag_filters(&record, tag_filters)?
         {
-            write_fastq_record_to_split(&mut split, &record, options)?;
+            let text = render_fastq_record_with_aux_to_vec(&record, options)?;
+            grouper.add_text(&record, text, &mut split)?;
         }
     }
+    grouper.flush(&mut split);
 
-    split.into_text()
+    Ok(split)
 }
 
 fn view_sam_reader_as_fasta_split<R>(
@@ -1096,28 +1141,31 @@ fn view_sam_reader_as_fasta_split<R>(
     umi_tags: Option<&[[u8; 2]]>,
     casava: bool,
     barcode_tag: [u8; 2],
-) -> io::Result<htslib_rs::alignment_compat::FastxSplitText>
+    singleton_set: bool,
+) -> io::Result<FastqSplitBuffers>
 where
     R: io::BufRead,
 {
     let _header = reader.read_header()?;
     let mut split = FastqSplitBuffers::default();
+    let mut grouper = GroupedSplitWriter::new(singleton_set);
 
     for result in reader.records() {
         let record = result?;
         if record_passes_flag_filter(&record, flag_filters)? {
-            write_fasta_record_to_split(
-                &mut split,
+            let text = render_fasta_record_to_vec(
                 &record,
                 append_read_number,
                 umi_tags,
                 casava,
                 barcode_tag,
             )?;
+            grouper.add_text(&record, text, &mut split)?;
         }
     }
+    grouper.flush(&mut split);
 
-    split.into_text()
+    Ok(split)
 }
 
 #[derive(Default)]
@@ -1125,69 +1173,203 @@ struct FastqSplitBuffers {
     read1: Vec<u8>,
     read2: Vec<u8>,
     singleton: Vec<u8>,
+    other: Vec<u8>,
 }
 
-impl FastqSplitBuffers {
-    fn into_text(self) -> io::Result<htslib_rs::alignment_compat::FastxSplitText> {
-        Ok(htslib_rs::alignment_compat::FastxSplitText {
-            read1: String::from_utf8(self.read1)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-            read2: String::from_utf8(self.read2)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-            singleton: String::from_utf8(self.singleton)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
-        })
-    }
+#[derive(Clone, Copy)]
+enum ReadPart {
+    Other = 0,
+    Read1 = 1,
+    Read2 = 2,
 }
 
-fn write_fastq_record_to_split<R>(
-    split: &mut FastqSplitBuffers,
-    record: &R,
-    options: FastqRenderOptions<'_>,
-) -> io::Result<()>
+fn record_read_part<R>(record: &R) -> io::Result<ReadPart>
 where
     R: htslib_rs::sam::alignment::Record + ?Sized,
 {
     let flags = record.flags()?;
-    let writer = if flags.is_first_segment() {
-        &mut split.read1
-    } else if flags.is_last_segment() {
-        &mut split.read2
+    Ok(if flags.is_first_segment() && !flags.is_last_segment() {
+        ReadPart::Read1
+    } else if flags.is_last_segment() && !flags.is_first_segment() {
+        ReadPart::Read2
     } else {
-        &mut split.singleton
-    };
-
-    write_fastq_record_with_aux(writer, record, options)
+        ReadPart::Other
+    })
 }
 
-fn write_fasta_record_to_split<R>(
-    split: &mut FastqSplitBuffers,
+fn record_score<R>(record: &R) -> u8
+where
+    R: htslib_rs::sam::alignment::Record + ?Sized,
+{
+    let qual = record.quality_scores();
+    let has_quality = qual.iter().next().is_some_and(|res| match res {
+        Ok(score) => score != 0xff,
+        Err(_) => false,
+    });
+    if has_quality { 2 } else { 1 }
+}
+
+/// Buffers FASTQ/FASTA text for the current qname group, flushing into a
+/// `FastqSplitBuffers` when the qname changes, applying upstream
+/// `bam_fastq.c::flush_rec` routing.
+///
+/// When `singleton_set` is true (a `-s` file is configured), R1-only and
+/// R2-only singletons go into `singleton`; otherwise they fall back to the
+/// `read1` / `read2` buffers respectively, matching upstream's `fpse` /
+/// `fpr[1]` / `fpr[2]` fallback.
+#[derive(Default)]
+struct GroupedSplitWriter {
+    singleton_set: bool,
+    current_qname: Option<Vec<u8>>,
+    best_score: [u8; 3],
+    pending_text: [Option<Vec<u8>>; 3],
+}
+
+impl GroupedSplitWriter {
+    fn new(singleton_set: bool) -> Self {
+        Self {
+            singleton_set,
+            ..Self::default()
+        }
+    }
+
+    fn add_text<R>(
+        &mut self,
+        record: &R,
+        text: Vec<u8>,
+        split: &mut FastqSplitBuffers,
+    ) -> io::Result<()>
+    where
+        R: htslib_rs::sam::alignment::Record + ?Sized,
+    {
+        let qname = record
+            .name()
+            .map(|name| name.to_vec())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing record name"))?;
+        if self.current_qname.as_deref() != Some(&qname) {
+            self.flush(split);
+            self.current_qname = Some(qname);
+        }
+
+        let part = record_read_part(record)? as usize;
+        let score = record_score(record);
+        if score > self.best_score[part] {
+            self.best_score[part] = score;
+            self.pending_text[part] = Some(text);
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, split: &mut FastqSplitBuffers) {
+        let [s0, s1, s2] = self.best_score;
+        let [t0, t1, t2] = std::mem::take(&mut self.pending_text);
+
+        if s1 > 0 && s2 > 0 {
+            if let Some(t) = t1 {
+                split.read1.extend_from_slice(&t);
+            }
+            if let Some(t) = t2 {
+                split.read2.extend_from_slice(&t);
+            }
+        } else if s1 > 0
+            && let Some(t) = t1
+        {
+            if self.singleton_set {
+                split.singleton.extend_from_slice(&t);
+            } else {
+                split.read1.extend_from_slice(&t);
+            }
+        } else if s2 > 0
+            && let Some(t) = t2
+        {
+            if self.singleton_set {
+                split.singleton.extend_from_slice(&t);
+            } else {
+                split.read2.extend_from_slice(&t);
+            }
+        }
+
+        if s0 > 0
+            && let Some(t) = t0
+        {
+            split.other.extend_from_slice(&t);
+        }
+
+        self.best_score = [0; 3];
+    }
+}
+
+/// Interleaves matched paired records: pair `k` from `read1` is written
+/// before pair `k` from `read2`. Both buffers must contain the same number
+/// of records (one record per name-grouped paired flush). Records are
+/// delimited by 4 lines each: header, sequence, `+` separator, quality
+/// (FASTQ) or 2 lines (FASTA: header, sequence).
+fn interleave_paired_records(read1: &[u8], read2: &[u8]) -> Vec<u8> {
+    let r1 = split_fastx_records(read1);
+    let r2 = split_fastx_records(read2);
+    let n = r1.len().min(r2.len());
+    let mut out =
+        Vec::with_capacity(read1.len() + read2.len() + 2 * (r1.len() + r2.len() - 2 * n) * 4);
+    for i in 0..n {
+        out.extend_from_slice(r1[i]);
+        out.extend_from_slice(r2[i]);
+    }
+    for record in &r1[n..] {
+        out.extend_from_slice(record);
+    }
+    for record in &r2[n..] {
+        out.extend_from_slice(record);
+    }
+    out
+}
+
+fn split_fastx_records(text: &[u8]) -> Vec<&[u8]> {
+    let mut records = Vec::new();
+    let mut start = 0;
+    for (i, &b) in text.iter().enumerate() {
+        if b == b'\n' && i + 1 < text.len() && matches!(text[i + 1], b'@' | b'>') {
+            records.push(&text[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < text.len() {
+        records.push(&text[start..]);
+    }
+    records
+}
+
+fn render_fastq_record_with_aux_to_vec<R>(
+    record: &R,
+    options: FastqRenderOptions<'_>,
+) -> io::Result<Vec<u8>>
+where
+    R: htslib_rs::sam::alignment::Record + ?Sized,
+{
+    let mut buf = Vec::new();
+    write_fastq_record_with_aux(&mut buf, record, options)?;
+    Ok(buf)
+}
+
+fn render_fasta_record_to_vec<R>(
     record: &R,
     append_read_number: bool,
     umi_tags: Option<&[[u8; 2]]>,
     casava: bool,
     barcode_tag: [u8; 2],
-) -> io::Result<()>
+) -> io::Result<Vec<u8>>
 where
     R: htslib_rs::sam::alignment::Record + ?Sized,
 {
-    let flags = record.flags()?;
-    let writer = if flags.is_first_segment() {
-        &mut split.read1
-    } else if flags.is_last_segment() {
-        &mut split.read2
-    } else {
-        &mut split.singleton
-    };
-
+    let mut buf = Vec::new();
     write_fasta_record(
-        writer,
+        &mut buf,
         record,
         append_read_number,
         umi_tags,
         casava,
         barcode_tag,
-    )
+    )?;
+    Ok(buf)
 }
 
 fn record_passes_tag_filters<R>(record: &R, filters: &[TagFilter]) -> io::Result<bool>

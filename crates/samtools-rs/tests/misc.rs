@@ -2074,6 +2074,209 @@ fn fastq_splits_read1_read2_and_singleton_outputs() {
 }
 
 #[test]
+fn fastq_dash_t_and_dash_cap_t_combine_aux_tags() {
+    let tmp = tmp_dir("fastq-t-T-combine");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:4\n",
+            "read1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:rg1\tBC:Z:AAAA\tMD:Z:4\tNM:i:0\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-n",
+                "-t",
+                "-T",
+                "MD",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.starts_with("@read1"));
+    assert!(text.contains("RG:Z:rg1"));
+    assert!(text.contains("BC:Z:AAAA"));
+    assert!(text.contains("MD:Z:4"));
+    assert!(!text.contains("NM:i:0"));
+}
+
+#[test]
+fn fastq_interleaves_read1_read2_when_paths_alias() {
+    let tmp = tmp_dir("fastq-interleave");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("o.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:queryname\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "pair1\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\n",
+            "pair1\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\n",
+            "pair2\t65\tchr1\t1\t60\t4M\t=\t5\t8\tAAAA\t****\n",
+            "pair2\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tCCCC\t&&&&\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-N",
+                "-1",
+                out.to_str().unwrap(),
+                "-2",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        concat!(
+            "@pair1/1\nACGT\n+\n!!!!\n",
+            "@pair1/2\nTGCA\n+\n####\n",
+            "@pair2/1\nAAAA\n+\n****\n",
+            "@pair2/2\nCCCC\n+\n&&&&\n",
+        )
+    );
+}
+
+#[test]
+fn fasta_reverse_strand_record_reverse_complemented_in_output() {
+    let tmp = tmp_dir("fasta-revcomp");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.fa");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "fwd\t0\tchr1\t1\t60\t8M\t*\t0\t0\tACGTAATT\t!!!!!!!!\n",
+            "rev\t16\tchr1\t1\t60\t8M\t*\t0\t0\tACGTAATT\t!!!!!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fasta",
+            &["-n", "-o", out.to_str().unwrap(), sam.to_str().unwrap(),]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    // Forward strand: as-stored.
+    assert!(text.contains(">fwd\nACGTAATT\n"));
+    // Reverse strand: reverse-complemented to AATTACGT.
+    assert!(text.contains(">rev\nAATTACGT\n"));
+}
+
+#[test]
+fn fastq_repeated_dash_d_unions_same_tag_values() {
+    let tmp = tmp_dir("fastq-d-union");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:4\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tNM:i:13\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\tNM:i:14\n",
+            "c\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\t****\tNM:i:0\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-n",
+                "-d",
+                "NM:13",
+                "-d",
+                "NM:14",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("@a\n"));
+    assert!(text.contains("@b\n"));
+    assert!(!text.contains("@c\n"));
+}
+
+#[test]
+fn fastq_routes_r1_only_singletons_to_singleton_output() {
+    let tmp = tmp_dir("fastq-r1-singleton");
+    let sam = tmp.join("in.sam");
+    let r1 = tmp.join("r1.fq");
+    let r2 = tmp.join("r2.fq");
+    let singleton = tmp.join("s.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:queryname\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "pair\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\n",
+            "pair\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\n",
+            "solo_r1\t73\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\t****\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-1",
+                r1.to_str().unwrap(),
+                "-2",
+                r2.to_str().unwrap(),
+                "-s",
+                singleton.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&r1).unwrap(),
+        "@pair\nACGT\n+\n!!!!\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&r2).unwrap(),
+        "@pair\nTGCA\n+\n####\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&singleton).unwrap(),
+        "@solo_r1\nAAAA\n+\n****\n"
+    );
+}
+
+#[test]
 fn fastq_zero_routes_unpaired_reads_in_split_mode() {
     let tmp = tmp_dir("fastq-split-zero");
     let sam = tmp.join("in.sam");
