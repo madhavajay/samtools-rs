@@ -298,6 +298,7 @@ where
         merge_command::OutFmt::Bam,
         false,
         None,
+        0,
         merge_command::MergeRestriction::None,
     )
 }

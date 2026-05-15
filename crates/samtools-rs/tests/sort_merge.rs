@@ -288,6 +288,7 @@ fn sort_short_output_format_consumes_value() {
     assert_eq!(exit_to_u8(sort::main(&argv)), 0);
 
     let text = std::fs::read_to_string(out).unwrap();
+    // sort (unlike merge) sets @HD SO:coordinate for a coordinate sort.
     assert!(text.starts_with("@HD\tVN:1.6\tSO:coordinate\n"));
     assert!(text.contains("\na\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n"));
 }
@@ -454,7 +455,9 @@ fn merge_sam_inputs_to_sam_output() {
         .map(|line| line.split('\t').next().unwrap().to_string())
         .collect();
     assert_eq!(names, ["a", "b"]);
-    assert!(text.contains("@HD\tVN:1.6\tSO:coordinate\n"));
+    // Upstream merge preserves input[0]'s @HD verbatim (no forced
+    // SO:coordinate) — verified vs the merge/* fixtures.
+    assert!(text.starts_with("@HD\tVN:1.6\n"));
 }
 
 #[test]
@@ -644,7 +647,10 @@ fn merge_unions_compatible_sq_metadata_fields() {
     assert_eq!(exit_to_u8(merge::main(&argv)), 0);
 
     let text = std::fs::read_to_string(out).unwrap();
-    assert!(text.contains("@SQ\tSN:chr1\tLN:8\tM5:0123456789abcdef0123456789abcdef\n"));
+    // Upstream keeps the *first* @SQ definition for an SN verbatim (it
+    // does not graft M5/etc from later inputs).
+    assert!(text.contains("@SQ\tSN:chr1\tLN:8\n"));
+    assert_eq!(text.matches("@SQ\tSN:chr1").count(), 1);
 }
 
 #[test]
@@ -740,7 +746,7 @@ fn merge_unions_read_group_headers() {
 }
 
 #[test]
-fn merge_rejects_conflicting_read_group_headers() {
+fn merge_reconciles_conflicting_read_group_headers() {
     let tmp = tmp_dir("merge-conflicting-rg");
     let sam_a = tmp.join("a.sam");
     let sam_b = tmp.join("b.sam");
@@ -779,8 +785,18 @@ fn merge_rejects_conflicting_read_group_headers() {
     .iter()
     .map(OsString::from)
     .collect();
-    assert_eq!(exit_to_u8(merge::main(&argv)), 1);
-    assert!(!out.exists());
+    // Upstream `samtools merge` does NOT reject a conflicting @RG ID — it
+    // reconciles by suffixing the colliding one (gen_unique_id PRNG).
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("@RG\tID:rg1\tSM:s1"));
+    let suffixed = text
+        .lines()
+        .any(|l| l.starts_with("@RG\tID:rg1-") && l.contains("SM:s2"));
+    assert!(suffixed, "conflicting @RG should be suffixed:\n{text}");
+    // Record `b` (from input b) has its RG:Z: remapped to the suffixed id.
+    let b = text.lines().find(|l| l.starts_with("b\t")).unwrap();
+    assert!(b.contains("RG:Z:rg1-"), "record RG not remapped: {b}");
 }
 
 #[test]
@@ -872,9 +888,10 @@ fn merge_preserves_later_header_metadata_when_first_input_lacks_hd() {
 
     let text = std::fs::read_to_string(out).unwrap();
     let hd = text.lines().find(|line| line.starts_with("@HD")).unwrap();
+    // input[0] has no @HD → the first @HD found (input b) is used
+    // verbatim; merge does not graft SO.
     assert!(hd.contains("VN:1.5"));
     assert!(hd.contains("GO:query"));
-    assert!(hd.contains("SO:coordinate"));
 }
 
 #[test]
@@ -920,9 +937,9 @@ fn merge_unions_compatible_header_metadata_fields() {
 
     let text = std::fs::read_to_string(out).unwrap();
     let hd = text.lines().find(|line| line.starts_with("@HD")).unwrap();
-    assert!(hd.contains("VN:1.6"));
-    assert!(hd.contains("GO:query"));
-    assert!(hd.contains("SO:coordinate"));
+    // Upstream uses input[0]'s @HD verbatim; it does not union later
+    // inputs' @HD metadata (no grafted GO:query) nor graft SO.
+    assert_eq!(hd, "@HD\tVN:1.6");
 }
 
 #[test]
@@ -1017,7 +1034,7 @@ fn merge_unions_program_headers() {
 }
 
 #[test]
-fn merge_rejects_conflicting_program_headers() {
+fn merge_reconciles_conflicting_program_headers() {
     let tmp = tmp_dir("merge-conflicting-pg");
     let sam_a = tmp.join("a.sam");
     let sam_b = tmp.join("b.sam");
@@ -1057,8 +1074,15 @@ fn merge_rejects_conflicting_program_headers() {
     .iter()
     .map(OsString::from)
     .collect();
-    assert_eq!(exit_to_u8(merge::main(&argv)), 1);
-    assert!(!out.exists());
+    // Upstream reconciles conflicting @PG IDs (suffix) rather than erroring.
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("@PG\tID:pg1\tPN:tool1"));
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("@PG\tID:pg1-") && l.contains("PN:tool2")),
+        "conflicting @PG should be suffixed:\n{text}"
+    );
 }
 
 #[test]
@@ -1095,7 +1119,8 @@ fn merge_short_output_format_consumes_value() {
     assert_eq!(exit_to_u8(merge::main(&argv)), 0);
 
     let text = std::fs::read_to_string(out).unwrap();
-    assert!(text.starts_with("@HD\tVN:1.6\tSO:coordinate\n"));
+    // Upstream merge preserves input[0]'s @HD verbatim (no forced SO).
+    assert!(text.starts_with("@HD\tVN:1.6\n"));
     assert!(text.contains("\na\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n"));
 }
 
@@ -1781,6 +1806,61 @@ fn sort_matches_upstream_test_sort_fixtures() {
             np(&std::fs::read_to_string(&out).unwrap()),
             np(&std::fs::read_to_string(d.join(expected)).unwrap()),
             "sort {expected} args={args:?}"
+        );
+    }
+}
+
+#[test]
+fn merge_reconciles_rg_pg_byte_exact_vs_upstream() {
+    // TODO-NEXT merge: `merge -s 1` @RG/@PG PRNG reconciliation +
+    // raw-header preservation, byte-exact vs upstream test_merge
+    // fixtures (modulo @PG, which the harness strips).
+    let d = fixtures_dir();
+    let tmp = tmp_dir("merge-fixtures");
+    let np = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.starts_with("@PG\t"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &[
+                "dat/test_input_1_a.sam",
+                "dat/test_input_1_b.sam",
+                "dat/test_input_1_c.sam",
+            ],
+            "merge/2.merge.expected.sam",
+        ),
+        (&["dat/test_input_1_b.bam"], "merge/4.merge.expected.sam"),
+        (
+            &[
+                "dat/test_input_1_a_regex.sam",
+                "dat/test_input_1_b_regex.sam",
+            ],
+            "merge/7.merge.expected.sam",
+        ),
+    ];
+    for (ins, expected) in cases {
+        let out = tmp.join(expected.replace('/', "_"));
+        let mut v: Vec<String> = vec![
+            "merge".into(),
+            "-s".into(),
+            "1".into(),
+            "-O".into(),
+            "sam".into(),
+            "-o".into(),
+            out.to_str().unwrap().into(),
+        ];
+        for i in *ins {
+            v.push(d.join(i).to_str().unwrap().into());
+        }
+        let argv: Vec<OsString> = v.iter().map(OsString::from).collect();
+        assert_eq!(exit_to_u8(merge::main(&argv)), 0, "{expected}");
+        assert_eq!(
+            np(&std::fs::read_to_string(&out).unwrap()),
+            np(&std::fs::read_to_string(d.join(expected)).unwrap()),
+            "merge {expected}"
         );
     }
 }

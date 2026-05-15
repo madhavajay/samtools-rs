@@ -36,6 +36,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut bed: Option<PathBuf> = None;
     let mut tag_sort: Option<[u8; 2]> = None;
     let mut input_lists: Vec<PathBuf> = Vec::new();
+    // `-s SEED` seeds the @RG/@PG ID-collision PRNG (default: HTSlib uses
+    // time(); 0 keeps merges deterministic when unspecified).
+    let mut seed: i64 = 0;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -103,7 +106,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 no_pg = true;
             }
             "-s" => {
-                let _ = iter.next();
+                if let Some(v) = iter.next().and_then(|a| a.to_str())
+                    && let Ok(n) = v.parse::<i64>()
+                {
+                    seed = n;
+                }
             }
             "-c" | "-p" | "-u" => {}
             "--help" => {
@@ -228,6 +235,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         output_fmt,
         write_index,
         if no_pg { None } else { Some(args) },
+        seed,
         match (region.as_deref(), bed.as_deref()) {
             (Some(r), None) => MergeRestriction::Region(r),
             (None, Some(path)) => MergeRestriction::Bed(path),
@@ -296,6 +304,7 @@ pub(crate) enum MergeOrder {
     Tag { tag: [u8; 2], name_secondary: bool },
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_merge(
     inputs: &[PathBuf],
     output: Option<&Path>,
@@ -303,6 +312,7 @@ pub(crate) fn run_merge(
     fmt: OutFmt,
     write_index: bool,
     pg_argv: Option<&[OsString]>,
+    seed: i64,
     restriction: MergeRestriction<'_>,
 ) -> io::Result<()> {
     let filter = match restriction {
@@ -321,11 +331,18 @@ pub(crate) fn run_merge(
         MergeRestriction::None => None,
     };
 
+    // Byte-faithful merged header text + per-file @RG/@PG ID translation
+    // (upstream `samtools merge` PRNG-suffixes colliding IDs).
+    let (merged_header_text, trans) = reconcile_merge_headers(inputs, seed)?;
+
     let (mut header, mut records) = read_records(&inputs[0], filter.as_ref())?;
     let first_reference_id_map: Vec<_> = (0..header.reference_sequences().len()).collect();
     remap_records(&mut records, &first_reference_id_map)?;
+    for rec in &mut records {
+        remap_record_rg_pg(rec, &trans.rg[0], &trans.pg[0]);
+    }
 
-    for path in &inputs[1..] {
+    for (idx, path) in inputs[1..].iter().enumerate() {
         let (input_header, mut input_records) = read_records(path, filter.as_ref())?;
         let reference_id_map = merge_reference_sequences(&mut header, &input_header)?;
         merge_header_metadata(&mut header, &input_header)?;
@@ -333,6 +350,9 @@ pub(crate) fn run_merge(
         merge_programs(&mut header, &input_header)?;
         merge_comments(&mut header, &input_header);
         remap_records(&mut input_records, &reference_id_map)?;
+        for rec in &mut input_records {
+            remap_record_rg_pg(rec, &trans.rg[idx + 1], &trans.pg[idx + 1]);
+        }
         records.append(&mut input_records);
     }
 
@@ -380,7 +400,49 @@ pub(crate) fn run_merge(
         header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
     }
 
-    {
+    if matches!(fmt, OutFmt::Sam) {
+        // SAM: emit the byte-faithful reconciled header text (preserving
+        // @RG/@SQ field order and the input @HD verbatim) + the samtools
+        // @PG, then records via the shared float-correct renderer.
+        // Coordinate merge keeps input[0]'s @HD verbatim (no SO — matches
+        // the upstream merge/* fixtures); name/tag merge sets SO/SS.
+        let mut header_text = match order {
+            MergeOrder::Coordinate => merged_header_text,
+            MergeOrder::Name => {
+                apply_hd_so(&merged_header_text, "queryname", Some("queryname:natural"))
+            }
+            MergeOrder::Tag {
+                tag,
+                name_secondary,
+            } => apply_hd_so(
+                &merged_header_text,
+                "unsorted",
+                Some(&format!(
+                    "unsorted:{}{}:{}",
+                    tag[0] as char,
+                    tag[1] as char,
+                    if name_secondary {
+                        "queryname:natural"
+                    } else {
+                        "coordinate"
+                    }
+                )),
+            ),
+        };
+        if let Some(argv) = pg_argv {
+            header_text =
+                crate::pg::add_samtools_pg(&header_text, argv).map_err(io::Error::other)?;
+        }
+        let mut out: Box<dyn Write> = match output {
+            Some(p) => Box::new(io::BufWriter::new(File::create(p)?)),
+            None => Box::new(io::BufWriter::new(io::stdout().lock())),
+        };
+        out.write_all(header_text.as_bytes())?;
+        for rec in &records {
+            crate::sam_render::write_record(&mut out, &header, rec)?;
+        }
+        out.flush()?;
+    } else {
         let mut writer = open_output(output, fmt, &header)?;
         for rec in &records {
             writer.write_record(&header, rec)?;
@@ -620,18 +682,12 @@ fn merge_read_groups(
     output_header: &mut sam::Header,
     input_header: &sam::Header,
 ) -> io::Result<()> {
+    // Reconciliation (PRNG ID-suffixing) is done on the *raw* header
+    // text for SAM output; the noodles header is only used for record
+    // ref-id remap / BAM output, so just keep the first definition of a
+    // colliding @RG ID instead of erroring.
     for (id, input_read_group) in input_header.read_groups() {
-        if let Some(output_read_group) = output_header.read_groups().get(id) {
-            if output_read_group != input_read_group {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "conflicting @RG definition for {}",
-                        String::from_utf8_lossy(id)
-                    ),
-                ));
-            }
-        } else {
+        if output_header.read_groups().get(id).is_none() {
             output_header
                 .read_groups_mut()
                 .insert(id.clone(), input_read_group.clone());
@@ -643,17 +699,7 @@ fn merge_read_groups(
 
 fn merge_programs(output_header: &mut sam::Header, input_header: &sam::Header) -> io::Result<()> {
     for (id, input_program) in input_header.programs().as_ref() {
-        if let Some(output_program) = output_header.programs().as_ref().get(id) {
-            if output_program != input_program {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "conflicting @PG definition for {}",
-                        String::from_utf8_lossy(id)
-                    ),
-                ));
-            }
-        } else {
+        if output_header.programs().as_ref().get(id).is_none() {
             output_header
                 .programs_mut()
                 .as_mut()
@@ -662,6 +708,177 @@ fn merge_programs(output_header: &mut sam::Header, input_header: &sam::Header) -
     }
 
     Ok(())
+}
+
+/// Sets the `@HD` `SO:`/`SS:` fields in raw header text (preserving the
+/// other fields/lines verbatim); used for name/tag merges only.
+fn apply_hd_so(raw: &str, so: &str, ss: Option<&str>) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut had_hd = false;
+    for line in raw.lines() {
+        if line.starts_with("@HD") {
+            had_hd = true;
+            let kept: Vec<&str> = line
+                .split('\t')
+                .filter(|f| !f.starts_with("SO:") && !f.starts_with("SS:"))
+                .collect();
+            let mut nl = kept.join("\t");
+            nl.push_str(&format!("\tSO:{so}"));
+            if let Some(ss) = ss {
+                nl.push_str(&format!("\tSS:{ss}"));
+            }
+            lines.push(nl);
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !had_hd {
+        let hd = match ss {
+            Some(ss) => format!("@HD\tVN:1.6\tSO:{so}\tSS:{ss}"),
+            None => format!("@HD\tVN:1.6\tSO:{so}"),
+        };
+        lines.insert(0, hd);
+    }
+    let mut s = lines.join("\n");
+    s.push('\n');
+    s
+}
+
+/// Value of a `TAG:value` field within a tab-split header line.
+fn header_field<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
+    line.split('\t').skip(1).find_map(|f| f.strip_prefix(tag))
+}
+
+/// Rewrites the `tag` field's value in a header line via `map` (only if
+/// the field exists and a mapping is present), preserving field order.
+fn rewrite_field(line: &str, tag: &str, map: &std::collections::HashMap<String, String>) -> String {
+    line.split('\t')
+        .map(|f| {
+            if let Some(v) = f.strip_prefix(tag)
+                && let Some(n) = map.get(v)
+            {
+                format!("{tag}{n}")
+            } else {
+                f.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\t")
+}
+
+/// Per-file `@RG`/`@PG` ID translation maps.
+struct MergeTrans {
+    rg: Vec<std::collections::HashMap<String, String>>,
+    pg: Vec<std::collections::HashMap<String, String>>,
+}
+
+/// Builds the byte-faithful merged header text plus per-file `@RG`/`@PG`
+/// ID translation maps, mirroring upstream `samtools merge` (`bam_sort.c`):
+/// `@HD` from input[0] verbatim, `@SQ` unioned by `SN`, colliding
+/// `@RG`/`@PG` IDs suffixed via the seeded `gen_unique_id` PRNG (in
+/// header-line order, per file), `@RG.PG`/`@PG.PP` fields remapped, `@CO`
+/// appended. `@PG` lines are emitted but the test harness strips them.
+fn reconcile_merge_headers(inputs: &[PathBuf], seed: i64) -> io::Result<(String, MergeTrans)> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut rng = crate::rand48::Rand48::new(seed);
+    let mut seen_rg: HashSet<String> = HashSet::new();
+    let mut seen_pg: HashSet<String> = HashSet::new();
+
+    let mut hd: Option<String> = None;
+    let mut seen_sn: HashSet<String> = HashSet::new();
+    let mut sq: Vec<String> = Vec::new();
+    let mut rg_lines: Vec<String> = Vec::new();
+    let mut pg_lines: Vec<String> = Vec::new();
+    let mut co: Vec<String> = Vec::new();
+
+    let mut trans = MergeTrans {
+        rg: Vec::with_capacity(inputs.len()),
+        pg: Vec::with_capacity(inputs.len()),
+    };
+
+    for path in inputs {
+        let exact = sam_io::sam_open_format(path)?.exact;
+        let raw = crate::header_text::read_raw_header_text_with_format(path, exact)?;
+        let mut rg_map: HashMap<String, String> = HashMap::new();
+        let mut pg_map: HashMap<String, String> = HashMap::new();
+
+        // Single pass in header-line order so the gen_unique_id PRNG draw
+        // sequence matches upstream exactly.
+        for line in raw.lines() {
+            if line.starts_with("@RG\t")
+                && let Some(id) = header_field(line, "ID:")
+            {
+                let new = crate::rand48::gen_unique_id(id, &mut seen_rg, &mut rng);
+                rg_map.insert(id.to_string(), new);
+            } else if line.starts_with("@PG\t")
+                && let Some(id) = header_field(line, "ID:")
+            {
+                let new = crate::rand48::gen_unique_id(id, &mut seen_pg, &mut rng);
+                pg_map.insert(id.to_string(), new);
+            }
+        }
+
+        for line in raw.lines() {
+            if let Some(rest) = line.strip_prefix("@HD") {
+                if hd.is_none() {
+                    hd = Some(format!("@HD{rest}"));
+                }
+            } else if line.starts_with("@SQ\t")
+                && let Some(sn) = header_field(line, "SN:")
+                && seen_sn.insert(sn.to_string())
+            {
+                sq.push(line.to_string());
+            } else if line.starts_with("@RG\t") {
+                let l = rewrite_field(line, "ID:", &rg_map);
+                rg_lines.push(rewrite_field(&l, "PG:", &pg_map));
+            } else if line.starts_with("@PG\t") {
+                let l = rewrite_field(line, "ID:", &pg_map);
+                pg_lines.push(rewrite_field(&l, "PP:", &pg_map));
+            } else if line.starts_with("@CO\t") {
+                co.push(line.to_string());
+            }
+        }
+
+        trans.rg.push(rg_map);
+        trans.pg.push(pg_map);
+    }
+
+    let mut text = String::new();
+    text.push_str(hd.as_deref().unwrap_or("@HD\tVN:1.6"));
+    text.push('\n');
+    for l in sq.iter().chain(&rg_lines).chain(&pg_lines).chain(&co) {
+        text.push_str(l);
+        text.push('\n');
+    }
+    Ok((text, trans))
+}
+
+/// Remaps a record's `RG:Z:` / `PG:Z:` aux values through the trans maps.
+fn remap_record_rg_pg(
+    record: &mut RecordBuf,
+    rg: &std::collections::HashMap<String, String>,
+    pg: &std::collections::HashMap<String, String>,
+) {
+    use htslib_rs::sam::alignment::record_buf::data::field::Value;
+    for (tag, map) in [([b'R', b'G'], rg), ([b'P', b'G'], pg)] {
+        let t = htslib_rs::sam::alignment::record::data::field::Tag::from(tag);
+        if let Some(Value::String(v)) = record.data().get(&t) {
+            let cur = String::from_utf8_lossy(v).into_owned();
+            match map.get(&cur) {
+                Some(n) => {
+                    record
+                        .data_mut()
+                        .insert(t, Value::String(bstr::BString::from(n.clone())));
+                }
+                // Upstream `bam_translate`: a tag with no corresponding
+                // header entry is dropped ("tag lost").
+                None => {
+                    record.data_mut().remove(&t);
+                }
+            }
+        }
+    }
 }
 
 fn merge_comments(output_header: &mut sam::Header, input_header: &sam::Header) {
