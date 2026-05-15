@@ -71,9 +71,39 @@ quick fix — verified by probing):
 - `sort` `name2` / `reset` → minimiser (`-N`/`-K`) + external merge.
 - `stats` → ~123k LOC C, deep structural gaps (CHK, per-SN comments,
   many histograms).
-- `ampliconstats` (1.8k LOC C), `phase`/`targetcut` (no upstream
-  fixtures + dense numerical HMM), consensus `recall`/Bayesian modes,
-  `reference` CRAM (needs MD recompute / embedded-ref internals).
+- `ampliconclip` → ✅ **DONE**: full port, byte-exact vs the entire
+  upstream `test_ampliconclip` harness (10 SAM + 3 primer-count TSVs).
+- `ampliconstats` (`amplicon_stats.c`, 1776 LOC) → **de-risked spec**.
+  Reuses the `ampliconclip` BED model (`load_bed`, per-ref sites sorted
+  by `right`). Turn-key steps: (a) `count_amplicon` + `bed2amplicon`
+  (collapse LEFT end / RIGHT start into `amplicon_t{left[],right[],
+  max_left,min_right,min_left,max_right}`, emit the `# Amplicon
+  locations`/`AMPLICON` block; `<bedleft+1>-<bedright>` 1-based
+  inclusive, comma-joined alt-primers); (b) `initialise_amp_pos_lookup`
+  → `pos2start`/`pos2end` arrays (±`max_delta`, default `m`=30? check
+  `-m`); (c) per-read `accumulate_stats`: flag_require/filter, qname
+  `qend` overlap removal (`mstart=max(start,prev_end)`),
+  `depth_all[mstart..end]++`, amplicon assign via pos2start/pos2end
+  (REV/!PAIR→pos2end[end-1] else pos2start[start]), `nreads`/`nbases`
+  (= `min(end,min_right+1)-max(start,max_left)`), `coverage[anum]`,
+  `amp_dist[anum][0|1|2]` via `oth_anum` from TLEN±`tlen_adj`,
+  `depth_valid` + `nfull_reads` (0.5/paired) when astatus==0, and the
+  `tcoord` freq khash keyed `(start+1)|((tend+1)<<32)` with
+  `status<<32`; (d) `append_lstats` (sum + sum² for s.d.; `nrperc` =
+  `100*nreads/all_nseq`); (e) `aggregate_tcoord` (freq-desc sort, mid
+  cluster, merge within `tcoord_bin`); (f) `dump_stats` sections SS,
+  AMPLICON, FSS/CSS, FREADS/CREADS, FVDEPTH/CVDEPTH, FRPERC/CRPERC,
+  FDEPTH/CDEPTH, FPCOV-d/CPCOV-d, FDP_ALL/CDP_ALL & FDP_VALID/CDP_VALID
+  (RLE `depth,runlen` pairs binned by `depth_bin`), FTCOORD/CTCOORD
+  (`start,end,freq,status` ≥ `tcoord_min_count`), FAMP/CAMP
+  (`amp_dist`), with COMBINED MEAN/STDDEV rows. Options `-S`(single-ref)
+  `-t tlen_adj` `-d d1,d2,d3` `-c tcoord_min_count` `-b tcoord_bin`
+  `-D depth_bin` `-m max_delta` `-s` `-a` `-l` `-f`/`-F`. Fixtures:
+  `ampliconstats/stats{,_mixed,_partial}.expected.txt` (strip
+  `Samtools version|Command line`).
+- `phase`/`targetcut` (no upstream fixtures + dense numerical HMM),
+  consensus `recall`/Bayesian modes, `reference` CRAM (needs MD
+  recompute / embedded-ref internals).
 - TODO-NEXT #3/#4/#5 (CRAM internals / binary-`@PG` / CRAM index meta).
 
 **Honest remaining scope:** the library-blocked *foundations* are all
