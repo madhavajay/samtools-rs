@@ -13,22 +13,36 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
 - **#6** ✅ done — `build_bai` no longer needs `@HD SO:coordinate`.
 - **#12** ✅ done — header-aware BAM-CSI depth fixes the `large_chrom`
   `> 2^29` reference panic; byte-exact vs `dat/large_chrom.out`.
-- **#1** core ✅ — public pileup iterator engine (`PileupColumn`/`PileupRead`
-  + `PileupOptions` flag/mapq/overlap/orphan + smart overlap removal);
-  `mpileup` text output byte-exact vs `mpileup.out.3`/`out.5`/stderr
-  (`out.1` matches depth+bases; only BAQ-adjusted quals differ → #11).
-  *Remaining:* consensus/targetcut/phase/ampliconstats + exact
-  bedcov/coverage/depth (large samtools ports, now unblocked).
-- **#2** core ✅ — whole-CRAM all-record iterator; `stats` and `checksum`
-  no-region CRAM wired (byte-identical to BAM bar NM-derived lines).
-  *Remaining:* `reference` CRAM MD path; optional CRAM NM recompute.
+- **#1** ✅ core + most wiring — public pileup iterator engine
+  (`PileupColumn`/`PileupRead` + `PileupOptions` flag/mapq/overlap/orphan
+  + smart overlap removal). **Byte-exact vs upstream fixtures:**
+  `mpileup` (`mpileup.out.3`/`out.5`/stderr; `out.1` depth+bases, only
+  BAQ quals differ → #11), `consensus --mode simple` (every
+  `test/consensus/expected` in `consensus.reg`), `coverage`
+  (`coverage/{1..5}`), `bedcov` (all four `test_bedcov`), `depth`
+  (`large_pos/depth{,_bed}`). *Remaining:* `targetcut`, `phase`,
+  `ampliconstats`, consensus `recall`/Bayesian modes.
+- **#2** ✅ core + wiring — whole-CRAM all-record iterator; `stats` and
+  `checksum` no-region CRAM byte-identical to BAM (bar NM-derived lines).
+  *Remaining:* `reference` CRAM MD path (needs MD recompute); optional
+  CRAM NM recompute for exact `stats` mismatch/error-rate.
 - **#8** correctness ✅ — `-@`/`--threads` accepted everywhere, output
   byte-identical regardless of count (perf worker-pool wiring deferred).
 - **#9** partial — `sort`/`view --write-index` BAI == post-pass BAI.
-- **#10** partial — `.` (everything) done; `*` (unmapped) remaining.
+  *Remaining:* `merge --write-index`, CSI/CRAI auto-write.
+- **#10** ✅ core — `.` (everything) and `*` (unplaced) both done for
+  the upstream-tested SAM/count paths. *Remaining:* binary `*` output.
 - **#11** htslib-rs verified (probaln/BAQ + realn fixtures); samtools
   `calmd` BAM-output wiring remaining.
-- **#3, #4, #5, #7** not yet started.
+- **#3, #4, #5, #7** assessed (large or possibly out-of-scope; #7 aux
+  mutation is functionally unblocked via `RecordBuf`).
+
+**Honest remaining scope:** the library-blocked *foundations* are all
+shipped, tested and pinned, so the rest is ordinary (if large)
+samtools-rs porting: `targetcut`/`phase`/`ampliconstats`/consensus-recall,
+`reference` CRAM, the #3/#4/#5/#7 tails, and all of `TODO.md` §13
+(remaining subcommands to byte parity + Phases 4–5). That is a
+multi-week/multi-engineer effort, not single-session work.
 
 ## Ground rules for this pass
 
