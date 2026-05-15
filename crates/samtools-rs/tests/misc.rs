@@ -6473,6 +6473,56 @@ fn stats_matches_upstream_stat_fixtures() {
         );
     }
 
+    // stat/11: `-t` target file on a SAM (streaming + region-clipped
+    // bases-mapped-cigar with the init_regions overlap-merge), the same
+    // expected via positional regions on the indexed BAM, and `-g 4`.
+    let targets11 = p(&stat.join("11.stats.targets"));
+    let sam11 = p(&stat.join("11_target.sam"));
+    let bam11 = p(&stat.join("11_target.bam"));
+    let region11_cases: [(Vec<String>, &str); 3] = [
+        (
+            vec!["-t".into(), targets11.clone(), sam11.clone()],
+            "11.stats.expected",
+        ),
+        (
+            vec![
+                bam11.clone(),
+                "ref1:10-24".into(),
+                "ref1:30-46".into(),
+                "ref1:39-56".into(),
+            ],
+            "11.stats.expected",
+        ),
+        (
+            vec![
+                "-g".into(),
+                "4".into(),
+                "-t".into(),
+                targets11.clone(),
+                sam11.clone(),
+            ],
+            "11.stats.g4.expected",
+        ),
+    ];
+    for (rest, expected) in region11_cases {
+        let out = tmp.join(expected);
+        let mut v: Vec<String> = vec!["-o".into(), p(&out)];
+        v.extend(rest);
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
+            ))),
+            0,
+            "stats region {expected}"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            std::fs::read_to_string(stat.join(expected)).unwrap(),
+            "stats region {expected} byte-exact",
+        );
+    }
+
     // `-S RG` split cases: stdout matches `<n>.stats.expected` and each
     // per-RG `<input>_<rg>.bamstat` matches its `.expected.bamstat`
     // (both modulo the three stripped header lines). The input is copied

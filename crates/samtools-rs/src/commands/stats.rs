@@ -282,10 +282,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
         None => Vec::new(),
     };
 
-    let parsed_regions = match regions
+    // Positional region arguments require indexed random access;
+    // `-t`/`--target-regions` is a streaming filter (no index needed).
+    let positional_regions = match regions
         .iter()
         .map(|region| parse_region(region))
-        .chain(target_regions.into_iter().map(Ok))
         .collect::<io::Result<Vec<_>>>()
     {
         Ok(regions) => regions,
@@ -294,6 +295,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let parsed_regions: Vec<Region> = positional_regions
+        .iter()
+        .cloned()
+        .chain(target_regions)
+        .collect();
     if config.cov_threshold > 0 && parsed_regions.is_empty() {
         print_error(
             "stats",
@@ -348,6 +354,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
             .map(|counts| StatsInput::Counts(Box::new(counts))),
         Exact::Bam if parsed_regions.is_empty() => collect_bam_full_stats(&input, &config)
             .map(|counts| StatsInput::Counts(Box::new(counts))),
+        Exact::Bam if positional_regions.is_empty() => {
+            // `-t` only: stream the whole BAM, filter by target overlap.
+            collect_bam_targets_stats(&input, &parsed_regions, &config)
+                .map(|counts| StatsInput::Counts(Box::new(counts)))
+        }
         Exact::Bam => collect_bam_region_stats(&input, &parsed_regions, &config)
             .map(|counts| StatsInput::Counts(Box::new(counts))),
         Exact::Cram => {
@@ -850,6 +861,112 @@ fn target_base_count(targets: &[RegionTarget]) -> u64 {
     total
 }
 
+/// Upstream `init_regions` per-reference interval merge applied to the
+/// resolved `RegionTarget`s: sort by start within a tid, then coalesce
+/// when the running end reaches the next start. Returns the merged
+/// targets in (tid, start) order.
+fn merge_region_targets(targets: Vec<RegionTarget>) -> Vec<RegionTarget> {
+    let mut v = targets;
+    v.sort_by_key(|t| (t.tid, t.start));
+    let mut out: Vec<RegionTarget> = Vec::with_capacity(v.len());
+    for t in v {
+        match out.last_mut() {
+            Some(last) if last.tid == t.tid && last.end >= t.start => {
+                if last.end < t.end {
+                    last.end = t.end;
+                }
+            }
+            _ => out.push(t),
+        }
+    }
+    out
+}
+
+/// `bases mapped (cigar)`: plain M/I/=/X sum without targets, or the
+/// region-clipped count (against the first overlapping merged target,
+/// upstream `is_in_regions` selecting the lowest-start region whose end
+/// is at/after the read start) when `-t`/region targets are active.
+fn cigar_mapped_bases(
+    rec: &(impl sam::alignment::Record + ?Sized),
+    rsid: Option<usize>,
+    pos: Option<usize>,
+    targets: Option<&[RegionTarget]>,
+) -> u64 {
+    use sam::alignment::record::cigar::op::Kind;
+    match (targets, rsid, pos) {
+        (Some(tg), Some(tid), Some(p)) => {
+            let p = p as i64;
+            let region = tg
+                .iter()
+                .filter(|t| t.tid == tid && t.end as i64 >= p)
+                .min_by_key(|t| t.start);
+            match region {
+                Some(t) => region_clipped_cigar_bases(rec, p, t.start as i64, t.end as i64),
+                None => 0,
+            }
+        }
+        _ => {
+            let mut total = 0u64;
+            for op in rec.cigar().iter().flatten() {
+                if matches!(
+                    op.kind(),
+                    Kind::Match | Kind::Insertion | Kind::SequenceMatch | Kind::SequenceMismatch
+                ) {
+                    total += op.len() as u64;
+                }
+            }
+            total
+        }
+    }
+}
+
+/// Region-restricted `bases mapped (cigar)` count, faithfully porting
+/// the `if (stats->regions)` branch of upstream `collect_stats`: M/=/X
+/// runs are clipped to `[reg_from, reg_to]` (1-based inclusive) and an
+/// I run counts only when `iref` lands inside the region. `iref` starts
+/// at the read's 1-based start and advances by the op length for M/=/X
+/// and I (not D — matching the upstream quirk).
+fn region_clipped_cigar_bases(
+    rec: &(impl sam::alignment::Record + ?Sized),
+    pos_1based: i64,
+    reg_from: i64,
+    reg_to: i64,
+) -> u64 {
+    use sam::alignment::record::cigar::op::Kind;
+    let mut iref = pos_1based;
+    let mut total: i64 = 0;
+    for op in rec.cigar().iter().flatten() {
+        let ncig = op.len() as i64;
+        if ncig == 0 {
+            continue;
+        }
+        match op.kind() {
+            Kind::Deletion => {}
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                let mut n = ncig;
+                if iref < reg_from {
+                    n -= reg_from - iref;
+                } else if iref + ncig - 1 > reg_to {
+                    n -= iref + ncig - 1 - reg_to;
+                }
+                if n < 0 {
+                    n = 0;
+                }
+                total += n;
+                iref += ncig;
+            }
+            Kind::Insertion => {
+                iref += ncig;
+                if iref >= reg_from && iref <= reg_to {
+                    total += ncig;
+                }
+            }
+            _ => {}
+        }
+    }
+    total as u64
+}
+
 fn matching_read_group_ids(header: &sam::Header, id: Option<&str>) -> Option<HashSet<String>> {
     let requested = id?;
     let sample_tag = sam::header::record::value::map::read_group::tag::SAMPLE;
@@ -975,7 +1092,7 @@ fn collect_sam_region_stats(
         .map(sam::io::Reader::new)?;
     let header = reader.read_header()?;
     let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
-    let targets = region_targets(&header, regions)?;
+    let targets = merge_region_targets(region_targets(&header, regions)?);
     let mut counts = StatsCounts {
         target_bases: target_base_count(&targets),
         ..Default::default()
@@ -1000,6 +1117,46 @@ fn collect_sam_region_stats(
     Ok(counts)
 }
 
+/// `-t`/`--target-regions` on a BAM with no positional region
+/// arguments: stream every record (no index needed) and accumulate
+/// only those overlapping a target, mirroring upstream `is_in_regions`
+/// over the streaming `sam_read1` path.
+fn collect_bam_targets_stats(
+    input: &PathBuf,
+    regions: &[Region],
+    config: &StatsConfig,
+) -> io::Result<StatsCounts> {
+    use htslib_rs::bam;
+    let mut reader = bam::io::Reader::new(File::open(input)?);
+    let header = reader.read_header()?;
+    let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
+    let targets = merge_region_targets(region_targets(&header, regions)?);
+    let mut counts = StatsCounts {
+        target_bases: target_base_count(&targets),
+        ..Default::default()
+    };
+    let mut seen = HashSet::new();
+    let mut record = bam::Record::default();
+    loop {
+        let n = reader.read_record(&mut record)?;
+        if n == 0 {
+            break;
+        }
+        if record_overlaps_targets(&header, &record, &targets)
+            && seen.insert(record_identity(&header, &record))
+        {
+            counts.update_record_with_targets(
+                &header,
+                &record,
+                config,
+                read_group_filter.as_ref(),
+                Some(&targets),
+            );
+        }
+    }
+    Ok(counts)
+}
+
 fn collect_bam_region_stats(
     input: &PathBuf,
     regions: &[Region],
@@ -1007,7 +1164,7 @@ fn collect_bam_region_stats(
 ) -> io::Result<StatsCounts> {
     let header = htslib_rs::alignment_compat::read_bam_header_from_path(input)?;
     let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
-    let targets = region_targets(&header, regions)?;
+    let targets = merge_region_targets(region_targets(&header, regions)?);
     let mut counts = StatsCounts {
         target_bases: target_base_count(&targets),
         ..Default::default()
@@ -1056,7 +1213,7 @@ fn collect_cram_region_stats(
 ) -> io::Result<StatsCounts> {
     let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
     let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
-    let targets = region_targets(&header, regions)?;
+    let targets = merge_region_targets(region_targets(&header, regions)?);
     let mut counts = StatsCounts {
         target_bases: target_base_count(&targets),
         ..Default::default()
@@ -1551,19 +1708,8 @@ impl StatsCounts {
 
             if flag & BAM_FUNMAP == 0 {
                 self.bases_mapped += u64::from(seq_len_u32);
-                use sam::alignment::record::cigar::op::Kind;
-                for op in rec.cigar().iter().flatten() {
-                    // Upstream (non-region path) counts M, I, =, X bases.
-                    if matches!(
-                        op.kind(),
-                        Kind::Match
-                            | Kind::Insertion
-                            | Kind::SequenceMatch
-                            | Kind::SequenceMismatch
-                    ) {
-                        self.bases_mapped_cigar += op.len() as u64;
-                    }
-                }
+                self.bases_mapped_cigar +=
+                    cigar_mapped_bases(rec, reference_sequence_id, pos, targets);
                 self.count_indels(rec, flag, seq_len_u32 as usize);
                 if let Some(nm) = read_nm_aux(rec) {
                     self.nmismatches += nm;
@@ -1579,15 +1725,7 @@ impl StatsCounts {
         // and the coverage histogram. They were counted (and skipped)
         // by `update`, so replay just those accumulations here.
         if self.supplementary > pre_supp && flag & BAM_FUNMAP == 0 {
-            use sam::alignment::record::cigar::op::Kind;
-            for op in rec.cigar().iter().flatten() {
-                if matches!(
-                    op.kind(),
-                    Kind::Match | Kind::Insertion | Kind::SequenceMatch | Kind::SequenceMismatch
-                ) {
-                    self.bases_mapped_cigar += op.len() as u64;
-                }
-            }
+            self.bases_mapped_cigar += cigar_mapped_bases(rec, reference_sequence_id, pos, targets);
             self.count_indels(rec, flag, seq_len);
             if let Some(nm) = read_nm_aux(rec) {
                 self.nmismatches += nm;
