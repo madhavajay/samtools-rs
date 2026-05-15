@@ -33,8 +33,11 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
   *Remaining:* `merge --write-index`, CSI/CRAI auto-write.
 - **#10** ✅ core — `.` (everything) and `*` (unplaced) both done for
   the upstream-tested SAM/count paths. *Remaining:* binary `*` output.
-- **#11** htslib-rs verified (probaln/BAQ + realn fixtures); samtools
-  `calmd` BAM-output wiring remaining.
+- **#11** ✅ done — htslib-rs probaln/BAQ verified (realn fixtures) and
+  `calmd` BAM output wired: `calmd -uAr in.sam ref.fa` emits BGZF
+  (upstream `test_calmd` acceptance), getopt-style `-uAr` cluster split,
+  `-A` applies recalculated BAQ to QUAL. Integration test
+  `calmd_dash_u_a_r_emits_bgzf_bam_like_upstream`.
 - **#3, #4, #5, #7** assessed (large or possibly out-of-scope; #7 aux
   mutation is functionally unblocked via `RecordBuf` — and an
   order-preserving `aux_del`/`aux_set_append` now exists in `fixmate`,
@@ -445,18 +448,23 @@ single-session work.
 - **samtools-rs tests:** region-grammar integration tests + `test.pl`
   region cases.
 
-### 11. `probaln_glocal` / BAQ wiring verification — 🟡 htslib-rs VERIFIED
+### 11. `probaln_glocal` / BAQ wiring verification — ✅ DONE
 
 > htslib-rs side **verified**: `htslib_rs::probaln::probaln_glocal` is
 > implemented with unit tests, and the BAQ surface
 > (`recalculate_baq_from_sam_path`, `apply_existing_baq_from_sam_path`,
 > `revert_existing_baq_from_sam_path`, `force_recalculate_baq_from_sam_path`,
 > extended BAQ) is wired and passes the upstream realn fixtures
-> (`ports_test_realn_*` in `alignment_io.rs`). **Remaining (samtools-rs):**
-> upstream `test_calmd` runs `calmd -uAr mpileup.1.sam mpileup.ref.fa` and
-> only checks the output is BGZF — needs `calmd` **BAM output** (currently
-> SAM-text only); the BAQ math itself is ready. Also feeds `mpileup`
-> out.1 BAQ-adjusted qualities. Bounded `calmd` follow-up.
+> (`ports_test_realn_*` in `alignment_io.rs`). **samtools-rs DONE**
+> (`5298222`): `calmd -uAr mpileup.1.sam mpileup.ref.fa` emits a BGZF
+> (BAM) stream — the exact upstream `test_calmd` acceptance check —
+> via `expand_short_clusters` (getopt-style `-uAr` split), `-A`
+> (apply recalculated BAQ to QUAL), and `-b`/`-u` BAM output through
+> `write_bam_from_sam_reader[_with_compression_level]`. Integration
+> test `calmd_dash_u_a_r_emits_bgzf_bam_like_upstream` (BGZF magic +
+> 569/569 record round-trip). Remaining (not fixture-blocking):
+> `-C cap`, `-n max_nm`, CRAM output, BAQ over BAM/CRAM input,
+> and feeding `mpileup` out.1 BAQ-adjusted qualities.
 
 - **htslib-rs:** verify `htslib-rs::probaln` (`probaln_glocal`) is wired and
   correct for BAQ recalculation (likely verification, not new API).

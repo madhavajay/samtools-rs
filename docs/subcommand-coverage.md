@@ -180,7 +180,7 @@ samtools-rs status legend:
 - **C source:** `bam_md.c`
 - **HTSlib APIs used:** record iteration, BAQ via `probaln_glocal`, MD/NM recomputation
 - **htslib-rs coverage:** ✅ partial via `htslib_rs::probaln` and `htslib_rs::alignment_compat::recalculate_baq_*`
-- **samtools-rs status:** 🟡 — SAM, BAM, and reference-backed CRAM input can emit SAM text with recomputed MD/NM tags against FASTA references; SAM input can also run BAQ paths, and `-d` drops existing `BQ` tags, with default `@PG`/`--no-PG`. BAM/CRAM output, BAM/CRAM BAQ paths, remaining flags, and full upstream MD/BAQ parity remain.
+- **samtools-rs status:** 🟡 — SAM, BAM, and reference-backed CRAM input can emit SAM text with recomputed MD/NM tags against FASTA references; SAM input can also run BAQ paths (`-r`/`-E`/`-A`/`-e`), `-d` drops existing `BQ` tags, `-b`/`-u` emit BGZF BAM output, and getopt-style glued short clusters (`-uAr`) are split, with default `@PG`/`--no-PG`. The upstream `test_calmd` invocation (`calmd -uAr mpileup.1.sam mpileup.ref.fa` → BGZF) passes (integration test `calmd_dash_u_a_r_emits_bgzf_bam_like_upstream`). Remaining: `-C cap`, `-n max_nm`, CRAM output, BAQ over BAM/CRAM input, full upstream MD/BAQ byte parity.
 
 ### targetcut
 
