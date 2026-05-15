@@ -6404,3 +6404,53 @@ fn threads_flag_is_byte_identical_for_view_and_sort() {
         "sort -@ output must be byte-identical"
     );
 }
+
+#[test]
+fn stats_cram_without_region_matches_bam_seq_quality() {
+    // TODO-NEXT #2: no-region CRAM stats now use the full-record iterator,
+    // so sequence-length/quality/length SN lines match the BAM equivalent
+    // (NM-derived `mismatches`/`error rate` excepted — CRAM has no NM).
+    use samtools_rs::commands::stats;
+    let bam = htslib_fixtures_dir().join("range.bam");
+    let cram = htslib_fixtures_dir().join("range.cram");
+    let reference = htslib_fixtures_dir().join("ce.fa");
+    let tmp = tmp_dir("stats-cram");
+    let bo = tmp.join("bam.txt");
+    let co = tmp.join("cram.txt");
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[bam.to_str().unwrap(), "-o", bo.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-r",
+                reference.to_str().unwrap(),
+                cram.to_str().unwrap(),
+                "-o",
+                co.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let pick = |s: &str| -> Vec<String> {
+        s.lines()
+            .filter(|l| {
+                l.starts_with("SN\t") && !l.contains("mismatches:") && !l.contains("error rate:")
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    let b = std::fs::read_to_string(&bo).unwrap();
+    let c = std::fs::read_to_string(&co).unwrap();
+    assert_eq!(pick(&b), pick(&c));
+    // Sanity: sequence/quality actually populated (not the old zeros).
+    assert!(b.contains("SN\ttotal length:\t11200"));
+    assert!(c.contains("SN\ttotal length:\t11200"));
+}

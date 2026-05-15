@@ -71,6 +71,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut output: Option<PathBuf> = None;
     let mut target_file: Option<PathBuf> = None;
     let mut config = StatsConfig::default();
+    let mut reference_arg: Option<PathBuf> = None;
     let mut regions: Vec<String> = Vec::new();
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -191,8 +192,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     }
                 }
             }
-            "-@" | "--threads" | "-r" | "--reference" | "-S" | "--split" | "-P"
-            | "--split-prefix" | "-G" => {
+            "-r" | "--reference" | "--ref-seq" => {
+                reference_arg = iter.next().map(PathBuf::from);
+            }
+            "-@" | "--threads" | "-S" | "--split" | "-P" | "--split-prefix" | "-G" => {
                 let _ = iter.next();
             }
             "-d" | "--remove-dups" => {
@@ -264,6 +267,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     enum StatsInput {
+        // Retained for the SAM/BAM/CRAM `AlignmentRecordSummary` fallback
+        // shape; no longer produced now that no-region CRAM uses the
+        // full-record iterator (TODO-NEXT #2).
+        #[allow(dead_code)]
         Summaries(Vec<AlignmentRecordSummary>),
         Counts(Box<StatsCounts>),
     }
@@ -290,15 +297,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
         Exact::Bam => collect_bam_region_stats(&input, &parsed_regions, &config)
             .map(|counts| StatsInput::Counts(Box::new(counts))),
         Exact::Cram => {
-            let Some(reference) = current_global_args().reference else {
-                print_error("stats", "CRAM input requires top-level --reference FILE");
+            let Some(reference) = reference_arg
+                .clone()
+                .or_else(|| current_global_args().reference)
+            else {
+                print_error(
+                    "stats",
+                    "CRAM input requires -r/--reference FILE or top-level --reference",
+                );
                 return ExitCode::from(1);
             };
             if parsed_regions.is_empty() {
-                htslib_rs::alignment_compat::summarize_cram_records_from_path_with_reference(
-                    &input, reference,
-                )
-                .map(StatsInput::Summaries)
+                collect_cram_full_stats(&input, reference, &config)
+                    .map(|counts| StatsInput::Counts(Box::new(counts)))
             } else {
                 collect_cram_region_stats(&input, reference, &parsed_regions, &config)
                     .map(|counts| StatsInput::Counts(Box::new(counts)))
@@ -711,6 +722,25 @@ fn collect_bam_region_stats(
                 );
             }
         }
+    }
+    Ok(counts)
+}
+
+/// Whole-CRAM (no region) stats using the htslib-rs all-record iterator,
+/// so sequence-length/quality/GC/COV/NM accumulate like the BAM path
+/// (TODO-NEXT #2) instead of the seq/quality-discarding `summarize_*` path.
+fn collect_cram_full_stats(
+    input: &PathBuf,
+    reference: PathBuf,
+    config: &StatsConfig,
+) -> io::Result<StatsCounts> {
+    let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
+    let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
+    let mut counts = StatsCounts::default();
+    for record in htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+        input, &reference,
+    )? {
+        counts.update_record(&header, &record, config, read_group_filter.as_ref());
     }
     Ok(counts)
 }
