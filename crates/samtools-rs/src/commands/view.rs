@@ -161,7 +161,15 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     match run(&opts, &input, format.exact) {
-        Ok(code) => code,
+        Ok(code) => {
+            if opts.write_index
+                && let Err(e) = write_output_index(&opts)
+            {
+                print_error_errno("view", "failed to write index", &e);
+                return ExitCode::from(1);
+            }
+            code
+        }
         // Broken pipe from a downstream consumer (e.g. `samtools view | head`)
         // is a clean exit, not an error — matches upstream behavior.
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
@@ -169,6 +177,28 @@ pub fn main(args: &[OsString]) -> ExitCode {
             print_error_errno("view", "I/O error during view", &e);
             ExitCode::from(1)
         }
+    }
+}
+
+/// Post-write index pass for `--write-index` (BAM file output only).
+fn write_output_index(opts: &Opts) -> io::Result<()> {
+    let Some(out) = opts.output.as_deref() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--write-index requires -o FILE",
+        ));
+    };
+    match resolved_output_fmt(opts)? {
+        OutputFmt::Bam => {
+            let index = htslib_rs::index_compat::build_bai(out)?;
+            let mut idx = out.as_os_str().to_os_string();
+            idx.push(".bai");
+            htslib_rs::index_compat::write_bai(PathBuf::from(idx), &index)
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--write-index is only supported for BAM file output in samtools-rs view",
+        )),
     }
 }
 
@@ -185,6 +215,8 @@ struct Opts {
     /// `None` means the caller didn't supply an argv (e.g. internal tests).
     argv: Option<Vec<OsString>>,
     unmap_unselected: bool,
+    /// `--write-index` — build an index next to a BAM file output.
+    write_index: bool,
     reference: Option<PathBuf>,
     /// `-f INT` — require ALL these flag bits to be set on the record.
     require_flags: u32,
@@ -757,6 +789,10 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
             }
             "-X" | "--customized-index" => {
                 opts.customized_index = true;
+                i += 1;
+            }
+            "--write-index" => {
+                opts.write_index = true;
                 i += 1;
             }
             "--help" => return Err(ParseError::Usage),

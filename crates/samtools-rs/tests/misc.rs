@@ -6499,3 +6499,47 @@ fn checksum_cram_matches_bam_via_all_record_iterator() {
         checksum_all_row(&std::fs::read_to_string(&co).unwrap()),
     );
 }
+
+#[test]
+fn view_write_index_matches_post_pass_index() {
+    // TODO-NEXT #9: `view --write-index` BAM output must produce a BAI
+    // byte-identical to a separate `samtools index` pass.
+    let bam = htslib_fixtures_dir().join("range.bam");
+    let tmp = tmp_dir("view-write-index");
+    let auto = tmp.join("auto.bam");
+    let post = tmp.join("post.bam");
+
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &[
+                "--write-index",
+                "-b",
+                "-o",
+                auto.to_str().unwrap(),
+                bam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &["-b", "-o", post.to_str().unwrap(), bam.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(index::main(&argv("index", &[post.to_str().unwrap()]))),
+        0
+    );
+
+    let auto_bai = auto.with_extension("bam.bai");
+    let post_bai = post.with_extension("bam.bai");
+    assert!(auto_bai.exists(), "view --write-index did not write a .bai");
+    assert_eq!(
+        std::fs::read(&auto_bai).unwrap(),
+        std::fs::read(&post_bai).unwrap(),
+        "--write-index BAI must equal the post-pass BAI"
+    );
+}
