@@ -151,34 +151,37 @@ quick fix — verified by probing):
      length around `qpos` in the read sequence) and **(b)**
      `nm_local()` (bam_consensus.c:976 — local mismatch count within
      `nm_halo` of the position, from the read + its `NM`/MD). Neither
-     is derivable from the current `PileupRead`. **htslib-rs
-     extension required (substantial — a library-side port, not an
-     accessor):** upstream computes both via a per-read precompute
-     `nm_init` (bam_consensus.c:1009-1110) that (i) **mutates** the
-     read qualities in place (`adj_qual`, default on — local
-     quality-minima + homopolymer windows) and (ii) builds a per-base
-     `local_nm[]` packing local-NM (low 24 bits, from an MD/`NM`
-     walk) + poly length (high 8 bits); `nm_local`/`poly_len` then
-     just index it. So the pileup layer must expose, per pileup read,
-     the CIGAR + `MD`/`NM` and run the `nm_init` quality-adjust +
-     `local_nm` precompute (the adjusted quals feed back into every
-     column's `quality`). `TestPileupRecord` currently has
-     `sequence`+`quality_scores` but no CIGAR/MD/NM and does no
-     quality adjustment. New htslib-rs item alongside #2/#3/#5/#7:
-     "pileup: expose per-read CIGAR+MD/NM and the `nm_init`
-     quality-adjust + packed `local_nm`/poly precompute". After the extension: wire into `consensus.rs`
-     (dispatch `--mode bayesian`/default, currently rejected at
-     consensus.rs:150), per column build `Vec<Gap5Obs>` (filter
-     `qual >= min_qual`, skip ref_skip; `base4`=`bam_seqi`/`*`→16;
-     `qual` with the 255→`default_qual` rule), then the
-     `consensus_base` thresholds (bam_consensus.c:2135+):
-     `min_depth`, `cons_cutoff`→N, het ambiguity from `het_call`/
-     `het_logodd` vs `het_fract`/`call_fract`, `all_bases`,
-     `--show-ins`/`--show-del`, then reuse the simple path's
-     FASTA/FASTQ/line-len writer. Defaults: min_depth=1,
-     call_fract=0.75, het_fract=0.5, cons_cutoff=10, default_qual=10,
-     use_mqual=1, nm_adjust=1, scale_mqual=1, low/high_mqual=1/60,
-     line_len=70, show_ins=1, show_del=0 (bam_consensus.c:2985+).
+     was derivable from the old `PileupRead`. **htslib-rs extension
+     ✅ DONE** (htslib-rs `0d81dec`/`abd52e9`/`5385da8`, pinned via
+     samtools-rs `f588f17`/`b54b021`/`d484beb`): (a) `TestPileupRecord`
+     now captures per-read CIGAR + `MD`/`NM`; (b) `compute_local_nm`
+     faithfully ports `nm_init`'s default path (adj_qual deficit,
+     homopolymer high-8-bits, soft-clip cost, MD-walk mismatch halo —
+     `homopoly_fix` opt-in path deferred) + `local_nm_poly`/
+     `local_nm_score`; (c) `PileupRead` now exposes `bayes_poly` and
+     `bayes_nm_local` (precomputed once per record, indexed at
+     `qpos+1`). All unit-tested; htslib-rs 133/0, workspace green.
+  5b. **Next — the samtools-rs wiring (now unblocked):** in
+     `consensus.rs`, dispatch `--mode bayesian`/default (currently
+     rejected at consensus.rs:150) to a `consensus_bayes(reads,cfg)`
+     paralleling `consensus_simple`: per column build `Vec<bayes::
+     Gap5Obs>` from `&[PileupRead]` — filter `!is_refskip` and
+     `qual >= min_qual`; `base4` = ASCII→SAM-4bit (A1 C2 G4 T8 N15,
+     deletion `*`→16); `qual` = `quality.or(qpos_quality)` with the
+     `255 || (0 && raw==255)`→`default_qual` rule; `mqual` =
+     `mapping_quality`; `nm_local` = `bayes_nm_local`; `poly` =
+     `bayes_poly`. Call `bayes::gap5_call` (td = column depth), then
+     the `consensus_base` thresholds (bam_consensus.c:2137-2167):
+     `cons.depth < min_depth && call!=4`→`N`/0; else if
+     `het_logodd>0 && ambig` → the 25-char "AMRWa MCSYc RSGKg WYKTt
+     acgt*"[het_call], cq=het_logodd; else `"ACGT*"[call]`, cq=phred;
+     then `cq<cons_cutoff && cb!='*' && het_call%5!=4 && het_call/5
+     !=4` → `N`/0. Reuse the simple path's ref-column + insertion
+     sub-column loop and FASTA/FASTQ/pileup/line-len writer. Defaults:
+     min_depth=1, call_fract=0.75, het_fract=0.5, cons_cutoff=10,
+     default_qual=10, use_mqual=1, nm_adjust=1, scale_mqual=1,
+     low/high_mqual=1/60, line_len=70, show_ins=1, show_del=0
+     (bam_consensus.c:2985+).
      Fixtures: `samtools/test/consensus/consensus.reg` ~38 cases
      (13 `-m bayesian` + 25 default) vs `consensus/expected/*`; the
      59 `simple` already pass. Verify byte-exact per fixture; gate +
