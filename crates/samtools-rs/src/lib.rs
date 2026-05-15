@@ -22,6 +22,7 @@ pub mod native;
 pub mod pg;
 pub mod reference;
 pub mod sam_global;
+pub mod sam_render;
 pub mod sanitize;
 pub mod tmp_file;
 pub mod version;

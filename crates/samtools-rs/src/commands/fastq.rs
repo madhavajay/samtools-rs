@@ -28,6 +28,7 @@ use htslib_rs::{bam, format::Exact};
 use crate::aux_list::parse_aux_list;
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
+use crate::sam_render::format_aux_float;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AuxSelection {
@@ -1832,24 +1833,6 @@ fn join_float_array(iter: Box<dyn Iterator<Item = io::Result<f32>> + '_>) -> io:
         values.push(format_aux_float(result?));
     }
     Ok(values.join(","))
-}
-
-fn format_aux_float(n: f32) -> String {
-    let abs = n.abs();
-    if n != 0.0 && !(1e-4..1e6).contains(&abs) {
-        format_htslib_exponent(n)
-    } else {
-        format!("{n}")
-    }
-}
-
-fn format_htslib_exponent(n: f32) -> String {
-    let raw = format!("{n:e}");
-    let Some((mantissa, exponent)) = raw.split_once('e') else {
-        return raw;
-    };
-    let value = exponent.parse::<i32>().unwrap_or(0);
-    format!("{mantissa}e{value:+03}")
 }
 
 fn parse_flag_arg(arg: Option<&OsString>, opt: &str, sub_name: &str) -> Result<u16, ExitCode> {
