@@ -6404,6 +6404,37 @@ fn stats_matches_upstream_stat_fixtures() {
         );
     }
 
+    // stat/16: `--ref-stats` with no reference — the RFS section is
+    // derived from the header @SQ dims (GC/N = -1). The upstream test
+    // compares only `grep ^RFS`.
+    {
+        let out = tmp.join("16.stats.expected");
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &[
+                    "--ref-stats",
+                    "-o",
+                    &p(&out),
+                    &p(&stat.join("11_target.sam")),
+                ]
+            ))),
+            0,
+            "stats --ref-stats"
+        );
+        let rfs: String = std::fs::read_to_string(&out)
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("RFS\t"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(
+            rfs,
+            std::fs::read_to_string(stat.join("16.stats.expected")).unwrap(),
+            "stats --ref-stats RFS byte-exact",
+        );
+    }
+
     // `-S RG` split cases: stdout matches `<n>.stats.expected` and each
     // per-RG `<input>_<rg>.bamstat` matches its `.expected.bamstat`
     // (both modulo the three stripped header lines). The input is copied

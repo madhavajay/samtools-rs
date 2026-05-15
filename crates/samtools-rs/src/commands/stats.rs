@@ -61,6 +61,8 @@ struct StatsConfig {
     // `-P`/`--split-prefix`: filename prefix (default = input path).
     split_tag: Option<String>,
     split_prefix: Option<String>,
+    // `--ref-stats`: emit the RFS reference-statistics section.
+    ref_stats: bool,
 }
 
 impl Default for StatsConfig {
@@ -82,6 +84,7 @@ impl Default for StatsConfig {
             reference_seqs: None,
             split_tag: None,
             split_prefix: None,
+            ref_stats: false,
         }
     }
 }
@@ -221,6 +224,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
             "-P" | "--split-prefix" => {
                 config.split_prefix = iter.next().and_then(|s| s.to_str().map(str::to_owned));
+            }
+            "--ref-stats" => {
+                config.ref_stats = true;
+            }
+            "--ref-stats-chunk" => {
+                let _ = iter.next();
             }
             "-@" | "--threads" | "-G" => {
                 let _ = iter.next();
@@ -419,6 +428,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
             })
         }
     };
+    let write_result = write_result.and_then(|()| {
+        if config.ref_stats {
+            let dims = read_input_ref_dims(&input, format.exact)?;
+            write_ref_stats(&mut writer, &dims)?;
+        }
+        Ok(())
+    });
     if let Err(e) = write_result {
         if e.kind() == io::ErrorKind::BrokenPipe {
             return ExitCode::SUCCESS;
@@ -479,6 +495,63 @@ fn read_input_header_sort_order(
         })
         .map(|value| String::from_utf8_lossy(value.as_ref()).to_lowercase());
     Ok(so)
+}
+
+/// Header `@SQ` (name, length) pairs in order, for the `--ref-stats`
+/// RFS section.
+fn read_input_ref_dims(input: &std::path::Path, exact: Exact) -> io::Result<Vec<(String, u64)>> {
+    let header = match exact {
+        Exact::Sam => htslib_rs::alignment_compat::read_sam_header_from_path(input)?,
+        Exact::Bam => htslib_rs::alignment_compat::read_bam_header_from_path(input)?,
+        Exact::Cram => htslib_rs::alignment_compat::read_cram_header_from_path(input)?,
+        _ => return Ok(Vec::new()),
+    };
+    Ok(header
+        .reference_sequences()
+        .iter()
+        .map(|(name, def)| {
+            (
+                String::from_utf8_lossy(name.as_ref()).into_owned(),
+                usize::from(def.length()) as u64,
+            )
+        })
+        .collect())
+}
+
+/// Writes the RFS reference-statistics section (`--ref-stats`). Without
+/// a reference / regions this is derived purely from the header `@SQ`
+/// dimensions (GC and N reported as -1, matching upstream `gcsum=-1`).
+fn write_ref_stats(out: &mut dyn Write, dims: &[(String, u64)]) -> io::Result<()> {
+    writeln!(
+        out,
+        "# Reference statistics. Use `grep ^RFS | cut -f 2-` to extract this part."
+    )?;
+    writeln!(
+        out,
+        "# Total count, Output count, Average GC, Min length, Max length, Average length, Total length in first row."
+    )?;
+    writeln!(
+        out,
+        "# Sequence name, Length, GC content, Unknown count in following rows."
+    )?;
+    let total = dims.len() as i64;
+    let combined: i64 = dims.iter().map(|(_, l)| *l as i64).sum();
+    let minlen = dims.iter().map(|(_, l)| *l as i64).min().unwrap_or(0);
+    let maxlen = dims.iter().map(|(_, l)| *l as i64).max().unwrap_or(0);
+    let avglen = if total > 0 {
+        combined as f64 / total as f64
+    } else {
+        -1.0
+    };
+    writeln!(
+        out,
+        "RFS\t{total}\t{total}\t{:.2}\t{minlen}\t{maxlen}\t{avglen:.2}\t{combined}",
+        -1.0
+    )?;
+    for (name, len) in dims {
+        writeln!(out, "RFS\t{name}\t{len}\t{:.2}\t{}", -1.0, -1)?;
+    }
+    Ok(())
 }
 
 fn parse_region(s: &str) -> io::Result<Region> {
