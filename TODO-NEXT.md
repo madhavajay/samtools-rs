@@ -59,12 +59,14 @@ quick fix — verified by probing):
   (modulo @PG); integration test `merge_reconciles_rg_pg_byte_exact_vs_upstream`
   covers all five. Remaining (not fixture-covered): k-way streaming
   merge, CRAM output, `--template-coordinate`.
-- `markdup` → duplicate-selection / optical / stats algorithm parity
-  (now *reads* the test_input_1_* fixtures via sam_compat). Key
-  actionable detail: upstream keeps the read/pair with the highest
-  `calc_score` = sum of base quals >= MD_MIN_QUALITY (bam_markdup.c:276),
-  **not** MAPQ as our port does; pair key uses unclipped start/end +
-  orientation (`make_pair_key`).
+- `markdup` → ✅ **core key/score DONE**: faithful `make_pair_key`
+  (template + sequence), `make_single_key`, `calc_score`+`ms`,
+  QCFAIL/qname tie-break, `-S` SA/XA/unmapped-mate `dup_hash`
+  propagation. Byte-exact vs upstream `markdup/{5,6,7,13}`.
+  *Remaining:* optical-chain re-tagging (`find_duplicate_chains`;
+  fixtures 8–12,15,16), `--read-coords`/`--coords-order`/
+  `--barcode-rgx`/`--barcode-name`/`--use-read-groups`/
+  `--duplicate-count`, exact `-s` stats counts, CRAM.
 - `reset` → tested only via pipes into `sort -M -K10` (minimiser).
 - `sort` `name2` / `reset` → minimiser (`-N`/`-K`) + external merge.
 - `stats` → ~123k LOC C, deep structural gaps (CHK, per-SN comments,
