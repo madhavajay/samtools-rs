@@ -71,7 +71,20 @@ re-scoped for the next pass where the samtools-only constraint is lifted.
 - **Unblocks:** ~5 whole subcommands plus exact `bedcov`/`coverage`/`depth`.
   Do this first.
 
-### 2. CRAM all-record (non-region) streaming iterator
+### 2. CRAM all-record (non-region) streaming iterator — 🟡 mostly DONE
+
+> **htslib-rs DONE + pinned** (`ca812dd`):
+> `query_cram_records_all_from_path_with_reference` /
+> `iter_cram_records_all_from_path_with_reference` (full RecordBuf;
+> count/name/flags/start/seq/qual == range.bam equivalent).
+> **samtools-rs `stats` DONE:** no-region CRAM now uses the full-record
+> iterator (`collect_cram_full_stats`) + wires `stats -r/--ref-seq`;
+> SN lines match BAM except NM-derived `mismatches`/`error rate` (CRAM
+> stores no NM and noodles does not synthesize it — recompute-from-ref is
+> a separate follow-up). Test `stats_cram_without_region_matches_bam_*`.
+> **Remaining:** wire `checksum` whole-CRAM and `reference` CRAM-input MD
+> path onto the same iterator; optional CRAM NM recompute for exact
+> `stats` mismatch/error-rate parity.
 
 - **htslib-rs:** add a non-region streaming record iterator for CRAM
   (today only `iter_cram_records_from_path_with_reference` for indexed
