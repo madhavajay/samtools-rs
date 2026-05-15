@@ -43,6 +43,19 @@ re-scoped for the next pass where the samtools-only constraint is lifted.
 
 ## Items (each: htslib-rs change + htslib-rs tests → samtools-rs wiring + samtools-rs tests)
 
+> **Status (in progress):** htslib-rs side **DONE + pinned** (`9cf30b3`):
+> public `pileup_from_alignment_paths[_with_reference][_and_options]` +
+> `PileupColumn`/`PileupRead` (`bam_pileup1_t`-shaped, incl. `qpos_quality`,
+> indel, head/tail, refskip) + `PileupOptions` (flag/mapq/`detect_overlaps`/
+> `discard_orphans`) + ported `tweak_overlap_quality`/`overlap_push` smart
+> overlap removal + `MPLP_NO_ORPHAN` filter; unit tests + CRAM==BAM equality.
+> samtools-rs side: **`mpileup`** default text output implemented and
+> byte-exact vs upstream `mpileup.out.3`/`out.5`/stderr (`out.1` matches on
+> depth+bases; quals differ only under BAQ → TODO-NEXT #11). Remaining
+> samtools-rs wiring (large per-subcommand ports, now unblocked by the
+> shipped pileup API): `consensus`, `targetcut`, `phase`, `ampliconstats`,
+> and the exact pileup-based `bedcov`/`coverage`/`depth` paths.
+
 ### 1. Pileup iterator — highest leverage
 
 - **htslib-rs:** expose a multi-input pileup iterator API surface
