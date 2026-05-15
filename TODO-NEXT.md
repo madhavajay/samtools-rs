@@ -190,7 +190,18 @@ re-scoped for the next pass where the samtools-only constraint is lifted.
 - **samtools-rs tests:** region-grammar integration tests + `test.pl`
   region cases.
 
-### 11. `probaln_glocal` / BAQ wiring verification
+### 11. `probaln_glocal` / BAQ wiring verification — 🟡 htslib-rs VERIFIED
+
+> htslib-rs side **verified**: `htslib_rs::probaln::probaln_glocal` is
+> implemented with unit tests, and the BAQ surface
+> (`recalculate_baq_from_sam_path`, `apply_existing_baq_from_sam_path`,
+> `revert_existing_baq_from_sam_path`, `force_recalculate_baq_from_sam_path`,
+> extended BAQ) is wired and passes the upstream realn fixtures
+> (`ports_test_realn_*` in `alignment_io.rs`). **Remaining (samtools-rs):**
+> upstream `test_calmd` runs `calmd -uAr mpileup.1.sam mpileup.ref.fa` and
+> only checks the output is BGZF — needs `calmd` **BAM output** (currently
+> SAM-text only); the BAQ math itself is ready. Also feeds `mpileup`
+> out.1 BAQ-adjusted qualities. Bounded `calmd` follow-up.
 
 - **htslib-rs:** verify `htslib-rs::probaln` (`probaln_glocal`) is wired and
   correct for BAQ recalculation (likely verification, not new API).
