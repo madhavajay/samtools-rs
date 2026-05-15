@@ -63,10 +63,29 @@ quick fix — verified by probing):
   (template + sequence), `make_single_key`, `calc_score`+`ms`,
   QCFAIL/qname tie-break, `-S` SA/XA/unmapped-mate `dup_hash`
   propagation. Byte-exact vs upstream `markdup/{5,6,7,13}`.
-  *Remaining:* optical-chain re-tagging (`find_duplicate_chains`;
-  fixtures 8–12,15,16), `--read-coords`/`--coords-order`/
-  `--barcode-rgx`/`--barcode-name`/`--use-read-groups`/
-  `--duplicate-count`, exact `-s` stats counts, CRAM.
+  Optical-name parse now faithful (`get_coordinates_colons`:
+  separator-count x/y selection, prefix-string equality + |x|/|y| ≤
+  dist). *Remaining: optical-chain re-tagging* — **de-risked spec:**
+  (a) in `mark()` maintain per-index `original[i]` and a `duplicate`
+  head/tail per kept read, mirroring `bam_markdup.c:1797-1845`/
+  `1855-1895` swap semantics (when the new read wins, the old `bp->p`'s
+  duplicate sub-chain is spliced under the new read; `original`
+  back-links); (b) after marking, for each chain root (read with no
+  `original` link and ≥1 duplicate) run `check_chain_against_original`:
+  `get_coordinates_colons(root)`; for each dup in `root.duplicate`
+  chain set `do`→root qname (if `-t`), `optical_duplicate_partial`
+  (sets `c.{x,y,beg,end,len}`, `is_opt` vs root prefix/x/y), `c.opt` if
+  existing `dt:Z:SQ` or is_opt (then `optical_retag` → `dt:Z:SQ` +
+  `optical`/`single_optical` stat + dup_hash type 'O'), `c.score` =
+  `calc_score`(+`ms` if paired); (c) `check_duplicate_chain`: qsort by
+  `(len, prefix-bytes, x)`, then within equal-prefix groups, for each
+  pair with `Δx ≤ opt_dist` and `Δy ≤ opt_dist`, pick the optical dup
+  by the same QCFAIL→score→qname-`strcmp` rule as the main pair
+  decision and `optical_retag` the loser (skip if both already
+  `c.opt`). Fixtures 8–12,15,16. Then `--read-coords`/`--coords-order`/
+  `--barcode-rgx`/`--barcode-name` (regex coord/barcode),
+  `--use-read-groups` (rg-keyed), `--duplicate-count` (`dc` tag),
+  exact `-s` stats counts, CRAM.
 - `reset` → tested only via pipes into `sort -M -K10` (minimiser).
 - `sort` `name2` / `reset` → minimiser (`-N`/`-K`) + external merge.
 - `stats` → ~123k LOC C, deep structural gaps (CHK, per-SN comments,
