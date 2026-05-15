@@ -40,23 +40,33 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
   the exact `bam_aux_del`+`bam_aux_append` semantics #7 wanted).
 
 **§13 byte-parity also achieved this batch** (beyond the pileup family):
-`fixmate` (entire `test_fixmate` group) and `addreplacerg` (entire
-`test_addrprg` group) are byte-exact modulo `@PG`; the `-` output
-operand → stdout bug fixed in `fixmate`/`markdup`/`rmdup`. So
+`fixmate` (entire `test_fixmate` group), `addreplacerg` (entire
+`test_addrprg` group), and `sort` (`pos/name/name3/tag.rg/tag.rg.n`) are
+byte-exact modulo `@PG` (sort via raw-header preservation + the exact
+`strnum_cmp` natural comparator + `-o -`→stdout; the `-`→stdout bug also
+fixed in `fixmate`/`markdup`/`rmdup`). So upstream byte-exact now:
 `flags`/`quickcheck`/`dict`/`idxstats`(BAM/SAM)/`coverage`/`bedcov`/
-`depth`/`mpileup`/`consensus`/`fixmate`/`addreplacerg` are upstream
-byte-exact, and `split` matches `test_split` under the harness'
-`reorder_header` (only header line order differs, which the harness
-normalizes — allowed by the parity rules); `markdup` dup-selection, full `stats`, `ampliconstats`,
-`phase`, `targetcut`, `sort` minimiser/external, `reference` CRAM, and
-the rest of §13 remain the large outstanding ports.
+`depth`/`mpileup`/`consensus`/`fixmate`/`addreplacerg`/`sort`(basic);
+`split` matches `test_split` under the harness' `reorder_header`.
+
+**Precisely-characterized remaining blockers** (each a large port, not a
+quick fix — verified by probing):
+- `merge` → the deferred `@RG`/`@PG` header-reconciliation rework
+  (we reject ID conflicts; upstream `-s SEED` random-suffixes).
+- `markdup` → duplicate-selection / optical / stats algorithm parity.
+- `reset` → tested only via pipes into `sort -M -K10` (minimiser).
+- `sort` `name2` / `reset` → minimiser (`-N`/`-K`) + external merge.
+- `stats` → ~123k LOC C, deep structural gaps (CHK, per-SN comments,
+  many histograms).
+- `ampliconstats` (1.8k LOC C), `phase`/`targetcut` (no upstream
+  fixtures + dense numerical HMM), consensus `recall`/Bayesian modes,
+  `reference` CRAM (needs MD recompute / embedded-ref internals).
+- TODO-NEXT #3/#4/#5 (CRAM internals / binary-`@PG` / CRAM index meta).
 
 **Honest remaining scope:** the library-blocked *foundations* are all
-shipped, tested and pinned, so the rest is ordinary (if large)
-samtools-rs porting: `targetcut`/`phase`/`ampliconstats`/consensus-recall,
-`reference` CRAM, the #3/#4/#5/#7 tails, and all of `TODO.md` §13
-(remaining subcommands to byte parity + Phases 4–5). That is a
-multi-week/multi-engineer effort, not single-session work.
+shipped, tested and pinned; the rest is ordinary (if large) samtools-rs
+porting + Phases 4–5 — a multi-week/multi-engineer effort, not
+single-session work.
 
 ## Ground rules for this pass
 
