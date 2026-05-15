@@ -27,8 +27,12 @@ use crate::bam_flag::{
 };
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
+
 use crate::sam_global::current_global_args;
 use crate::version::SAMTOOLS_VERSION;
+
+/// Upstream `stats.c` `stats->ngc` — GC-fraction histogram array size.
+const NGC: usize = 200;
 
 #[derive(Clone, Debug)]
 struct StatsConfig {
@@ -881,8 +885,9 @@ struct StatsCounts {
     qual_count: u64,
     first_qual_hist: Vec<[u64; 256]>,
     last_qual_hist: Vec<[u64; 256]>,
-    first_gc_hist: BTreeMap<u16, u64>,
-    last_gc_hist: BTreeMap<u16, u64>,
+    // Upstream `gc_1st`/`gc_2nd`: fixed `ngc`-sized GC-fraction arrays.
+    first_gc_hist: Vec<u64>,
+    last_gc_hist: Vec<u64>,
     coverage_depths: BTreeMap<(usize, usize), u32>,
     target_bases: u64,
     // Bases mapped (sum of sequence lengths for mapped reads, ignoring
@@ -1034,12 +1039,33 @@ impl StatsCounts {
             }
 
             if seq_len_u32 > 0 {
-                let gc_percent = gc_percent_hundredths(rec.sequence().iter());
-                if flag & BAM_FREAD1 != 0 {
-                    *self.first_gc_hist.entry(gc_percent).or_default() += 1;
+                // Upstream `stats.c`: bin into `gc_*[gc*(NGC-1)/L ..
+                // (gc+1)*(NGC-1)/L)` (capped at NGC-1).
+                let l = seq_len_u32 as u64;
+                let gc = rec
+                    .sequence()
+                    .iter()
+                    .filter(|b| matches!(b.to_ascii_uppercase(), b'G' | b'C'))
+                    .count() as u64;
+                let lo = (gc * (NGC as u64 - 1) / l) as usize;
+                let mut hi = ((gc + 1) * (NGC as u64 - 1) / l) as usize;
+                if hi >= NGC {
+                    hi = NGC - 1;
                 }
-                if flag & BAM_FREAD2 != 0 {
-                    *self.last_gc_hist.entry(gc_percent).or_default() += 1;
+                let tgt = if flag & BAM_FREAD1 != 0 {
+                    Some(&mut self.first_gc_hist)
+                } else if flag & BAM_FREAD2 != 0 {
+                    Some(&mut self.last_gc_hist)
+                } else {
+                    None
+                };
+                if let Some(h) = tgt {
+                    if h.len() < NGC {
+                        h.resize(NGC, 0);
+                    }
+                    for slot in h.iter_mut().take(hi).skip(lo) {
+                        *slot += 1;
+                    }
                 }
             }
 
@@ -1309,22 +1335,6 @@ fn c_e6(x: f64) -> String {
         if e < 0 { "-" } else { "+" },
         e.abs()
     )
-}
-
-fn gc_percent_hundredths(bases: impl IntoIterator<Item = u8>) -> u16 {
-    let mut len = 0u64;
-    let mut gc = 0u64;
-    for base in bases {
-        len += 1;
-        if matches!(base.to_ascii_uppercase(), b'G' | b'C') {
-            gc += 1;
-        }
-    }
-    if len == 0 {
-        return 0;
-    }
-
-    ((gc * 10_000 + (len / 2)) / len) as u16
 }
 
 fn write_stats(
@@ -1632,20 +1642,27 @@ fn write_gc_histograms(out: &mut dyn Write, counts: &StatsCounts) -> io::Result<
     Ok(())
 }
 
-fn write_gc_histogram(
-    out: &mut dyn Write,
-    label: &str,
-    hist: &BTreeMap<u16, u64>,
-) -> io::Result<()> {
-    for (percent, count) in hist {
+/// Upstream `stats.c` GC output loop: walk the `ngc`-sized array and,
+/// at each step where the value differs from the last emitted bin,
+/// print `(ibase+ibase_prev)*0.5*100/(ngc-1)` with the *previous* bin's
+/// count.
+fn write_gc_histogram(out: &mut dyn Write, label: &str, hist: &[u64]) -> io::Result<()> {
+    if hist.is_empty() {
+        return Ok(());
+    }
+    let mut prev = 0usize;
+    for ibase in 0..hist.len() {
+        if hist[ibase] == hist[prev] {
+            continue;
+        }
         writeln!(
             out,
-            "{}\t{}.{:02}\t{}",
+            "{}\t{:.2}\t{}",
             label,
-            percent / 100,
-            percent % 100,
-            count
+            (ibase + prev) as f64 * 0.5 * 100.0 / (NGC as f64 - 1.0),
+            hist[prev]
         )?;
+        prev = ibase;
     }
     Ok(())
 }
