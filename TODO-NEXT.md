@@ -53,7 +53,8 @@ fixed in `fixmate`/`markdup`/`rmdup`). So upstream byte-exact now:
 quick fix — verified by probing):
 - `merge` → the deferred `@RG`/`@PG` header-reconciliation rework
   (we reject ID conflicts; upstream `-s SEED` random-suffixes).
-- `markdup` → duplicate-selection / optical / stats algorithm parity.
+- `markdup` → duplicate-selection / optical / stats algorithm parity
+  (now *reads* the test_input_1_* fixtures via sam_compat).
 - `reset` → tested only via pipes into `sort -M -K10` (minimiser).
 - `sort` `name2` / `reset` → minimiser (`-N`/`-K`) + external merge.
 - `stats` → ~123k LOC C, deep structural gaps (CHK, per-SN comments,
