@@ -841,17 +841,14 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
             q.truncate(len);
             (s, q)
         } else {
-            // Trim leading/trailing all-N (HTSlib un-padded output).
-            let start = rs
-                .seq
-                .iter()
-                .position(|&b| b != b'N')
-                .unwrap_or(rs.seq.len());
-            let end = rs.seq.iter().rposition(|&b| b != b'N').map_or(0, |i| i + 1);
-            if start >= end {
+            // Non-all-bases: emit exactly the covered span (first..last
+            // covered column + interior fills). Covered-but-low-depth
+            // edge columns are `N` and ARE emitted (no trim); a contig
+            // with no emitted columns is skipped.
+            if rs.seq.is_empty() {
                 continue;
             }
-            (rs.seq[start..end].to_vec(), rs.qual[start..end].to_vec())
+            (rs.seq.clone(), rs.qual.clone())
         };
         writer.write_all(&[lead])?;
         writer.write_all(name.as_bytes())?;
