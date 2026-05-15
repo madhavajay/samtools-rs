@@ -274,7 +274,7 @@ samtools-rs status legend:
 - **C source:** `bam_samples.c`
 - **HTSlib APIs used:** `sam_hdr_*` to list `@RG` SM values
 - **htslib-rs coverage:** ✅
-- **samtools-rs status:** ✅ — lists `@RG SM:` samples across inputs with header-driven de-duplication, `-T`, `-o`, `-h`, `-i`, `-f`/`-F`, stdin path lists, `-X` custom index pairs, and CRAM headers.
+- **samtools-rs status:** ✅ — lists `@RG SM:` samples across inputs with header-driven de-duplication, `-T`, `-o`, `-h`, `-i`, `-f`/`-F`, stdin path lists, `-X` custom index pairs (exact file, directory, or prefix — `sam_index_load3`-style resolution), and CRAM headers.
 
 ### reference
 

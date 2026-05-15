@@ -1071,6 +1071,43 @@ fn samples_custom_index_pair_reports_index_presence() {
 }
 
 #[test]
+fn samples_custom_index_directory_reports_index_presence() {
+    // Upstream `sam_index_load3` accepts a *directory* as the custom
+    // index argument and finds `<dir>/<data-name>.bai` inside it. A bare
+    // `.exists()` on the directory used to (wrongly) report nothing /
+    // the directory itself; verify the resolver finds the relocated
+    // index at this non-default location.
+    let tmp = tmp_dir("samples-custom-index-dir");
+    let bam = tmp.join("in.bam");
+    let out = tmp.join("samples.txt");
+    let idx_dir = tmp.join("indexes");
+    std::fs::create_dir_all(&idx_dir).unwrap();
+    std::fs::copy(sample_bam(), &bam).unwrap();
+
+    assert_eq!(
+        exit_to_u8(index::main(&argv("index", &[bam.to_str().unwrap()]))),
+        0
+    );
+    std::fs::rename(tmp.join("in.bam.bai"), idx_dir.join("in.bam.bai")).unwrap();
+
+    assert_eq!(
+        exit_to_u8(samples::main(&argv(
+            "samples",
+            &[
+                "-X",
+                "-i",
+                "-o",
+                out.to_str().unwrap(),
+                bam.to_str().unwrap(),
+                idx_dir.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert!(std::fs::read_to_string(out).unwrap().ends_with("\tY\n"));
+}
+
+#[test]
 fn samples_cram_header_succeeds() {
     let tmp = tmp_dir("samples-cram");
     let out = tmp.join("samples.txt");
