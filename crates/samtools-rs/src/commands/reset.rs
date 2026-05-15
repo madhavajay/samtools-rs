@@ -238,34 +238,18 @@ fn run_reset(
 fn reset_raw_header(path: &Path, settings: &ResetSettings<'_>) -> Option<String> {
     let raw = crate::header_text::read_raw_header_text(path).ok()?;
 
-    // `--reject-PG ID`: remove that @PG and every @PG descending from it
-    // via the `PP` chain (transitive closure).
     let field = |line: &str, tag: &str| -> Option<String> {
         line.split('\t')
             .skip(1)
             .find_map(|f| f.strip_prefix(tag).map(|v| v.to_string()))
     };
-    let mut rejected: std::collections::HashSet<String> =
+    let rejected: std::collections::HashSet<String> =
         settings.reject_programs.iter().cloned().collect();
-    if !rejected.is_empty() {
-        loop {
-            let mut changed = false;
-            for line in raw.lines().filter(|l| l.starts_with("@PG")) {
-                if let Some(id) = field(line, "ID:")
-                    && !rejected.contains(&id)
-                    && let Some(pp) = field(line, "PP:")
-                    && rejected.contains(&pp)
-                {
-                    rejected.insert(id);
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-    }
 
+    // `--reject-PG ID` (`reset.c:223`): iterate @PG lines in header
+    // order; keep them until the first whose `ID` matches, then drop
+    // that one and **all subsequent @PG** ("from this PG onwards").
+    let mut pg_cut = false;
     let mut lines: Vec<String> = Vec::new();
     for line in raw.lines() {
         if line.starts_with("@SQ") || line.starts_with("@CO") {
@@ -274,11 +258,16 @@ fn reset_raw_header(path: &Path, settings: &ResetSettings<'_>) -> Option<String>
         if line.starts_with("@RG") && settings.remove_read_groups {
             continue;
         }
-        if line.starts_with("@PG")
-            && let Some(id) = field(line, "ID:")
-            && rejected.contains(&id)
-        {
-            continue;
+        if line.starts_with("@PG") {
+            if pg_cut {
+                continue;
+            }
+            if let Some(id) = field(line, "ID:")
+                && rejected.contains(&id)
+            {
+                pg_cut = true;
+                continue;
+            }
         }
         if line.is_empty() {
             continue;
