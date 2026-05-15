@@ -21,6 +21,7 @@ pub mod logging;
 pub mod native;
 pub mod pg;
 pub mod reference;
+pub mod sam_compat;
 pub mod sam_global;
 pub mod sam_render;
 pub mod sanitize;

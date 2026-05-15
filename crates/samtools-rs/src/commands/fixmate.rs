@@ -9,7 +9,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -280,7 +280,7 @@ fn run_fixmate_sam(
     pg_argv: Option<&[OsString]>,
     settings: FixmateSettings,
 ) -> io::Result<()> {
-    let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
+    let mut reader = crate::sam_compat::open_sam_reader_tolerant(input)?;
     let mut header = reader.read_header()?;
     reject_coordinate_sorted(&header)?;
     if let Some(argv) = pg_argv {

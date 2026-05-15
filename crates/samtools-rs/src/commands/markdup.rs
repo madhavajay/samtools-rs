@@ -32,7 +32,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -307,7 +307,7 @@ fn run_sam_markdup(
     pg_argv: Option<&[OsString]>,
     options: MarkdupOptions,
 ) -> io::Result<()> {
-    let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
+    let mut reader = crate::sam_compat::open_sam_reader_tolerant(input)?;
     let mut header = reader.read_header()?;
     if let Some(argv) = pg_argv {
         header = crate::pg::add_samtools_pg_to_header(&header, argv)?;

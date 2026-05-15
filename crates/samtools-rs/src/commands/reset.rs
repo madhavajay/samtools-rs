@@ -259,6 +259,7 @@ fn run_reset_sam(
     settings: &ResetSettings<'_>,
 ) -> io::Result<()> {
     let input = normalize_legacy_sam_header_version(std::fs::read(input)?);
+    let input = crate::sam_compat::normalize_sam_aux_int_types(&input);
     let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(input)));
     run_reset_sam_reader(&mut reader, output, fmt, settings)
 }
@@ -278,6 +279,7 @@ fn run_reset_stdin(
     }
 
     let input = normalize_legacy_sam_header_version(input);
+    let input = crate::sam_compat::normalize_sam_aux_int_types(&input);
     let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(input)));
     run_reset_sam_reader(&mut reader, output, fmt, settings)
 }

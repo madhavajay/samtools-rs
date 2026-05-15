@@ -327,48 +327,8 @@ fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
     Ok((header, records))
 }
 
-/// HTSlib's SAM parser accepts `c/C/s/S/I` as integer-type synonyms for
-/// scalar aux fields (only `i` is in the SAM spec; the others are BAM
-/// subtypes). noodles' `RecordBuf` reader rejects them, so normalize a
-/// scalar `TAG:[cCsSI]:` → `TAG:i:` (B-array subtypes are left alone).
-fn normalize_sam_aux_int_types(text: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len());
-    for line in text.split_inclusive(|&b| b == b'\n') {
-        if line.first() == Some(&b'@') {
-            out.extend_from_slice(line);
-            continue;
-        }
-        let mut col = 0usize;
-        let mut field_start = 0usize;
-        let mut buf = line.to_vec();
-        for i in 0..=buf.len() {
-            let at_sep = i == buf.len() || buf[i] == b'\t' || buf[i] == b'\n';
-            if at_sep {
-                if col >= 11 {
-                    let f = field_start;
-                    // TAG:T: where T is a single scalar integer synonym.
-                    if i >= f + 5
-                        && buf[f + 2] == b':'
-                        && buf[f + 4] == b':'
-                        && matches!(buf[f + 3], b'c' | b'C' | b's' | b'S' | b'I')
-                    {
-                        buf[f + 3] = b'i';
-                    }
-                }
-                col += 1;
-                field_start = i + 1;
-            }
-        }
-        out.extend_from_slice(&buf);
-    }
-    out
-}
-
 fn read_sam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
-    let raw = std::fs::read(input)?;
-    let normalized = normalize_sam_aux_int_types(&raw);
-    let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(normalized)));
-    read_sam_records_from_reader(&mut reader)
+    crate::sam_compat::read_sam_records_tolerant(input)
 }
 
 fn read_cram_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
