@@ -1358,10 +1358,6 @@ struct StatsCounts {
     isize_in: Vec<u64>,
     isize_out: Vec<u64>,
     isize_oth: Vec<u64>,
-    // Per-record abs(template_length) histogram across the same population
-    // that feeds the orientation bins. Used to apply `-m/--most-inserts`
-    // before computing the reported mean / standard deviation.
-    isize_hist: BTreeMap<u64, u64>,
     // Sequence-length and quality accumulators (only populated when the
     // collection path has access to record-level data — currently SAM /
     // BAM iteration and any region path, but not the CRAM-non-region
@@ -2228,7 +2224,6 @@ impl StatsCounts {
         if !(isize > 0 || same_ref) {
             return;
         }
-        *self.isize_hist.entry(isize).or_default() += 1;
         let i = isize as usize;
         if self.isize_in.len() <= i {
             self.isize_in.resize(i + 1, 0);
@@ -2606,8 +2601,7 @@ fn write_stats_counts(
     };
     writeln!(out, "SN\taverage quality:\t{:.1}", avg_quality)?;
 
-    let (avg_isize, sd_isize) =
-        insert_size_mean_sd(&counts.isize_hist, config.insert_size_main_bulk);
+    let (avg_isize, sd_isize) = insert_size_mean_sd(counts, config.insert_size_main_bulk);
     writeln!(out, "SN\tinsert size average:\t{:.1}", avg_isize)?;
     writeln!(out, "SN\tinsert size standard deviation:\t{:.1}", sd_isize)?;
     writeln!(
@@ -2774,41 +2768,47 @@ fn write_indel_cov_gcd(
     Ok(())
 }
 
-fn insert_size_mean_sd(isize_hist: &BTreeMap<u64, u64>, main_bulk: f64) -> (f64, f64) {
-    let total: u64 = isize_hist.values().sum();
-    if total == 0 {
-        return (0.0, 0.0);
-    }
-
-    let mut selected = Vec::new();
-    let mut selected_count = 0_u64;
-    let mut selected_sum = 0.0;
-    for (&isize, &count) in isize_hist {
-        if count == 0 {
-            continue;
+/// Faithful port of upstream `output_stats`' insert-size mean/sd: the
+/// per-size inward/outward/other counts are halved with integer
+/// truncation (so a lone in-region read whose mate was filtered out
+/// drops to zero), then the `-m` cumulative bulk cutoff selects
+/// `ibulk` and the divisor `nisize` exactly as upstream.
+fn insert_size_mean_sd(counts: &StatsCounts, main_bulk: f64) -> (f64, f64) {
+    let n = counts
+        .isize_in
+        .len()
+        .max(counts.isize_out.len())
+        .max(counts.isize_oth.len());
+    let num = |i: usize| -> u64 {
+        let g = |v: &[u64]| v.get(i).copied().unwrap_or(0) / 2;
+        g(&counts.isize_in) + g(&counts.isize_out) + g(&counts.isize_oth)
+    };
+    let nisize_total: u64 = (0..n).map(num).sum();
+    let mut ibulk = 0usize;
+    let mut bulk = 0.0_f64;
+    let mut avg = 0.0_f64;
+    let mut nisize = nisize_total as f64;
+    for i in 0..n {
+        let k = num(i);
+        if k > 0 {
+            ibulk = i + 1;
         }
-        selected.push((isize, count));
-        selected_count = selected_count.saturating_add(count);
-        selected_sum += isize as f64 * count as f64;
-        if selected_count as f64 / total as f64 > main_bulk {
+        bulk += k as f64;
+        avg += i as f64 * k as f64;
+        if nisize_total > 0 && bulk / nisize_total as f64 > main_bulk {
+            ibulk = i + 1;
+            nisize = bulk;
             break;
         }
     }
-
-    if selected_count == 0 {
-        return (0.0, 0.0);
+    let denom = if nisize != 0.0 { nisize } else { 1.0 };
+    avg /= denom;
+    let mut sd = 0.0_f64;
+    for i in 1..ibulk {
+        let k = num(i) as f64;
+        sd += k * (i as f64 - avg) * (i as f64 - avg) / denom;
     }
-
-    let avg = selected_sum / selected_count as f64;
-    let variance = selected
-        .iter()
-        .map(|(isize, count)| {
-            let delta = *isize as f64 - avg;
-            *count as f64 * delta * delta
-        })
-        .sum::<f64>()
-        / selected_count as f64;
-    (avg, variance.max(0.0).sqrt())
+    (avg, sd.max(0.0).sqrt())
 }
 
 fn write_quality_histograms(out: &mut dyn Write, counts: &StatsCounts) -> io::Result<()> {

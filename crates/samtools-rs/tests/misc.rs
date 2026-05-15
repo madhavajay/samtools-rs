@@ -6425,6 +6425,37 @@ fn stats_matches_upstream_stat_fixtures() {
         );
     }
 
+    // stat/12 overlap variants: `-t` BED on an overlapping-pairs BAM.
+    // The insert-size avg/sd is computed from the integer-halved
+    // per-size arrays (a lone in-region read whose mate was filtered
+    // drops to zero). The `-p`/--remove-overlaps variants additionally
+    // need the paired-overlap chunk subtraction and are not yet exact.
+    for (bed, expected) in [
+        ("12_3reads.bed", "12.3reads.overlap.expected"),
+        ("12_2reads.bed", "12.2reads.overlap.expected"),
+    ] {
+        let out = tmp.join(expected);
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &[
+                    "-o",
+                    &p(&out),
+                    "-t",
+                    &p(&stat.join(bed)),
+                    &p(&stat.join("12_overlaps.bam")),
+                ]
+            ))),
+            0,
+            "stats -t {bed}"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            std::fs::read_to_string(stat.join(expected)).unwrap(),
+            "stats -t {bed} byte-exact",
+        );
+    }
+
     // `--ref-stats` RFS section (upstream compares only `grep ^RFS`):
     // stat/16 no reference (GC/N = -1), stat/17 reference-backed GC/N
     // (plain and `--ref-stats-chunk -1` no-op), stat/18 positional
