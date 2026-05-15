@@ -32,6 +32,7 @@ In-flight PRs (samtools-rs-only, ready for review/merge):
 - PR #11, https://github.com/madhavajay/samtools-rs/pull/11, branch `view-r-rg-filter` (stacked on PR #10) — `view -r STR` / `-R FILE` accumulating read-group ID filter plus `-n` exclude-no-RG.
 - PR #13, https://github.com/madhavajay/samtools-rs/pull/13, branch `view-d-aux-tag-filter` (stacked on PR #11) — `view -d TAG[:VAL]` / `-D TAG:FILE` aux-tag presence/value filtering with shared-tag validation.
 - PR #14, https://github.com/madhavajay/samtools-rs/pull/14, branch `addreplacerg-default-rg` (from `main`, two commits) — `addreplacerg` defaults to the first header `@RG` ID when neither `-r`/`-R` is given, upstream `@RG` header reconciliation (`-r` + `overwrite_all` strips other `@RG` lines; `-w` overwrites a same-ID line), and `-R ID` rejection when the ID is absent from the header. Brings the whole upstream `test_addrprg` group (`addrprg/{1,2,3,4,5}`, #3 = expected failure) to parity modulo `@PG`.
+- PR #15, https://github.com/madhavajay/samtools-rs/pull/15, branch `reheader-parity` (from `main`) — reorders the shared `pg::push_pg_line` output to upstream's `@PG` field order `ID, PN, PP, VN, CL`. Benefits every command that inserts a samtools `@PG`; the upstream harness strips `\tVN:.*`, so `PP` must precede `VN`. Brings the `reheader/{1,4}` header section to parity after harness reordering.
 
 Latest known validation (against the tip of PR #13 / latest fastq-index-paired-grouping / PR #14):
 - Rust tests: 408 on PR #13-tip, plus the FASTA revcomp test on PR #9 tip, plus 2 addreplacerg tests on PR #14.
@@ -43,7 +44,7 @@ Estimated whole-project completion:
 - Rationale: core workspace/subcommand layout, common I/O, many read/write/index/file-operation/statistics/editing commands, the upstream-style fastq split routing, an extended view filter suite (qname/RG/aux-tag), addreplacerg upstream `@RG` header semantics, and 408+ Rust tests are in place. The remaining risk is concentrated in byte-for-byte upstream parity for the higher-complexity subcommands (view binary aux mutation, sort external merge, markdup/stats per-cycle, full checksum/reference/depad), pileup-dependent commands, full CRAM streaming, and large external algorithms.
 
 What to do next:
-1. Land PRs #8–#14 (#8, #10, #9, #11, #13 are the stacked fastq/view chain; #14 `addreplacerg` is independent from `main`; #12 is documentation-only and merges any time).
+1. Land PRs #8–#15 (#8, #10, #9, #11, #13 are the stacked fastq/view chain; #14 `addreplacerg` and #15 `pg.rs @PG order` are independent from `main`; #12 is documentation-only and merges any time). Note #15 touches the shared `pg.rs` helper, so land it early and rebase others if needed.
 2. Pick the next bounded slice from **Remaining tractable samtools-rs-only items** below.
 3. Run the full gate, update `TODO.md`, `docs/subcommand-coverage.md`, and `docs/test-status.md`, then commit, push, and open the next PR.
 
