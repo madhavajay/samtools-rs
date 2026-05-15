@@ -6329,6 +6329,43 @@ fn ampliconstats_matches_upstream_test_ampliconstats_fixtures() {
 }
 
 #[test]
+fn stats_matches_upstream_stat_1_2_3_fixtures() {
+    use samtools_rs::commands::stats;
+    // Byte-exact end to end vs samtools' own `test/stat/{1,2,3}`
+    // expected output (modulo the three harness-stripped header lines,
+    // i.e. `| tail -n+4`): CHK, all SN lines, FFQ/LFQ, MPC, GCF/GCL,
+    // GCC/GCT/FBC/FTC/LBC/LTC, IS, RL/FRL/LRL, MAPQ, the
+    // Indel/Indels-per-cycle comment headers, COV, and the GC-depth row.
+    let stat = fixtures_dir().join("stat");
+    let tmp = tmp_dir("stats-fixtures");
+    let reference = stat.join("test.fa");
+    let p = |b: &std::path::Path| b.to_str().unwrap().to_string();
+    // `tail -n+4`: drop the produced-by / contains / command-line lines.
+    let strip = |s: &str| -> String { s.lines().skip(3).map(|l| format!("{l}\n")).collect() };
+    let cases = [
+        ("1_map_cigar.sam", "1.stats.expected"),
+        ("2_equal_cigar_full_seq.sam", "2.stats.expected"),
+        ("3_map_cigar_equal_seq.sam", "3.stats.expected"),
+    ];
+    for (sam, expected) in cases {
+        let out = tmp.join(expected);
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &["-r", &p(&reference), "-o", &p(&out), &p(&stat.join(sam)),]
+            ))),
+            0,
+            "stats {expected}"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            std::fs::read_to_string(stat.join(expected)).unwrap(),
+            "stats {expected} byte-exact",
+        );
+    }
+}
+
+#[test]
 fn ampliconclip_matches_upstream_test_ampliconclip_fixtures() {
     use samtools_rs::commands::ampliconclip;
     // Byte-exact vs the entire upstream `test/ampliconclip` harness:
