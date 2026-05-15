@@ -5,8 +5,8 @@
 //! single-output mode (all reads written to stdout, `-o FILE`, or `-0 FILE`) and
 //! basic paired-output split (`-1`/`-2`/`-s`).
 //!
-//! **Not yet supported:** exact name-grouped singleton/other routing, barcode
-//! index file extraction (`--i1`/`--i2`).
+//! **Not yet supported:** exact name-grouped singleton/other routing for the
+//! full upstream grouping model.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -89,6 +89,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut umi_tags = vec![*b"OX", *b"RX"];
     let mut casava = false;
     let mut barcode_tag = *b"BC";
+    let mut quality_tag = *b"QT";
+    let mut index_file_1: Option<PathBuf> = None;
+    let mut index_file_2: Option<PathBuf> = None;
+    let mut index_format_arg: Option<String> = None;
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
         let s = arg.to_str().unwrap_or("");
@@ -218,6 +222,32 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     }
                 };
             }
+            "--quality-tag" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error(sub_name, "missing value for --quality-tag");
+                    return ExitCode::from(1);
+                };
+                quality_tag = match parse_filter_tag(raw) {
+                    Ok(tag) => tag,
+                    Err(e) => {
+                        print_error(sub_name, e);
+                        return ExitCode::from(1);
+                    }
+                };
+            }
+            "--i1" | "--I1" => {
+                index_file_1 = iter.next().map(PathBuf::from);
+            }
+            "--i2" | "--I2" => {
+                index_file_2 = iter.next().map(PathBuf::from);
+            }
+            "--index-format" | "--if" | "--IF" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error(sub_name, "missing value for --index-format");
+                    return ExitCode::from(1);
+                };
+                index_format_arg = Some(raw.to_string());
+            }
             "-v" => {
                 let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
                     print_error(sub_name, "missing value for -v");
@@ -256,6 +286,40 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     }
     let umi_tags = umi_enabled.then_some(umi_tags);
+
+    if index_file_2.is_some() && index_file_1.is_none() {
+        print_error(sub_name, "Index one specified, but index two not given");
+        return ExitCode::from(1);
+    }
+
+    let parsed_index_format = match index_format_arg.as_deref() {
+        Some(spec) => match parse_index_format(spec) {
+            Ok(items) => Some(items),
+            Err(e) => {
+                print_error(sub_name, e);
+                return ExitCode::from(1);
+            }
+        },
+        None => None,
+    };
+
+    let n_index_segments = parsed_index_format
+        .as_ref()
+        .map(|items| items.iter().filter(|item| item.is_index).count())
+        .unwrap_or(0);
+    if n_index_segments > 2 {
+        print_error(sub_name, "Invalid index format: more than 2 indexes");
+        return ExitCode::from(1);
+    }
+    if index_file_1.is_some() && index_format_arg.is_some() && n_index_segments == 0 {
+        print_error(sub_name, "index_format not specified, but index file given");
+        return ExitCode::from(1);
+    }
+
+    let effective_index_format = match parsed_index_format {
+        Some(items) => items,
+        None => parse_index_format("i*i*").expect("default index format parses"),
+    };
 
     let stdin_input = input.as_ref().is_none_or(|path| path.as_os_str() == "-");
 
@@ -448,6 +512,30 @@ pub fn main(args: &[OsString]) -> ExitCode {
             && let Err(e) = write_text_file(path, split.singleton.as_bytes())
         {
             print_error_errno(sub_name, format!("open/write {}", path.display()), &e);
+            return ExitCode::from(1);
+        }
+
+        if (index_file_1.is_some() || index_file_2.is_some())
+            && let Err(e) = emit_index_files(
+                input.as_deref(),
+                format.as_ref(),
+                stdin_input,
+                flag_filters,
+                IndexEmitOptions {
+                    append_read_number,
+                    use_original_quality,
+                    default_quality,
+                    umi_tags: umi_tags.as_deref(),
+                    barcode_tag,
+                    quality_tag,
+                    index_format: &effective_index_format,
+                    index_file_1: index_file_1.as_deref(),
+                    index_file_2: index_file_2.as_deref(),
+                    fasta_mode,
+                },
+            )
+        {
+            print_error_errno(sub_name, "index FASTQ output", &e);
             return ExitCode::from(1);
         }
 
@@ -698,13 +786,39 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
     match sam_io::check_sam_close(&mut out) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
         Err(e) => {
             print_error_errno(sub_name, "close output", &e);
-            ExitCode::from(1)
+            return ExitCode::from(1);
         }
     }
+
+    if (index_file_1.is_some() || index_file_2.is_some())
+        && let Err(e) = emit_index_files(
+            input.as_deref(),
+            format.as_ref(),
+            stdin_input,
+            flag_filters,
+            IndexEmitOptions {
+                append_read_number,
+                use_original_quality,
+                default_quality,
+                umi_tags: umi_tags.as_deref(),
+                barcode_tag,
+                quality_tag,
+                index_format: &effective_index_format,
+                index_file_1: index_file_1.as_deref(),
+                index_file_2: index_file_2.as_deref(),
+                fasta_mode,
+            },
+        )
+    {
+        print_error_errno(sub_name, "index FASTQ output", &e);
+        return ExitCode::from(1);
+    }
+
+    ExitCode::SUCCESS
 }
 
 fn write_text_file(path: &std::path::Path, text: &[u8]) -> io::Result<()> {
@@ -1681,5 +1795,370 @@ fn print_usage(sub: &str) -> io::Result<()> {
         "  -F, --exclude-flags FLAG exclude reads with any FLAG bits set"
     )?;
     writeln!(w, "  -G FLAG      exclude reads with all FLAG bits set")?;
+    writeln!(w, "  --i1 FILE    write first index reads to FILE")?;
+    writeln!(w, "  --i2 FILE    write second index reads to FILE")?;
+    writeln!(w, "  --quality-tag TAG")?;
+    writeln!(w, "               aux tag holding barcode qualities [QT]")?;
+    writeln!(w, "  --index-format STR")?;
+    writeln!(w, "               how to parse barcode/quality tags [i*i*]")?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IndexFormatItem {
+    is_index: bool,
+    len: Option<usize>,
+}
+
+fn parse_index_format(spec: &str) -> Result<Vec<IndexFormatItem>, String> {
+    let mut items = Vec::new();
+    let bytes = spec.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let kind = match bytes[i] {
+            b'i' | b'I' => true,
+            b'n' | b'N' => false,
+            other => {
+                return Err(format!(
+                    "Unknown index-format code '{}' in \"{}\"",
+                    char::from(other),
+                    spec
+                ));
+            }
+        };
+        i += 1;
+
+        let len = if i < bytes.len() && bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let digits = std::str::from_utf8(&bytes[start..i]).unwrap_or("0");
+            let n = digits
+                .parse::<usize>()
+                .map_err(|_| format!("invalid length in index-format \"{}\"", spec))?;
+            Some(n)
+        } else if i < bytes.len() && bytes[i] == b'*' {
+            i += 1;
+            None
+        } else if i >= bytes.len() {
+            return Err(format!(
+                "incomplete index-format \"{}\": expected length or '*'",
+                spec
+            ));
+        } else {
+            return Err(format!(
+                "unexpected character '{}' in index-format \"{}\"",
+                char::from(bytes[i]),
+                spec
+            ));
+        };
+
+        items.push(IndexFormatItem {
+            is_index: kind,
+            len,
+        });
+    }
+
+    if items.iter().filter(|item| item.is_index).count() > 2 {
+        return Err(format!(
+            "Invalid index format: more than 2 indexes in \"{}\"",
+            spec
+        ));
+    }
+
+    Ok(items)
+}
+
+#[derive(Clone, Copy)]
+struct IndexEmitOptions<'a> {
+    append_read_number: bool,
+    use_original_quality: bool,
+    default_quality: Option<u8>,
+    umi_tags: Option<&'a [[u8; 2]]>,
+    barcode_tag: [u8; 2],
+    quality_tag: [u8; 2],
+    index_format: &'a [IndexFormatItem],
+    index_file_1: Option<&'a std::path::Path>,
+    index_file_2: Option<&'a std::path::Path>,
+    fasta_mode: bool,
+}
+
+fn emit_index_files(
+    input: Option<&std::path::Path>,
+    format: Option<&htslib_rs::format::Format>,
+    stdin_input: bool,
+    flag_filters: FlagFilters,
+    options: IndexEmitOptions<'_>,
+) -> io::Result<()> {
+    let mut i1_writer = match options.index_file_1 {
+        Some(path) => Some(File::create(path)?),
+        None => None,
+    };
+    let mut i2_writer = match options.index_file_2 {
+        Some(path) => Some(File::create(path)?),
+        None => None,
+    };
+
+    let render = |out_i1: &mut Option<File>,
+                  out_i2: &mut Option<File>,
+                  record: &dyn IndexRecord|
+     -> io::Result<()> {
+        emit_index_for_record(out_i1.as_mut(), out_i2.as_mut(), record, options)
+    };
+
+    if stdin_input {
+        // For stdin we cannot re-iterate; skip index emission.
+        return Ok(());
+    }
+    let input =
+        input.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing input path"))?;
+    let exact = format
+        .map(|f| f.exact)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing input format"))?;
+
+    match exact {
+        Exact::Sam => {
+            let file = File::open(input)?;
+            let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(file));
+            let _header = reader.read_header()?;
+            for result in reader.records() {
+                let record = result?;
+                if record_passes_flag_filter(&record, flag_filters)?
+                    && record_index_eligible(&record)?
+                {
+                    render(&mut i1_writer, &mut i2_writer, &SamIndexRecord(&record))?;
+                }
+            }
+        }
+        Exact::Bam => {
+            let mut reader = bam::io::Reader::new(File::open(input)?);
+            let header = reader.read_header()?;
+            let mut record = htslib_rs::sam::alignment::RecordBuf::default();
+            loop {
+                let n = reader.read_record_buf(&header, &mut record)?;
+                if n == 0 {
+                    break;
+                }
+                if record_passes_flag_filter(&record, flag_filters)?
+                    && record_index_eligible(&record)?
+                {
+                    render(
+                        &mut i1_writer,
+                        &mut i2_writer,
+                        &RecordBufIndexRecord(&record),
+                    )?;
+                }
+            }
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "index FASTQ output for CRAM input is not yet supported",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn record_index_eligible<R>(record: &R) -> io::Result<bool>
+where
+    R: htslib_rs::sam::alignment::Record + ?Sized,
+{
+    let flags = record.flags()?;
+    Ok(!flags.is_last_segment())
+}
+
+trait IndexRecord {
+    fn name(&self) -> io::Result<String>;
+    fn flags(&self) -> io::Result<htslib_rs::sam::alignment::record::Flags>;
+    fn barcode(&self, tag: [u8; 2]) -> io::Result<Option<String>>;
+    fn quality_tag(&self, tag: [u8; 2]) -> io::Result<Option<String>>;
+    fn umi(&self, tags: &[[u8; 2]]) -> io::Result<Option<String>>;
+}
+
+struct SamIndexRecord<'a>(&'a htslib_rs::sam::record::Record);
+struct RecordBufIndexRecord<'a>(&'a htslib_rs::sam::alignment::RecordBuf);
+
+impl IndexRecord for SamIndexRecord<'_> {
+    fn name(&self) -> io::Result<String> {
+        fastq_record_name(self.0)
+    }
+    fn flags(&self) -> io::Result<htslib_rs::sam::alignment::record::Flags> {
+        self.0.flags()
+    }
+    fn barcode(&self, tag: [u8; 2]) -> io::Result<Option<String>> {
+        fastq_string_tag(self.0, tag)
+    }
+    fn quality_tag(&self, tag: [u8; 2]) -> io::Result<Option<String>> {
+        fastq_string_tag(self.0, tag)
+    }
+    fn umi(&self, tags: &[[u8; 2]]) -> io::Result<Option<String>> {
+        fastq_umi_string(self.0, tags)
+    }
+}
+
+impl IndexRecord for RecordBufIndexRecord<'_> {
+    fn name(&self) -> io::Result<String> {
+        fastq_record_name(self.0)
+    }
+    fn flags(&self) -> io::Result<htslib_rs::sam::alignment::record::Flags> {
+        htslib_rs::sam::alignment::Record::flags(self.0)
+    }
+    fn barcode(&self, tag: [u8; 2]) -> io::Result<Option<String>> {
+        fastq_string_tag(self.0, tag)
+    }
+    fn quality_tag(&self, tag: [u8; 2]) -> io::Result<Option<String>> {
+        fastq_string_tag(self.0, tag)
+    }
+    fn umi(&self, tags: &[[u8; 2]]) -> io::Result<Option<String>> {
+        fastq_umi_string(self.0, tags)
+    }
+}
+
+fn emit_index_for_record(
+    i1_writer: Option<&mut File>,
+    i2_writer: Option<&mut File>,
+    record: &dyn IndexRecord,
+    options: IndexEmitOptions<'_>,
+) -> io::Result<()> {
+    let Some(bc) = record.barcode(options.barcode_tag)? else {
+        return Ok(());
+    };
+
+    let qt_raw = record.quality_tag(options.quality_tag)?;
+    let qt = match qt_raw.as_deref() {
+        Some(q) if q.len() == bc.len() => Some(q.to_string()),
+        _ => None,
+    };
+
+    let bc_bytes = bc.as_bytes();
+    let qt_bytes = qt.as_deref().map(str::as_bytes);
+
+    let name = record.name()?;
+    let name = append_fastq_umi_with_str(name, record, options.umi_tags)?;
+    let name = append_fastq_read_number_with_record(name, record, options.append_read_number)?;
+
+    let writers = [i1_writer, i2_writer];
+    let mut writer_idx = 0usize;
+    let mut writers_arr: [Option<&mut File>; 2] = writers;
+    let mut bc_cursor = 0usize;
+
+    for item in options.index_format {
+        if bc_cursor >= bc_bytes.len() {
+            break;
+        }
+
+        let segment_end = match item.len {
+            Some(n) => (bc_cursor + n).min(bc_bytes.len()),
+            None => {
+                let mut j = bc_cursor;
+                while j < bc_bytes.len() && bc_bytes[j].is_ascii_alphabetic() {
+                    j += 1;
+                }
+                j
+            }
+        };
+        let advance_past_sep = item.len.is_none();
+
+        if item.is_index {
+            if writer_idx >= 2 {
+                break;
+            }
+            if let Some(out) = writers_arr[writer_idx].as_deref_mut() {
+                let seq = &bc_bytes[bc_cursor..segment_end];
+                let qual = qt_bytes.map(|q| &q[bc_cursor..segment_end]);
+                write_index_fastq_record(
+                    out,
+                    &name,
+                    seq,
+                    qual,
+                    options.fasta_mode,
+                    options.default_quality,
+                    options.use_original_quality,
+                )?;
+            }
+            writer_idx += 1;
+        }
+
+        bc_cursor = segment_end + if advance_past_sep { 1 } else { 0 };
+    }
+
+    Ok(())
+}
+
+fn write_index_fastq_record(
+    writer: &mut File,
+    name: &str,
+    seq: &[u8],
+    qual: Option<&[u8]>,
+    fasta_mode: bool,
+    default_quality: Option<u8>,
+    _use_original_quality: bool,
+) -> io::Result<()> {
+    if seq.is_empty() {
+        return Ok(());
+    }
+    if fasta_mode {
+        writeln!(writer, ">{name}")?;
+        writer.write_all(seq)?;
+        writer.write_all(b"\n")?;
+        return Ok(());
+    }
+    writeln!(writer, "@{name}")?;
+    writer.write_all(seq)?;
+    writer.write_all(b"\n+\n")?;
+    match qual {
+        Some(q) if q.len() == seq.len() => writer.write_all(q)?,
+        _ => {
+            let fill = default_quality.unwrap_or(1) + b'!';
+            for _ in 0..seq.len() {
+                writer.write_all(&[fill])?;
+            }
+        }
+    }
+    writer.write_all(b"\n")?;
+    Ok(())
+}
+
+fn append_fastq_umi_with_str(
+    name: String,
+    record: &dyn IndexRecord,
+    umi_tags: Option<&[[u8; 2]]>,
+) -> io::Result<String> {
+    let Some(umi_tags) = umi_tags else {
+        return Ok(name);
+    };
+    let Some(umi) = record.umi(umi_tags)? else {
+        return Ok(name);
+    };
+    let mut name = name;
+    let umi = umi
+        .chars()
+        .map(|c| if c.is_ascii_alphabetic() { c } else { '+' })
+        .collect::<String>();
+    if let Some(hash) = name.rfind('#') {
+        name.insert_str(hash, &format!(":{umi}"));
+    } else {
+        name.push(':');
+        name.push_str(&umi);
+    }
+    Ok(name)
+}
+
+fn append_fastq_read_number_with_record(
+    mut name: String,
+    record: &dyn IndexRecord,
+    append: bool,
+) -> io::Result<String> {
+    if append {
+        let flags = record.flags()?;
+        if flags.is_first_segment() {
+            name.push_str("/1");
+        } else if flags.is_last_segment() {
+            name.push_str("/2");
+        }
+    }
+    Ok(name)
 }
