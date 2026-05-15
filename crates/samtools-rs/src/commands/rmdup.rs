@@ -52,7 +52,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
             _ => {
                 if input.is_none() {
                     input = Some(PathBuf::from(arg));
-                } else if output.is_none() {
+                } else if output.is_none() && s != "-" {
+                    // A `-` output operand means stdout (output stays None).
                     output = Some(PathBuf::from(arg));
                 }
             }
