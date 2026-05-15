@@ -14,12 +14,13 @@
 //! parse plus the `find_duplicate_chains` re-tagging pass (per-read
 //! `original`/`duplicate` chain links with the exact swap/splice
 //! semantics). `--use-read-groups` keys the hashes by `@RG` order;
-//! `--duplicate-count` emits `dc:i`. Byte-exact vs upstream
-//! `markdup/{5,6,7,8,9,10,13,18}`. **Not yet:** `--read-coords` /
-//! `--coords-order` / `--barcode-rgx` / `--barcode-name` (regex
-//! coords/barcode; fixtures 11,12,14,15,16), markdup-17's non-canonical
-//! `@RG`/`@SQ` header order (needs raw-header output), exact `-s` stats,
-//! CRAM.
+//! `--duplicate-count` emits `dc:i`. Regex `--read-coords` /
+//! `--coords-order` / `--barcode-rgx` / `--barcode-name` supported (via
+//! the `regex` crate). Raw-header SAM output preserves input `@RG`/`@SQ`
+//! order. **Byte-exact vs upstream
+//! `markdup/{5,6,7,8,9,10,12,13,14,15,17,18}`** (12 of 14 fixtures).
+//! **Not yet:** fixtures 11 / 16 (residual regex-coords optical-chain
+//! edge), exact `-s` stats counts, CRAM.
 //!
 //! Supported flags:
 //!  - `-r` — remove duplicates from the output (rather than just flagging).
@@ -88,7 +89,6 @@ struct MarkdupOptions {
     duplicate_origin_tag: bool,
     optical_distance: Option<u32>,
     include_fails: bool,
-    barcode_tag: Option<Tag>,
     mode: DupMode,
     supp: bool,
     use_read_groups: bool,
@@ -112,6 +112,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut supp = false;
     let mut use_read_groups = false;
     let mut duplicate_count = false;
+    let mut read_coords: Option<String> = None;
+    let mut coords_order = String::from("txy");
+    let mut barcode_rgx: Option<String> = None;
+    let mut barcode_name = false;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -122,6 +126,18 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-S" => supp = true,
             "--use-read-groups" => use_read_groups = true,
             "--duplicate-count" => duplicate_count = true,
+            "--barcode-name" => barcode_name = true,
+            "--read-coords" => {
+                read_coords = iter.next().and_then(|a| a.to_str()).map(str::to_owned);
+            }
+            "--coords-order" => {
+                if let Some(v) = iter.next().and_then(|a| a.to_str()) {
+                    coords_order = v.to_owned();
+                }
+            }
+            "--barcode-rgx" => {
+                barcode_rgx = iter.next().and_then(|a| a.to_str()).map(str::to_owned);
+            }
             "--include-fails" => include_fails = true,
             "-c" => clear_existing_dups = true,
             "-t" => duplicate_origin_tag = true,
@@ -237,15 +253,82 @@ pub fn main(args: &[OsString]) -> ExitCode {
         duplicate_origin_tag,
         optical_distance,
         include_fails,
-        barcode_tag,
         mode,
         supp,
         use_read_groups,
         duplicate_count,
     };
+    // Compile the optical-coordinate / barcode regexes once.
+    let coord = if let Some(rx) = &read_coords {
+        let (x, y, t) = match coords_order.as_str() {
+            o if o.starts_with("txy") || o.starts_with("tyx") => (2, 3, 1),
+            o if o.starts_with("xyt") || o.starts_with("yxt") => (1, 2, 3),
+            o if o.starts_with("xty") || o.starts_with("ytx") => (1, 3, 2),
+            o if o.starts_with("xy") || o.starts_with("yx") => (1, 2, 0),
+            _ => {
+                print_error(
+                    "markdup",
+                    format!("could not recognise regex coordinate order \"{coords_order}\""),
+                );
+                return ExitCode::from(1);
+            }
+        };
+        match regex::Regex::new(rx) {
+            Ok(re) => CoordCfg {
+                rx: Some(re),
+                x,
+                y,
+                t,
+            },
+            Err(e) => {
+                print_error("markdup", format!("regex fail \"{e}\""));
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        CoordCfg {
+            rx: None,
+            x: 0,
+            y: 0,
+            t: 0,
+        }
+    };
+    let bc = if barcode_name || barcode_rgx.is_some() {
+        // Default UMI regex: the 8th colon-delimited read-name field.
+        let pat = barcode_rgx.as_deref().unwrap_or(
+            "[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:([!-?A-~]+)",
+        );
+        match regex::Regex::new(pat) {
+            Ok(re) => BcMode::Rgx(re),
+            Err(e) => {
+                print_error("markdup", format!("barcode regex fail \"{e}\""));
+                return ExitCode::from(1);
+            }
+        }
+    } else if let Some(t) = barcode_tag {
+        BcMode::Tag(t)
+    } else {
+        BcMode::None
+    };
+    let cfg = Cfg { coord, bc };
+
     let result = match format.exact {
-        Exact::Sam => run_sam_markdup(&input, output.as_deref(), output_fmt, pg_argv, options),
-        Exact::Bam => run_bam_markdup(&input, output.as_deref(), output_fmt, pg_argv, options),
+        Exact::Sam => run_sam_markdup(
+            &input,
+            output.as_deref(),
+            output_fmt,
+            pg_argv,
+            options,
+            &cfg,
+        ),
+        Exact::Bam => run_bam_markdup(
+            &input,
+            output.as_deref(),
+            output_fmt,
+            pg_argv,
+            options,
+            &cfg,
+        ),
         _ => unreachable!("format checked above"),
     };
 
@@ -331,6 +414,7 @@ fn run_bam_markdup(
     fmt: OutFmt,
     pg_argv: Option<&[OsString]>,
     options: MarkdupOptions,
+    cfg: &Cfg,
 ) -> io::Result<()> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let mut header = reader.read_header()?;
@@ -349,7 +433,7 @@ fn run_bam_markdup(
         clear_duplicate_marks(&mut records);
     }
     let rg_of = compute_rg_of(&header, &records, options.use_read_groups);
-    let mut stats = mark_duplicates(&mut records, options, &rg_of);
+    let mut stats = mark_duplicates(&mut records, options, &rg_of, cfg);
     stats.written = output_record_count(&records, options.remove_dups);
     if matches!(fmt, OutFmt::Sam) {
         // Byte-faithful: emit the raw input header (preserving @RG/@SQ
@@ -393,6 +477,7 @@ fn run_sam_markdup(
     fmt: OutFmt,
     pg_argv: Option<&[OsString]>,
     options: MarkdupOptions,
+    cfg: &Cfg,
 ) -> io::Result<()> {
     let mut reader = crate::sam_compat::open_sam_reader_tolerant(input)?;
     let mut header = reader.read_header()?;
@@ -411,7 +496,7 @@ fn run_sam_markdup(
         clear_duplicate_marks(&mut records);
     }
     let rg_of = compute_rg_of(&header, &records, options.use_read_groups);
-    let mut stats = mark_duplicates(&mut records, options, &rg_of);
+    let mut stats = mark_duplicates(&mut records, options, &rg_of, cfg);
     stats.written = output_record_count(&records, options.remove_dups);
     if matches!(fmt, OutFmt::Sam) {
         // Byte-faithful: emit the raw input header (preserving @RG/@SQ
@@ -628,8 +713,64 @@ fn mate_score(r: &RecordBuf) -> i64 {
         .unwrap_or(0)
 }
 
-fn barcode_bytes(r: &RecordBuf, tag: Option<Tag>) -> Vec<u8> {
-    barcode_value(r, tag).unwrap_or_default()
+/// Optical-coordinate config: a compiled `--read-coords` regex (else the
+/// `get_coordinates_colons` fallback) plus the 1-based capture-group
+/// indices for x / y / tile (`t == 0` ⇒ no tile, empty prefix).
+struct CoordCfg {
+    rx: Option<regex::Regex>,
+    x: usize,
+    y: usize,
+    t: usize,
+}
+
+/// Barcode key source.
+enum BcMode {
+    None,
+    Tag(Tag),
+    Rgx(regex::Regex),
+}
+
+struct Cfg {
+    coord: CoordCfg,
+    bc: BcMode,
+}
+
+/// Port of `get_coordinates`: regex path when `--read-coords` was given,
+/// else the colon-separator heuristic.
+fn get_coords(name: &[u8], cfg: &CoordCfg) -> Option<(usize, usize, i64, i64)> {
+    let Some(rx) = &cfg.rx else {
+        return get_coordinates_colons(name);
+    };
+    let s = std::str::from_utf8(name).ok()?;
+    let caps = rx.captures(s)?;
+    let xm = caps.get(cfg.x)?;
+    let ym = caps.get(cfg.y)?;
+    let x = parse_strtol(name, xm.start())?;
+    let y = parse_strtol(name, ym.start())?;
+    let (tb, te) = if cfg.t > 0 {
+        let tm = caps.get(cfg.t)?;
+        (tm.start(), tm.end())
+    } else {
+        (0, 0)
+    };
+    Some((tb, te, x, y))
+}
+
+fn barcode_bytes(r: &RecordBuf, bc: &BcMode) -> Vec<u8> {
+    match bc {
+        BcMode::None => Vec::new(),
+        BcMode::Tag(t) => barcode_value(r, Some(*t)).unwrap_or_default(),
+        BcMode::Rgx(rx) => {
+            let n = rec_name(r);
+            if let Ok(s) = std::str::from_utf8(&n)
+                && let Some(c) = rx.captures(s)
+                && let Some(m) = c.get(1)
+            {
+                return n[m.start()..m.end()].to_vec();
+            }
+            Vec::new()
+        }
+    }
 }
 
 fn mc_string(r: &RecordBuf) -> Option<String> {
@@ -646,7 +787,7 @@ fn has_mate(r: &RecordBuf) -> bool {
 }
 
 #[allow(clippy::collapsible_else_if)]
-fn make_pair_key(r: &RecordBuf, mode: DupMode, barcode_tag: Option<Tag>, rg: i32) -> KeyData {
+fn make_pair_key(r: &RecordBuf, mode: DupMode, bc: &BcMode, rg: i32) -> KeyData {
     let this_ref = rec_tid(r) + 1;
     let other_ref = rec_mtid(r) + 1;
     let mut this_coord = unclipped_start(r);
@@ -772,12 +913,12 @@ fn make_pair_key(r: &RecordBuf, mode: DupMode, barcode_tag: Option<Tag>, rg: i32
         other_coord,
         leftmost: left_read,
         orientation,
-        barcode: barcode_bytes(r, barcode_tag),
+        barcode: barcode_bytes(r, bc),
         read_group: rg,
     }
 }
 
-fn make_single_key(r: &RecordBuf, barcode_tag: Option<Tag>, rg: i32) -> KeyData {
+fn make_single_key(r: &RecordBuf, bc: &BcMode, rg: i32) -> KeyData {
     let this_ref = rec_tid(r) + 1;
     let (this_coord, orientation) = if is_rev(r) {
         (unclipped_end(r), O_RR)
@@ -792,7 +933,7 @@ fn make_single_key(r: &RecordBuf, barcode_tag: Option<Tag>, rg: i32) -> KeyData 
         other_coord: 0,
         leftmost: 0,
         orientation,
-        barcode: barcode_bytes(r, barcode_tag),
+        barcode: barcode_bytes(r, bc),
         read_group: rg,
     }
 }
@@ -826,6 +967,7 @@ fn mark_duplicates(
     records: &mut [RecordBuf],
     options: MarkdupOptions,
     rg_of: &[i32],
+    cfg: &Cfg,
 ) -> MarkdupStats {
     let mut single_hash: HashMap<KeyData, usize> = HashMap::new();
     let mut pair_hash: HashMap<KeyData, usize> = HashMap::new();
@@ -870,7 +1012,7 @@ fn mark_duplicates(
                 orig_idx: usize|
      -> Option<DuplicateType> {
         let origin = rec_name(&records[orig_idx]);
-        let dtype = duplicate_type(&records[dup_idx], &records[orig_idx], opt);
+        let dtype = duplicate_type(&records[dup_idx], &records[orig_idx], opt, &cfg.coord);
         mark_duplicate(&mut records[dup_idx], Some(&origin), do_tag, dtype);
         remember_duplicate_metadata(
             duplicate_primary_metadata,
@@ -905,8 +1047,8 @@ fn mark_duplicates(
         stats.examined += 1;
 
         if has_mate(&records[i]) {
-            let pair_key = make_pair_key(&records[i], options.mode, options.barcode_tag, rg_of[i]);
-            let single_key = make_single_key(&records[i], options.barcode_tag, rg_of[i]);
+            let pair_key = make_pair_key(&records[i], options.mode, &cfg.bc, rg_of[i]);
+            let single_key = make_single_key(&records[i], &cfg.bc, rg_of[i]);
             stats.paired += 1;
 
             // Single hash: a true singleton already stored loses to this pair.
@@ -985,7 +1127,7 @@ fn mark_duplicates(
             }
         } else {
             // Single (or effectively single) reads.
-            let single_key = make_single_key(&records[i], options.barcode_tag, rg_of[i]);
+            let single_key = make_single_key(&records[i], &cfg.bc, rg_of[i]);
             stats.single += 1;
             match single_hash.get(&single_key).copied() {
                 None => {
@@ -1070,7 +1212,7 @@ fn mark_duplicates(
                 continue;
             }
             let ori_name = rec_name(&records[root]);
-            let root_coord = get_coordinates_colons(&ori_name);
+            let root_coord = get_coords(&ori_name, &cfg.coord);
             let mut list: Vec<Chk> = Vec::new();
             let mut cur = dup_next[root];
             while let Some(c) = cur {
@@ -1105,7 +1247,7 @@ fn mark_duplicates(
                     );
                     chk.opt = already_sq;
                     let cn = rec_name(&records[c]);
-                    if let Some((db, de, dx, dy)) = get_coordinates_colons(&cn) {
+                    if let Some((db, de, dx, dy)) = get_coords(&cn, &cfg.coord) {
                         chk.x = dx;
                         chk.y = dy;
                         chk.len = de - db;
@@ -1421,25 +1563,33 @@ fn duplicate_type(
     duplicate: &RecordBuf,
     original: &RecordBuf,
     optical_distance: Option<u32>,
+    coord: &CoordCfg,
 ) -> Option<DuplicateType> {
     let distance = optical_distance?;
-    Some(if is_optical_duplicate(duplicate, original, distance) {
-        DuplicateType::Optical
-    } else {
-        DuplicateType::Library
-    })
+    Some(
+        if is_optical_duplicate(duplicate, original, distance, coord) {
+            DuplicateType::Optical
+        } else {
+            DuplicateType::Library
+        },
+    )
 }
 
-fn is_optical_duplicate(duplicate: &RecordBuf, original: &RecordBuf, distance: u32) -> bool {
+fn is_optical_duplicate(
+    duplicate: &RecordBuf,
+    original: &RecordBuf,
+    distance: u32,
+    coord: &CoordCfg,
+) -> bool {
     let (Some(dn), Some(on)) = (duplicate.name(), original.name()) else {
         return false;
     };
     let dn = dn.as_ref();
     let on = on.as_ref();
-    let Some((d_beg, d_end, dx, dy)) = get_coordinates_colons(dn) else {
+    let Some((d_beg, d_end, dx, dy)) = get_coords(dn, coord) else {
         return false;
     };
-    let Some((o_beg, o_end, ox, oy)) = get_coordinates_colons(on) else {
+    let Some((o_beg, o_end, ox, oy)) = get_coords(on, coord) else {
         return false;
     };
     let o_len = o_end - o_beg;

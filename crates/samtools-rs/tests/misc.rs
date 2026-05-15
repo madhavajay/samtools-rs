@@ -6410,6 +6410,45 @@ fn markdup_matches_upstream_test_markdup_fixtures() {
             "17_read_group",
             "17_read_group.expected.sam",
         ),
+        (
+            &[
+                "-S",
+                "-d",
+                "2500",
+                "--mode",
+                "s",
+                "-t",
+                "--read-coords",
+                "([[:digit:]]+):([[:digit:]]+)$",
+                "--coords-order",
+                "xy",
+            ],
+            "12_optical_chain_regex",
+            "12_optical_chain_regex.expected.sam",
+        ),
+        (
+            &["-S", "-d", "100", "--mode", "s", "-t", "--barcode-name"],
+            "14_optical_barcode_name",
+            "14_optical_barcode_name.expected.sam",
+        ),
+        (
+            &[
+                "-S",
+                "-d",
+                "100",
+                "--mode",
+                "s",
+                "-t",
+                "--barcode-rgx",
+                "^([!-9;-?A-~]+):[0-9]+:",
+                "--read-coords",
+                "^[!-9;-?A-~]+:([0-9]+):([0-9]+)",
+                "--coords-order",
+                "xy",
+            ],
+            "15_optical_barcode_rgx_name",
+            "15_optical_barcode_rgx_name.expected.sam",
+        ),
     ];
     for (flags, stem, expected) in cases {
         let inp = d.join("markdup").join(format!("{stem}.sam"));
