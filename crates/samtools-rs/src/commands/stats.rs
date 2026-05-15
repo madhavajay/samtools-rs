@@ -1009,6 +1009,7 @@ impl StatsCounts {
         self.accumulate_checksum(flag, config, &chk_name, &chk_seq, &chk_qual);
 
         let pre_total = self.total;
+        let pre_supp = self.supplementary;
         self.update(
             StatsRecordFields {
                 flag,
@@ -1227,6 +1228,29 @@ impl StatsCounts {
                 }
                 self.update_coverage_depths(header, rec, targets);
             }
+        }
+
+        // Supplementary alignments do not return early in upstream
+        // `collect_stats`: they are excluded from the IS_ORIGINAL
+        // sequence/quality/read-length stats but still contribute to
+        // the indel distribution, bases-mapped-(cigar), NM mismatches
+        // and the coverage histogram. They were counted (and skipped)
+        // by `update`, so replay just those accumulations here.
+        if self.supplementary > pre_supp && flag & BAM_FUNMAP == 0 {
+            use sam::alignment::record::cigar::op::Kind;
+            for op in rec.cigar().iter().flatten() {
+                if matches!(
+                    op.kind(),
+                    Kind::Match | Kind::Insertion | Kind::SequenceMatch | Kind::SequenceMismatch
+                ) {
+                    self.bases_mapped_cigar += op.len() as u64;
+                }
+            }
+            self.count_indels(rec, flag, seq_len);
+            if let Some(nm) = read_nm_aux(rec) {
+                self.nmismatches += nm;
+            }
+            self.update_coverage_depths(header, rec, targets);
         }
     }
 
