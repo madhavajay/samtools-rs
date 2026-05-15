@@ -375,7 +375,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         let split = if stdin_input {
             let stdin = io::stdin().lock();
             let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(stdin));
-            if fasta_mode && (flag_filters.include_any != 0 || umi_tags.is_some() || casava) {
+            if fasta_mode {
                 view_sam_reader_as_fasta_split(
                     &mut reader,
                     flag_filters,
@@ -385,15 +385,6 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     barcode_tag,
                     singleton_set,
                 )
-            } else if fasta_mode {
-                htslib_rs::alignment_compat::view_sam_as_fasta_split_text_from_reader_with_flag_filter_and_suffix(
-                    &mut reader,
-                    require_flags,
-                    exclude_flags,
-                    exclude_all_flags,
-                    append_read_number,
-                )
-                .map(FastqSplitBuffers::from_fast_path)
             } else {
                 view_sam_reader_as_fastq_split_with_aux(
                     &mut reader,
@@ -413,28 +404,15 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     &tag_filters,
                     singleton_set,
                 ),
-                (Exact::Sam, true) => {
-                    if flag_filters.include_any != 0 || umi_tags.is_some() || casava {
-                        view_sam_path_as_fasta_split(
-                            input,
-                            flag_filters,
-                            append_read_number,
-                            umi_tags.as_deref(),
-                            casava,
-                            barcode_tag,
-                            singleton_set,
-                        )
-                    } else {
-                        htslib_rs::alignment_compat::view_sam_as_fasta_split_text_from_path_with_flag_filter_and_suffix(
-                            input,
-                            require_flags,
-                            exclude_flags,
-                            exclude_all_flags,
-                            append_read_number,
-                        )
-                        .map(FastqSplitBuffers::from_fast_path)
-                    }
-                }
+                (Exact::Sam, true) => view_sam_path_as_fasta_split(
+                    input,
+                    flag_filters,
+                    append_read_number,
+                    umi_tags.as_deref(),
+                    casava,
+                    barcode_tag,
+                    singleton_set,
+                ),
                 (Exact::Bam, false) => view_bam_path_as_fastq_split_with_aux(
                     input,
                     flag_filters,
@@ -442,28 +420,15 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     &tag_filters,
                     singleton_set,
                 ),
-                (Exact::Bam, true) => {
-                    if flag_filters.include_any != 0 || umi_tags.is_some() || casava {
-                        view_bam_path_as_fasta_split(
-                            input,
-                            flag_filters,
-                            append_read_number,
-                            umi_tags.as_deref(),
-                            casava,
-                            barcode_tag,
-                            singleton_set,
-                        )
-                    } else {
-                        htslib_rs::alignment_compat::view_bam_as_fasta_split_text_from_path_with_flag_filter_and_suffix(
-                            input,
-                            require_flags,
-                            exclude_flags,
-                            exclude_all_flags,
-                            append_read_number,
-                        )
-                        .map(FastqSplitBuffers::from_fast_path)
-                    }
-                }
+                (Exact::Bam, true) => view_bam_path_as_fasta_split(
+                    input,
+                    flag_filters,
+                    append_read_number,
+                    umi_tags.as_deref(),
+                    casava,
+                    barcode_tag,
+                    singleton_set,
+                ),
                 _ => {
                     print_error(
                         sub_name,
@@ -579,7 +544,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 render_options,
                 &tag_filters,
             )
-        } else if fasta_mode && (flag_filters.include_any != 0 || umi_tags.is_some() || casava) {
+        } else if fasta_mode {
             view_sam_reader_as_fasta_text(
                 &mut reader,
                 flag_filters,
@@ -587,14 +552,6 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 umi_tags.as_deref(),
                 casava,
                 barcode_tag,
-            )
-        } else if fasta_mode {
-            htslib_rs::alignment_compat::view_sam_as_fasta_text_from_reader_with_flag_filter_and_suffix(
-                &mut reader,
-                require_flags,
-                exclude_flags,
-                exclude_all_flags,
-                append_read_number,
             )
         } else {
             htslib_rs::alignment_compat::view_sam_as_fastq_text_from_reader_with_flag_filter_and_suffix(
@@ -680,33 +637,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 append_read_number,
             )
         }
-        (Exact::Sam, true, false, _) => {
-            htslib_rs::alignment_compat::view_sam_as_fasta_text_from_path_with_limit_and_suffix(
-                input,
-                None,
-                append_read_number,
-            )
-        }
-        (Exact::Sam, true, true, _) => {
-            if flag_filters.include_any != 0 {
-                view_sam_path_as_fasta_text(
-                    input,
-                    flag_filters,
-                    append_read_number,
-                    None,
-                    false,
-                    *b"BC",
-                )
-            } else {
-                htslib_rs::alignment_compat::view_sam_as_fasta_text_from_path_with_flag_filter_and_suffix(
-                input,
-                require_flags,
-                exclude_flags,
-                exclude_all_flags,
-                append_read_number,
-            )
-            }
-        }
+        (Exact::Sam, true, _, _) => view_sam_path_as_fasta_text(
+            input,
+            flag_filters,
+            append_read_number,
+            umi_tags.as_deref(),
+            casava,
+            barcode_tag,
+        ),
         (Exact::Bam, false, false, false) => {
             htslib_rs::alignment_compat::view_bam_as_fastq_text_from_path_with_limit_and_suffix(
                 input,
@@ -729,33 +667,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
             render_options,
             &tag_filters,
         ),
-        (Exact::Bam, true, false, _) => {
-            htslib_rs::alignment_compat::view_bam_as_fasta_text_from_path_with_limit_and_suffix(
-                input,
-                None,
-                append_read_number,
-            )
-        }
-        (Exact::Bam, true, true, _) => {
-            if flag_filters.include_any != 0 {
-                view_bam_path_as_fasta_text(
-                    input,
-                    flag_filters,
-                    append_read_number,
-                    None,
-                    false,
-                    *b"BC",
-                )
-            } else {
-                htslib_rs::alignment_compat::view_bam_as_fasta_text_from_path_with_flag_filter_and_suffix(
-                input,
-                require_flags,
-                exclude_flags,
-                exclude_all_flags,
-                append_read_number,
-            )
-            }
-        }
+        (Exact::Bam, true, _, _) => view_bam_path_as_fasta_text(
+            input,
+            flag_filters,
+            append_read_number,
+            umi_tags.as_deref(),
+            casava,
+            barcode_tag,
+        ),
         _ => {
             print_error(
                 sub_name,
@@ -1136,17 +1055,6 @@ struct FastqSplitBuffers {
     read2: Vec<u8>,
     singleton: Vec<u8>,
     other: Vec<u8>,
-}
-
-impl FastqSplitBuffers {
-    fn from_fast_path(text: htslib_rs::alignment_compat::FastxSplitText) -> Self {
-        Self {
-            read1: text.read1.into_bytes(),
-            read2: text.read2.into_bytes(),
-            singleton: text.singleton.into_bytes(),
-            other: Vec::new(),
-        }
-    }
 }
 
 #[derive(Clone, Copy)]

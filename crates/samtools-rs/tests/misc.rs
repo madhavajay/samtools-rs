@@ -2101,6 +2101,37 @@ fn fastq_interleaves_read1_read2_when_paths_alias() {
 }
 
 #[test]
+fn fasta_reverse_strand_record_reverse_complemented_in_output() {
+    let tmp = tmp_dir("fasta-revcomp");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.fa");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "fwd\t0\tchr1\t1\t60\t8M\t*\t0\t0\tACGTAATT\t!!!!!!!!\n",
+            "rev\t16\tchr1\t1\t60\t8M\t*\t0\t0\tACGTAATT\t!!!!!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fasta",
+            &["-n", "-o", out.to_str().unwrap(), sam.to_str().unwrap(),]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    // Forward strand: as-stored.
+    assert!(text.contains(">fwd\nACGTAATT\n"));
+    // Reverse strand: reverse-complemented to AATTACGT.
+    assert!(text.contains(">rev\nAATTACGT\n"));
+}
+
+#[test]
 fn fastq_repeated_dash_d_unions_same_tag_values() {
     let tmp = tmp_dir("fastq-d-union");
     let sam = tmp.join("in.sam");
