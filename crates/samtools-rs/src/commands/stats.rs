@@ -919,6 +919,15 @@ struct StatsCounts {
     bases_mapped: u64,
     bases_mapped_cigar: u64,
     nmismatches: u64,
+    // Indel distribution (ID) and indels-per-cycle (IC), faithful to
+    // upstream `count_indels`. `*_len[k]` counts indels of length k+1;
+    // `*_cycles_{1st,2nd}[c]` counts read1/read2 indels at cycle c.
+    insertions_len: Vec<u64>,
+    deletions_len: Vec<u64>,
+    ins_cycles_1st: Vec<u64>,
+    ins_cycles_2nd: Vec<u64>,
+    del_cycles_1st: Vec<u64>,
+    del_cycles_2nd: Vec<u64>,
     // Sum of sequence lengths for records carrying the duplicate flag.
     bases_dup: u64,
     bases_trimmed: u64,
@@ -1201,17 +1210,92 @@ impl StatsCounts {
                 self.bases_mapped += u64::from(seq_len_u32);
                 use sam::alignment::record::cigar::op::Kind;
                 for op in rec.cigar().iter().flatten() {
+                    // Upstream (non-region path) counts M, I, =, X bases.
                     if matches!(
                         op.kind(),
-                        Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch
+                        Kind::Match
+                            | Kind::Insertion
+                            | Kind::SequenceMatch
+                            | Kind::SequenceMismatch
                     ) {
                         self.bases_mapped_cigar += op.len() as u64;
                     }
                 }
+                self.count_indels(rec, flag, seq_len_u32 as usize);
                 if let Some(nm) = read_nm_aux(rec) {
                     self.nmismatches += nm;
                 }
                 self.update_coverage_depths(header, rec, targets);
+            }
+        }
+    }
+
+    /// Faithful port of upstream `count_indels`: per-CIGAR insertion /
+    /// deletion length distribution (ID) and per-cycle indel counts
+    /// split by read1/read2 (IC). `read_len` is `l_qseq`.
+    fn count_indels(
+        &mut self,
+        rec: &(impl sam::alignment::Record + ?Sized),
+        flag: u32,
+        read_len: usize,
+    ) {
+        use sam::alignment::record::cigar::op::Kind;
+        let is_fwd = flag & BAM_FREVERSE == 0;
+        // order: 1 = read1 only, 2 = read2 only (per READ_ORDER_*).
+        let order: u32 = if flag & BAM_FPAIRED != 0 {
+            (if flag & BAM_FREAD1 != 0 { 1 } else { 0 })
+                + (if flag & BAM_FREAD2 != 0 { 2 } else { 0 })
+        } else {
+            1
+        };
+        fn bump(v: &mut Vec<u64>, idx: usize) {
+            if v.len() <= idx {
+                v.resize(idx + 1, 0);
+            }
+            v[idx] += 1;
+        }
+        let mut icycle: isize = 0;
+        for op in rec.cigar().iter().flatten() {
+            let ncig = op.len();
+            if ncig == 0 {
+                continue;
+            }
+            let ncig_i = ncig as isize;
+            match op.kind() {
+                Kind::Insertion => {
+                    let idx = if is_fwd {
+                        icycle
+                    } else {
+                        read_len as isize - icycle - ncig_i
+                    };
+                    if idx >= 0 {
+                        if order == 1 {
+                            bump(&mut self.ins_cycles_1st, idx as usize);
+                        } else if order == 2 {
+                            bump(&mut self.ins_cycles_2nd, idx as usize);
+                        }
+                    }
+                    icycle += ncig_i;
+                    bump(&mut self.insertions_len, ncig - 1);
+                }
+                Kind::Deletion => {
+                    let idx = if is_fwd {
+                        icycle - 1
+                    } else {
+                        read_len as isize - icycle - 1
+                    };
+                    if idx < 0 {
+                        continue;
+                    }
+                    if order == 1 {
+                        bump(&mut self.del_cycles_1st, idx as usize);
+                    } else if order == 2 {
+                        bump(&mut self.del_cycles_2nd, idx as usize);
+                    }
+                    bump(&mut self.deletions_len, ncig - 1);
+                }
+                Kind::Skip | Kind::HardClip | Kind::Pad => {}
+                _ => icycle += ncig_i,
             }
         }
     }
@@ -1884,10 +1968,36 @@ fn write_indel_cov_gcd(
         out,
         "# Indel distribution. Use `grep ^ID | cut -f 2-` to extract this part. The columns are: length, number of insertions, number of deletions"
     )?;
+    let id_len = counts.insertions_len.len().max(counts.deletions_len.len());
+    for ilen in 0..id_len {
+        let ins = counts.insertions_len.get(ilen).copied().unwrap_or(0);
+        let del = counts.deletions_len.get(ilen).copied().unwrap_or(0);
+        if ins > 0 || del > 0 {
+            writeln!(out, "ID\t{}\t{}\t{}", ilen + 1, ins, del)?;
+        }
+    }
     writeln!(
         out,
         "# Indels per cycle. Use `grep ^IC | cut -f 2-` to extract this part. The columns are: cycle, number of insertions (fwd), .. (rev) , number of deletions (fwd), .. (rev)"
     )?;
+    let ic_len = counts
+        .ins_cycles_1st
+        .len()
+        .max(counts.ins_cycles_2nd.len())
+        .max(counts.del_cycles_1st.len())
+        .max(counts.del_cycles_2nd.len());
+    for ilen in 0..ic_len {
+        let g = |v: &[u64]| v.get(ilen).copied().unwrap_or(0);
+        let (i1, i2, d1, d2) = (
+            g(&counts.ins_cycles_1st),
+            g(&counts.ins_cycles_2nd),
+            g(&counts.del_cycles_1st),
+            g(&counts.del_cycles_2nd),
+        );
+        if i1 > 0 || i2 > 0 || d1 > 0 || d2 > 0 {
+            writeln!(out, "IC\t{}\t{}\t{}\t{}\t{}", ilen + 1, i1, i2, d1, d2)?;
+        }
+    }
     if !is_sorted {
         return Ok(());
     }

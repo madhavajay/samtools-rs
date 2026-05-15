@@ -6329,30 +6329,39 @@ fn ampliconstats_matches_upstream_test_ampliconstats_fixtures() {
 }
 
 #[test]
-fn stats_matches_upstream_stat_1_2_3_fixtures() {
+fn stats_matches_upstream_stat_fixtures() {
     use samtools_rs::commands::stats;
-    // Byte-exact end to end vs samtools' own `test/stat/{1,2,3}`
-    // expected output (modulo the three harness-stripped header lines,
-    // i.e. `| tail -n+4`): CHK, all SN lines, FFQ/LFQ, MPC, GCF/GCL,
-    // GCC/GCT/FBC/FTC/LBC/LTC, IS, RL/FRL/LRL, MAPQ, the
-    // Indel/Indels-per-cycle comment headers, COV, and the GC-depth row.
+    // Byte-exact end to end vs samtools' own `test/stat/*` expected
+    // output (modulo the three harness-stripped header lines, i.e.
+    // `| tail -n+4`): CHK, all SN lines, FFQ/LFQ, MPC, GCF/GCL,
+    // GCC/GCT/FBC/FTC/LBC/LTC, IS, RL/FRL/LRL, MAPQ, the ID/IC indel
+    // distribution + per-cycle rows, COV, and the GC-depth row. Covers
+    // the plain map, equal/full-seq, insertion (ID/IC + bases-cigar),
+    // `-i 0`, and secondary-read fixtures.
     let stat = fixtures_dir().join("stat");
     let tmp = tmp_dir("stats-fixtures");
     let reference = stat.join("test.fa");
     let p = |b: &std::path::Path| b.to_str().unwrap().to_string();
     // `tail -n+4`: drop the produced-by / contains / command-line lines.
     let strip = |s: &str| -> String { s.lines().skip(3).map(|l| format!("{l}\n")).collect() };
-    let cases = [
-        ("1_map_cigar.sam", "1.stats.expected"),
-        ("2_equal_cigar_full_seq.sam", "2.stats.expected"),
-        ("3_map_cigar_equal_seq.sam", "3.stats.expected"),
+    // (sam, extra args, expected)
+    let cases: [(&str, &[&str], &str); 6] = [
+        ("1_map_cigar.sam", &[], "1.stats.expected"),
+        ("2_equal_cigar_full_seq.sam", &[], "2.stats.expected"),
+        ("3_map_cigar_equal_seq.sam", &[], "3.stats.expected"),
+        ("5_insert_cigar.sam", &[], "5.stats.expected"),
+        ("5_insert_cigar.sam", &["-i", "0"], "6.stats.expected"),
+        ("8_secondary.sam", &[], "8.stats.expected"),
     ];
-    for (sam, expected) in cases {
+    for (sam, extra, expected) in cases {
         let out = tmp.join(expected);
+        let mut v: Vec<String> = vec!["-r".into(), p(&reference), "-o".into(), p(&out)];
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v.push(p(&stat.join(sam)));
         assert_eq!(
             exit_to_u8(stats::main(&argv(
                 "stats",
-                &["-r", &p(&reference), "-o", &p(&out), &p(&stat.join(sam)),]
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
             ))),
             0,
             "stats {expected}"
