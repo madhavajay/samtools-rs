@@ -867,6 +867,13 @@ struct StatsCounts {
     isize_inward: u64,
     isize_outward: u64,
     isize_other: u64,
+    // Per-size orientation arrays (still double-counted, halved on
+    // output) indexed by abs(template_length) capped at `-i`. These
+    // drive the `IS` section's `ibulk`/sparse logic exactly as
+    // upstream `output_stats` does.
+    isize_in: Vec<u64>,
+    isize_out: Vec<u64>,
+    isize_oth: Vec<u64>,
     // Per-record abs(template_length) histogram across the same population
     // that feeds the orientation bins. Used to apply `-m/--most-inserts`
     // before computing the reported mean / standard deviation.
@@ -920,6 +927,8 @@ struct StatsRecordFields {
     mate_reference_sequence_id: Option<usize>,
     template_length: i32,
     read_len: Option<usize>,
+    pos: Option<usize>,
+    mpos: Option<usize>,
 }
 
 impl StatsCounts {
@@ -964,6 +973,11 @@ impl StatsCounts {
             .transpose()
             .unwrap_or_default();
         let template_length = rec.template_length().ok().unwrap_or(0);
+        let pos = rec.alignment_start().and_then(Result::ok).map(usize::from);
+        let mpos = rec
+            .mate_alignment_start()
+            .and_then(Result::ok)
+            .map(usize::from);
         let seq_len = rec.sequence().len();
 
         let pre_total = self.total;
@@ -975,6 +989,8 @@ impl StatsCounts {
                 mate_reference_sequence_id,
                 template_length,
                 read_len: Some(seq_len),
+                pos,
+                mpos,
             },
             config,
         );
@@ -1248,6 +1264,8 @@ impl StatsCounts {
                 mate_reference_sequence_id: rec.mate_reference_sequence_id(),
                 template_length: rec.template_length(),
                 read_len: None,
+                pos: rec.alignment_start(),
+                mpos: rec.mate_alignment_start(),
             },
             config,
         );
@@ -1314,11 +1332,15 @@ impl StatsCounts {
                 {
                     self.diffchr += 1;
                 }
-                if rec.reference_sequence_id == rec.mate_reference_sequence_id
-                    && rec.reference_sequence_id.is_some()
-                {
-                    self.update_isize_bin(flag, rec.template_length, config.insert_size_max);
-                }
+                self.update_isize_bin(
+                    flag,
+                    rec.template_length,
+                    rec.pos,
+                    rec.mpos,
+                    rec.reference_sequence_id,
+                    rec.mate_reference_sequence_id,
+                    config.insert_size_max,
+                );
             }
             if flag & BAM_FMUNMAP != 0 && flag & BAM_FUNMAP == 0 {
                 self.singletons += 1;
@@ -1333,39 +1355,84 @@ impl StatsCounts {
     }
 
     /// Classify an insert-size observation into inward/outward/other,
-    /// mirroring `stats.c`'s orientation logic. Each record contributes
-    /// once; the output divides by two to obtain per-pair counts.
-    ///
-    /// Without alignment positions we infer "5' end" from the sign of
-    /// `template_length`: the leftmost read has positive TLEN. A pair
-    /// with opposite strands is FR (inward) when the leftmost read is
-    /// forward, and RF (outward) otherwise. Same-direction pairs are
-    /// classified as "other".
-    fn update_isize_bin(&mut self, flag: u32, template_length: i32, insert_size_max: u32) {
-        let read_reverse = flag & BAM_FREVERSE != 0;
-        let mate_reverse = flag & 0x20 /* BAM_FMREVERSE */ != 0;
+    /// faithfully mirroring the orientation logic in `stats.c`'s
+    /// `collect_stats` (the `IS_PAIRED_AND_MAPPED && IS_ORIGINAL` block).
+    /// Each record contributes once; the output halves to obtain
+    /// per-pair counts. The accumulation gate is upstream's
+    /// `isize > 0 || tid == mtid`.
+    #[allow(clippy::too_many_arguments)]
+    fn update_isize_bin(
+        &mut self,
+        flag: u32,
+        template_length: i32,
+        pos: Option<usize>,
+        mpos: Option<usize>,
+        rsid: Option<usize>,
+        mrsid: Option<usize>,
+        insert_size_max: u32,
+    ) {
         let mut isize = template_length.unsigned_abs() as u64;
         if insert_size_max > 0 {
             isize = isize.min(u64::from(insert_size_max));
         }
+        let same_ref = rsid.is_some() && rsid == mrsid;
+        if !(isize > 0 || same_ref) {
+            return;
+        }
         *self.isize_hist.entry(isize).or_default() += 1;
+        let i = isize as usize;
+        if self.isize_in.len() <= i {
+            self.isize_in.resize(i + 1, 0);
+            self.isize_out.resize(i + 1, 0);
+            self.isize_oth.resize(i + 1, 0);
+        }
 
-        if read_reverse == mate_reverse {
-            self.isize_other += 1;
-        } else if template_length == 0 {
-            // Upstream stats.c treats exactly overlapping mates as inward.
-            self.isize_inward += 1;
+        // pos_fst = mpos - pos (cancels the 0-/1-based offset since both
+        // ends share it). is_fst is the read1/read2 discriminator.
+        let pos_fst: i64 = mpos.unwrap_or(0) as i64 - pos.unwrap_or(0) as i64;
+        let is_fst: i64 = if flag & BAM_FREAD1 != 0 { 1 } else { -1 };
+        let is_fwd: i64 = if flag & BAM_FREVERSE != 0 { -1 } else { 1 };
+        let is_mfwd: i64 = if flag & 0x20 /* BAM_FMREVERSE */ != 0 {
+            -1
         } else {
-            let leftmost = template_length > 0;
-            let inward = if leftmost {
-                !read_reverse
+            1
+        };
+
+        enum Ori {
+            In,
+            Out,
+            Oth,
+        }
+        let ori = if is_fwd * is_mfwd > 0 {
+            Ori::Oth
+        } else if is_fst * pos_fst > 0 {
+            if is_fst * is_fwd > 0 {
+                Ori::In
             } else {
-                read_reverse
-            };
-            if inward {
+                Ori::Out
+            }
+        } else if is_fst * pos_fst < 0 {
+            if is_fst * is_fwd > 0 {
+                Ori::Out
+            } else {
+                Ori::In
+            }
+        } else {
+            // Exactly overlapping reads are assumed inward.
+            Ori::In
+        };
+        match ori {
+            Ori::In => {
                 self.isize_inward += 1;
-            } else {
+                self.isize_in[i] += 1;
+            }
+            Ori::Out => {
                 self.isize_outward += 1;
+                self.isize_out[i] += 1;
+            }
+            Ori::Oth => {
+                self.isize_other += 1;
+                self.isize_oth[i] += 1;
             }
         }
     }
@@ -1635,7 +1702,7 @@ fn write_stats_counts(
     }
     write_quality_histograms(out, counts)?;
     write_gc_histograms(out, counts)?;
-    write_acgt_rl_mapq_sections(out, counts)?;
+    write_acgt_rl_mapq_sections(out, counts, &config)?;
     write_coverage_histogram(out, counts, config)?;
     Ok(())
 }
@@ -1765,7 +1832,11 @@ fn write_gc_histogram(out: &mut dyn Write, label: &str, hist: &[u64]) -> io::Res
 /// sections (reference-independent). `MPC`, `IS`, and `GCD` need the
 /// reference-mismatch / per-size / GC-depth engines and are not yet
 /// emitted.
-fn write_acgt_rl_mapq_sections(out: &mut dyn Write, c: &StatsCounts) -> io::Result<()> {
+fn write_acgt_rl_mapq_sections(
+    out: &mut dyn Write,
+    c: &StatsCounts,
+    config: &StatsConfig,
+) -> io::Result<()> {
     let max_len = c.acgt_1st.len().max(c.acgt_2nd.len()).max(c.acgt_rc.len());
     let g1 = |a: &[[u64; 6]], i: usize| -> [u64; 6] { a.get(i).copied().unwrap_or([0; 6]) };
     let pct = |x: u64, s: u64| -> f64 {
@@ -1886,6 +1957,36 @@ fn write_acgt_rl_mapq_sections(out: &mut dyn Write, c: &StatsCounts) -> io::Resu
         "# ACGT raw counters for last fragments. Use `grep ^LTC | cut -f 2-` to extract this part. The columns are: A,C,G,T,N base counters"
     )?;
     writeln!(out, "LTC\t{}\t{}\t{}\t{}\t{}", ta, tc, tg, tt, tn)?;
+
+    // Insert sizes. Mirrors `output_stats`: halve the double-counted
+    // per-size bins, derive `ibulk` from the cumulative `-m` cutoff,
+    // then print `0..ibulk`.
+    writeln!(
+        out,
+        "# Insert sizes. Use `grep ^IS | cut -f 2-` to extract this part. The columns are: insert size, pairs total, inward oriented pairs, outward oriented pairs, other pairs"
+    )?;
+    let n = c.isize_in.len();
+    let hin: Vec<u64> = c.isize_in.iter().map(|&v| v / 2).collect();
+    let hout: Vec<u64> = c.isize_out.iter().map(|&v| v / 2).collect();
+    let hoth: Vec<u64> = c.isize_oth.iter().map(|&v| v / 2).collect();
+    let nisize: u64 = (0..n).map(|i| hin[i] + hout[i] + hoth[i]).sum();
+    let mut ibulk: usize = 0;
+    let mut bulk: u64 = 0;
+    for i in 0..n {
+        let num = hin[i] + hout[i] + hoth[i];
+        if num > 0 {
+            ibulk = i + 1;
+        }
+        bulk += num;
+        if nisize > 0 && bulk as f64 / nisize as f64 > config.insert_size_main_bulk {
+            ibulk = i + 1;
+            break;
+        }
+    }
+    for i in 0..ibulk {
+        let (a, b, d) = (hin[i], hout[i], hoth[i]);
+        writeln!(out, "IS\t{}\t{}\t{}\t{}\t{}", i, a + b + d, a, b, d)?;
+    }
 
     let rl = |label: &str, h: &[u64], out: &mut dyn Write| -> io::Result<()> {
         for (len, &cnt) in h.iter().enumerate() {
