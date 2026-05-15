@@ -39,6 +39,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
     // `-s SEED` seeds the @RG/@PG ID-collision PRNG (default: HTSlib uses
     // time(); 0 keeps merges deterministic when unspecified).
     let mut seed: i64 = 0;
+    // `-c` combine identical @RG IDs (don't suffix); `-p` same for @PG;
+    // `-r` attach a filename-derived @RG to every record.
+    let mut combine_rg = false;
+    let mut combine_pg = false;
+    let mut attach_rg = false;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -112,7 +117,24 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     seed = n;
                 }
             }
-            "-c" | "-p" | "-u" => {}
+            "-u" => {}
+            // `-c`/`-p`/`-r` (also grouped, e.g. `-cp`, `-rp`).
+            _ if s.len() >= 2
+                && s.starts_with('-')
+                && !s.starts_with("--")
+                && s[1..]
+                    .bytes()
+                    .all(|b| matches!(b, b'c' | b'p' | b'r' | b'u')) =>
+            {
+                for b in s[1..].bytes() {
+                    match b {
+                        b'c' => combine_rg = true,
+                        b'p' => combine_pg = true,
+                        b'r' => attach_rg = true,
+                        _ => {}
+                    }
+                }
+            }
             "--help" => {
                 let _ = print_usage();
                 return ExitCode::SUCCESS;
@@ -233,6 +255,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
         out_path.as_deref(),
         order,
         output_fmt,
+        MergeIdMode {
+            combine_rg,
+            combine_pg,
+            attach_rg,
+        },
         write_index,
         if no_pg { None } else { Some(args) },
         seed,
@@ -304,12 +331,22 @@ pub(crate) enum MergeOrder {
     Tag { tag: [u8; 2], name_secondary: bool },
 }
 
+/// `-c` (combine identical @RG IDs), `-p` (same for @PG), `-r` (attach a
+/// filename-derived @RG to every record / one @RG per input).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MergeIdMode {
+    pub combine_rg: bool,
+    pub combine_pg: bool,
+    pub attach_rg: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_merge(
     inputs: &[PathBuf],
     output: Option<&Path>,
     order: MergeOrder,
     fmt: OutFmt,
+    id_mode: MergeIdMode,
     write_index: bool,
     pg_argv: Option<&[OsString]>,
     seed: i64,
@@ -333,13 +370,13 @@ pub(crate) fn run_merge(
 
     // Byte-faithful merged header text + per-file @RG/@PG ID translation
     // (upstream `samtools merge` PRNG-suffixes colliding IDs).
-    let (merged_header_text, trans) = reconcile_merge_headers(inputs, seed)?;
+    let (merged_header_text, trans, force_rg) = reconcile_merge_headers(inputs, seed, id_mode)?;
 
     let (mut header, mut records) = read_records(&inputs[0], filter.as_ref())?;
     let first_reference_id_map: Vec<_> = (0..header.reference_sequences().len()).collect();
     remap_records(&mut records, &first_reference_id_map)?;
     for rec in &mut records {
-        remap_record_rg_pg(rec, &trans.rg[0], &trans.pg[0]);
+        remap_record_rg_pg(rec, &trans.rg[0], &trans.pg[0], force_rg[0].as_deref());
     }
 
     for (idx, path) in inputs[1..].iter().enumerate() {
@@ -351,7 +388,12 @@ pub(crate) fn run_merge(
         merge_comments(&mut header, &input_header);
         remap_records(&mut input_records, &reference_id_map)?;
         for rec in &mut input_records {
-            remap_record_rg_pg(rec, &trans.rg[idx + 1], &trans.pg[idx + 1]);
+            remap_record_rg_pg(
+                rec,
+                &trans.rg[idx + 1],
+                &trans.pg[idx + 1],
+                force_rg[idx + 1].as_deref(),
+            );
         }
         records.append(&mut input_records);
     }
@@ -778,12 +820,20 @@ struct MergeTrans {
 /// `@RG`/`@PG` IDs suffixed via the seeded `gen_unique_id` PRNG (in
 /// header-line order, per file), `@RG.PG`/`@PG.PP` fields remapped, `@CO`
 /// appended. `@PG` lines are emitted but the test harness strips them.
-fn reconcile_merge_headers(inputs: &[PathBuf], seed: i64) -> io::Result<(String, MergeTrans)> {
+#[allow(clippy::type_complexity)]
+fn reconcile_merge_headers(
+    inputs: &[PathBuf],
+    seed: i64,
+    id_mode: MergeIdMode,
+) -> io::Result<(String, MergeTrans, Vec<Option<String>>)> {
     use std::collections::{HashMap, HashSet};
 
     let mut rng = crate::rand48::Rand48::new(seed);
     let mut seen_rg: HashSet<String> = HashSet::new();
     let mut seen_pg: HashSet<String> = HashSet::new();
+    // Final IDs already emitted, so `-c`/`-p` combine (don't duplicate).
+    let mut emitted_rg: HashSet<String> = HashSet::new();
+    let mut emitted_pg: HashSet<String> = HashSet::new();
 
     let mut hd: Option<String> = None;
     let mut seen_sn: HashSet<String> = HashSet::new();
@@ -796,6 +846,21 @@ fn reconcile_merge_headers(inputs: &[PathBuf], seed: i64) -> io::Result<(String,
         rg: Vec::with_capacity(inputs.len()),
         pg: Vec::with_capacity(inputs.len()),
     };
+    let mut force_rg: Vec<Option<String>> = Vec::with_capacity(inputs.len());
+
+    // `id, seen, combine` → final id (combine: keep existing, no PRNG draw).
+    let assign = |id: &str,
+                  seen: &mut HashSet<String>,
+                  rng: &mut crate::rand48::Rand48,
+                  combine: bool|
+     -> String {
+        if combine {
+            seen.insert(id.to_string());
+            id.to_string()
+        } else {
+            crate::rand48::gen_unique_id(id, seen, rng)
+        }
+    };
 
     for path in inputs {
         let exact = sam_io::sam_open_format(path)?.exact;
@@ -803,22 +868,32 @@ fn reconcile_merge_headers(inputs: &[PathBuf], seed: i64) -> io::Result<(String,
         let mut rg_map: HashMap<String, String> = HashMap::new();
         let mut pg_map: HashMap<String, String> = HashMap::new();
 
-        // Single pass in header-line order so the gen_unique_id PRNG draw
-        // sequence matches upstream exactly.
+        // `-r`: one filename-stem @RG per file (from its first @RG line),
+        // all records forced to it.
+        let stem = if id_mode.attach_rg {
+            path.file_stem().map(|s| s.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+
+        // Pass 1: build the @RG/@PG id maps in header-line order so the
+        // gen_unique_id PRNG draw sequence matches upstream exactly.
         for line in raw.lines() {
-            if line.starts_with("@RG\t")
+            if !id_mode.attach_rg
+                && line.starts_with("@RG\t")
                 && let Some(id) = header_field(line, "ID:")
             {
-                let new = crate::rand48::gen_unique_id(id, &mut seen_rg, &mut rng);
+                let new = assign(id, &mut seen_rg, &mut rng, id_mode.combine_rg);
                 rg_map.insert(id.to_string(), new);
             } else if line.starts_with("@PG\t")
                 && let Some(id) = header_field(line, "ID:")
             {
-                let new = crate::rand48::gen_unique_id(id, &mut seen_pg, &mut rng);
+                let new = assign(id, &mut seen_pg, &mut rng, id_mode.combine_pg);
                 pg_map.insert(id.to_string(), new);
             }
         }
 
+        let mut emitted_file_rg = false;
         for line in raw.lines() {
             if let Some(rest) = line.strip_prefix("@HD") {
                 if hd.is_none() {
@@ -830,18 +905,48 @@ fn reconcile_merge_headers(inputs: &[PathBuf], seed: i64) -> io::Result<(String,
             {
                 sq.push(line.to_string());
             } else if line.starts_with("@RG\t") {
+                if let Some(stem) = &stem {
+                    // `-r`: emit the file's *first* @RG with ID→stem.
+                    if !emitted_file_rg {
+                        let mut m = HashMap::new();
+                        if let Some(id) = header_field(line, "ID:") {
+                            m.insert(id.to_string(), stem.clone());
+                        }
+                        rg_lines.push(rewrite_field(line, "ID:", &m));
+                        emitted_file_rg = true;
+                    }
+                    continue;
+                }
                 let l = rewrite_field(line, "ID:", &rg_map);
-                rg_lines.push(rewrite_field(&l, "PG:", &pg_map));
+                let final_id = header_field(line, "ID:")
+                    .and_then(|i| rg_map.get(i).cloned())
+                    .unwrap_or_default();
+                if emitted_rg.insert(final_id) {
+                    rg_lines.push(rewrite_field(&l, "PG:", &pg_map));
+                }
             } else if line.starts_with("@PG\t") {
                 let l = rewrite_field(line, "ID:", &pg_map);
-                pg_lines.push(rewrite_field(&l, "PP:", &pg_map));
+                let final_id = header_field(line, "ID:")
+                    .and_then(|i| pg_map.get(i).cloned())
+                    .unwrap_or_default();
+                if emitted_pg.insert(final_id) {
+                    pg_lines.push(rewrite_field(&l, "PP:", &pg_map));
+                }
             } else if line.starts_with("@CO\t") {
                 co.push(line.to_string());
             }
         }
 
+        // `-r` with no @RG in the file still gets one synthesized line.
+        if let Some(stem) = &stem
+            && !emitted_file_rg
+        {
+            rg_lines.push(format!("@RG\tID:{stem}"));
+        }
+
         trans.rg.push(rg_map);
         trans.pg.push(pg_map);
+        force_rg.push(stem);
     }
 
     let mut text = String::new();
@@ -851,7 +956,7 @@ fn reconcile_merge_headers(inputs: &[PathBuf], seed: i64) -> io::Result<(String,
         text.push_str(l);
         text.push('\n');
     }
-    Ok((text, trans))
+    Ok((text, trans, force_rg))
 }
 
 /// Remaps a record's `RG:Z:` / `PG:Z:` aux values through the trans maps.
@@ -859,8 +964,39 @@ fn remap_record_rg_pg(
     record: &mut RecordBuf,
     rg: &std::collections::HashMap<String, String>,
     pg: &std::collections::HashMap<String, String>,
+    force_rg: Option<&str>,
 ) {
     use htslib_rs::sam::alignment::record_buf::data::field::Value;
+    // `-r`: force RG:Z: to the filename-derived id on every record.
+    if let Some(stem) = force_rg {
+        let t = htslib_rs::sam::alignment::record::data::field::Tag::from([b'R', b'G']);
+        // Upstream `-r` deletes any existing RG then appends the new one
+        // at the tail (order-preserving, like bam_aux_del+bam_aux_append).
+        let mut fields: Vec<_> = record
+            .data()
+            .iter()
+            .filter(|(tg, _)| *tg != t)
+            .map(|(tg, v)| (tg, v.clone()))
+            .collect();
+        fields.push((t, Value::String(bstr::BString::from(stem))));
+        *record.data_mut() = fields.into_iter().collect();
+        // PG is still remapped below; skip the RG map.
+        let t = htslib_rs::sam::alignment::record::data::field::Tag::from([b'P', b'G']);
+        if let Some(Value::String(v)) = record.data().get(&t) {
+            let cur = String::from_utf8_lossy(v).into_owned();
+            match pg.get(&cur) {
+                Some(n) => {
+                    record
+                        .data_mut()
+                        .insert(t, Value::String(bstr::BString::from(n.clone())));
+                }
+                None => {
+                    record.data_mut().remove(&t);
+                }
+            }
+        }
+        return;
+    }
     for (tag, map) in [([b'R', b'G'], rg), ([b'P', b'G'], pg)] {
         let t = htslib_rs::sam::alignment::record::data::field::Tag::from(tag);
         if let Some(Value::String(v)) = record.data().get(&t) {

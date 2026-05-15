@@ -1823,8 +1823,12 @@ fn merge_reconciles_rg_pg_byte_exact_vs_upstream() {
             .map(|l| format!("{l}\n"))
             .collect()
     };
-    let cases: &[(&[&str], &str)] = &[
+    // (extra_flags, inputs, expected). merge/5 exercises `-r`
+    // (filename-derived @RG attached to every record); merge/6 `-cp`
+    // (combine identical @RG and @PG IDs instead of suffixing).
+    let cases: &[(&[&str], &[&str], &str)] = &[
         (
+            &[],
             &[
                 "dat/test_input_1_a.sam",
                 "dat/test_input_1_b.sam",
@@ -1832,8 +1836,23 @@ fn merge_reconciles_rg_pg_byte_exact_vs_upstream() {
             ],
             "merge/2.merge.expected.sam",
         ),
-        (&["dat/test_input_1_b.bam"], "merge/4.merge.expected.sam"),
+        (&[], &["dat/test_input_1_b.bam"], "merge/4.merge.expected.sam"),
         (
+            &["-r"],
+            &[
+                "dat/test_input_1_a.sam",
+                "dat/test_input_1_b.sam",
+                "dat/test_input_1_c.sam",
+            ],
+            "merge/5.merge.expected.sam",
+        ),
+        (
+            &["-cp"],
+            &["dat/test_input_1_a.sam", "dat/test_input_1_b.sam"],
+            "merge/6.merge.expected.sam",
+        ),
+        (
+            &[],
             &[
                 "dat/test_input_1_a_regex.sam",
                 "dat/test_input_1_b_regex.sam",
@@ -1841,17 +1860,20 @@ fn merge_reconciles_rg_pg_byte_exact_vs_upstream() {
             "merge/7.merge.expected.sam",
         ),
     ];
-    for (ins, expected) in cases {
+    for (flags, ins, expected) in cases {
         let out = tmp.join(expected.replace('/', "_"));
-        let mut v: Vec<String> = vec![
-            "merge".into(),
+        let mut v: Vec<String> = vec!["merge".into()];
+        for f in *flags {
+            v.push((*f).into());
+        }
+        v.extend([
             "-s".into(),
             "1".into(),
             "-O".into(),
             "sam".into(),
             "-o".into(),
             out.to_str().unwrap().into(),
-        ];
+        ]);
         for i in *ins {
             v.push(d.join(i).to_str().unwrap().into());
         }

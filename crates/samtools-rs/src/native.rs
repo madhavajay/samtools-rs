@@ -296,6 +296,7 @@ where
         Some(output_bam),
         merge_command::MergeOrder::Coordinate,
         merge_command::OutFmt::Bam,
+        merge_command::MergeIdMode::default(),
         false,
         None,
         0,
