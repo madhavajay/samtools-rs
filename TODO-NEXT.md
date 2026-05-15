@@ -113,8 +113,19 @@ quick fix — verified by probing):
   lines). Remaining: `--tcoord-bin` aggregation, CRAM,
   `--use-sample-name`.
 - `phase`/`targetcut` (no upstream fixtures + dense numerical HMM),
-  consensus `recall`/Bayesian modes, `reference` CRAM (needs MD
-  recompute / embedded-ref internals).
+  `reference` CRAM (needs MD recompute / embedded-ref internals).
+- **consensus Bayesian/default mode** — the next fixture-backed port.
+  Entry point: port `calculate_consensus_gap5()`
+  (`samtools/bam_consensus.c:1256`, ~540 lines, the Gap5-derived
+  probabilistic model) + its `calculate_consensus_gap5m` MD/quality
+  wrapper (`:1797`) and the precomputed probability tables in
+  `samtools/bam_consensus_tab.h` (13 kB). Our `consensus.rs` currently
+  only does `--mode simple` (rejects others at consensus.rs:150).
+  Fixtures: `samtools/test/consensus/consensus.reg` has ~38
+  Bayesian/default invocations (13 `-m bayesian` + 25 default) vs the
+  `samtools/test/consensus/expected/*` FASTA/FASTQ outputs; the 59
+  `simple` cases already pass. Verify byte-exact per fixture, gate +
+  workspace green per commit, exactly as the `stats` port was done.
 - TODO-NEXT #3/#4/#5 (CRAM internals / binary-`@PG` / CRAM index meta).
 
 **Honest remaining scope:** the library-blocked *foundations* are all
