@@ -5,6 +5,31 @@ underlying-library extensions**. It is the successor to the "Items blocked on
 htslib-rs / noodles extensions" and "Extensions Needed" sections of `TODO.md`,
 re-scoped for the next pass where the samtools-only constraint is lifted.
 
+## Batch progress (working branch `work-htslib-blocked-batch`)
+
+htslib-rs pinned forward through several known-green commits (current pin
+in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
+
+- **#6** ✅ done — `build_bai` no longer needs `@HD SO:coordinate`.
+- **#12** ✅ done — header-aware BAM-CSI depth fixes the `large_chrom`
+  `> 2^29` reference panic; byte-exact vs `dat/large_chrom.out`.
+- **#1** core ✅ — public pileup iterator engine (`PileupColumn`/`PileupRead`
+  + `PileupOptions` flag/mapq/overlap/orphan + smart overlap removal);
+  `mpileup` text output byte-exact vs `mpileup.out.3`/`out.5`/stderr
+  (`out.1` matches depth+bases; only BAQ-adjusted quals differ → #11).
+  *Remaining:* consensus/targetcut/phase/ampliconstats + exact
+  bedcov/coverage/depth (large samtools ports, now unblocked).
+- **#2** core ✅ — whole-CRAM all-record iterator; `stats` and `checksum`
+  no-region CRAM wired (byte-identical to BAM bar NM-derived lines).
+  *Remaining:* `reference` CRAM MD path; optional CRAM NM recompute.
+- **#8** correctness ✅ — `-@`/`--threads` accepted everywhere, output
+  byte-identical regardless of count (perf worker-pool wiring deferred).
+- **#9** partial — `sort`/`view --write-index` BAI == post-pass BAI.
+- **#10** partial — `.` (everything) done; `*` (unmapped) remaining.
+- **#11** htslib-rs verified (probaln/BAQ + realn fixtures); samtools
+  `calmd` BAM-output wiring remaining.
+- **#3, #4, #5, #7** not yet started.
+
 ## Ground rules for this pass
 
 - **All library changes go in `htslib-rs`. Do not patch `noodles`.**
@@ -187,7 +212,16 @@ re-scoped for the next pass where the samtools-only constraint is lifted.
 - **samtools-rs tests:** assert `-@ N` output is byte-identical to `-@ 1`
   (correctness, not perf).
 
-### 9. `auto_index` / index-save-during-write
+### 9. `auto_index` / index-save-during-write — 🟡 PARTIAL
+
+> `sort --write-index` (BAI) and now `view --write-index` (BAM file
+> output) both work via a post-write `index_compat::build_bai` pass that
+> is **byte-identical** to a separate `samtools index` run (test
+> `view_write_index_matches_post_pass_index`). The TODO deliverable
+> ("writer-produced index == post-pass byte-for-byte") is met for these.
+> **Remaining:** `merge --write-index`, CSI/CRAI auto-write, and true
+> inline (during-write) index emission instead of a post-write pass
+> (perf/streaming — not a correctness gap).
 
 - **htslib-rs:** write BAI/CSI/CRAI alongside the writer (some samtools-rs
   paths currently do a separate post-write index pass).
