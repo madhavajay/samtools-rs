@@ -1866,6 +1866,53 @@ fn fastq_index_emits_one_record_per_qname_group_with_casava_comment() {
 }
 
 #[test]
+fn fastq_casava_barcode_propagates_from_r1_to_r2_mate() {
+    // Only the R1 record carries BC; with -i, upstream copies the
+    // barcode into the R2 mate's CASAVA comment within the qname group
+    // (bam_fastq.c:952). So `*.2.fq` must show `2:N:0:AC+GT`, not
+    // `2:N:0:0`.
+    let tmp = tmp_dir("fastq-casava-propagate");
+    let sam = tmp.join("in.sam");
+    let r1 = tmp.join("1.fq");
+    let r2 = tmp.join("2.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:16\n",
+            "p\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\tBC:Z:ac-gt\n",
+            "p\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-i",
+                "-1",
+                r1.to_str().unwrap(),
+                "-2",
+                r2.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&r1).unwrap(),
+        "@p 1:N:0:AC+GT\nACGT\n+\n!!!!\n"
+    );
+    // R2 had no BC of its own — the group barcode is propagated in.
+    assert_eq!(
+        std::fs::read_to_string(&r2).unwrap(),
+        "@p 2:N:0:AC+GT\nTGCA\n+\n####\n"
+    );
+}
+
+#[test]
 fn fastq_single_sam_path_filters_by_aux_tag_value() {
     let tmp = tmp_dir("fastq-aux-filter-value");
     let sam = tmp.join("in.sam");

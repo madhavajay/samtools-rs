@@ -14,10 +14,11 @@
 //! (upstream `flush_rec` → `output_index`) with the htslib-exact CASAVA
 //! barcode normalization and, under `-i`, the CASAVA comment.
 //!
-//! **Not yet supported:** CRAM input, and `score`-vs-`b_score`
-//! propagation of the CASAVA barcode from the R1 mate to the R2
-//! `*.2.fq` comment (the main `-1`/`-2` flush renders text before
-//! grouping; needs render-after-group restructuring).
+//! The group's barcode is propagated across mates so an R2 (or other)
+//! record lacking its own `BC` inherits the R1 mate's barcode in its
+//! CASAVA comment (upstream `bam_fastq.c:952`).
+//!
+//! **Not yet supported:** CRAM input.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -999,7 +1000,7 @@ fn view_bam_path_as_fastq_split_with_aux(
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let header = reader.read_header()?;
     let mut split = FastqSplitBuffers::default();
-    let mut grouper = GroupedSplitWriter::new(singleton_set);
+    let mut grouper = GroupedSplitWriter::new(singleton_set, options.casava, options.barcode_tag);
     let mut record = htslib_rs::sam::alignment::RecordBuf::default();
 
     loop {
@@ -1032,7 +1033,7 @@ fn view_bam_path_as_fasta_split(
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let header = reader.read_header()?;
     let mut split = FastqSplitBuffers::default();
-    let mut grouper = GroupedSplitWriter::new(singleton_set);
+    let mut grouper = GroupedSplitWriter::new(singleton_set, casava, barcode_tag);
     let mut record = htslib_rs::sam::alignment::RecordBuf::default();
 
     loop {
@@ -1124,7 +1125,7 @@ where
 {
     let _header = reader.read_header()?;
     let mut split = FastqSplitBuffers::default();
-    let mut grouper = GroupedSplitWriter::new(singleton_set);
+    let mut grouper = GroupedSplitWriter::new(singleton_set, options.casava, options.barcode_tag);
 
     for result in reader.records() {
         let record = result?;
@@ -1154,7 +1155,7 @@ where
 {
     let _header = reader.read_header()?;
     let mut split = FastqSplitBuffers::default();
-    let mut grouper = GroupedSplitWriter::new(singleton_set);
+    let mut grouper = GroupedSplitWriter::new(singleton_set, casava, barcode_tag);
 
     for result in reader.records() {
         let record = result?;
@@ -1226,15 +1227,24 @@ where
 #[derive(Default)]
 struct GroupedSplitWriter {
     singleton_set: bool,
+    /// `-i` (CASAVA): when set, the group's barcode is propagated to
+    /// every mate's CASAVA comment that lacked its own (upstream copies
+    /// the `BC` aux across mates before formatting — `bam_fastq.c:952`).
+    casava: bool,
+    barcode_tag: [u8; 2],
     current_qname: Option<Vec<u8>>,
     best_score: [u8; 3],
     pending_text: [Option<Vec<u8>>; 3],
+    /// First non-empty raw barcode seen in the current qname group.
+    group_barcode: Option<String>,
 }
 
 impl GroupedSplitWriter {
-    fn new(singleton_set: bool) -> Self {
+    fn new(singleton_set: bool, casava: bool, barcode_tag: [u8; 2]) -> Self {
         Self {
             singleton_set,
+            casava,
+            barcode_tag,
             ..Self::default()
         }
     }
@@ -1255,6 +1265,15 @@ impl GroupedSplitWriter {
         if self.current_qname.as_deref() != Some(&qname) {
             self.flush(split);
             self.current_qname = Some(qname);
+            self.group_barcode = None;
+        }
+
+        if self.casava
+            && self.group_barcode.is_none()
+            && let Some(bc) = fastq_string_tag(record, self.barcode_tag)?
+            && !bc.is_empty()
+        {
+            self.group_barcode = Some(bc);
         }
 
         let part = record_read_part(record)? as usize;
@@ -1268,7 +1287,21 @@ impl GroupedSplitWriter {
 
     fn flush(&mut self, split: &mut FastqSplitBuffers) {
         let [s0, s1, s2] = self.best_score;
-        let [t0, t1, t2] = std::mem::take(&mut self.pending_text);
+        let [mut t0, mut t1, mut t2] = std::mem::take(&mut self.pending_text);
+
+        // Propagate the group's barcode into any mate whose CASAVA
+        // comment had no barcode of its own (upstream copies the `BC`
+        // aux across mates before formatting the comment).
+        if self.casava
+            && let Some(bc) = self.group_barcode.as_deref()
+        {
+            let bc_field = casava_barcode_field(Some(bc));
+            for t in [&mut t0, &mut t1, &mut t2] {
+                if let Some(text) = t.as_mut() {
+                    fill_casava_barcode(text, &bc_field);
+                }
+            }
+        }
 
         if s1 > 0 && s2 > 0 {
             if let Some(t) = t1 {
@@ -1591,6 +1624,39 @@ where
     let barcode = casava_barcode_field(fastq_string_tag(record, barcode_tag)?.as_deref());
 
     Ok(format!("{read_number}:{filter}:0:{barcode}"))
+}
+
+/// If the FASTQ/FASTA header line of `text` ends with a CASAVA comment
+/// whose barcode is the placeholder `0` (the record had no `BC` of its
+/// own), replaces that `0` with `bc_field`. A record that already
+/// carries its own barcode is left untouched (mirrors upstream copying
+/// `BC` only into mates that lack it).
+fn fill_casava_barcode(text: &mut Vec<u8>, bc_field: &str) {
+    let hdr_end = text.iter().position(|&b| b == b'\n').unwrap_or(text.len());
+    let Some(sp) = text[..hdr_end].iter().rposition(|&b| b == b' ') else {
+        return;
+    };
+    let token_start = sp + 1;
+    let token = &text[token_start..hdr_end];
+    // Shape: `<rnum>:<filt>:0:<bc>` — digit, ':', Y/N, ':', '0', ':'.
+    if token.len() < 6
+        || !token[0].is_ascii_digit()
+        || token[1] != b':'
+        || token[3] != b':'
+        || token[4] != b'0'
+        || token[5] != b':'
+    {
+        return;
+    }
+    let bc_start = token_start + 6;
+    if &text[bc_start..hdr_end] != b"0" {
+        return; // record had its own barcode; leave it.
+    }
+    let mut new = Vec::with_capacity(text.len() - 1 + bc_field.len());
+    new.extend_from_slice(&text[..bc_start]);
+    new.extend_from_slice(bc_field.as_bytes());
+    new.extend_from_slice(&text[hdr_end..]);
+    *text = new;
 }
 
 /// Renders the barcode portion of a CASAVA comment exactly as htslib's

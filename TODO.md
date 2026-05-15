@@ -74,13 +74,13 @@ Landed slices on this branch:
   `stats_remove_dups_excludes_duplicates_on_cram_region_path`. The
   no-region CRAM summarize path remains blocked on the htslib-rs CRAM
   all-record iterator.
-- **`fastq` index × name-grouping:** one index record per qname-group,
-  htslib-exact CASAVA barcode normalization (`ac-gt` → `AC+GT`), and
-  the CASAVA comment on `-i` index records — `bam2fq/{8,12}` now byte
-  parity on `1.fq`/`s.fq`/`i.fq`. Remaining: R2 CASAVA barcode
-  propagation from the R1 mate (`*.2.fq`), a render-after-group
-  follow-on. New test:
-  `fastq_index_emits_one_record_per_qname_group_with_casava_comment`.
+- **`fastq` index × name-grouping (complete):** one index record per
+  qname-group, htslib-exact CASAVA barcode normalization
+  (`ac-gt` → `AC+GT`), the CASAVA comment on `-i` index records, and
+  cross-mate barcode propagation (R2/other inherits the R1 mate's
+  `BC`). **`bam2fq/{5,8,10,12}` now byte parity on every output.** New
+  tests: `fastq_index_emits_one_record_per_qname_group_with_casava_comment`,
+  `fastq_casava_barcode_propagates_from_r1_to_r2_mate`.
 
 Latest known validation (on `main` at `b312c99`, post-merge):
 - Rust tests: 416 `samtools-rs` passing, 0 failing (`cargo test --workspace`: 2587 passing).
@@ -108,7 +108,7 @@ What to do next:
 
 Remaining tractable samtools-rs-only items (no htslib-rs / noodles changes required):
 - ~~**SAM aux float formatting — remaining commands.**~~ **Done.** The shared `samtools_rs::sam_render` module (`format_aux_float`, `format_htslib_exponent`, `fix_sam_aux_floats`, `fix_sam_text`, `write_record`, `write_header`) now backs every noodles-`sam::io::Writer` SAM-output path: `view`, `split`, plus `reheader` SAM→SAM, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, `markdup`, and `cat` (their `SamFile`/`SamStdout`/`Sam*Sink` sinks now wrap a plain `File`/`Stdout` and render through `sam_render`). So every SAM-text output path emits htslib `%g`-style float aux spelling. Regression covered by `sort_sam_output_uses_htslib_float_aux_spelling` plus the existing `view`/`split` fixtures.
-- **`fastq` index extraction × name-grouping interaction.** *Substantially done; one narrowed sub-item remains.* `emit_index_files` now dedupes to **one index record per adjacent qname-group** (emits for the first barcode-bearing record in the group, skips the rest — matching upstream `flush_rec` → `output_index`). The CASAVA barcode field is normalized exactly like htslib `fastq_format1` (`casava_barcode_field`: absent/non-sequence-first → `0`; otherwise non-alpha → `+`, lowercase → upper, e.g. `ac-gt` → `AC+GT`), and with `-i` the index records carry the ` <rnum>:<filt>:0:<barcode>` CASAVA comment. This brings `bam2fq/8` and `bam2fq/12` to byte parity on `1.fq`, `s.fq`, and `i.fq`. **Remaining:** the R2 `*.2.fq` CASAVA comment needs the barcode **propagated from the R1 mate** within the qname group (upstream copies BC across mates before formatting; `bam_fastq.c:952`). The main `-1`/`-2` flush renders each record's text *before* grouping, so this needs the render-after-group restructuring — its own bounded follow-on. New tests: `fastq_index_emits_one_record_per_qname_group_with_casava_comment` (plus the 45 existing fastq tests still green).
+- ~~**`fastq` index extraction × name-grouping interaction.**~~ **Done.** `emit_index_files` dedupes to **one index record per adjacent qname-group** (matching upstream `flush_rec` → `output_index`). The CASAVA barcode field is normalized exactly like htslib `fastq_format1` (`casava_barcode_field`: absent/non-sequence-first → `0`; otherwise non-alpha → `+`, lowercase → upper, e.g. `ac-gt` → `AC+GT`), `-i` index records carry the ` <rnum>:<filt>:0:<barcode>` CASAVA comment, and `GroupedSplitWriter` now **propagates the group barcode across mates** so an R2 (or other) record lacking its own `BC` gets the R1 mate's barcode in its CASAVA comment (`fill_casava_barcode`; upstream `bam_fastq.c:952`). **`bam2fq/{5,8,10,12}` now match byte-for-byte on every output (`1.fq`/`2.fq`/`s.fq` and the index/`bc` files).** New tests: `fastq_index_emits_one_record_per_qname_group_with_casava_comment`, `fastq_casava_barcode_propagates_from_r1_to_r2_mate` (plus the 45 existing fastq tests still green).
 - ~~**`view --library` (`-l`)** library filter via `@RG LB:` aux lookup.~~ **Done.** `view -l STR` / `--library STR` resolves the requested library to the set of `@RG` IDs whose `LB:` equals STR (scanned from the input header for path, SAM/BAM/CRAM stdin), then a record passes iff its `RG:Z:` value is in that set (no-RG / non-matching RG excluded, matching upstream `bam_get_library`). Regression: `view_dash_l_filters_by_read_group_library`.
 - ~~**`view -X` legacy custom-index synopsis**~~ **Done.** `view -X` / `--customized-index` accepts the legacy synopsis where the second positional is the explicit index path (`view -X in.bam in.bam.bai [region…]`); accepted as a no-op (our region queries build/find the index themselves), matching `idxstats -X`. Regression: `view_dash_cap_x_accepts_legacy_custom_index_synopsis`.
 - **`merge -s SEED`** — *deferred (not a bounded slice).* The option is already parsed and its value consumed. Upstream's only use of the seed is `hts_srand48` feeding `lrand48()` for random `@RG`/`@PG`-ID collision suffixes during header merge (`bam_sort.c:408`). Our merge reconciles headers by *rejecting* ID conflicts rather than random-suffixing, so the seed has no observable effect until that suffixing path is implemented — a header-reconciliation rework, larger than a bounded slice.
