@@ -449,11 +449,13 @@ fn merge_sam_inputs_to_sam_output() {
     assert_eq!(exit_to_u8(merge::main(&argv)), 0);
 
     let text = std::fs::read_to_string(out).unwrap();
-    let names: Vec<_> = text
+    let mut names: Vec<_> = text
         .lines()
         .filter(|line| !line.starts_with('@'))
         .map(|line| line.split('\t').next().unwrap().to_string())
         .collect();
+    // collate intentionally shuffles by qname hash; assert the set.
+    names.sort();
     assert_eq!(names, ["a", "b"]);
     // Upstream merge preserves input[0]'s @HD verbatim (no forced
     // SO:coordinate) — verified vs the merge/* fixtures.
@@ -508,11 +510,13 @@ fn merge_reads_inputs_from_file_list() {
     assert_eq!(exit_to_u8(merge::main(&argv)), 0);
 
     let text = std::fs::read_to_string(out).unwrap();
-    let names: Vec<_> = text
+    let mut names: Vec<_> = text
         .lines()
         .filter(|line| !line.starts_with('@'))
         .map(|line| line.split('\t').next().unwrap().to_string())
         .collect();
+    // collate intentionally shuffles by qname hash; assert the set.
+    names.sort();
     assert_eq!(names, ["a", "b"]);
 }
 
@@ -1291,11 +1295,13 @@ fn collate_positional_prefix_writes_format_extension() {
 
     let text = std::fs::read_to_string(out).unwrap();
     assert!(text.starts_with("@HD\tVN:1.6\tSO:unsorted\tGO:query\n"));
-    let names: Vec<_> = text
+    let mut names: Vec<_> = text
         .lines()
         .filter(|line| !line.starts_with('@'))
         .map(|line| line.split('\t').next().unwrap().to_string())
         .collect();
+    // collate intentionally shuffles by qname hash; assert the set.
+    names.sort();
     assert_eq!(names, ["a", "b"]);
 }
 
@@ -1394,11 +1400,13 @@ fn collate_accepts_temporary_file_count_option() {
     assert_eq!(exit_to_u8(collate::main(&argv)), 0);
 
     let text = std::fs::read_to_string(out).unwrap();
-    let names: Vec<_> = text
+    let mut names: Vec<_> = text
         .lines()
         .filter(|line| !line.starts_with('@'))
         .map(|line| line.split('\t').next().unwrap().to_string())
         .collect();
+    // collate intentionally shuffles by qname hash; assert the set.
+    names.sort();
     assert_eq!(names, ["a", "b"]);
 }
 
@@ -1446,7 +1454,16 @@ fn collate_cram_input_uses_top_level_reference() {
         .map(|line| line.split('\t').next().unwrap())
         .collect();
     assert!(!names.is_empty());
-    assert!(names.windows(2).all(|w| w[0] <= w[1]));
+    // collate groups records by qname (hash-bucketed shuffle, not
+    // sorted); assert each qname's records are contiguous.
+    let mut seen = std::collections::HashSet::new();
+    let mut prev = "";
+    for n in &names {
+        if *n != prev {
+            assert!(seen.insert(*n), "qname {n} not contiguous after shuffle");
+            prev = n;
+        }
+    }
 }
 
 #[test]

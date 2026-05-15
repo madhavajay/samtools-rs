@@ -10,7 +10,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Cursor, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -31,6 +31,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut positional_prefix: Option<String> = None;
     let mut to_stdout = false;
     let mut output_fmt = OutFmt::Bam;
+    let mut fmt_explicit = false;
     let mut input: Option<PathBuf> = None;
     let mut no_pg = false;
     let mut fast = false;
@@ -48,6 +49,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
+            fmt_explicit = true;
             continue;
         }
         match s {
@@ -69,6 +71,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                         return ExitCode::from(1);
                     }
                 };
+                fmt_explicit = true;
             }
             "--no-PG" => {
                 no_pg = true;
@@ -149,6 +152,16 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "only SAM, BAM, and reference-backed CRAM input are currently supported",
         );
         return ExitCode::from(1);
+    }
+
+    // Upstream `sam_open_mode` infers the format from the `-o` filename
+    // extension when `--output-fmt` was not given.
+    if !fmt_explicit && let Some(p) = output_prefix.as_deref() {
+        if p.ends_with(".sam") {
+            output_fmt = OutFmt::Sam;
+        } else if p.ends_with(".bam") {
+            output_fmt = OutFmt::Bam;
+        }
     }
 
     let output = if to_stdout {
@@ -233,6 +246,27 @@ fn run_collate(
         sort_records_by_name(records)
     };
 
+    if matches!(fmt, OutFmt::Sam) {
+        // Byte-faithful SAM: raw input header (preserving @RG/@SQ field
+        // order) with @HD SO:unsorted GO:query applied, + records via the
+        // float-correct renderer (mirrors merge/markdup/ampliconclip).
+        let mut header_text = collate_raw_header(input)?;
+        if let Some(argv) = pg_argv {
+            header_text =
+                crate::pg::add_samtools_pg(&header_text, argv).map_err(io::Error::other)?;
+        }
+        let mut w: Box<dyn Write> = match &output {
+            OutputTarget::Stdout => Box::new(BufWriter::new(io::stdout().lock())),
+            OutputTarget::File(p) => Box::new(BufWriter::new(File::create(p)?)),
+        };
+        w.write_all(header_text.as_bytes())?;
+        for rec in &records {
+            crate::sam_render::write_record(&mut w, &header, rec)?;
+        }
+        w.flush()?;
+        return Ok(());
+    }
+
     if let Some(argv) = pg_argv {
         header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
     }
@@ -244,8 +278,71 @@ fn run_collate(
     Ok(())
 }
 
+/// Raw input header with the `@HD` line forced to `SO:unsorted
+/// GO:query` (removing any existing `SO:`/`GO:` fields, appending in
+/// that order), preserving all other lines/fields verbatim.
+fn collate_raw_header(input: &Path) -> io::Result<String> {
+    let raw = crate::header_text::read_raw_header_text(input)?;
+    let mut lines: Vec<String> = Vec::new();
+    let mut had_hd = false;
+    for line in raw.lines() {
+        if line.starts_with("@HD") {
+            had_hd = true;
+            let mut fields: Vec<&str> = line
+                .split('\t')
+                .filter(|f| !f.starts_with("SO:") && !f.starts_with("GO:"))
+                .collect();
+            fields.push("SO:unsorted");
+            fields.push("GO:query");
+            lines.push(fields.join("\t"));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !had_hd {
+        lines.insert(0, "@HD\tVN:1.6\tSO:unsorted\tGO:query".to_string());
+    }
+    let mut s = lines.join("\n");
+    s.push('\n');
+    Ok(s)
+}
+
+/// `bamshuf.c` `hash_Wang`: 32-bit integer bit-mix (wrapping).
+fn hash_wang(mut key: u32) -> u32 {
+    key = key.wrapping_add(!(key << 15));
+    key ^= key >> 10;
+    key = key.wrapping_add(key << 3);
+    key ^= key >> 6;
+    key = key.wrapping_add(!(key << 11));
+    key ^= key >> 16;
+    key
+}
+
+/// `bamshuf.c` `hash_X31_Wang`: X31 string hash of the qname fed through
+/// `hash_Wang`. Empty name → 0.
+fn hash_x31_wang(name: &[u8]) -> u32 {
+    if name.is_empty() {
+        return 0;
+    }
+    let mut h = name[0] as u32;
+    for &c in &name[1..] {
+        h = (h << 5).wrapping_sub(h).wrapping_add(c as u32);
+    }
+    hash_wang(h)
+}
+
+/// Upstream non-fast `collate` order: reads are bucketed by
+/// `hash_X31_Wang(qname) % 64`, then each bucket is sorted by
+/// `elem_lt` — full hash, then qname, then `(flag>>6)&3` (READ1/READ2).
+/// The concatenation of the 64 sorted buckets equals a stable sort on
+/// `(hash%64, hash, qname, flag>>6&3)`.
 fn sort_records_by_name(mut records: Vec<RecordBuf>) -> Vec<RecordBuf> {
-    records.sort_by_key(name_key);
+    records.sort_by_cached_key(|r| {
+        let name = name_key(r);
+        let h = hash_x31_wang(&name);
+        let fb = (r.flags().bits() as u32 >> 6) & 3;
+        (h % 64, h, name, fb)
+    });
     records
 }
 
@@ -348,8 +445,10 @@ fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
 }
 
 fn read_sam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
-    let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
-    read_sam_records_from_reader(&mut reader)
+    // Tolerant reader: HTSlib accepts `c/C/s/S/I` scalar aux type
+    // synonyms in SAM text (e.g. the `test_input_1_*` fixtures); noodles
+    // rejects them, so normalize first (mirrors sort/fixmate/markdup).
+    crate::sam_compat::read_sam_records_tolerant(input)
 }
 
 fn read_cram_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
