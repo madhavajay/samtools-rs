@@ -20,6 +20,7 @@ pub mod io;
 pub mod logging;
 pub mod native;
 pub mod pg;
+pub mod rand48;
 pub mod reference;
 pub mod sam_compat;
 pub mod sam_global;
