@@ -780,6 +780,12 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
             }
         }
     }
+
+    // HTSlib region grammar: `.` means "everything" — equivalent to no
+    // region restriction (a whole-file pass). Drop it so the no-region
+    // code paths handle it.
+    opts.regions.retain(|r| r != ".");
+
     Ok(opts)
 }
 

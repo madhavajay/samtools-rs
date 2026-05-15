@@ -6252,3 +6252,50 @@ fn index_bam_without_so_coordinate_header() {
     );
     assert!(bam.with_extension("bam.bai").exists());
 }
+
+#[test]
+fn view_dot_region_means_whole_file() {
+    // HTSlib region grammar: `.` == everything (TODO-NEXT #10).
+    let bam = fixtures_dir().join("dat").join("test_input_1_a.bam");
+    let tmp = tmp_dir("view-dot");
+    let with_dot = tmp.join("dot.txt");
+    let no_region = tmp.join("all.txt");
+
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &["-c", bam.to_str().unwrap(), "."]
+        ))),
+        0
+    );
+    // -c writes the count to stdout; compare via -o.
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &[
+                "-c",
+                "-o",
+                with_dot.to_str().unwrap(),
+                bam.to_str().unwrap(),
+                "."
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &[
+                "-c",
+                "-o",
+                no_region.to_str().unwrap(),
+                bam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(with_dot).unwrap(),
+        std::fs::read_to_string(no_region).unwrap()
+    );
+}
