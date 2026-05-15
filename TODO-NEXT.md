@@ -182,10 +182,32 @@ quick fix — verified by probing):
      default_qual=10, use_mqual=1, nm_adjust=1, scale_mqual=1,
      low/high_mqual=1/60, line_len=70, show_ins=1, show_del=0
      (bam_consensus.c:2985+).
-     Fixtures: `samtools/test/consensus/consensus.reg` ~38 cases
-     (13 `-m bayesian` + 25 default) vs `consensus/expected/*`; the
-     59 `simple` already pass. Verify byte-exact per fixture; gate +
-     workspace green per commit, as the `stats` port was done.
+     Fixtures: `samtools/test/consensus/consensus.reg`. **Status:
+     52/77 byte-exact** (engine wired end-to-end; `4ff63fa`,
+     `a0d4d53`). Remaining 25, by feature (each a bounded fix):
+     • **`-a`/`-aa` all-bases** (13q/13p/14*/15p/16*/17q/31/32/41/42,
+       ~12) — emit every reference position (uncovered = `N`/qual 0);
+       `-a` spans the covered range, `-aa` the whole contig. Needs the
+       reference length + region span, NOT a naive interior gap-fill
+       (an unconditional fill regressed 19 fixtures 52→33 — reverted;
+       upstream only fills under all-bases / within the pileup span,
+       not between separate read clusters in plain FASTA).
+     • **`-r region`** (14q/14p/15p/16q/16p) — restrict to `c2:beg-end`
+       (currently `-r` is ignored).
+     • **`--min-MQ <n>`** (22p/23p/24p) — filter reads by mapping
+       quality (parse + apply in both paths; not yet parsed).
+     • **`--min-BQ`/pileup-format nuances** (26p and the `*p` set) —
+       simple-mode pileup output details.
+     • **30/31/32 bayesian `--show-del yes --show-ins no -C0`** on
+       consen1c — show-del interaction in the bayesian path.
+     • **`--ref-qual`/`-T` reference** (30T/31T/32T/40T/41T/42T) —
+       reference-aware quality (`-T fa` + `--ref-qual`).
+     Verify byte-exact per fixture; gate + workspace green per commit,
+     as the `stats` port was done. (12q showed the gap-fill subtlety:
+     `consen2 c2` s2a@3 ACG + s2b@10 → expected `ACGNNNNCGT`, i.e. the
+     gap *is* filled there but not in the 19 regressed cases — the
+     correct rule is tied to the pileup span / all-bases, to be
+     derived from upstream `basic_pileup`/`empty_pileup2`.)
 - TODO-NEXT #3/#4/#5 (CRAM internals / binary-`@PG` / CRAM index meta).
 
 **Honest remaining scope:** the library-blocked *foundations* are all
