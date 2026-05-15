@@ -217,6 +217,8 @@ struct Opts {
     unmap_unselected: bool,
     /// `--write-index` — build an index next to a BAM file output.
     write_index: bool,
+    /// Region `*` — emit only unplaced (RNAME `*`) records.
+    only_unplaced: bool,
     reference: Option<PathBuf>,
     /// `-f INT` — require ALL these flag bits to be set on the record.
     require_flags: u32,
@@ -839,6 +841,14 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
     // region restriction (a whole-file pass). Drop it so the no-region
     // code paths handle it.
     opts.regions.retain(|r| r != ".");
+
+    // HTSlib region grammar: `*` selects only unplaced ("no coordinate")
+    // reads (RNAME `*`). Treat it as a whole-file pass with an
+    // unplaced-only filter rather than a noodles region query.
+    if opts.regions.iter().any(|r| r == "*") {
+        opts.only_unplaced = true;
+        opts.regions.retain(|r| r != "*");
+    }
 
     Ok(opts)
 }
@@ -2028,6 +2038,7 @@ fn has_filters(opts: &Opts) -> bool {
         || opts.exclude_no_rg
         || opts.library.is_some()
         || opts.aux_tag_filter.is_some()
+        || opts.only_unplaced
 }
 
 fn has_sanitizer(opts: &Opts) -> bool {
@@ -2260,7 +2271,10 @@ fn line_passes(line: &[u8], opts: &Opts) -> bool {
         .and_then(|f| std::str::from_utf8(f).ok())
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
-    let _rname = fields.next();
+    let rname = fields.next().unwrap_or(b"");
+    if opts.only_unplaced && rname != b"*" {
+        return false;
+    }
     let _pos = fields.next();
     let mapq = fields
         .next()

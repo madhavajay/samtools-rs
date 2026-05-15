@@ -6543,3 +6543,49 @@ fn view_write_index_matches_post_pass_index() {
         "--write-index BAI must equal the post-pass BAI"
     );
 }
+
+#[test]
+fn view_star_region_selects_unplaced_reads() {
+    // HTSlib region grammar: `*` selects only unplaced (RNAME `*`) reads
+    // (TODO-NEXT #10). Verified for SAM-text + count output.
+    let tmp = tmp_dir("view-star");
+    let sam = tmp.join("un.sam");
+    std::fs::write(
+        &sam,
+        "@HD\tVN:1.6\tSO:coordinate\n\
+         @SQ\tSN:ref1\tLN:100\n\
+         m1\t0\tref1\t10\t60\t5M\t*\t0\t0\tACGTA\tIIIII\n\
+         u1\t4\t*\t0\t0\t*\t*\t0\t0\tACGTA\tIIIII\n\
+         u2\t4\t*\t0\t0\t*\t*\t0\t0\tTTTTT\tIIIII\n",
+    )
+    .unwrap();
+    let bam = tmp.join("un.bam");
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &["-b", "-o", bam.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(index::main(&argv("index", &[bam.to_str().unwrap()]))),
+        0
+    );
+
+    let out = tmp.join("star.sam");
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &["-o", out.to_str().unwrap(), bam.to_str().unwrap(), "*"]
+        ))),
+        0
+    );
+    let body: Vec<String> = std::fs::read_to_string(&out)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('@'))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(body.len(), 2);
+    assert!(body.iter().all(|l| l.split('\t').nth(2) == Some("*")));
+}
