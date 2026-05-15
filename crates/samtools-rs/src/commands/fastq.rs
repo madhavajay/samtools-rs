@@ -68,6 +68,25 @@ impl AuxSelection {
     }
 }
 
+/// Union-merges `extra` into `selection`. `None` becomes `Tags(extra)`;
+/// `All` is unchanged; `Tags(existing)` extends with non-duplicate tags
+/// from `extra`. Matches upstream's accumulating `-t` / `-T` behavior.
+fn merge_aux_selection(selection: &mut AuxSelection, extra: &[[u8; 2]]) {
+    match selection {
+        AuxSelection::None => {
+            *selection = AuxSelection::Tags(extra.to_vec());
+        }
+        AuxSelection::All => {}
+        AuxSelection::Tags(existing) => {
+            for tag in extra {
+                if !existing.iter().any(|t| t == tag) {
+                    existing.push(*tag);
+                }
+            }
+        }
+    }
+}
+
 /// Entry point for `samtools fastq` / `samtools fasta` / `samtools bam2fq`.
 pub fn main(args: &[OsString]) -> ExitCode {
     let sub_name = args.first().and_then(|a| a.to_str()).unwrap_or("fastq");
@@ -140,19 +159,22 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     print_error(sub_name, "missing value for -T");
                     return ExitCode::from(1);
                 };
-                aux_selection = match raw {
-                    "" | "*" => AuxSelection::All,
+                match raw {
+                    "" | "*" => aux_selection = AuxSelection::All,
                     _ => match parse_aux_list(raw) {
-                        Ok(tags) => AuxSelection::Tags(tags.into_iter().collect()),
+                        Ok(tags) => {
+                            let tags: Vec<[u8; 2]> = tags.into_iter().collect();
+                            merge_aux_selection(&mut aux_selection, &tags);
+                        }
                         Err(e) => {
                             print_error(sub_name, format!("invalid -T value \"{raw}\": {e}"));
                             return ExitCode::from(1);
                         }
                     },
-                };
+                }
             }
             "-t" => {
-                aux_selection = AuxSelection::Tags(vec![*b"RG", *b"BC", *b"QT"]);
+                merge_aux_selection(&mut aux_selection, &[*b"RG", *b"BC", *b"QT"]);
             }
             "-d" | "--tag" => {
                 let Some(raw) = iter.next().and_then(|a| a.to_str()) else {

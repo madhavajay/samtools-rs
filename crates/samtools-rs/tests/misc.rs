@@ -2018,6 +2018,45 @@ fn fastq_splits_read1_read2_and_singleton_outputs() {
 }
 
 #[test]
+fn fastq_dash_t_and_dash_cap_t_combine_aux_tags() {
+    let tmp = tmp_dir("fastq-t-T-combine");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:4\n",
+            "read1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:rg1\tBC:Z:AAAA\tMD:Z:4\tNM:i:0\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-n",
+                "-t",
+                "-T",
+                "MD",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.starts_with("@read1"));
+    assert!(text.contains("RG:Z:rg1"));
+    assert!(text.contains("BC:Z:AAAA"));
+    assert!(text.contains("MD:Z:4"));
+    assert!(!text.contains("NM:i:0"));
+}
+
+#[test]
 fn fastq_routes_r1_only_singletons_to_singleton_output() {
     let tmp = tmp_dir("fastq-r1-singleton");
     let sam = tmp.join("in.sam");
