@@ -760,6 +760,24 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
                 i += 1;
             }
             "--help" => return Err(ParseError::Usage),
+            // Thread count: accepted and recorded. Output is byte-identical
+            // regardless of the value (worker-pool wiring is a perf-only
+            // follow-up — TODO-NEXT #8); `-@ N`, `-@N`, `--threads N`.
+            "-@" | "--threads" => {
+                i += 1;
+                let _ = args
+                    .get(i)
+                    .and_then(|a| a.to_str())
+                    .ok_or_else(|| ParseError::Err("missing value for -@".into()))?;
+                i += 1;
+            }
+            _ if s.starts_with("-@") && s.len() > 2 => {
+                // Attached form `-@N`.
+                i += 1;
+            }
+            _ if s.starts_with("--threads=") => {
+                i += 1;
+            }
             _ if s.starts_with('-') && s != "-" => {
                 return Err(ParseError::Err(format!(
                     "option `{}` is not yet supported in samtools-rs view",

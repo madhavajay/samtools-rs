@@ -109,6 +109,25 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 let _ = print_usage();
                 return ExitCode::SUCCESS;
             }
+            // Attached-value forms of the accepted-but-ignored options
+            // (`-@4`, `-m768M`, `-l6`, `-Kprefix`, `-Tprefix`, `--threads=4`).
+            _ if (s.starts_with("-@")
+                || s.starts_with("-m")
+                || s.starts_with("-l")
+                || s.starts_with("-K")
+                || s.starts_with("-T"))
+                && s.len() > 2
+                && !s.starts_with("--") =>
+            {
+                // value is in the same token; nothing to consume.
+            }
+            _ if s.starts_with("--threads=")
+                || s.starts_with("--max-mem=")
+                || s.starts_with("--compression-level=")
+                || s.starts_with("--temp=") =>
+            {
+                // value embedded; ignored.
+            }
             _ if s.starts_with('-') && s != "-" => {
                 print_error(
                     "sort",

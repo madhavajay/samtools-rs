@@ -11,7 +11,8 @@ use htslib_rs::bam;
 use htslib_rs::sam;
 use samtools_rs::commands::{
     addreplacerg, bedcov, calmd, cat, checksum, depad, faidx, fastq, fixmate, flagstat, fqidx,
-    idxstats, import, index, mpileup, reference, reheader, reset, rmdup, samples, split, view,
+    idxstats, import, index, mpileup, reference, reheader, reset, rmdup, samples, sort, split,
+    view,
 };
 use samtools_rs::header_text;
 use samtools_rs::run as samtools_run;
@@ -6346,4 +6347,60 @@ fn view_large_chrom_csi_region_matches_upstream() {
             "region {region}"
         );
     }
+}
+
+#[test]
+fn threads_flag_is_byte_identical_for_view_and_sort() {
+    // TODO-NEXT #8: `-@ N` must not change output bytes (worker-pool
+    // wiring is perf-only). `--no-PG` isolates payload from the @PG CL
+    // string, which legitimately embeds the thread arg.
+    let tmp = tmp_dir("threads");
+    let sam = fixtures_dir().join("dat").join("mpileup.1.sam");
+
+    let v4 = tmp.join("v4.bam");
+    let v1 = tmp.join("v1.bam");
+    for (out, n) in [(&v4, "-@4"), (&v1, "-@1")] {
+        assert_eq!(
+            exit_to_u8(view::main(&argv(
+                "view",
+                &[
+                    "--no-PG",
+                    n,
+                    "-b",
+                    "-o",
+                    out.to_str().unwrap(),
+                    sam.to_str().unwrap()
+                ]
+            ))),
+            0
+        );
+    }
+    assert_eq!(
+        std::fs::read(&v4).unwrap(),
+        std::fs::read(&v1).unwrap(),
+        "view -@ output must be byte-identical"
+    );
+
+    let s4 = tmp.join("s4.bam");
+    let s1 = tmp.join("s1.bam");
+    for (out, n) in [(&s4, "-@4"), (&s1, "-@1")] {
+        assert_eq!(
+            exit_to_u8(sort::main(&argv(
+                "sort",
+                &[
+                    "--no-PG",
+                    n,
+                    "-o",
+                    out.to_str().unwrap(),
+                    v1.to_str().unwrap()
+                ]
+            ))),
+            0
+        );
+    }
+    assert_eq!(
+        std::fs::read(&s4).unwrap(),
+        std::fs::read(&s1).unwrap(),
+        "sort -@ output must be byte-identical"
+    );
 }
