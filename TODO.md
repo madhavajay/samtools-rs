@@ -35,6 +35,66 @@ Merged PRs (samtools-rs-only, consolidated via PR #16 `integration-all-prs` → 
 - PR #14, https://github.com/madhavajay/samtools-rs/pull/14, branch `addreplacerg-default-rg` (from `main`, two commits) — `addreplacerg` defaults to the first header `@RG` ID when neither `-r`/`-R` is given, upstream `@RG` header reconciliation (`-r` + `overwrite_all` strips other `@RG` lines; `-w` overwrites a same-ID line), and `-R ID` rejection when the ID is absent from the header. Brings the whole upstream `test_addrprg` group (`addrprg/{1,2,3,4,5}`, #3 = expected failure) to parity modulo `@PG`.
 - PR #15, https://github.com/madhavajay/samtools-rs/pull/15, branch `reheader-parity` (from `main`) — reorders the shared `pg::push_pg_line` output to upstream's `@PG` field order `ID, PN, PP, VN, CL`. Benefits every command that inserts a samtools `@PG`; the upstream harness strips `\tVN:.*`, so `PP` must precede `VN`. Brings the `reheader/{1,4}` header section to parity after harness reordering.
 
+Active working branch (not yet merged): `work-sam-float-renderer` (off `main`).
+Landed slices on this branch:
+- Shared `sam_render` module with htslib-style aux float formatting.
+- `view` BAM/CRAM→SAM aux float spelling via `sam_render`.
+- `split` SAM output routed through `sam_render::write_record`.
+- **SAM aux float formatting — remaining commands (this slice):** `reheader`
+  SAM→SAM, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`,
+  `rmdup`, `markdup`, and `cat` SAM-output sinks now wrap a plain
+  `File`/`Stdout` and render through `sam_render::write_record` /
+  `write_header`. Full gate green after this slice (samtools-rs: 422
+  passing, 0 failing; `cargo test --workspace`: 2593 passing; fmt + clippy
+  `-D warnings` clean). New test:
+  `sort_sam_output_uses_htslib_float_aux_spelling`.
+- **`view -X` legacy custom-index synopsis:** `view -X` /
+  `--customized-index` accepts `in.bam in.bam.bai [region…]` (index
+  positional accepted as a no-op). New test:
+  `view_dash_cap_x_accepts_legacy_custom_index_synopsis`.
+- **`view --library` / `-l`:** resolves `@RG LB:STR` → RG-ID set from
+  the header (path + SAM/BAM/CRAM stdin) and filters records by
+  `RG:Z:` membership. New test:
+  `view_dash_l_filters_by_read_group_library`. (`merge -s SEED` was
+  examined and skipped: it's already accepted/consumed, and its only
+  upstream effect — random RG/PG-ID collision suffixing — would require
+  reworking merge header reconciliation, out of scope for a bounded
+  slice.)
+- **`samples -i` custom-index resolution:** `-X` index path now
+  resolves an exact file, a directory holding the index, or a prefix
+  (matching `sam_index_load3`). New test:
+  `samples_custom_index_directory_reports_index_presence`.
+- **`addreplacerg` CRAM output:** `-O cram` / `--output-fmt[=]cram`
+  with `-T`/`--reference` writes reference-backed CRAM (SAM/BAM input)
+  via a temp-BAM → shared CRAM-writer path. New test:
+  `addreplacerg_writes_cram_output_with_reference`.
+- **`stats -d` CRAM region path verified:** the CRAM region path
+  shares the SAM/BAM `update` chokepoint, so `--remove-dups` already
+  excludes `BAM_FDUP` records from histograms there. New test:
+  `stats_remove_dups_excludes_duplicates_on_cram_region_path`. The
+  no-region CRAM summarize path remains blocked on the htslib-rs CRAM
+  all-record iterator.
+- **`fastq` index × name-grouping (complete):** one index record per
+  qname-group, htslib-exact CASAVA barcode normalization
+  (`ac-gt` → `AC+GT`), the CASAVA comment on `-i` index records, and
+  cross-mate barcode propagation (R2/other inherits the R1 mate's
+  `BC`). **`bam2fq/{5,8,10,12}` now byte parity on every output.** New
+  tests: `fastq_index_emits_one_record_per_qname_group_with_casava_comment`,
+  `fastq_casava_barcode_propagates_from_r1_to_r2_mate`.
+
+Batch status: **all "Remaining tractable samtools-rs-only items" are now
+done or explicitly deferred** (only `merge -s SEED`, whose sole upstream
+effect needs a merge header-reconciliation rework — a substantial
+samtools-rs effort, not a bounded slice). Per the **Active Goal**, the
+remaining actionable work requires htslib-rs / noodles changes (see
+*Items blocked …* below); this samtools-only pass stops here. Final
+validation on `work-sam-float-renderer`: `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace` (**2601 passing, 0 failing**) all green; the
+upstream `bam2fq/{5,8,10,12}` fixtures now match byte-for-byte. Next:
+open one PR for this branch, get CI green, merge to `main`, then a new
+working branch (the next batch is htslib-rs/noodles-blocked work).
+
 Latest known validation (on `main` at `b312c99`, post-merge):
 - Rust tests: 416 `samtools-rs` passing, 0 failing (`cargo test --workspace`: 2587 passing).
 - Full gate green in CI on PR #16: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and the advisory parity gate.
@@ -60,14 +120,14 @@ What to do next:
 3. Open a single PR for the whole batch, get CI green, merge to `main`, then start the next working branch.
 
 Remaining tractable samtools-rs-only items (no htslib-rs / noodles changes required):
-- **SAM aux float formatting (shared renderer).** High impact: split/reheader/sort/merge/collate/addreplacerg/reset/fixmate/rmdup binary→SAM fixtures match on headers but differ only on float-bearing aux fields because noodles' `sam::io::Writer` formats `f32` as plain decimals. samtools-rs already has the correct `format_aux_float`/`format_htslib_exponent` in `commands/fastq.rs`; promote them to a shared module and route the binary→SAM record paths through a samtools-rs renderer (see the noodles Extensions Needed note).
-- **`fastq` index extraction × name-grouping interaction.** Fold the per-record index emission into the name-grouped flush so each qname-group emits at most one index record per `--i1` / `--i2`, matching upstream's `flush_rec` → `output_index` (required for `bam2fq/{5,8,10,12}` parity).
-- **`view --library` (`-l`)** library filter via `@RG LB:` aux lookup. Builds on the merged read-group filter infrastructure.
-- **`view -X` legacy custom-index synopsis** for BAM/CRAM; the second positional becomes the index path. Already supported as a no-op in `idxstats`.
-- **`merge -s SEED`** random-seed acceptance for `-n` mode (currently the option is parsed but the seed is unused).
-- **`samples` BAM index path verification** for the `-i` index-presence column when index files are at non-default locations.
-- **`addreplacerg --output-fmt=cram`** with a `-T` reference — needs reference-backed CRAM writer path (already used in `view`).
-- **`stats -d` / `--remove-dups` edge cases**: ensure histogram contributions are excluded for primary duplicates across CRAM record paths.
+- ~~**SAM aux float formatting — remaining commands.**~~ **Done.** The shared `samtools_rs::sam_render` module (`format_aux_float`, `format_htslib_exponent`, `fix_sam_aux_floats`, `fix_sam_text`, `write_record`, `write_header`) now backs every noodles-`sam::io::Writer` SAM-output path: `view`, `split`, plus `reheader` SAM→SAM, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, `markdup`, and `cat` (their `SamFile`/`SamStdout`/`Sam*Sink` sinks now wrap a plain `File`/`Stdout` and render through `sam_render`). So every SAM-text output path emits htslib `%g`-style float aux spelling. Regression covered by `sort_sam_output_uses_htslib_float_aux_spelling` plus the existing `view`/`split` fixtures.
+- ~~**`fastq` index extraction × name-grouping interaction.**~~ **Done.** `emit_index_files` dedupes to **one index record per adjacent qname-group** (matching upstream `flush_rec` → `output_index`). The CASAVA barcode field is normalized exactly like htslib `fastq_format1` (`casava_barcode_field`: absent/non-sequence-first → `0`; otherwise non-alpha → `+`, lowercase → upper, e.g. `ac-gt` → `AC+GT`), `-i` index records carry the ` <rnum>:<filt>:0:<barcode>` CASAVA comment, and `GroupedSplitWriter` now **propagates the group barcode across mates** so an R2 (or other) record lacking its own `BC` gets the R1 mate's barcode in its CASAVA comment (`fill_casava_barcode`; upstream `bam_fastq.c:952`). **`bam2fq/{5,8,10,12}` now match byte-for-byte on every output (`1.fq`/`2.fq`/`s.fq` and the index/`bc` files).** New tests: `fastq_index_emits_one_record_per_qname_group_with_casava_comment`, `fastq_casava_barcode_propagates_from_r1_to_r2_mate` (plus the 45 existing fastq tests still green).
+- ~~**`view --library` (`-l`)** library filter via `@RG LB:` aux lookup.~~ **Done.** `view -l STR` / `--library STR` resolves the requested library to the set of `@RG` IDs whose `LB:` equals STR (scanned from the input header for path, SAM/BAM/CRAM stdin), then a record passes iff its `RG:Z:` value is in that set (no-RG / non-matching RG excluded, matching upstream `bam_get_library`). Regression: `view_dash_l_filters_by_read_group_library`.
+- ~~**`view -X` legacy custom-index synopsis**~~ **Done.** `view -X` / `--customized-index` accepts the legacy synopsis where the second positional is the explicit index path (`view -X in.bam in.bam.bai [region…]`); accepted as a no-op (our region queries build/find the index themselves), matching `idxstats -X`. Regression: `view_dash_cap_x_accepts_legacy_custom_index_synopsis`.
+- **`merge -s SEED`** — *deferred (not a bounded slice).* The option is already parsed and its value consumed. Upstream's only use of the seed is `hts_srand48` feeding `lrand48()` for random `@RG`/`@PG`-ID collision suffixes during header merge (`bam_sort.c:408`). Our merge reconciles headers by *rejecting* ID conflicts rather than random-suffixing, so the seed has no observable effect until that suffixing path is implemented — a header-reconciliation rework, larger than a bounded slice.
+- ~~**`samples` BAM index path verification**~~ **Done.** `samples -i` with a custom `-X` index path now mirrors `sam_index_load3`: an exact index file, a *directory* holding the index (`<dir>/<data-name>.bai`), or a suffix-less prefix all resolve via the shared `locate_associated_index` resolver, so index files at non-default locations register `Y`. Regression: `samples_custom_index_directory_reports_index_presence` (and the existing exact-file/pair test still passes).
+- ~~**`addreplacerg --output-fmt=cram`** with a `-T` reference~~ **Done.** `addreplacerg` accepts `-O cram` / `--output-fmt cram` / `--output-fmt=cram` and `-T`/`--reference[=]FILE`; SAM/BAM input → CRAM output spools rewritten records to a temp BAM and converts via the shared `write_cram_from_bam_path_with_reference` (the `.fai` is built if missing). CRAM output without `-T` errors. Regression: `addreplacerg_writes_cram_output_with_reference`.
+- ~~**`stats -d` / `--remove-dups` edge cases**~~ **Done (tractable part).** The CRAM *region* path iterates real records through the same `update_record_with_targets` → `update` chokepoint as SAM/BAM, which already gates all histogram/seq/quality accumulation on `self.total` increasing (and `--remove-dups` filters `BAM_FDUP` before `total` is bumped). Verified end-to-end by `stats_remove_dups_excludes_duplicates_on_cram_region_path` (SAM→CRAM→indexed→region stats with/without `-d`). The CRAM *no-region* path uses the `summarize_cram_records_from_path_with_reference` summary path, which discards per-record seq/quality — that remains **blocked on the htslib-rs CRAM all-record iterator** (already tracked in the blocked list).
 
 Items blocked on htslib-rs / noodles extensions (see the rolling list at the end of this file):
 - All pileup-dependent commands (`mpileup`, `consensus`, `targetcut`, `phase`, `ampliconstats`, exact pileup-based `bedcov`/`coverage`/`depth`).
@@ -76,7 +136,7 @@ Items blocked on htslib-rs / noodles extensions (see the rolling list at the end
 - `view --no-PG` for BAM/CRAM output (needs `sam_hdr_add_pg` equivalent that writes through the binary header).
 - `flagstat` / `idxstats` for CRAM input without an explicit reference (needs CRAM index meta accessor in `htslib-rs::index_compat`).
 - CSI query robustness for very large references (noodles `index out of bounds` panic on the upstream `test_index` `large_chrom.bam ref2` query).
-- SAM aux float formatting in noodles' `sam::io::Writer` (alternative to the samtools-rs shared-renderer approach above).
+- ~~SAM aux float formatting in noodles' `sam::io::Writer`~~ — resolved in samtools-rs via `sam_render` (no noodles change needed).
 
 ## Progress Snapshot
 
@@ -239,6 +299,7 @@ These are used by nearly every subcommand and must exist before subcommands can 
 - [~] **Reference helpers** (`samtools-rs/src/reference.rs`): shared FASTA helper now derives associated `.fai` paths, builds missing FASTA indexes through `htslib-rs::faidx_compat`, loads `(SN, LN)` dictionaries, and matches candidate FASTA references against BAM/CRAM `@SQ` dictionaries for `samples -f/-F`. **Pending:** mmap/FASTA sequence cache, common `--reference` option plumbing, CRAM reference resolution, and integration into `calmd`, `consensus`, `mpileup`, `phase`, and `import`.
 - [~] **Temp file helper** (`samtools-rs/src/tmp_file.rs`): shared temp path helper now creates collision-resistant temp files, owns best-effort cleanup on drop, supports explicit persist/close, and is used by native name-sort FASTQ conversion instead of ad hoc temp names. **Pending:** BAM record temp spooling, compression support, and integration into external `sort` / `collate` algorithms.
 - [x] **Logging passthrough**: bridge to `htslib-rs::log_compat` so top-level `--verbosity` flows correctly.
+- [x] **SAM render helper** (`samtools-rs/src/sam_render.rs`): shared htslib-style aux float formatting (`format_aux_float`/`format_htslib_exponent`), SAM-line/SAM-text float fixers (`fix_sam_aux_floats`/`fix_sam_text`), and noodles `sam::io::Writer` drop-ins (`write_record`/`write_header`). Used by `fastq` (float helper) and now every SAM-text output path: `view`, `split`, `reheader` SAM→SAM, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, `markdup`, and `cat` route through `write_record`/`write_header`, so binary→SAM and SAM→SAM both get htslib `%g` float spelling.
 
 ## Phase 2: Subcommand Surface Mapping
 
@@ -343,7 +404,7 @@ noodles submodule for these blockers until explicitly switching back to
 underlying-library work.
 
 - [ ] **CSI query robustness for very large references/regions** — the local parity harness now reaches `test_index`, where `samtools view large_chrom.bam ref2` panics inside `noodles-csi/src/binning_index/index/reference_sequence.rs` with `index out of bounds`, and `ref2:1-541556283` reports `invalid end bound`. Defer to noodles/htslib-rs region/index handling rather than patching noodles from this samtools-rs pass.
-- [ ] **SAM aux float formatting (`f:` scalars and `B:f` arrays)** — noodles' `sam::io::Writer` (used by `split`, `reheader`, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, and any other binary→SAM record path) formats `f32` aux values as plain decimals/integers (`6.626e-34` → `0.0000…0006626`, `2.9979e+09` → `2997900000`, `6.022e+23` → `6.022e23`), whereas htslib uses `%g`-style scientific notation with a signed two-digit exponent. samtools-rs already has the correct formatter (`format_aux_float` / `format_htslib_exponent` in `commands/fastq.rs`); the blocker is that the shared binary→SAM path routes through `noodles sam::io::Writer::write_alignment_record` rather than a samtools-rs renderer. Options: (a) add an htslib-style float `Display`/serializer in noodles (underlying-library change, deferred), or (b) introduce a shared samtools-rs SAM-record renderer that reuses the fastq float helpers and switch the binary→SAM commands to it (a non-trivial samtools-rs refactor — promote `format_aux_float` to a shared module and add a `record → SAM line` helper). Surfacing here: the `split/`, `reheader/`, and similar fixtures match byte-for-byte on headers but differ only on float-bearing aux fields because of this.
+- [~] **SAM aux float formatting (`f:` scalars and `B:f` arrays)** — RESOLVED via samtools-rs option (b): `samtools_rs::sam_render` reuses the htslib-style `format_aux_float` / `format_htslib_exponent` and adds `fix_sam_aux_floats` / `fix_sam_text` (post-process noodles SAM text) plus `write_record` / `write_header` (drop-in for noodles `sam::io::Writer`). Wired into `view` (all binary→SAM text paths + `record_to_sam_line`) and `split` SAM output, bringing `reheader/1` (via `… | view -h`) and `split.expected.grp{1,2}.sam` to byte parity. Remaining commands (`reheader` SAM→SAM, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, `markdup`, `cat`) still write through noodles directly — tracked as a bounded follow-up in the *Remaining tractable items*. The noodles-side option (a) is no longer required.
 
 ## Submodule Pinning
 

@@ -84,6 +84,34 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
 
+        if let Some(lib) = opts.library.clone() {
+            let header_text: io::Result<String> = match stdin_format(&data) {
+                StdinFormat::Sam => {
+                    Ok(String::from_utf8_lossy(sam_header_lines(&data)).into_owned())
+                }
+                StdinFormat::Bam => htslib_rs::alignment_compat::view_bam_as_sam_text(
+                    io::Cursor::new(&data),
+                    Some(0),
+                ),
+                StdinFormat::Cram => cram_reference(&opts).and_then(|reference| {
+                    htslib_rs::alignment_compat::view_cram_as_sam_text_with_reference(
+                        io::Cursor::new(&data),
+                        &reference,
+                        Some(0),
+                    )
+                }),
+            };
+            match header_text {
+                Ok(text) => {
+                    opts.library_rg_ids = library_rg_ids_from_header(&text, &lib);
+                }
+                Err(e) => {
+                    print_error_errno("view", "failed to read header for -l", &e);
+                    return ExitCode::from(1);
+                }
+            }
+        }
+
         let result = match stdin_format(&data) {
             StdinFormat::Sam => run_sam_stdin(&opts, &data),
             StdinFormat::Bam => run_bam_stdin(&opts, &data),
@@ -114,6 +142,22 @@ pub fn main(args: &[OsString]) -> ExitCode {
     if format.category != Category::SequenceData {
         print_error("view", format!("{} is not sequence data", input.display()));
         return ExitCode::from(1);
+    }
+
+    if let Some(lib) = opts.library.clone() {
+        match read_raw_header_text_with_format(&input, format.exact) {
+            Ok(header_text) => {
+                opts.library_rg_ids = library_rg_ids_from_header(&header_text, &lib);
+            }
+            Err(e) => {
+                print_error_errno(
+                    "view",
+                    format!("failed to read header of \"{}\"", input.display()),
+                    &e,
+                );
+                return ExitCode::from(1);
+            }
+        }
     }
 
     match run(&opts, &input, format.exact) {
@@ -172,6 +216,23 @@ struct Opts {
     read_groups: HashSet<Vec<u8>>,
     /// `-n` — exclude records that have no `RG:Z:` aux tag at all.
     exclude_no_rg: bool,
+    /// `-l STR` / `--library STR` — only output records whose read group's
+    /// `@RG LB:` value equals STR. `None` means the filter is off.
+    library: Option<String>,
+    /// Resolved from the header once the input is known: the set of `@RG`
+    /// IDs whose `LB:` matches [`Opts::library`]. A record passes the
+    /// library filter iff its `RG:Z:` value is in this set (so a record
+    /// with no `RG` is excluded, matching upstream `bam_get_library`).
+    library_rg_ids: HashSet<Vec<u8>>,
+    /// `-X` / `--customized-index` — legacy synopsis where the second
+    /// positional is an explicit index path
+    /// (`view -X in.bam in.bam.bai [region…]`).
+    customized_index: bool,
+    /// Explicit index path captured under `-X`. Accepted for synopsis
+    /// compatibility; our region queries build/find the index
+    /// themselves, so this is currently informational (a no-op, matching
+    /// `idxstats -X`).
+    index_path: Option<PathBuf>,
     /// `-d TAG[:VAL]` / `-D TAG:FILE` — aux-tag presence (or value-set)
     /// filter. All `-d` / `-D` invocations must share the same TAG, and
     /// values accumulate into the same `AuxTagFilter`. `None` means the
@@ -198,6 +259,37 @@ impl QnameFilter {
         let contained = self.names.contains(qname);
         if self.negate { !contained } else { contained }
     }
+}
+
+/// Scans the `@RG` lines of a SAM header text and returns the set of
+/// read-group IDs whose `LB:` field equals `library` (upstream
+/// `bam_get_library`/`-l` semantics). Only the leading `@`-prefixed
+/// header block is inspected.
+fn library_rg_ids_from_header(header_text: &str, library: &str) -> HashSet<Vec<u8>> {
+    let mut ids = HashSet::new();
+    for line in header_text.lines() {
+        if !line.starts_with('@') {
+            break;
+        }
+        if !line.starts_with("@RG\t") {
+            continue;
+        }
+        let mut id = None;
+        let mut lb = None;
+        for field in line.split('\t').skip(1) {
+            if let Some(v) = field.strip_prefix("ID:") {
+                id = Some(v);
+            } else if let Some(v) = field.strip_prefix("LB:") {
+                lb = Some(v);
+            }
+        }
+        if lb == Some(library)
+            && let Some(id) = id
+        {
+            ids.insert(id.as_bytes().to_vec());
+        }
+    }
+    ids
 }
 
 /// Walk a SAM record line and return the `RG:Z:` value, or `None` if not
@@ -318,6 +410,11 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
         let Some(s) = arg.to_str() else {
             if opts.input.is_none() {
                 opts.input = Some(PathBuf::from(arg));
+                i += 1;
+                continue;
+            }
+            if opts.customized_index && opts.index_path.is_none() {
+                opts.index_path = Some(PathBuf::from(arg));
                 i += 1;
                 continue;
             }
@@ -469,6 +566,15 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
             }
             "-n" => {
                 opts.exclude_no_rg = true;
+                i += 1;
+            }
+            "-l" | "--library" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .and_then(|a| a.to_str())
+                    .ok_or_else(|| ParseError::Err("missing value for -l".into()))?;
+                opts.library = Some(v.to_string());
                 i += 1;
             }
             "-d" | "--tag" => {
@@ -649,6 +755,10 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
                 };
                 i += 1;
             }
+            "-X" | "--customized-index" => {
+                opts.customized_index = true;
+                i += 1;
+            }
             "--help" => return Err(ParseError::Usage),
             _ if s.starts_with('-') && s != "-" => {
                 return Err(ParseError::Err(format!(
@@ -659,6 +769,10 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
             _ => {
                 if opts.input.is_none() {
                     opts.input = Some(PathBuf::from(arg));
+                } else if opts.customized_index && opts.index_path.is_none() {
+                    // Legacy `-X` synopsis: the second positional is the
+                    // explicit index path. Accepted as a no-op.
+                    opts.index_path = Some(PathBuf::from(arg));
                 } else {
                     opts.regions.push(s.to_string());
                 }
@@ -1325,6 +1439,9 @@ fn run_bam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
         } else {
             htslib_rs::alignment_compat::view_bam_as_sam_text(io::Cursor::new(input), None)?
         };
+        // Records came from binary; fix noodles' plain-decimal float
+        // spelling to htslib's `%g` form (header lines pass through).
+        let text = crate::sam_render::fix_sam_text(&text);
         let mut out = open_text_output(opts)?;
         let mut unselected = open_unselected_text_output(opts)?;
         if opts.header == HeaderMode::Include {
@@ -1783,8 +1900,10 @@ fn write_records_as_sam<W: Write>(
                     )?
                 }
             };
-            // For BAM input we already have SAM text. Apply filters
-            // line-by-line if any are set.
+            // For BAM input we already have SAM text. Records came from
+            // binary, so fix noodles' plain-decimal float spelling to
+            // htslib's `%g` form, then apply filters line-by-line.
+            let text = crate::sam_render::fix_sam_text(&text);
             write_sam_text_records_split(out, unselected, text.as_bytes(), opts)
         }
         Exact::Cram => {
@@ -1816,6 +1935,8 @@ fn write_records_as_sam<W: Write>(
                     )?
                 }
             };
+            // CRAM records came from binary; fix float spelling.
+            let text = crate::sam_render::fix_sam_text(&text);
             write_sam_text_records_split(out, unselected, text.as_bytes(), opts)
         }
         _ => Err(io::Error::new(
@@ -1845,6 +1966,7 @@ fn has_filters(opts: &Opts) -> bool {
         || opts.qname_filter.is_some()
         || !opts.read_groups.is_empty()
         || opts.exclude_no_rg
+        || opts.library.is_some()
         || opts.aux_tag_filter.is_some()
 }
 
@@ -1987,7 +2109,11 @@ fn record_to_sam_line(header: &sam::Header, record: &RecordBuf) -> io::Result<Ve
     if buf.last() == Some(&b'\n') {
         buf.pop();
     }
-    Ok(buf)
+    // noodles spells `f32` aux values as plain decimals; rewrite `:f:`
+    // scalars and `B:f,` arrays to htslib's `%g` form for byte parity.
+    let line =
+        std::str::from_utf8(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(crate::sam_render::fix_sam_aux_floats(line).into_bytes())
 }
 
 fn write_prepared_sam_record_line<W: Write + ?Sized>(
@@ -2100,6 +2226,15 @@ fn line_passes(line: &[u8], opts: &Opts) -> bool {
                     return false;
                 }
             }
+        }
+    }
+    if opts.library.is_some() {
+        // A record passes iff its read group's LB matches; no RG (or an
+        // RG not in the resolved set) fails, like upstream's
+        // bam_get_library check.
+        match extract_rg_value(line) {
+            Some(rg) if opts.library_rg_ids.contains(rg) => {}
+            _ => return false,
         }
     }
     if let Some(filter) = opts.aux_tag_filter.as_ref() {

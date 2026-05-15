@@ -248,10 +248,8 @@ fn rewrite_sam_with_header<W: Write>(
     input_sam: &Path,
     add_pg: bool,
     argv: &[OsString],
-    output: W,
+    mut output: W,
 ) -> io::Result<()> {
-    use sam::alignment::io::Write as _;
-
     let new_header = if add_pg {
         crate::pg::add_samtools_pg_to_header(&new_header, argv)?
     } else {
@@ -260,15 +258,15 @@ fn rewrite_sam_with_header<W: Write>(
 
     let mut input = sam::io::Reader::new(BufReader::new(File::open(input_sam)?));
     let input_header = input.read_header()?;
-    let mut writer = sam::io::Writer::new(output);
-    writer.write_header(&new_header)?;
+    // Shared renderer: htslib `%g` float aux spelling.
+    crate::sam_render::write_header(&mut output, &new_header)?;
 
     loop {
         let mut record = RecordBuf::default();
         if input.read_record_buf(&input_header, &mut record)? == 0 {
             break;
         }
-        writer.write_alignment_record(&new_header, &record)?;
+        crate::sam_render::write_record(&mut output, &new_header, &record)?;
     }
     Ok(())
 }

@@ -353,10 +353,6 @@ fn parse_sq(line: &str) -> (String, u64) {
 }
 
 fn index_present(fname: &Path, custom_index: Option<&Path>) -> bool {
-    if let Some(index_path) = custom_index {
-        return index_path.exists();
-    }
-
     use htslib_rs::index_compat::{IndexFormat, locate_associated_index};
     let candidates = [
         IndexFormat::Bai,
@@ -364,9 +360,33 @@ fn index_present(fname: &Path, custom_index: Option<&Path>) -> bool {
         IndexFormat::Crai,
         IndexFormat::Tbi,
     ];
-    candidates
-        .into_iter()
-        .any(|fmt| locate_associated_index(fname, fmt).is_some())
+    let resolves = |base: &Path| {
+        candidates
+            .into_iter()
+            .any(|fmt| locate_associated_index(base, fmt).is_some())
+    };
+
+    if let Some(index_path) = custom_index {
+        // Upstream passes the custom path to `sam_index_load3`, which
+        // accepts an exact index file, a directory holding the index, or
+        // a prefix to which the standard suffix is appended. A bare
+        // `.exists()` only caught the first; emulate the other two via
+        // the shared resolver so non-default index locations register.
+        if index_path.is_file() {
+            return true;
+        }
+        let base = if index_path.is_dir() {
+            match fname.file_name() {
+                Some(name) => index_path.join(name),
+                None => return false,
+            }
+        } else {
+            index_path.to_path_buf()
+        };
+        return resolves(&base);
+    }
+
+    resolves(fname)
 }
 
 fn write_usage<W: Write>(w: &mut W) -> io::Result<()> {

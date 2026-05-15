@@ -819,8 +819,8 @@ trait MergeSink {
 
 struct BamFile(bam::io::Writer<bgzf::io::Writer<File>>);
 struct BamStdout(bam::io::Writer<bgzf::io::Writer<io::Stdout>>);
-struct SamFile(sam::io::Writer<File>);
-struct SamStdout(sam::io::Writer<io::Stdout>);
+struct SamFile(File);
+struct SamStdout(io::Stdout);
 
 impl MergeSink for BamFile {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
@@ -836,14 +836,13 @@ impl MergeSink for BamStdout {
 }
 impl MergeSink for SamFile {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
-        use sam::alignment::io::Write as _;
-        self.0.write_alignment_record(header, record)
+        // Shared renderer: htslib `%g` float aux spelling.
+        crate::sam_render::write_record(&mut self.0, header, record)
     }
 }
 impl MergeSink for SamStdout {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
-        use sam::alignment::io::Write as _;
-        self.0.write_alignment_record(header, record)
+        crate::sam_render::write_record(&mut self.0, header, record)
     }
 }
 
@@ -854,10 +853,9 @@ fn open_output(
 ) -> io::Result<Box<dyn MergeSink>> {
     match (out, fmt) {
         (Some(p), OutFmt::Sam) => {
-            let file = File::create(p)?;
-            let mut writer = sam::io::Writer::new(file);
-            writer.write_header(header)?;
-            Ok(Box::new(SamFile(writer)))
+            let mut file = File::create(p)?;
+            crate::sam_render::write_header(&mut file, header)?;
+            Ok(Box::new(SamFile(file)))
         }
         (Some(p), OutFmt::Bam) => {
             let file = File::create(p)?;
@@ -866,9 +864,9 @@ fn open_output(
             Ok(Box::new(BamFile(writer)))
         }
         (None, OutFmt::Sam) => {
-            let mut writer = sam::io::Writer::new(io::stdout());
-            writer.write_header(header)?;
-            Ok(Box::new(SamStdout(writer)))
+            let mut stdout = io::stdout();
+            crate::sam_render::write_header(&mut stdout, header)?;
+            Ok(Box::new(SamStdout(stdout)))
         }
         (None, OutFmt::Bam) => {
             let mut writer = bam::io::Writer::new(io::stdout());

@@ -284,21 +284,21 @@ trait SamSink {
 }
 
 struct SamFileSink {
-    writer: sam::io::Writer<File>,
+    writer: File,
 }
 
 impl SamFileSink {
     fn new(path: &Path, header: &sam::Header) -> io::Result<Self> {
-        let mut writer = sam::io::Writer::new(File::create(path)?);
-        writer.write_header(header)?;
+        let mut writer = File::create(path)?;
+        crate::sam_render::write_header(&mut writer, header)?;
         Ok(Self { writer })
     }
 }
 
 impl SamSink for SamFileSink {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
-        use sam::alignment::io::Write as _;
-        self.writer.write_alignment_record(header, record)
+        // Shared renderer: htslib `%g` float aux spelling.
+        crate::sam_render::write_record(&mut self.writer, header, record)
     }
 
     fn finish(self: Box<Self>) -> io::Result<()> {
@@ -307,21 +307,20 @@ impl SamSink for SamFileSink {
 }
 
 struct SamStdoutSink {
-    writer: sam::io::Writer<io::Stdout>,
+    writer: io::Stdout,
 }
 
 impl SamStdoutSink {
     fn new(header: &sam::Header) -> io::Result<Self> {
-        let mut writer = sam::io::Writer::new(io::stdout());
-        writer.write_header(header)?;
+        let mut writer = io::stdout();
+        crate::sam_render::write_header(&mut writer, header)?;
         Ok(Self { writer })
     }
 }
 
 impl SamSink for SamStdoutSink {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
-        use sam::alignment::io::Write as _;
-        self.writer.write_alignment_record(header, record)
+        crate::sam_render::write_record(&mut self.writer, header, record)
     }
 
     fn finish(self: Box<Self>) -> io::Result<()> {

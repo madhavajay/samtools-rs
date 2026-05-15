@@ -512,11 +512,12 @@ impl SplitSink for BamFile {
     }
 }
 
-struct SamFile(sam::io::Writer<File>);
+struct SamFile(File);
 impl SplitSink for SamFile {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
-        use sam::alignment::io::Write as _;
-        self.0.write_alignment_record(header, record)
+        // Use the shared renderer so `f32` aux values get htslib's `%g`
+        // spelling rather than noodles' plain decimals.
+        crate::sam_render::write_record(&mut self.0, header, record)
     }
 }
 
@@ -529,9 +530,9 @@ fn open_output(path: &Path, fmt: OutFmt, header: &sam::Header) -> io::Result<Box
     let file = File::create(path)?;
     match fmt {
         OutFmt::Sam => {
-            let mut writer = sam::io::Writer::new(file);
-            writer.write_header(header)?;
-            Ok(Box::new(SamFile(writer)))
+            let mut file = file;
+            crate::sam_render::write_header(&mut file, header)?;
+            Ok(Box::new(SamFile(file)))
         }
         OutFmt::Bam => {
             let mut writer = bam::io::Writer::new(file);

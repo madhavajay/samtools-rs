@@ -274,30 +274,31 @@ trait SamLike {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()>;
 }
 
-struct SamFile(sam::io::Writer<File>);
-struct SamStdout(sam::io::Writer<io::Stdout>);
+struct SamFile(File);
+struct SamStdout(io::Stdout);
 
 impl SamLike for SamFile {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
-        self.0.write_alignment_record(header, record)
+        // Shared renderer: htslib `%g` float aux spelling.
+        crate::sam_render::write_record(&mut self.0, header, record)
     }
 }
 impl SamLike for SamStdout {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
-        self.0.write_alignment_record(header, record)
+        crate::sam_render::write_record(&mut self.0, header, record)
     }
 }
 
 fn open_sam_output(out: Option<&Path>, header: &sam::Header) -> io::Result<Box<dyn SamLike>> {
     match out {
         Some(p) => {
-            let mut writer = sam::io::Writer::new(File::create(p)?);
-            writer.write_header(header)?;
+            let mut writer = File::create(p)?;
+            crate::sam_render::write_header(&mut writer, header)?;
             Ok(Box::new(SamFile(writer)))
         }
         None => {
-            let mut writer = sam::io::Writer::new(io::stdout());
-            writer.write_header(header)?;
+            let mut writer = io::stdout();
+            crate::sam_render::write_header(&mut writer, header)?;
             Ok(Box::new(SamStdout(writer)))
         }
     }

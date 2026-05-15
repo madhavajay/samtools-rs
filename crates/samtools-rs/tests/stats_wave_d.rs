@@ -1178,6 +1178,86 @@ r2\t1024\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####
 }
 
 #[test]
+fn stats_remove_dups_excludes_duplicates_on_cram_region_path() {
+    // The CRAM region path iterates real records through the same
+    // `update_record_with_targets` chokepoint as SAM/BAM, so `-d` must
+    // exclude FDUP records from histograms/counts there too. (The
+    // no-region CRAM path is the blocked summarize path — see TODO.)
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("stats-cram-dups");
+    let sam = tmp.join("dups.sam");
+    let reference = tmp.join("ref.fa");
+    let cram = tmp.join("dups.cram");
+    let all_out = tmp.join("all.stats");
+    let dedup_out = tmp.join("dedup.stats");
+
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:100
+r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!
+r2\t1024\tchr1\t2\t60\t4M\t*\t0\t0\tCGTA\t####
+",
+    )
+    .unwrap();
+    std::fs::write(&reference, format!(">chr1\n{}\n", "ACGT".repeat(25))).unwrap();
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &["faidx", reference.to_str().unwrap()],
+        ))),
+        0
+    );
+
+    // SAM → CRAM (reference-backed), then index for region queries.
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "view",
+                "-C",
+                "-T",
+                reference.to_str().unwrap(),
+                "-o",
+                cram.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &["index", cram.to_str().unwrap()],
+        ))),
+        0
+    );
+
+    let run_stats = |out: &std::path::Path, extra: &[&str]| {
+        let mut a = vec!["--reference", reference.to_str().unwrap(), "stats"];
+        a.extend_from_slice(extra);
+        a.push("-o");
+        a.push(out.to_str().unwrap());
+        a.push(cram.to_str().unwrap());
+        a.push("chr1:1-100");
+        assert_eq!(exit_to_u8(samtools_run(argv("samtools", &a))), 0);
+    };
+    run_stats(&all_out, &[]);
+    run_stats(&dedup_out, &["-d"]);
+
+    let all_text = std::fs::read_to_string(all_out).unwrap();
+    let dedup_text = std::fs::read_to_string(dedup_out).unwrap();
+    assert_eq!(stats_sn_value(&all_text, "sequences"), 2);
+    assert_eq!(stats_sn_value(&all_text, "reads duplicated"), 1);
+    assert_eq!(stats_sn_value(&dedup_text, "filtered sequences"), 1);
+    assert_eq!(stats_sn_value(&dedup_text, "sequences"), 1);
+    assert_eq!(stats_sn_value(&dedup_text, "reads duplicated"), 0);
+}
+
+#[test]
 fn stats_target_regions_deduplicate_overlaps_for_sam_and_bam() {
     let fixtures = fixtures_dir().join("stat");
     let sam = fixtures.join("11_target.sam");

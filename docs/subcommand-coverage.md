@@ -33,7 +33,7 @@ samtools-rs status legend:
   - `hts_expr_*` filter evaluation — ✅ via `htslib_rs::expr` (audit needed)
   - Aux-tag filter / remove (`-x`, `--keep-tag`) — implemented for SAM output and SAM-input BAM/CRAM output; BAM/CRAM-input binary aux mutation still needs deeper mutable-record support — ⚠️
   - Shared sanitizer mutation (`-z`/`--sanitize`) — implemented through text-record rewrites / text roundtrips for supported view output paths — ⚠️
-- **samtools-rs status:** 🟡 (SAM/BAM/reference-backed CRAM count/text/BAM/CRAM paths, stdin paths, region/BED queries, simple filters, expression filters, SAM-output `-U`/`-p`, SAM-input aux stripping, `-z` sanitizer mutation, `-N`/`--qname-file FILE` qname filter with `^FILE` negation, accumulating `-r STR` / `-R FILE` read-group filtering, `-n` exclude-no-read-group filtering, and `-d TAG[:VAL]` / `-D TAG:FILE` aux-tag presence/value filtering work; BAM/CRAM-input binary aux mutation, binary `-U`/`-p`, multi-file inputs, paired filters, and full CRAM parity remain)
+- **samtools-rs status:** 🟡 (SAM/BAM/reference-backed CRAM count/text/BAM/CRAM paths, stdin paths, region/BED queries, simple filters, expression filters, SAM-output `-U`/`-p`, SAM-input aux stripping, `-z` sanitizer mutation, `-N`/`--qname-file FILE` qname filter with `^FILE` negation, accumulating `-r STR` / `-R FILE` read-group filtering, `-n` exclude-no-read-group filtering, `-d TAG[:VAL]` / `-D TAG:FILE` aux-tag presence/value filtering, `-X`/`--customized-index` legacy index synopsis (no-op), `-l`/`--library STR` `@RG LB:` library filtering, and htslib-style aux float spelling for binary→SAM output via `sam_render` work; BAM/CRAM-input binary aux mutation, binary `-U`/`-p`, multi-file inputs, paired filters, and full CRAM parity remain)
 
 ### head
 
@@ -139,7 +139,7 @@ samtools-rs status legend:
 - **C source:** `bam_addrprg.c`
 - **HTSlib APIs used:** `sam_hdr_add_line`, `bam_aux_update_str`, record iteration
 - **htslib-rs coverage:** ⚠️ — mutable SAM/BAM `RecordBuf` paths cover current RG string replacement; direct `bam_aux_update_str` parity and CRAM remain unavailable
-- **samtools-rs status:** 🟡 — SAM/BAM add/replace exists with `-O sam|bam`, default `@PG` insertion, and `--no-PG`; CRAM, mate-aware updates, and full orphan-first semantics remain.
+- **samtools-rs status:** 🟡 — SAM/BAM add/replace exists with `-O sam|bam|cram` (`cram` requires `-T`/`--reference`; SAM/BAM input only), default `@PG` insertion, and `--no-PG`; CRAM *input*, mate-aware updates, and full orphan-first semantics remain.
 
 ### fastq / fasta / bam2fq
 
@@ -274,7 +274,7 @@ samtools-rs status legend:
 - **C source:** `bam_samples.c`
 - **HTSlib APIs used:** `sam_hdr_*` to list `@RG` SM values
 - **htslib-rs coverage:** ✅
-- **samtools-rs status:** ✅ — lists `@RG SM:` samples across inputs with header-driven de-duplication, `-T`, `-o`, `-h`, `-i`, `-f`/`-F`, stdin path lists, `-X` custom index pairs, and CRAM headers.
+- **samtools-rs status:** ✅ — lists `@RG SM:` samples across inputs with header-driven de-duplication, `-T`, `-o`, `-h`, `-i`, `-f`/`-F`, stdin path lists, `-X` custom index pairs (exact file, directory, or prefix — `sam_index_load3`-style resolution), and CRAM headers.
 
 ### reference
 

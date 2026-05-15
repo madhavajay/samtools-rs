@@ -181,6 +181,44 @@ fn sort_sam_input_by_name_to_sam_output() {
 }
 
 #[test]
+fn sort_sam_output_uses_htslib_float_aux_spelling() {
+    // A large-exponent f32 aux value must be re-spelled the htslib `%g`
+    // way (`6.022e+23`) rather than noodles' plain decimal, now that
+    // sort's SAM sink routes through sam_render::write_record.
+    let tmp = tmp_dir("sort-sam-float");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("sorted.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:unsorted\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tfa:f:6.022e+23\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "sort",
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(sort::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(
+        text.contains("fa:f:6.022e+23"),
+        "expected htslib float spelling, got:\n{text}"
+    );
+}
+
+#[test]
 fn sort_short_output_format_consumes_value() {
     let tmp = tmp_dir("sort-short-output-fmt");
     let sam = tmp.join("in.sam");

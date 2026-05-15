@@ -1071,6 +1071,43 @@ fn samples_custom_index_pair_reports_index_presence() {
 }
 
 #[test]
+fn samples_custom_index_directory_reports_index_presence() {
+    // Upstream `sam_index_load3` accepts a *directory* as the custom
+    // index argument and finds `<dir>/<data-name>.bai` inside it. A bare
+    // `.exists()` on the directory used to (wrongly) report nothing /
+    // the directory itself; verify the resolver finds the relocated
+    // index at this non-default location.
+    let tmp = tmp_dir("samples-custom-index-dir");
+    let bam = tmp.join("in.bam");
+    let out = tmp.join("samples.txt");
+    let idx_dir = tmp.join("indexes");
+    std::fs::create_dir_all(&idx_dir).unwrap();
+    std::fs::copy(sample_bam(), &bam).unwrap();
+
+    assert_eq!(
+        exit_to_u8(index::main(&argv("index", &[bam.to_str().unwrap()]))),
+        0
+    );
+    std::fs::rename(tmp.join("in.bam.bai"), idx_dir.join("in.bam.bai")).unwrap();
+
+    assert_eq!(
+        exit_to_u8(samples::main(&argv(
+            "samples",
+            &[
+                "-X",
+                "-i",
+                "-o",
+                out.to_str().unwrap(),
+                bam.to_str().unwrap(),
+                idx_dir.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert!(std::fs::read_to_string(out).unwrap().ends_with("\tY\n"));
+}
+
+#[test]
 fn samples_cram_header_succeeds() {
     let tmp = tmp_dir("samples-cram");
     let out = tmp.join("samples.txt");
@@ -1767,6 +1804,112 @@ fn fastq_index_files_extract_from_barcode_tag() {
             "@foo\nCGGGGGGT\n+\nPqq1qqqR\n"
         );
     }
+}
+
+#[test]
+fn fastq_index_emits_one_record_per_qname_group_with_casava_comment() {
+    // A qname with two non-last-segment records (primary + a
+    // supplementary that survives a relaxed -F) must yield exactly ONE
+    // index record (upstream `flush_rec` is one-per-template). With -i
+    // the index record gets the CASAVA comment, with the barcode
+    // separator normalized to '+' and lower-cased bases upper-cased.
+    let tmp = tmp_dir("fastq-index-group");
+    let sam = tmp.join("in.sam");
+    let i1_out = tmp.join("i1.fq");
+    let main_out = tmp.join("0.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:16\n",
+            // p1: primary R1 + supplementary R1 (same qname) — one index.
+            "p1\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\tBC:Z:ac-gt\n",
+            "p1\t2113\tchr1\t9\t60\t4M\t=\t5\t0\tACGT\t!!!!\tBC:Z:ac-gt\n",
+            "p1\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\n",
+            // p2: a separate template — its own single index record.
+            "p2\t65\tchr1\t1\t60\t4M\t=\t5\t8\tGGGG\t!!!!\tBC:Z:TT+AA\n",
+            "p2\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tCCCC\t####\n",
+        ),
+    )
+    .unwrap();
+
+    // -F 0 so the supplementary record is not filtered, proving the
+    // dedup is by qname group (not by flag filtering).
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-i",
+                "-F",
+                "0",
+                "--index-format",
+                "i*",
+                "--i1",
+                i1_out.to_str().unwrap(),
+                "-0",
+                main_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    // Exactly one index record per template, CASAVA comment present,
+    // `ac-gt` → `AC+GT`, `TT+AA` stays `TT+AA`.
+    // Index sequence is the raw BC segment (`ac`, `TT`); only the CASAVA
+    // comment normalizes/upper-cases. Quality is the default (`"`) since
+    // no QT tag is present.
+    assert_eq!(
+        std::fs::read_to_string(&i1_out).unwrap(),
+        "@p1 1:N:0:AC+GT\nac\n+\n\"\"\n@p2 1:N:0:TT+AA\nTT\n+\n\"\"\n"
+    );
+}
+
+#[test]
+fn fastq_casava_barcode_propagates_from_r1_to_r2_mate() {
+    // Only the R1 record carries BC; with -i, upstream copies the
+    // barcode into the R2 mate's CASAVA comment within the qname group
+    // (bam_fastq.c:952). So `*.2.fq` must show `2:N:0:AC+GT`, not
+    // `2:N:0:0`.
+    let tmp = tmp_dir("fastq-casava-propagate");
+    let sam = tmp.join("in.sam");
+    let r1 = tmp.join("1.fq");
+    let r2 = tmp.join("2.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:16\n",
+            "p\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\tBC:Z:ac-gt\n",
+            "p\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-i",
+                "-1",
+                r1.to_str().unwrap(),
+                "-2",
+                r2.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&r1).unwrap(),
+        "@p 1:N:0:AC+GT\nACGT\n+\n!!!!\n"
+    );
+    // R2 had no BC of its own — the group barcode is propagated in.
+    assert_eq!(
+        std::fs::read_to_string(&r2).unwrap(),
+        "@p 2:N:0:AC+GT\nTGCA\n+\n####\n"
+    );
 }
 
 #[test]
@@ -4987,6 +5130,56 @@ fn addreplacerg_writes_bam_output_with_rg_header_and_tag() {
         value,
         &sam::alignment::record_buf::data::field::Value::String("g1".into())
     );
+}
+
+#[test]
+fn addreplacerg_writes_cram_output_with_reference() {
+    let tmp = tmp_dir("addreplacerg-cram-output");
+    let sam = tmp.join("in.sam");
+    let reference = tmp.join("ref.fa");
+    let out = tmp.join("out.cram");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(&reference, ">chr1\nACGTACGT\n").unwrap();
+
+    assert_eq!(
+        exit_to_u8(addreplacerg::main(&argv(
+            "addreplacerg",
+            &[
+                "--no-PG",
+                "-r",
+                "ID:g1",
+                "-r",
+                "SM:s1",
+                "--output-fmt",
+                "cram",
+                "-T",
+                reference.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    // Read the CRAM back through the shared reference-backed decoder and
+    // confirm the new @RG header and per-record RG:Z: tag are present.
+    let text = htslib_rs::alignment_compat::view_cram_as_sam_text_with_reference(
+        std::io::Cursor::new(std::fs::read(&out).unwrap()),
+        &reference,
+        None,
+    )
+    .unwrap();
+    assert!(text.contains("@RG\t") && text.contains("ID:g1"));
+    assert!(text.contains("RG:Z:g1"));
 }
 
 #[test]

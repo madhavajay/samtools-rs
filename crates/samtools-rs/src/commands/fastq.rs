@@ -8,13 +8,17 @@
 //! a unit (paired R1+R2 to `-1`/`-2`, R1-only or R2-only singletons to `-s`
 //! when set or falling back to `-1`/`-2`, and READ_OTHER to `-0`).
 //!
-//! Also supports per-record `--i1`/`--i2` index FASTQ extraction with
-//! `--index-format` (default `i*i*`), `--quality-tag`, and `--barcode-tag`.
+//! Also supports `--i1`/`--i2` index FASTQ extraction with
+//! `--index-format` (default `i*i*`), `--quality-tag`, and
+//! `--barcode-tag`, emitting one index record per adjacent qname-group
+//! (upstream `flush_rec` → `output_index`) with the htslib-exact CASAVA
+//! barcode normalization and, under `-i`, the CASAVA comment.
 //!
-//! **Not yet supported:** CRAM input, exact upstream name-grouped
-//! one-record-per-qname-pair index emission, and exact
-//! `score`-vs-`b_score` propagation through CASAVA barcode copying
-//! between paired ends.
+//! The group's barcode is propagated across mates so an R2 (or other)
+//! record lacking its own `BC` inherits the R1 mate's barcode in its
+//! CASAVA comment (upstream `bam_fastq.c:952`).
+//!
+//! **Not yet supported:** CRAM input.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -28,6 +32,7 @@ use htslib_rs::{bam, format::Exact};
 use crate::aux_list::parse_aux_list;
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
+use crate::sam_render::format_aux_float;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum AuxSelection {
@@ -597,6 +602,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     use_original_quality,
                     default_quality,
                     umi_tags: umi_tags.as_deref(),
+                    casava,
                     barcode_tag,
                     quality_tag,
                     index_format: &effective_index_format,
@@ -830,6 +836,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 use_original_quality,
                 default_quality,
                 umi_tags: umi_tags.as_deref(),
+                casava,
                 barcode_tag,
                 quality_tag,
                 index_format: &effective_index_format,
@@ -993,7 +1000,7 @@ fn view_bam_path_as_fastq_split_with_aux(
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let header = reader.read_header()?;
     let mut split = FastqSplitBuffers::default();
-    let mut grouper = GroupedSplitWriter::new(singleton_set);
+    let mut grouper = GroupedSplitWriter::new(singleton_set, options.casava, options.barcode_tag);
     let mut record = htslib_rs::sam::alignment::RecordBuf::default();
 
     loop {
@@ -1026,7 +1033,7 @@ fn view_bam_path_as_fasta_split(
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let header = reader.read_header()?;
     let mut split = FastqSplitBuffers::default();
-    let mut grouper = GroupedSplitWriter::new(singleton_set);
+    let mut grouper = GroupedSplitWriter::new(singleton_set, casava, barcode_tag);
     let mut record = htslib_rs::sam::alignment::RecordBuf::default();
 
     loop {
@@ -1118,7 +1125,7 @@ where
 {
     let _header = reader.read_header()?;
     let mut split = FastqSplitBuffers::default();
-    let mut grouper = GroupedSplitWriter::new(singleton_set);
+    let mut grouper = GroupedSplitWriter::new(singleton_set, options.casava, options.barcode_tag);
 
     for result in reader.records() {
         let record = result?;
@@ -1148,7 +1155,7 @@ where
 {
     let _header = reader.read_header()?;
     let mut split = FastqSplitBuffers::default();
-    let mut grouper = GroupedSplitWriter::new(singleton_set);
+    let mut grouper = GroupedSplitWriter::new(singleton_set, casava, barcode_tag);
 
     for result in reader.records() {
         let record = result?;
@@ -1220,15 +1227,24 @@ where
 #[derive(Default)]
 struct GroupedSplitWriter {
     singleton_set: bool,
+    /// `-i` (CASAVA): when set, the group's barcode is propagated to
+    /// every mate's CASAVA comment that lacked its own (upstream copies
+    /// the `BC` aux across mates before formatting — `bam_fastq.c:952`).
+    casava: bool,
+    barcode_tag: [u8; 2],
     current_qname: Option<Vec<u8>>,
     best_score: [u8; 3],
     pending_text: [Option<Vec<u8>>; 3],
+    /// First non-empty raw barcode seen in the current qname group.
+    group_barcode: Option<String>,
 }
 
 impl GroupedSplitWriter {
-    fn new(singleton_set: bool) -> Self {
+    fn new(singleton_set: bool, casava: bool, barcode_tag: [u8; 2]) -> Self {
         Self {
             singleton_set,
+            casava,
+            barcode_tag,
             ..Self::default()
         }
     }
@@ -1249,6 +1265,15 @@ impl GroupedSplitWriter {
         if self.current_qname.as_deref() != Some(&qname) {
             self.flush(split);
             self.current_qname = Some(qname);
+            self.group_barcode = None;
+        }
+
+        if self.casava
+            && self.group_barcode.is_none()
+            && let Some(bc) = fastq_string_tag(record, self.barcode_tag)?
+            && !bc.is_empty()
+        {
+            self.group_barcode = Some(bc);
         }
 
         let part = record_read_part(record)? as usize;
@@ -1262,7 +1287,21 @@ impl GroupedSplitWriter {
 
     fn flush(&mut self, split: &mut FastqSplitBuffers) {
         let [s0, s1, s2] = self.best_score;
-        let [t0, t1, t2] = std::mem::take(&mut self.pending_text);
+        let [mut t0, mut t1, mut t2] = std::mem::take(&mut self.pending_text);
+
+        // Propagate the group's barcode into any mate whose CASAVA
+        // comment had no barcode of its own (upstream copies the `BC`
+        // aux across mates before formatting the comment).
+        if self.casava
+            && let Some(bc) = self.group_barcode.as_deref()
+        {
+            let bc_field = casava_barcode_field(Some(bc));
+            for t in [&mut t0, &mut t1, &mut t2] {
+                if let Some(text) = t.as_mut() {
+                    fill_casava_barcode(text, &bc_field);
+                }
+            }
+        }
 
         if s1 > 0 && s2 > 0 {
             if let Some(t) = t1 {
@@ -1582,9 +1621,65 @@ where
     let flags = record.flags()?;
     let read_number = if flags.is_last_segment() { 2 } else { 1 };
     let filter = if flags.is_qc_fail() { "Y" } else { "N" };
-    let barcode = fastq_string_tag(record, barcode_tag)?.unwrap_or_else(|| "0".to_string());
+    let barcode = casava_barcode_field(fastq_string_tag(record, barcode_tag)?.as_deref());
 
     Ok(format!("{read_number}:{filter}:0:{barcode}"))
+}
+
+/// If the FASTQ/FASTA header line of `text` ends with a CASAVA comment
+/// whose barcode is the placeholder `0` (the record had no `BC` of its
+/// own), replaces that `0` with `bc_field`. A record that already
+/// carries its own barcode is left untouched (mirrors upstream copying
+/// `BC` only into mates that lack it).
+fn fill_casava_barcode(text: &mut Vec<u8>, bc_field: &str) {
+    let hdr_end = text.iter().position(|&b| b == b'\n').unwrap_or(text.len());
+    let Some(sp) = text[..hdr_end].iter().rposition(|&b| b == b' ') else {
+        return;
+    };
+    let token_start = sp + 1;
+    let token = &text[token_start..hdr_end];
+    // Shape: `<rnum>:<filt>:0:<bc>` — digit, ':', Y/N, ':', '0', ':'.
+    if token.len() < 6
+        || !token[0].is_ascii_digit()
+        || token[1] != b':'
+        || token[3] != b':'
+        || token[4] != b'0'
+        || token[5] != b':'
+    {
+        return;
+    }
+    let bc_start = token_start + 6;
+    if &text[bc_start..hdr_end] != b"0" {
+        return; // record had its own barcode; leave it.
+    }
+    let mut new = Vec::with_capacity(text.len() - 1 + bc_field.len());
+    new.extend_from_slice(&text[..bc_start]);
+    new.extend_from_slice(bc_field.as_bytes());
+    new.extend_from_slice(&text[hdr_end..]);
+    *text = new;
+}
+
+/// Renders the barcode portion of a CASAVA comment exactly as htslib's
+/// `fastq_format1` does: `0` when absent or when the first character is
+/// not a sequence base; otherwise every non-alphabetic byte becomes `+`
+/// and lowercase is upper-cased (so `ac-gt` → `AC+GT`).
+fn casava_barcode_field(bc: Option<&str>) -> String {
+    let Some(bc) = bc.filter(|b| !b.is_empty()) else {
+        return "0".to_string();
+    };
+    let first = bc.as_bytes()[0];
+    if !first.is_ascii_alphabetic() {
+        return "0".to_string();
+    }
+    bc.chars()
+        .map(|c| {
+            if c.is_ascii_alphabetic() {
+                c.to_ascii_uppercase()
+            } else {
+                '+'
+            }
+        })
+        .collect()
 }
 
 fn fastq_string_tag<R>(record: &R, tag: [u8; 2]) -> io::Result<Option<String>>
@@ -1834,24 +1929,6 @@ fn join_float_array(iter: Box<dyn Iterator<Item = io::Result<f32>> + '_>) -> io:
     Ok(values.join(","))
 }
 
-fn format_aux_float(n: f32) -> String {
-    let abs = n.abs();
-    if n != 0.0 && !(1e-4..1e6).contains(&abs) {
-        format_htslib_exponent(n)
-    } else {
-        format!("{n}")
-    }
-}
-
-fn format_htslib_exponent(n: f32) -> String {
-    let raw = format!("{n:e}");
-    let Some((mantissa, exponent)) = raw.split_once('e') else {
-        return raw;
-    };
-    let value = exponent.parse::<i32>().unwrap_or(0);
-    format!("{mantissa}e{value:+03}")
-}
-
 fn parse_flag_arg(arg: Option<&OsString>, opt: &str, sub_name: &str) -> Result<u16, ExitCode> {
     let Some(raw) = arg.and_then(|a| a.to_str()) else {
         print_error(sub_name, format!("missing value for {}", opt));
@@ -2058,6 +2135,7 @@ struct IndexEmitOptions<'a> {
     use_original_quality: bool,
     default_quality: Option<u8>,
     umi_tags: Option<&'a [[u8; 2]]>,
+    casava: bool,
     barcode_tag: [u8; 2],
     quality_tag: [u8; 2],
     index_format: &'a [IndexFormatItem],
@@ -2085,9 +2163,16 @@ fn emit_index_files(
     let render = |out_i1: &mut Option<File>,
                   out_i2: &mut Option<File>,
                   record: &dyn IndexRecord|
-     -> io::Result<()> {
+     -> io::Result<bool> {
         emit_index_for_record(out_i1.as_mut(), out_i2.as_mut(), record, options)
     };
+
+    // Upstream `bam_fastq.c::flush_rec` emits at most ONE index record
+    // per qname group (template), not per alignment record. Records
+    // arrive name-grouped; emit for the first barcode-bearing record in
+    // each group and skip the rest of that group.
+    let mut group_qname: Option<String> = None;
+    let mut group_emitted = false;
 
     if stdin_input {
         // For stdin we cannot re-iterate; skip index emission.
@@ -2109,7 +2194,15 @@ fn emit_index_files(
                 if record_passes_flag_filter(&record, flag_filters)?
                     && record_index_eligible(&record)?
                 {
-                    render(&mut i1_writer, &mut i2_writer, &SamIndexRecord(&record))?;
+                    let wrapped = SamIndexRecord(&record);
+                    let qname = wrapped.name()?;
+                    if group_qname.as_deref() != Some(qname.as_str()) {
+                        group_qname = Some(qname);
+                        group_emitted = false;
+                    }
+                    if !group_emitted && render(&mut i1_writer, &mut i2_writer, &wrapped)? {
+                        group_emitted = true;
+                    }
                 }
             }
         }
@@ -2125,11 +2218,15 @@ fn emit_index_files(
                 if record_passes_flag_filter(&record, flag_filters)?
                     && record_index_eligible(&record)?
                 {
-                    render(
-                        &mut i1_writer,
-                        &mut i2_writer,
-                        &RecordBufIndexRecord(&record),
-                    )?;
+                    let wrapped = RecordBufIndexRecord(&record);
+                    let qname = wrapped.name()?;
+                    if group_qname.as_deref() != Some(qname.as_str()) {
+                        group_qname = Some(qname);
+                        group_emitted = false;
+                    }
+                    if !group_emitted && render(&mut i1_writer, &mut i2_writer, &wrapped)? {
+                        group_emitted = true;
+                    }
                 }
             }
         }
@@ -2204,9 +2301,9 @@ fn emit_index_for_record(
     i2_writer: Option<&mut File>,
     record: &dyn IndexRecord,
     options: IndexEmitOptions<'_>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let Some(bc) = record.barcode(options.barcode_tag)? else {
-        return Ok(());
+        return Ok(false);
     };
 
     let qt_raw = record.quality_tag(options.quality_tag)?;
@@ -2221,6 +2318,18 @@ fn emit_index_for_record(
     let name = record.name()?;
     let name = append_fastq_umi_with_str(name, record, options.umi_tags)?;
     let name = append_fastq_read_number_with_record(name, record, options.append_read_number)?;
+    // With `-i` (CASAVA), the index record carries the same
+    // ` <rnum>:<filt>:0:<barcode>` comment as the main reads, using the
+    // representative record's normalized barcode (upstream `flush_rec`).
+    let name = if options.casava {
+        let flags = record.flags()?;
+        let read_number = if flags.is_last_segment() { 2 } else { 1 };
+        let filter = if flags.is_qc_fail() { "Y" } else { "N" };
+        let bc_field = casava_barcode_field(record.barcode(options.barcode_tag)?.as_deref());
+        format!("{name} {read_number}:{filter}:0:{bc_field}")
+    } else {
+        name
+    };
 
     let writers = [i1_writer, i2_writer];
     let mut writer_idx = 0usize;
@@ -2267,7 +2376,7 @@ fn emit_index_for_record(
         bc_cursor = segment_end + if advance_past_sep { 1 } else { 0 };
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn write_index_fastq_record(
