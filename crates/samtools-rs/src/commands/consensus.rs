@@ -615,7 +615,7 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
 
         // Reference position (nth = 0).
         let entries = ref_entries(reads);
-        let depth = entries.iter().filter(|e| e.qual >= cfg.min_qual).count();
+        let depth = reads.iter().filter(|r| !r.is_refskip).count();
         let (cb, cq) = match &bayes_ctx {
             Some(ctx) => consensus_bayes(reads, cfg, ctx, 0),
             None => consensus_simple(&entries, cfg),
@@ -719,7 +719,7 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
             .unwrap_or(0);
         for nth in 1..=max_ins {
             let ins = insertion_entries(reads, nth);
-            let idepth = ins.iter().filter(|e| e.qual >= cfg.min_qual).count();
+            let idepth = reads.iter().filter(|r| !r.is_refskip).count();
             let (ib, iq) = match &bayes_ctx {
                 Some(ctx) => consensus_bayes(reads, cfg, ctx, nth),
                 None => consensus_simple(&ins, cfg),
