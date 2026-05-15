@@ -46,6 +46,7 @@ struct Config {
     min_depth: usize,
     use_qual: bool,
     min_qual: u8,
+    min_mqual: u8,
     ambig: bool,
     show_del: bool,
     show_ins: bool,
@@ -72,6 +73,7 @@ impl Default for Config {
             min_depth: 1,
             use_qual: false,
             min_qual: 0,
+            min_mqual: 0,
             ambig: false,
             show_del: false,
             show_ins: true,
@@ -170,6 +172,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
             "--min-BQ" => {
                 cfg.min_qual = iter
+                    .next()
+                    .and_then(|a| a.to_str())
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            }
+            "--min-MQ" => {
+                cfg.min_mqual = iter
                     .next()
                     .and_then(|a| a.to_str())
                     .and_then(|v| v.parse().ok())
@@ -441,8 +450,12 @@ struct RefSeq {
 }
 
 fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
+    let pileup_opts = htslib_rs::alignment_compat::PileupOptions {
+        min_mapping_quality: cfg.min_mqual,
+        ..Default::default()
+    };
     let columns =
-        pileup_from_alignment_paths_with_options(std::slice::from_ref(input), &Default::default())?;
+        pileup_from_alignment_paths_with_options(std::slice::from_ref(input), &pileup_opts)?;
 
     let bayes_ctx = if cfg.mode_simple {
         None
