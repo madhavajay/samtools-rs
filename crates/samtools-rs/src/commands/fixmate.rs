@@ -555,8 +555,17 @@ fn update_mate_aux_tags(target: &mut RecordBuf, mate: &RecordBuf) {
     let mq_tag = Tag::from([b'M', b'Q']);
 
     if mate.flags().is_unmapped() {
-        target.data_mut().remove(&mc_tag);
         target.data_mut().remove(&mq_tag);
+        if target.flags().is_unmapped() {
+            target.data_mut().remove(&mc_tag);
+        } else {
+            // bam_mate.c:197 — MC is added when *either* read is mapped;
+            // an empty mate CIGAR formats as `*` (→ `MC:Z:*`).
+            target.data_mut().insert(
+                mc_tag,
+                Value::String(BString::from(format_cigar(mate.cigar()))),
+            );
+        }
         return;
     }
 
