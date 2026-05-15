@@ -140,14 +140,37 @@ quick fix — verified by probing):
      it is exactly `gap5_call` with `cp_recall`, so step 3 already
      covers every fixture; the experimental MIXED combination
      (`-m bayesian_m`, no fixtures) is deferred.
-  5. **Next — the integration:** wire into `consensus.rs`. Dispatch
-     `--mode bayesian`/default (currently rejected at consensus.rs
-     :150) to the new engine over the existing pileup loop. Per
-     column build `Vec<Gap5Obs>` (filter `qual >= min_qual`, skip
-     ref_skip; `base4`=`bam_seqi`/`*`→16; `qual` with the
-     255→`default_qual` rule; `mqual`=read MAPQ; `nm_local` via the
-     halo-NM count `nm_local()` bam_consensus.c:975 only when
-     `--NM-adjust`; `poly`=`poly_len()` homopolymer run). Then the
+  5. **Library-blocked (htslib-rs first).** The numerical engine
+     (steps 1–4) is done and unit-tested, but wiring it byte-exact is
+     blocked: `htslib_rs::alignment_compat::PileupRead` only carries
+     the base at the column (`base`, `qpos`, `mapping_quality`, …) —
+     not the aligned read's sequence/CIGAR/`NM`. Upstream defaults
+     enable `use_mqual` **and** `nm_adjust`, and `poly_len` is applied
+     unconditionally, so byte-exact output needs, per pileup read,
+     **(a)** `poly_len()` (bam_consensus.c:989 — homopolymer run
+     length around `qpos` in the read sequence) and **(b)**
+     `nm_local()` (bam_consensus.c:976 — local mismatch count within
+     `nm_halo` of the position, from the read + its `NM`/MD). Neither
+     is derivable from the current `PileupRead`. **htslib-rs
+     extension required (substantial — a library-side port, not an
+     accessor):** upstream computes both via a per-read precompute
+     `nm_init` (bam_consensus.c:1009-1110) that (i) **mutates** the
+     read qualities in place (`adj_qual`, default on — local
+     quality-minima + homopolymer windows) and (ii) builds a per-base
+     `local_nm[]` packing local-NM (low 24 bits, from an MD/`NM`
+     walk) + poly length (high 8 bits); `nm_local`/`poly_len` then
+     just index it. So the pileup layer must expose, per pileup read,
+     the CIGAR + `MD`/`NM` and run the `nm_init` quality-adjust +
+     `local_nm` precompute (the adjusted quals feed back into every
+     column's `quality`). `TestPileupRecord` currently has
+     `sequence`+`quality_scores` but no CIGAR/MD/NM and does no
+     quality adjustment. New htslib-rs item alongside #2/#3/#5/#7:
+     "pileup: expose per-read CIGAR+MD/NM and the `nm_init`
+     quality-adjust + packed `local_nm`/poly precompute". After the extension: wire into `consensus.rs`
+     (dispatch `--mode bayesian`/default, currently rejected at
+     consensus.rs:150), per column build `Vec<Gap5Obs>` (filter
+     `qual >= min_qual`, skip ref_skip; `base4`=`bam_seqi`/`*`→16;
+     `qual` with the 255→`default_qual` rule), then the
      `consensus_base` thresholds (bam_consensus.c:2135+):
      `min_depth`, `cons_cutoff`→N, het ambiguity from `het_call`/
      `het_logodd` vs `het_fract`/`call_fract`, `all_bases`,
