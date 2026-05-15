@@ -17,10 +17,9 @@
 //! `--duplicate-count` emits `dc:i`. Regex `--read-coords` /
 //! `--coords-order` / `--barcode-rgx` / `--barcode-name` supported (via
 //! the `regex` crate). Raw-header SAM output preserves input `@RG`/`@SQ`
-//! order. **Byte-exact vs upstream
-//! `markdup/{5,6,7,8,9,10,11,12,13,14,15,17,18}`** (13 of 14 fixtures).
-//! **Not yet:** fixture 16 (a subtle optical-chain pairwise-traversal
-//! edge with empty-prefix regex coords), exact `-s` stats counts, CRAM.
+//! order. **Byte-exact vs the entire upstream `test_markdup` SAM
+//! harness — `markdup/{5..18}` (all 14 fixtures)**. **Not yet:** exact
+//! `-s` stats counts, CRAM, the `1..4` expect-fail error-message cases.
 //!
 //! Supported flags:
 //!  - `-r` — remove duplicates from the output (rather than just flagging).
@@ -745,8 +744,10 @@ fn get_coords(name: &[u8], cfg: &CoordCfg) -> Option<(usize, usize, i64, i64)> {
     let caps = rx.captures(s)?;
     let xm = caps.get(cfg.x)?;
     let ym = caps.get(cfg.y)?;
-    let x = parse_strtol(name, xm.start())?;
-    let y = parse_strtol(name, ym.start())?;
+    // Upstream copies the exact captured substring before `strtol`, so
+    // parsing must stop at the group end (groups may be adjacent digits).
+    let x = parse_strtol_span(name, xm.start(), xm.end())?;
+    let y = parse_strtol_span(name, ym.start(), ym.end())?;
     let (tb, te) = if cfg.t > 0 {
         let tm = caps.get(cfg.t)?;
         (tm.start(), tm.end())
@@ -1649,6 +1650,28 @@ fn parse_strtol(bytes: &[u8], start: usize) -> Option<i64> {
     let digit_start = i;
     let mut v: i64 = 0;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
+        v = v * 10 + (bytes[i] - b'0') as i64;
+        i += 1;
+    }
+    if i == digit_start {
+        return None;
+    }
+    Some(if neg { -v } else { v })
+}
+
+/// `strtol` of `bytes[start..end]` (bounded; stops at the span end or
+/// first non-digit). `None` if no digits.
+fn parse_strtol_span(bytes: &[u8], start: usize, end: usize) -> Option<i64> {
+    let end = end.min(bytes.len());
+    let mut i = start;
+    let mut neg = false;
+    if i < end && (bytes[i] == b'-' || bytes[i] == b'+') {
+        neg = bytes[i] == b'-';
+        i += 1;
+    }
+    let digit_start = i;
+    let mut v: i64 = 0;
+    while i < end && bytes[i].is_ascii_digit() {
         v = v * 10 + (bytes[i] - b'0') as i64;
         i += 1;
     }
