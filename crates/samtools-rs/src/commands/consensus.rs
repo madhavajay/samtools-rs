@@ -1497,7 +1497,7 @@ pub mod bayes {
             let m = mqual_pow_1m_table();
             assert_eq!(m[0], 1.0);
             assert!((m[1] - 0.812_830_516_164_099_3).abs() < 1e-15);
-            assert!((m[2] - 0.660_693_448_007_596_0).abs() < 1e-15);
+            assert!((m[2] - 0.660_693_448_007_596).abs() < 1e-15);
             assert_eq!(m[255], m[10]);
 
             // fast_log2 within the documented deg-3 Taylor tolerance,

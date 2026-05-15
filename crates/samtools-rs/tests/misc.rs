@@ -5725,6 +5725,62 @@ fn calmd_drop_baq_removes_bq_tags() {
     assert!(record.contains("\tNM:i:0"));
 }
 
+/// Mirrors upstream `test_calmd`: `calmd -uAr mpileup.1.sam
+/// mpileup.ref.fa` must emit a BGZF (BAM) stream. We additionally
+/// assert the BAM round-trips with the input record count via `view`,
+/// and that the glued `-uAr` cluster is split like `getopt`.
+#[test]
+fn calmd_dash_u_a_r_emits_bgzf_bam_like_upstream() {
+    use samtools_rs::commands::view;
+    let dat = fixtures_dir().join("dat");
+    let sam = dat.join("mpileup.1.sam");
+    let reference = dat.join("mpileup.ref.fa");
+    let tmp = tmp_dir("calmd-uAr");
+    let out = tmp.join("out.bam");
+
+    assert_eq!(
+        exit_to_u8(calmd::main(&argv(
+            "calmd",
+            &[
+                "--no-PG",
+                "-uAr",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+                reference.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    // BGZF magic (gzip \x1f\x8b + BAM's FEXTRA), the exact upstream
+    // `test_calmd` acceptance check.
+    let bytes = std::fs::read(&out).unwrap();
+    assert!(
+        bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b,
+        "calmd -uAr output is not BGZF-compressed"
+    );
+
+    // Record count is preserved through the SAM->BAQ->BAM path.
+    let in_records = std::fs::read_to_string(&sam)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('@'))
+        .count();
+    let counted = tmp.join("count.txt");
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &["-c", "-o", counted.to_str().unwrap(), out.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(&counted).unwrap().trim(),
+        in_records.to_string()
+    );
+}
+
 #[test]
 fn markdup_sam_input_flags_duplicates_keeping_highest_score() {
     use samtools_rs::commands::markdup;
