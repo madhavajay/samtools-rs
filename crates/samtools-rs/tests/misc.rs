@@ -6404,6 +6404,27 @@ fn stats_matches_upstream_stat_fixtures() {
         );
     }
 
+    // stat/13: barcode BCC/QTQ (and OXC/BZQ) sections, no reference.
+    for (sam, expected) in [
+        ("13_barcodes_ok.sam", "13.barcodes.bc.ok.expected"),
+        ("13_barcodes_ok_ox_bz.sam", "13.barcodes.ox.ok.expected"),
+    ] {
+        let out = tmp.join(expected);
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &["-o", &p(&out), &p(&stat.join(sam))]
+            ))),
+            0,
+            "stats {sam}"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            std::fs::read_to_string(stat.join(expected)).unwrap(),
+            "stats {sam} byte-exact",
+        );
+    }
+
     // `--ref-stats` RFS section (upstream compares only `grep ^RFS`):
     // stat/16 no reference (GC/N = -1), stat/17 reference-backed GC/N
     // (plain and `--ref-stats-chunk -1` no-op), stat/18 positional

@@ -1298,6 +1298,34 @@ fn record_overlaps_targets(
         .any(|target| target.tid == tid && start <= target.end && target.start <= end)
 }
 
+/// Per-tag barcode accumulator (upstream `barcode_info_t` +
+/// `acgtno_barcode`/`quals_barcode`). One per default tag pair.
+struct BarcodeAcc {
+    tag: &'static str,
+    qual_tag: &'static str,
+    nbases: usize,
+    tag_sep: i32,
+    max_qual: i32,
+    acgtno: Vec<[u64; 5]>,
+    quals: Vec<[u64; 256]>,
+}
+
+/// Upstream `init_barcode_tags`: BC/QT, CR/CY, OX/BZ, RX/QX.
+fn default_barcode_tags() -> Vec<BarcodeAcc> {
+    [("BC", "QT"), ("CR", "CY"), ("OX", "BZ"), ("RX", "QX")]
+        .into_iter()
+        .map(|(tag, qual_tag)| BarcodeAcc {
+            tag,
+            qual_tag,
+            nbases: 0,
+            tag_sep: -1,
+            max_qual: -1,
+            acgtno: Vec::new(),
+            quals: Vec::new(),
+        })
+        .collect()
+}
+
 #[derive(Default)]
 struct StatsCounts {
     raw_total: u64,
@@ -1390,6 +1418,9 @@ struct StatsCounts {
     // for reads with tag" header line), and the per-tag-value sub-stats.
     split_name: Option<String>,
     splits: BTreeMap<String, StatsCounts>,
+    // Barcode tag stats (BCC/QTQ etc.), one accumulator per default
+    // tag pair; lazily initialised on first barcoded read.
+    barcodes: Vec<BarcodeAcc>,
     // Sum of sequence lengths for records carrying the duplicate flag.
     bases_dup: u64,
     bases_trimmed: u64,
@@ -1587,6 +1618,10 @@ impl StatsCounts {
                         increment_quality_hist(&mut self.last_qual_hist, cycle, q);
                     }
                 }
+            }
+            // Upstream: barcode stats only for first-fragment originals.
+            if order_first {
+                self.accumulate_barcodes(rec);
             }
             if config.trim_quality > 0 {
                 let reverse = flag & BAM_FREVERSE != 0;
@@ -1915,6 +1950,74 @@ impl StatsCounts {
                         iref += 1;
                         iread += 1;
                         icycle += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Faithful port of upstream `collect_barcode_stats` (called only
+    /// for first-fragment / unpaired originals): per default tag, the
+    /// barcode bases feed an A/C/G/T/N-per-position counter (the
+    /// non-ACGTN separator fixes `tag_sep`), and the matching quality
+    /// tag (`char - '!'`) feeds a per-position quality histogram.
+    fn accumulate_barcodes(&mut self, rec: &(impl sam::alignment::Record + ?Sized)) {
+        if self.barcodes.is_empty() {
+            self.barcodes = default_barcode_tags();
+        }
+        for b in &mut self.barcodes {
+            let Some(barcode) = record_aux_string(rec, b.tag).ok().flatten() else {
+                continue;
+            };
+            let bc = barcode.as_bytes();
+            if bc.is_empty() {
+                continue;
+            }
+            if b.nbases == 0 {
+                b.nbases = bc.len();
+                b.acgtno = vec![[0; 5]; b.nbases];
+                b.quals = vec![[0; 256]; b.nbases];
+            }
+            if bc.len() > b.nbases {
+                continue; // differing barcode length: skip (as upstream)
+            }
+            let mut error = false;
+            for (i, &ch) in bc.iter().enumerate() {
+                match ch {
+                    b'A' => b.acgtno[i][0] += 1,
+                    b'C' => b.acgtno[i][1] += 1,
+                    b'G' => b.acgtno[i][2] += 1,
+                    b'T' => b.acgtno[i][3] += 1,
+                    b'N' => b.acgtno[i][4] += 1,
+                    _ => {
+                        if b.tag_sep >= 0 {
+                            if b.tag_sep != i as i32 {
+                                error = true;
+                            }
+                        } else {
+                            b.tag_sep = i as i32;
+                        }
+                    }
+                }
+                if error {
+                    break;
+                }
+            }
+            if error {
+                continue;
+            }
+            let Some(barqual) = record_aux_string(rec, b.qual_tag).ok().flatten() else {
+                continue;
+            };
+            let qb = barqual.as_bytes();
+            if qb.len() == bc.len() {
+                for (i, &c) in qb.iter().enumerate() {
+                    let q = c as i32 - 33;
+                    if (0..256).contains(&q) {
+                        b.quals[i][q as usize] += 1;
+                        if q > b.max_qual {
+                            b.max_qual = q;
+                        }
                     }
                 }
             }
@@ -2788,6 +2891,77 @@ fn write_gc_histogram(out: &mut dyn Write, label: &str, hist: &[u64]) -> io::Res
     Ok(())
 }
 
+/// Barcode sections (`{tag}C{1,2}` ACGTN-percent-per-cycle and
+/// `{qualtag}Q{1,2}` quality histograms), emitted between LTC and IS
+/// for every default tag actually seen, faithful to upstream's
+/// separator-split cycle numbering.
+fn write_barcode_sections(out: &mut dyn Write, c: &StatsCounts) -> io::Result<()> {
+    for b in &c.barcodes {
+        if b.nbases == 0 {
+            continue;
+        }
+        let half_cyc = |ibase: usize| -> (u32, usize) {
+            if b.tag_sep < 0 || (ibase as i32) < b.tag_sep {
+                (1, ibase + 1)
+            } else {
+                (2, ibase - b.tag_sep as usize)
+            }
+        };
+        writeln!(
+            out,
+            "# ACGT content per cycle for barcodes. Use `grep ^{}C | cut -f 2-` to extract this part. The columns are: cycle; A,C,G,T base counts as a percentage of all A/C/G/T bases [%]; and N counts as a percentage of all A/C/G/T bases [%]",
+            b.tag
+        )?;
+        for ibase in 0..b.nbases {
+            if ibase as i32 == b.tag_sep {
+                continue;
+            }
+            let a = b.acgtno[ibase];
+            let sum = a[0] + a[1] + a[2] + a[3];
+            if sum == 0 {
+                continue;
+            }
+            let (half, cyc) = half_cyc(ibase);
+            let pct = |x: u64| 100.0 * x as f64 / sum as f64;
+            writeln!(
+                out,
+                "{}C{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+                b.tag,
+                half,
+                cyc,
+                pct(a[0]),
+                pct(a[1]),
+                pct(a[2]),
+                pct(a[3]),
+                pct(a[4])
+            )?;
+        }
+        writeln!(
+            out,
+            "# Barcode Qualities. Use `grep ^{}Q | cut -f 2-` to extract this part.",
+            b.qual_tag
+        )?;
+        writeln!(
+            out,
+            "# Columns correspond to qualities and rows to barcode cycles. First column is the cycle number."
+        )?;
+        for ibase in 0..b.nbases {
+            if ibase as i32 == b.tag_sep {
+                continue;
+            }
+            let (half, cyc) = half_cyc(ibase);
+            write!(out, "{}Q{}\t{}", b.qual_tag, half, cyc)?;
+            if b.max_qual >= 0 {
+                for iqual in 0..=b.max_qual as usize {
+                    write!(out, "\t{}", b.quals[ibase][iqual])?;
+                }
+            }
+            writeln!(out)?;
+        }
+    }
+    Ok(())
+}
+
 /// Upstream `stats.c` GCC/GCT/FBC/FTC/LBC/LTC + RL/FRL/LRL + MAPQ
 /// sections (reference-independent). `MPC`, `IS`, and `GCD` need the
 /// reference-mismatch / per-size / GC-depth engines and are not yet
@@ -2917,6 +3091,8 @@ fn write_acgt_rl_mapq_sections(
         "# ACGT raw counters for last fragments. Use `grep ^LTC | cut -f 2-` to extract this part. The columns are: A,C,G,T,N base counters"
     )?;
     writeln!(out, "LTC\t{}\t{}\t{}\t{}\t{}", ta, tc, tg, tt, tn)?;
+
+    write_barcode_sections(out, c)?;
 
     // Insert sizes. Mirrors `output_stats`: halve the double-counted
     // per-size bins, derive `ibulk` from the cumulative `-m` cutoff,
