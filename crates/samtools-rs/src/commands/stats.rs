@@ -918,6 +918,14 @@ struct StatsCounts {
     bases_trimmed: u64,
     last_sort_position: Option<(usize, usize)>,
     sort_order_violation: bool,
+    // CHK section: 32-bit-wrapping sums of per-record CRC32 over the
+    // read name, BAM-packed sequence nibbles, and raw quality bytes.
+    // Accumulated for every record passing flag-require/flag-filter/
+    // read-length filtering (before the secondary/supplementary skip),
+    // exactly as upstream `update_checksum`.
+    chk_names: u32,
+    chk_reads: u32,
+    chk_quals: u32,
 }
 
 struct StatsRecordFields {
@@ -979,6 +987,11 @@ impl StatsCounts {
             .and_then(Result::ok)
             .map(usize::from);
         let seq_len = rec.sequence().len();
+
+        let chk_name = rec.name().map(|n| n.to_vec()).unwrap_or_default();
+        let chk_seq: Vec<u8> = rec.sequence().iter().collect();
+        let chk_qual: Vec<u8> = rec.quality_scores().iter().flatten().collect();
+        self.accumulate_checksum(flag, config, &chk_name, &chk_seq, &chk_qual);
 
         let pre_total = self.total;
         self.update(
@@ -1256,6 +1269,14 @@ impl StatsCounts {
     }
 
     fn update_summary(&mut self, rec: &AlignmentRecordSummary, config: &StatsConfig) {
+        let flag = rec.flags_u16() as u32;
+        self.accumulate_checksum(
+            flag,
+            config,
+            rec.name_bytes().unwrap_or_default(),
+            rec.sequence_bytes(),
+            rec.quality_score_bytes(),
+        );
         self.update(
             StatsRecordFields {
                 flag: rec.flags_u16() as u32,
@@ -1436,6 +1457,88 @@ impl StatsCounts {
             }
         }
     }
+
+    /// Faithful port of upstream `update_checksum`. Runs for every
+    /// record that survives the flag-require / flag-filter /
+    /// read-length filters (before the secondary/supplementary skip),
+    /// summing per-record CRC32 with 32-bit overflow.
+    fn accumulate_checksum(
+        &mut self,
+        flag: u32,
+        config: &StatsConfig,
+        name: &[u8],
+        seq_ascii: &[u8],
+        quals: &[u8],
+    ) {
+        if config.required_flags != 0 && flag & config.required_flags != config.required_flags {
+            return;
+        }
+        if config.filter_flags != 0 && flag & config.filter_flags != 0 {
+            return;
+        }
+        if config
+            .read_length_filter
+            .is_some_and(|required_len| seq_ascii.len() != required_len)
+        {
+            return;
+        }
+        self.chk_names = self.chk_names.wrapping_add(crc32_bytes(0, name));
+        let seq_len = seq_ascii.len();
+        if seq_len == 0 {
+            return;
+        }
+        let packed = bam_pack_seq(seq_ascii);
+        self.chk_reads = self.chk_reads.wrapping_add(crc32_bytes(0, &packed));
+        if quals.len() == seq_len {
+            self.chk_quals = self.chk_quals.wrapping_add(crc32_bytes(0, quals));
+        } else {
+            // SAM `*` quality is stored as 0xFF per base in BAM.
+            let missing = vec![0xFFu8; seq_len];
+            self.chk_quals = self.chk_quals.wrapping_add(crc32_bytes(0, &missing));
+        }
+    }
+}
+
+/// zlib `crc32(initial, buf, len)` over `bytes`.
+fn crc32_bytes(initial: u32, bytes: &[u8]) -> u32 {
+    let mut crc = libdeflater::Crc::with_initial(initial);
+    crc.update(bytes);
+    crc.sum()
+}
+
+/// Packs an ASCII sequence into BAM 4-bit-per-base nibbles
+/// (`(len + 1) / 2` bytes), using HTSlib's `seq_nt16_table` codes.
+fn bam_pack_seq(seq_ascii: &[u8]) -> Vec<u8> {
+    fn code(b: u8) -> u8 {
+        match b {
+            b'=' => 0,
+            b'A' | b'a' => 1,
+            b'C' | b'c' => 2,
+            b'M' | b'm' => 3,
+            b'G' | b'g' => 4,
+            b'R' | b'r' => 5,
+            b'S' | b's' => 6,
+            b'V' | b'v' => 7,
+            b'T' | b't' => 8,
+            b'W' | b'w' => 9,
+            b'Y' | b'y' => 10,
+            b'H' | b'h' => 11,
+            b'K' | b'k' => 12,
+            b'D' | b'd' => 13,
+            b'B' | b'b' => 14,
+            _ => 15,
+        }
+    }
+    let mut out = vec![0u8; seq_ascii.len().div_ceil(2)];
+    for (i, &b) in seq_ascii.iter().enumerate() {
+        let c = code(b);
+        if i % 2 == 0 {
+            out[i / 2] = c << 4;
+        } else {
+            out[i / 2] |= c;
+        }
+    }
+    out
 }
 
 fn increment_quality_hist(hist: &mut Vec<[u64; 256]>, cycle: usize, quality: u8) {
@@ -1522,6 +1625,24 @@ fn write_stats_counts(
         SAMTOOLS_VERSION
     )?;
     writeln!(out, "# This file contains statistics for all reads.")?;
+    writeln!(out, "# The command line was:  samtools-rs stats")?;
+    writeln!(
+        out,
+        "# CHK, Checksum\t[2]Read Names\t[3]Sequences\t[4]Qualities"
+    )?;
+    writeln!(
+        out,
+        "# CHK, CRC32 of reads which passed filtering followed by addition (32bit overflow)"
+    )?;
+    writeln!(
+        out,
+        "CHK\t{:08x}\t{:08x}\t{:08x}",
+        counts.chk_names, counts.chk_reads, counts.chk_quals
+    )?;
+    writeln!(
+        out,
+        "# Summary Numbers. Use `grep ^SN | cut -f 2-` to extract this part."
+    )?;
     writeln!(
         out,
         "SN\traw total sequences:\t{}\t# excluding supplementary and secondary reads",
