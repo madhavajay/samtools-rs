@@ -79,12 +79,13 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
 > quals differ only under BAQ → #11). **`consensus --mode simple`**
 > implemented, byte-exact vs every `test/consensus/expected` fixture in
 > `consensus.reg` (FASTA/FASTQ/pileup, show-del/ins, call/het-fract).
-> **`coverage`** byte-exact vs the whole `test_coverage` tabular suite
-> (`%g`/`%.3g` formatting, min_depth-gated means, row ordering);
-> **`bedcov`** byte-exact vs all four `test_bedcov` fixtures; **`depth`**
-> already excludes deletions correctly (pileup-equivalent). Remaining
-> pileup-dependent ports: `targetcut`, `phase`, `ampliconstats`, and
-> consensus `recall`/Bayesian modes.
+> **`coverage`/`bedcov`/`depth` byte-exact** vs their full upstream
+> tabular suites: coverage (`%g`/`%.3g`, min_depth-gated means, row
+> ordering — `coverage/{1..5}`), bedcov (all four `test_bedcov` incl.
+> attached `-g512`), depth (`large_pos/depth{,_bed}.expected.out` — sparse
+> storage fixes the `LN:10001009800` OOM; bedidx now whitespace-tolerant).
+> Remaining pileup-dependent ports: `targetcut`, `phase`,
+> `ampliconstats`, and consensus `recall`/Bayesian modes.
 
 ### 1. Pileup iterator — highest leverage
 
