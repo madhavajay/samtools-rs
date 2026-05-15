@@ -155,11 +155,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
     // Upstream `sam_open_mode`: infer the format from the `-o` filename
     // extension when `--output-fmt` was not given.
     if !fmt_explicit && let Some(p) = output.as_deref().and_then(|p| p.to_str()) {
-        if p.ends_with(".sam") {
-            output_fmt = OutFmt::Sam;
-        } else if p.ends_with(".bam") {
-            output_fmt = OutFmt::Bam;
-        }
+        // `sam_open_mode`: BAM/CRAM only for those extensions; otherwise
+        // (incl. `.sam` and no/unknown extension) plain SAM text.
+        output_fmt = if p.ends_with(".bam") {
+            OutFmt::Bam
+        } else {
+            OutFmt::Sam
+        };
     }
 
     let result = match input {
