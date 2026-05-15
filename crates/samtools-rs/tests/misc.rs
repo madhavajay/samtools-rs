@@ -6830,3 +6830,67 @@ fn fixmate_matches_upstream_group() {
         );
     }
 }
+
+#[test]
+fn addreplacerg_matches_upstream_group() {
+    // TODO.md §13: full upstream test_addrprg group byte-exact (modulo
+    // @PG). Covers -m overwrite_all/orphan_only, full `@RG\t..` -r spec
+    // (escaped tabs), incremental -r ID:/-r CN:, -w edit, -R overwrite.
+    let a = fixtures_dir().join("addrprg");
+    let tmp = tmp_dir("addrprg-group");
+    let cases: &[(&[&str], &str, &str)] = &[
+        (
+            &["-m", "overwrite_all"],
+            "1_fixup.sam",
+            "1_fixup.sam.expected",
+        ),
+        (
+            &["-m", "orphan_only"],
+            "2_fixup_orphan.sam",
+            "2_fixup_orphan.sam.expected",
+        ),
+        (
+            &["-r", "@RG\tID:1#8\tCN:SC"],
+            "4_fixup_norg.sam",
+            "4_fixup_norg.sam.expected",
+        ),
+        (
+            &["-r", "ID:1#8", "-r", "CN:SC"],
+            "4_fixup_norg.sam",
+            "4_fixup_norg.sam.expected",
+        ),
+        (
+            &[
+                "-w",
+                "-r",
+                "@RG\tID:1#8\tCN:Sanger\tDS:Testing the editing code.",
+            ],
+            "1_fixup.sam",
+            "5_editrg.sam.expected",
+        ),
+        (
+            &["-m", "overwrite_all", "-R", "1#8"],
+            "1_fixup.sam",
+            "1_fixup.sam.expected",
+        ),
+    ];
+    for (i, (args, input, expected)) in cases.iter().enumerate() {
+        let out = tmp.join(format!("o{i}"));
+        let mut v: Vec<String> = vec!["-O".into(), "sam".into()];
+        v.extend(args.iter().map(|s| s.to_string()));
+        v.push(a.join(input).to_str().unwrap().into());
+        v.push("-o".into());
+        v.push(out.to_str().unwrap().into());
+        let refs: Vec<&str> = v.iter().map(String::as_str).collect();
+        assert_eq!(
+            exit_to_u8(addreplacerg::main(&argv("addreplacerg", &refs))),
+            0,
+            "{expected}"
+        );
+        assert_eq!(
+            without_pg_lines(&std::fs::read_to_string(&out).unwrap()),
+            without_pg_lines(&std::fs::read_to_string(a.join(expected)).unwrap()),
+            "addrprg case {i} ({expected}) args={args:?}"
+        );
+    }
+}

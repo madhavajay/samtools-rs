@@ -74,7 +74,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
         match s {
             "-r" => {
                 let v = iter.next().and_then(|a| a.to_str()).unwrap_or("");
-                tag_pieces.push(v.to_string());
+                // Upstream unescapes `\t` (and `\n`) in the -r spec so a full
+                // `@RG\tID:..\tCN:..` line works from the shell.
+                tag_pieces.push(v.replace("\\t", "\t").replace("\\n", "\n"));
             }
             "-R" => {
                 replace_id = iter.next().and_then(|a| a.to_str()).map(|s| s.to_string());
