@@ -20,7 +20,7 @@ Merged baseline:
 - PRs #8–#15 (the work below) were consolidated into `integration-all-prs` and merged back to `main`.
 - The next work should start from `main` on a new short-lived branch.
 
-In-flight PRs (samtools-rs-only, ready for review/merge):
+Merged PRs (samtools-rs-only, consolidated via PR #16 `integration-all-prs` → `main` as `b312c99`, CI green):
 - PR #8, https://github.com/madhavajay/samtools-rs/pull/8, branch `fastq-index-files` — `fastq --i1 FILE` / `--i2 FILE` per-record index FASTQ extraction with `--index-format` (default `i*i*`), `--quality-tag` (default `QT`), and `--barcode-tag`. Emits one index record per primary non-READ2 record; exact upstream name-grouped one-record-per-qname-pair emission remains pending.
 - PR #9, https://github.com/madhavajay/samtools-rs/pull/9, branch `fastq-index-paired-grouping` — five stacked commits:
   1. Upstream-style name-grouped fastq split routing (paired R1+R2 → `-1`/`-2`; R1-only / R2-only singleton → `-s` with fallback to `-1`/`-2`; READ_OTHER → `-0` with fallback to `-s`).
@@ -35,18 +35,29 @@ In-flight PRs (samtools-rs-only, ready for review/merge):
 - PR #14, https://github.com/madhavajay/samtools-rs/pull/14, branch `addreplacerg-default-rg` (from `main`, two commits) — `addreplacerg` defaults to the first header `@RG` ID when neither `-r`/`-R` is given, upstream `@RG` header reconciliation (`-r` + `overwrite_all` strips other `@RG` lines; `-w` overwrites a same-ID line), and `-R ID` rejection when the ID is absent from the header. Brings the whole upstream `test_addrprg` group (`addrprg/{1,2,3,4,5}`, #3 = expected failure) to parity modulo `@PG`.
 - PR #15, https://github.com/madhavajay/samtools-rs/pull/15, branch `reheader-parity` (from `main`) — reorders the shared `pg::push_pg_line` output to upstream's `@PG` field order `ID, PN, PP, VN, CL`. Benefits every command that inserts a samtools `@PG`; the upstream harness strips `\tVN:.*`, so `PP` must precede `VN`. Brings the `reheader/{1,4}` header section to parity after harness reordering.
 
-Latest known validation (consolidated `integration-all-prs`, all of #8–#15):
-- Rust tests: 416 passing, 0 failing.
-- Full gate: `cargo fmt --all --check`, `cargo clippy -p samtools-rs --all-targets -- -D warnings`, and `cargo test -p samtools-rs` all green.
+Latest known validation (on `main` at `b312c99`, post-merge):
+- Rust tests: 416 `samtools-rs` passing, 0 failing (`cargo test --workspace`: 2587 passing).
+- Full gate green in CI on PR #16: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and the advisory parity gate.
 - New focused tests added across PRs: `fastq_index_files_extract_from_barcode_tag`, `fastq_routes_r1_only_singletons_to_singleton_output`, `fastq_dash_t_and_dash_cap_t_combine_aux_tags`, `fastq_interleaves_read1_read2_when_paths_alias`, `fastq_repeated_dash_d_unions_same_tag_values`, `fasta_reverse_strand_record_reverse_complemented_in_output`, `view_qname_file_filters_records_by_name`, `view_r_and_dash_cap_r_filter_by_read_group`, `view_d_and_dash_cap_d_filter_by_aux_tag`, `addreplacerg_defaults_to_first_header_rg_and_preserves_lines`, `addreplacerg_r_overwrite_all_removes_other_header_rg_lines`, and `addreplacerg_dash_cap_r_unknown_id_is_rejected`.
 
 Estimated whole-project completion:
-- Roughly 60–65% complete toward the full `samtools` replacement goal once the in-flight PRs land.
-- Rationale: core workspace/subcommand layout, common I/O, many read/write/index/file-operation/statistics/editing commands, the upstream-style fastq split routing, an extended view filter suite (qname/RG/aux-tag), addreplacerg upstream `@RG` header semantics, and 408+ Rust tests are in place. The remaining risk is concentrated in byte-for-byte upstream parity for the higher-complexity subcommands (view binary aux mutation, sort external merge, markdup/stats per-cycle, full checksum/reference/depad), pileup-dependent commands, full CRAM streaming, and large external algorithms.
+- Roughly 60–65% complete toward the full `samtools` replacement goal (PRs #8–#15 have landed on `main`).
+- Rationale: core workspace/subcommand layout, common I/O, many read/write/index/file-operation/statistics/editing commands, the upstream-style fastq split routing, an extended view filter suite (qname/RG/aux-tag), addreplacerg upstream `@RG` header semantics, and 416 Rust tests are in place. The remaining risk is concentrated in byte-for-byte upstream parity for the higher-complexity subcommands (view binary aux mutation, sort external merge, markdup/stats per-cycle, full checksum/reference/depad), pileup-dependent commands, full CRAM streaming, and large external algorithms.
+
+### Workflow rule: one large PR branch at a time
+
+Do **not** open many small per-slice PRs. Use a single long-lived working
+branch off `main` (e.g. `work-<topic>`), land multiple related bounded
+slices onto it as separate commits, keep the full gate green after each
+commit, and open **one** large PR for that batch. Only start the next
+working branch after that PR has merged to `main`. (PRs #8–#15 were the
+fragmented anti-pattern; #16 consolidated them — keep it to one large PR
+branch going forward.)
 
 What to do next:
-1. Pick the next bounded slice from **Remaining tractable samtools-rs-only items** below.
-2. Run the full gate, update `TODO.md`, `docs/subcommand-coverage.md`, and `docs/test-status.md`, then commit, push, and open the next PR.
+1. Create one working branch off `main` for the next batch of bounded slices.
+2. Land each slice from **Remaining tractable samtools-rs-only items** below as its own commit on that branch, running the full gate (`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`) green after every commit, and updating `TODO.md`, `docs/subcommand-coverage.md`, and `docs/test-status.md` as you go.
+3. Open a single PR for the whole batch, get CI green, merge to `main`, then start the next working branch.
 
 Remaining tractable samtools-rs-only items (no htslib-rs / noodles changes required):
 - **SAM aux float formatting (shared renderer).** High impact: split/reheader/sort/merge/collate/addreplacerg/reset/fixmate/rmdup binary→SAM fixtures match on headers but differ only on float-bearing aux fields because noodles' `sam::io::Writer` formats `f32` as plain decimals. samtools-rs already has the correct `format_aux_float`/`format_htslib_exponent` in `commands/fastq.rs`; promote them to a shared module and route the binary→SAM record paths through a samtools-rs renderer (see the noodles Extensions Needed note).
