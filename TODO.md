@@ -17,47 +17,55 @@ the underlying libraries.
 Merged baseline:
 - PR #7, https://github.com/madhavajay/samtools-rs/pull/7, is merged into `main`.
 - Merge commit: `ae15e4ad603892912fe0c5175491e1d0e3f210eb`.
-- Previous branch: `stats-cov-threshold-target-lines`.
-- Active branch: `fastq-index-files` (work in progress on top of `main`).
-- The next work should continue from the current branch or restart from `main` on a new short-lived branch.
+- PRs #8–#15 (the work below) were consolidated into `integration-all-prs` and merged back to `main`.
+- The next work should start from `main` on a new short-lived branch.
 
-Recently merged work from PR #7, newest first:
-- `e4f2f9e` — documented the current project handoff and corrected the active samtools-rs PR pointer.
-- `288f992` — `fastq -i` / `--barcode-tag` CASAVA barcode fields for SAM/BAM FASTQ/FASTA local paths.
-- `f88e172` — `fastq -U` / `--UMI-tag` UMI read-name suffixes.
-- `0cc6202` — `fastq -v INT` default-quality output for missing qualities.
-- `c9a20c6` — accepted `collate -n INT` temporary-file-count compatibility.
-- `ca58fcc` — `cat -b FILE` input file lists.
-- `f22f0bc` through `820dbf8` / `b1bff15` / `1103de7` / `f2af4aa` / `d0c1587` / `35586da` / `e3d6b5e` / `192b193` — merge input lists, tag ordering, and richer header reconciliation.
-- Earlier PR #7 commits include stats coverage/filtering/read-length/trim/read-group/insert-size work, markdup/fixmate compatibility increments, reference indexed-BAM regions, SAM depad conversion, sanitizer options, CRAM-backed sort/collate input, and docs/status synchronization.
+In-flight PRs (samtools-rs-only, ready for review/merge):
+- PR #8, https://github.com/madhavajay/samtools-rs/pull/8, branch `fastq-index-files` — `fastq --i1 FILE` / `--i2 FILE` per-record index FASTQ extraction with `--index-format` (default `i*i*`), `--quality-tag` (default `QT`), and `--barcode-tag`. Emits one index record per primary non-READ2 record; exact upstream name-grouped one-record-per-qname-pair emission remains pending.
+- PR #9, https://github.com/madhavajay/samtools-rs/pull/9, branch `fastq-index-paired-grouping` — five stacked commits:
+  1. Upstream-style name-grouped fastq split routing (paired R1+R2 → `-1`/`-2`; R1-only / R2-only singleton → `-s` with fallback to `-1`/`-2`; READ_OTHER → `-0` with fallback to `-s`).
+  2. Accumulating `-t` / `-T` aux-tag selections (union rather than override).
+  3. Per-record interleaved output when `-1` and `-2` paths alias to the same file.
+  4. Repeated `-d` / `-D` value-union for the same tag with mismatched-tag rejection.
+  5. Route all FASTA paths through the local renderer so reverse-strand records are reverse-complemented (the htslib-rs FASTA fast paths skipped that step).
+  Brings `bam2fq/{1,2,3,4,6,7,9,11,13,15,16,17,18,19,20}.{1,2,s}.fq.expected` and `bam2fq/11.fa.expected` upstream fixtures to byte parity for SAM input.
+- PR #10, https://github.com/madhavajay/samtools-rs/pull/10, branch `view-n-qname-filter` — `view -N FILE` / `--qname-file FILE` allow/deny qname list with `^FILE` negation; wired into the shared `line_passes` filter pass.
+- PR #11, https://github.com/madhavajay/samtools-rs/pull/11, branch `view-r-rg-filter` (stacked on PR #10) — `view -r STR` / `-R FILE` accumulating read-group ID filter plus `-n` exclude-no-RG.
+- PR #13, https://github.com/madhavajay/samtools-rs/pull/13, branch `view-d-aux-tag-filter` (stacked on PR #11) — `view -d TAG[:VAL]` / `-D TAG:FILE` aux-tag presence/value filtering with shared-tag validation.
+- PR #14, https://github.com/madhavajay/samtools-rs/pull/14, branch `addreplacerg-default-rg` (from `main`, two commits) — `addreplacerg` defaults to the first header `@RG` ID when neither `-r`/`-R` is given, upstream `@RG` header reconciliation (`-r` + `overwrite_all` strips other `@RG` lines; `-w` overwrites a same-ID line), and `-R ID` rejection when the ID is absent from the header. Brings the whole upstream `test_addrprg` group (`addrprg/{1,2,3,4,5}`, #3 = expected failure) to parity modulo `@PG`.
+- PR #15, https://github.com/madhavajay/samtools-rs/pull/15, branch `reheader-parity` (from `main`) — reorders the shared `pg::push_pg_line` output to upstream's `@PG` field order `ID, PN, PP, VN, CL`. Benefits every command that inserts a samtools `@PG`; the upstream harness strips `\tVN:.*`, so `PP` must precede `VN`. Brings the `reheader/{1,4}` header section to parity after harness reordering.
 
-In-progress work on branch `fastq-index-files`:
-- `fastq --i1 FILE` / `--i2 FILE` index FASTQ extraction with `--index-format` (default `i*i*`), `--quality-tag` (default `QT`), and `--barcode-tag` (default `BC`) for SAM/BAM local paths.
-- Implemented as a second-pass over the input after the main FASTQ output, emitting one index record per primary non-READ2 record (intentionally not yet name-grouped to a single record per qname-pair).
-- Format parser supports `iN`, `nN`, `i*`, and `n*` items chained; up to 2 `i` segments.
-- Index file output reuses the rendered read name (no CASAVA comment) and honors `-n` / `-N` plus UMI suffix where the surrounding render options apply.
-
-Latest known validation on `fastq-index-files`:
-- Rust tests: 405 passing.
-- Last full gate: `cargo fmt --all --check`, `cargo clippy -p samtools-rs --all-targets -- -D warnings`, `cargo test -p samtools-rs`, `cargo test -p samtools-rs -- --list | rg ': test$' | wc -l`, and `git diff --check`.
-- Latest focused test added: `fastq_index_files_extract_from_barcode_tag` covering the upstream `bam2fq/14.{0,i1,i2}.fq.expected` fixture shape (`--index-format i8n1i8`, `--i1`, `--i2`, `-0`) for both SAM and BAM input.
+Latest known validation (consolidated `integration-all-prs`, all of #8–#15):
+- Rust tests: 416 passing, 0 failing.
+- Full gate: `cargo fmt --all --check`, `cargo clippy -p samtools-rs --all-targets -- -D warnings`, and `cargo test -p samtools-rs` all green.
+- New focused tests added across PRs: `fastq_index_files_extract_from_barcode_tag`, `fastq_routes_r1_only_singletons_to_singleton_output`, `fastq_dash_t_and_dash_cap_t_combine_aux_tags`, `fastq_interleaves_read1_read2_when_paths_alias`, `fastq_repeated_dash_d_unions_same_tag_values`, `fasta_reverse_strand_record_reverse_complemented_in_output`, `view_qname_file_filters_records_by_name`, `view_r_and_dash_cap_r_filter_by_read_group`, `view_d_and_dash_cap_d_filter_by_aux_tag`, `addreplacerg_defaults_to_first_header_rg_and_preserves_lines`, `addreplacerg_r_overwrite_all_removes_other_header_rg_lines`, and `addreplacerg_dash_cap_r_unknown_id_is_rejected`.
 
 Estimated whole-project completion:
-- Roughly 55-60% complete toward the full `samtools` replacement goal.
-- Rationale: core workspace/subcommand layout, common I/O, many read/write/index/file-operation/statistics/editing commands, and 404 Rust tests are in place. The remaining risk is concentrated in byte-for-byte upstream parity, pileup-dependent commands, full CRAM streaming, large external algorithms, and several partially implemented high-complexity commands.
+- Roughly 60–65% complete toward the full `samtools` replacement goal once the in-flight PRs land.
+- Rationale: core workspace/subcommand layout, common I/O, many read/write/index/file-operation/statistics/editing commands, the upstream-style fastq split routing, an extended view filter suite (qname/RG/aux-tag), addreplacerg upstream `@RG` header semantics, and 408+ Rust tests are in place. The remaining risk is concentrated in byte-for-byte upstream parity for the higher-complexity subcommands (view binary aux mutation, sort external merge, markdup/stats per-cycle, full checksum/reference/depad), pileup-dependent commands, full CRAM streaming, and large external algorithms.
 
 What to do next:
-1. Commit the in-progress `fastq --i1/--i2` slice on `fastq-index-files`, push, and open a follow-up PR from `main`.
-2. After that PR lands, extend `fastq` toward exact upstream name-grouped one-record-per-qname index emission (currently the slice emits per non-READ2 record without name grouping).
-3. Then pick one of: a small `view` parity slice using existing mutable BAM/SAM record infrastructure, or a `checksum`/`reference`/`depad`/`markdup`/`sort`/`merge` parity case from the upstream harness that does not require pileup, CRAM internals, or noodles changes.
-4. Run the full gate, update `TODO.md`, `docs/subcommand-coverage.md`, and `docs/test-status.md`, then commit, push, and open each follow-up PR.
+1. Pick the next bounded slice from **Remaining tractable samtools-rs-only items** below.
+2. Run the full gate, update `TODO.md`, `docs/subcommand-coverage.md`, and `docs/test-status.md`, then commit, push, and open the next PR.
 
-After `fastq --i1/--i2`, the next best samtools-rs-only items are:
-- Extend `fastq` toward exact name-grouped paired/singleton/other routing and the corresponding one-record-per-qname index emission, still without touching `htslib-rs`.
-- Pick one small `view` parity slice that can be done with existing mutable BAM/SAM record infrastructure.
-- Pick one `checksum`, `reference`, `depad`, `markdup`, `sort`, or `merge` parity case from the upstream harness that does not require pileup, CRAM internals, or noodles changes.
-- Keep deferring pileup-dependent commands (`mpileup`, `consensus`, `targetcut`, `phase`, `ampliconstats`) until `htslib-rs` exposes a pileup iterator.
-- Keep deferring CRAM whole-file stats/checksum/reference paths until `htslib-rs` exposes a CRAM all-record iterator.
+Remaining tractable samtools-rs-only items (no htslib-rs / noodles changes required):
+- **SAM aux float formatting (shared renderer).** High impact: split/reheader/sort/merge/collate/addreplacerg/reset/fixmate/rmdup binary→SAM fixtures match on headers but differ only on float-bearing aux fields because noodles' `sam::io::Writer` formats `f32` as plain decimals. samtools-rs already has the correct `format_aux_float`/`format_htslib_exponent` in `commands/fastq.rs`; promote them to a shared module and route the binary→SAM record paths through a samtools-rs renderer (see the noodles Extensions Needed note).
+- **`fastq` index extraction × name-grouping interaction.** Fold the per-record index emission into the name-grouped flush so each qname-group emits at most one index record per `--i1` / `--i2`, matching upstream's `flush_rec` → `output_index` (required for `bam2fq/{5,8,10,12}` parity).
+- **`view --library` (`-l`)** library filter via `@RG LB:` aux lookup. Builds on the merged read-group filter infrastructure.
+- **`view -X` legacy custom-index synopsis** for BAM/CRAM; the second positional becomes the index path. Already supported as a no-op in `idxstats`.
+- **`merge -s SEED`** random-seed acceptance for `-n` mode (currently the option is parsed but the seed is unused).
+- **`samples` BAM index path verification** for the `-i` index-presence column when index files are at non-default locations.
+- **`addreplacerg --output-fmt=cram`** with a `-T` reference — needs reference-backed CRAM writer path (already used in `view`).
+- **`stats -d` / `--remove-dups` edge cases**: ensure histogram contributions are excluded for primary duplicates across CRAM record paths.
+
+Items blocked on htslib-rs / noodles extensions (see the rolling list at the end of this file):
+- All pileup-dependent commands (`mpileup`, `consensus`, `targetcut`, `phase`, `ampliconstats`, exact pileup-based `bedcov`/`coverage`/`depth`).
+- Full `stats` and `checksum` for CRAM input without a region (needs CRAM all-record iterator).
+- `cram-size` (needs CRAM container/block API exposure).
+- `view --no-PG` for BAM/CRAM output (needs `sam_hdr_add_pg` equivalent that writes through the binary header).
+- `flagstat` / `idxstats` for CRAM input without an explicit reference (needs CRAM index meta accessor in `htslib-rs::index_compat`).
+- CSI query robustness for very large references (noodles `index out of bounds` panic on the upstream `test_index` `large_chrom.bam ref2` query).
+- SAM aux float formatting in noodles' `sam::io::Writer` (alternative to the samtools-rs shared-renderer approach above).
 
 ## Progress Snapshot
 
@@ -324,6 +332,7 @@ noodles submodule for these blockers until explicitly switching back to
 underlying-library work.
 
 - [ ] **CSI query robustness for very large references/regions** — the local parity harness now reaches `test_index`, where `samtools view large_chrom.bam ref2` panics inside `noodles-csi/src/binning_index/index/reference_sequence.rs` with `index out of bounds`, and `ref2:1-541556283` reports `invalid end bound`. Defer to noodles/htslib-rs region/index handling rather than patching noodles from this samtools-rs pass.
+- [ ] **SAM aux float formatting (`f:` scalars and `B:f` arrays)** — noodles' `sam::io::Writer` (used by `split`, `reheader`, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, and any other binary→SAM record path) formats `f32` aux values as plain decimals/integers (`6.626e-34` → `0.0000…0006626`, `2.9979e+09` → `2997900000`, `6.022e+23` → `6.022e23`), whereas htslib uses `%g`-style scientific notation with a signed two-digit exponent. samtools-rs already has the correct formatter (`format_aux_float` / `format_htslib_exponent` in `commands/fastq.rs`); the blocker is that the shared binary→SAM path routes through `noodles sam::io::Writer::write_alignment_record` rather than a samtools-rs renderer. Options: (a) add an htslib-style float `Display`/serializer in noodles (underlying-library change, deferred), or (b) introduce a shared samtools-rs SAM-record renderer that reuses the fastq float helpers and switch the binary→SAM commands to it (a non-trivial samtools-rs refactor — promote `format_aux_float` to a shared module and add a `record → SAM line` helper). Surfacing here: the `split/`, `reheader/`, and similar fixtures match byte-for-byte on headers but differ only on float-bearing aux fields because of this.
 
 ## Submodule Pinning
 
