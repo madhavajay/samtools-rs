@@ -11,8 +11,12 @@
 //! FASTQ/pileup quality is `100 * used_score / total_score` (capped at 93
 //! for the FASTQ ASCII char).
 //!
-//! **Scope:** `--mode simple` only (the default `recall`/Bayesian modes
-//! are not ported). No reference is required (simple mode is freq-based).
+//! **Modes:** `--mode simple` (frequency counting) and the default
+//! `bayesian`/`recall` Gap5 model (`calculate_consensus_gap5` ported in
+//! the `bayes` submodule, fed by the htslib-rs pileup `nm_init`
+//! precompute via `PileupRead::bayes_poly`/`bayes_nm_local`). 50/77
+//! `test/consensus/consensus.reg` cases byte-exact; the remaining
+//! pileup-format / `--ref-qual`+`-T` / glued-`-C` variants are WIP.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -45,6 +49,15 @@ struct Config {
     show_del: bool,
     show_ins: bool,
     line_len: usize,
+    // Bayesian-mode (`--mode bayesian`/default) parameters.
+    mode_simple: bool,
+    default_qual: u8,
+    cons_cutoff: i32,
+    use_mqual: bool,
+    nm_adjust: bool,
+    scale_mqual: f64,
+    low_mqual: f64,
+    high_mqual: f64,
 }
 
 impl Default for Config {
@@ -62,6 +75,14 @@ impl Default for Config {
             show_del: false,
             show_ins: true,
             line_len: 70,
+            mode_simple: false, // upstream default is bayesian/recall
+            default_qual: 10,
+            cons_cutoff: 10,
+            use_mqual: true,
+            nm_adjust: true,
+            scale_mqual: 1.0,
+            low_mqual: 1.0,
+            high_mqual: 60.0,
         }
     }
 }
@@ -73,7 +94,9 @@ fn yes(v: Option<&str>) -> bool {
 /// Entry point for `samtools consensus`.
 pub fn main(args: &[OsString]) -> ExitCode {
     let mut cfg = Config::default();
-    let mut mode_simple = true;
+    // Upstream default is bayesian/recall; only an explicit
+    // `-m simple`/`--mode simple` selects the frequency-count path.
+    let mut mode_simple = false;
 
     let mut iter = args.iter().skip(1);
     while let Some(arg) = iter.next() {
@@ -117,6 +140,22 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
             "-q" | "--use-qual" => cfg.use_qual = true,
             "--no-use-qual" => cfg.use_qual = false,
+            "--use-MQ" => cfg.use_mqual = true,
+            "--no-use-MQ" => cfg.use_mqual = false,
+            "-C" | "--cutoff" => {
+                cfg.cons_cutoff = iter
+                    .next()
+                    .and_then(|a| a.to_str())
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(10);
+            }
+            "--default-qual" => {
+                cfg.default_qual = iter
+                    .next()
+                    .and_then(|a| a.to_str())
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(10);
+            }
             "-A" | "--ambig" => cfg.ambig = true,
             "--show-del" => cfg.show_del = yes(iter.next().and_then(|a| a.to_str())),
             "--show-ins" => cfg.show_ins = yes(iter.next().and_then(|a| a.to_str())),
@@ -144,13 +183,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     }
 
-    if !mode_simple {
-        print_error(
-            "consensus",
-            "only --mode simple is supported in samtools-rs consensus",
-        );
-        return ExitCode::from(1);
-    }
+    cfg.mode_simple = mode_simple;
 
     let Some(input) = cfg.input.clone() else {
         print_error("consensus", "no input file");
@@ -289,6 +322,99 @@ fn insertion_entries(reads: &[PileupRead], nth: usize) -> Vec<Entry> {
         .collect()
 }
 
+/// Prebuilt Bayesian-mode tables (`MODE_RECALL`), constructed once.
+struct BayesCtx {
+    cp: bayes::ConsProbs,
+    et: bayes::ETab,
+    q2p: [f64; 101],
+    mpow: [f64; 256],
+}
+
+impl BayesCtx {
+    fn new() -> Self {
+        BayesCtx {
+            cp: bayes::default_recall(),
+            et: bayes::ETab::new(),
+            q2p: bayes::q2p_table(),
+            mpow: bayes::mqual_pow_1m_table(),
+        }
+    }
+}
+
+/// Build one `Gap5Obs` per read for the reference column (`nth==0`) or
+/// an insertion sub-column (`nth>=1`), filtering ref-skips and reads
+/// below `min_qual`, applying the upstream `255 -> default_qual` rule.
+fn gap5_obs(reads: &[PileupRead], cfg: &Config, nth: usize) -> Vec<bayes::Gap5Obs> {
+    let mut v = Vec::new();
+    for r in reads {
+        if r.is_refskip {
+            continue;
+        }
+        let (code, raw) = if nth == 0 {
+            (
+                match r.base {
+                    Some(b) => base4(b),
+                    None => 16,
+                },
+                r.quality.unwrap_or(r.qpos_quality),
+            )
+        } else if r.indel > 0 && r.insertion.len() >= nth {
+            (base4(r.insertion[nth - 1]), r.qpos_quality)
+        } else {
+            (16, r.qpos_quality)
+        };
+        if raw < cfg.min_qual {
+            continue;
+        }
+        let qual = if raw == 255 || (raw == 0 && r.qpos_quality == 255) {
+            cfg.default_qual
+        } else {
+            raw
+        };
+        v.push(bayes::Gap5Obs {
+            base4: code as u8,
+            qual,
+            mqual: r.mapping_quality as f64,
+            nm_local: r.bayes_nm_local as i32,
+            poly: r.bayes_poly as f64,
+        });
+    }
+    v
+}
+
+/// Bayesian consensus for one column, faithfully porting upstream
+/// `consensus_base`'s non-simple branch (the `min_depth`/ambiguity/
+/// `cons_cutoff` thresholds on top of `gap5_call`).
+fn consensus_bayes(reads: &[PileupRead], cfg: &Config, ctx: &BayesCtx, nth: usize) -> (u8, u32) {
+    let td = reads.iter().filter(|r| !r.is_refskip).count() as i32;
+    let obs = gap5_obs(reads, cfg, nth);
+    let opts = bayes::Gap5Opts {
+        use_mqual: cfg.use_mqual,
+        nm_adjust: cfg.nm_adjust,
+        scale_mqual: cfg.scale_mqual,
+        low_mqual: cfg.low_mqual,
+        high_mqual: cfg.high_mqual,
+    };
+    let cons = bayes::gap5_call(&obs, td, &ctx.cp, &ctx.et, &ctx.q2p, &ctx.mpow, &opts);
+
+    let acgt = [b'A', b'C', b'G', b'T', b'*'];
+    // 5x5 ACGT* ambiguity matrix (rows/cols A C G T *).
+    const AMBIG: &[u8; 25] = b"AMRWaMCSYcRSGKgWYKTtacgt*";
+
+    let (mut cb, mut cq): (u8, i32) = if (cons.depth as usize) < cfg.min_depth && cons.call != 4 {
+        (b'N', 0)
+    } else if cons.het_logodd > 0 && cfg.ambig {
+        (AMBIG[cons.het_call], cons.het_logodd)
+    } else {
+        (acgt[cons.call.min(4)], cons.phred)
+    };
+    if cq < cfg.cons_cutoff && cb != b'*' && cons.het_call % 5 != 4 && cons.het_call / 5 != 4 {
+        cb = b'N';
+        cq = 0;
+    }
+    (cb, cq.max(0) as u32)
+}
+
 fn fastq_qual_char(q: u32) -> u8 {
     if q > 93 { 126 } else { (q as u8) + 33 }
 }
@@ -302,6 +428,12 @@ struct RefSeq {
 fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
     let columns =
         pileup_from_alignment_paths_with_options(std::slice::from_ref(input), &Default::default())?;
+
+    let bayes_ctx = if cfg.mode_simple {
+        None
+    } else {
+        Some(BayesCtx::new())
+    };
 
     let mut writer: Box<dyn Write> = match cfg.output.as_ref() {
         Some(p) => Box::new(io::BufWriter::new(File::create(p)?)),
@@ -331,7 +463,10 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
         // Reference position (nth = 0).
         let entries = ref_entries(reads);
         let depth = entries.iter().filter(|e| e.qual >= cfg.min_qual).count();
-        let (cb, cq) = consensus_simple(&entries, cfg);
+        let (cb, cq) = match &bayes_ctx {
+            Some(ctx) => consensus_bayes(reads, cfg, ctx, 0),
+            None => consensus_simple(&entries, cfg),
+        };
 
         if cfg.format == Format::Pileup {
             if cb != b'*' || cfg.show_del {
@@ -366,7 +501,10 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
         for nth in 1..=max_ins {
             let ins = insertion_entries(reads, nth);
             let idepth = ins.iter().filter(|e| e.qual >= cfg.min_qual).count();
-            let (ib, iq) = consensus_simple(&ins, cfg);
+            let (ib, iq) = match &bayes_ctx {
+                Some(ctx) => consensus_bayes(reads, cfg, ctx, nth),
+                None => consensus_simple(&ins, cfg),
+            };
             if cfg.format == Format::Pileup {
                 emit_pileup_row(
                     &mut pileup_rows,
