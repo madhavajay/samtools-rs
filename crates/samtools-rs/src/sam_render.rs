@@ -13,6 +13,15 @@ use std::io::{self, Write};
 
 use htslib_rs::sam::{self, alignment::RecordBuf};
 
+/// Writes a SAM header to `out` (no float fields exist in `@` lines, so
+/// this is a thin pass-through to noodles' header serializer; provided so
+/// callers can keep a plain `Write` sink and use [`write_record`] for the
+/// record stream).
+pub fn write_header<W: Write>(out: &mut W, header: &sam::Header) -> io::Result<()> {
+    let mut w = sam::io::Writer::new(out);
+    w.write_header(header)
+}
+
 /// Writes one alignment record as a SAM text line to `out`, applying
 /// [`fix_sam_aux_floats`] so float aux fields match htslib's spelling.
 /// Drop-in replacement for `sam::io::Writer::write_alignment_record`
