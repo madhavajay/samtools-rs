@@ -10,11 +10,16 @@
 //! corresponding mates of duplicate templates collide. With `-S`,
 //! duplicate reads carrying `SA`/`XA` or an unmapped mate seed a
 //! qname `dup_hash` that flags matching supplementary/secondary/unmapped
-//! records. Byte-exact vs upstream `markdup/{5,6,7,13}` (template,
-//! sequence, supplementary, barcode-tag). **Not yet:** optical-duplicate
-//! chain re-tagging (`find_duplicate_chains`), `--read-coords` /
-//! `--coords-order` / `--barcode-rgx` / `--barcode-name` /
-//! `--use-read-groups` / `--duplicate-count`, exact `-s` stats, CRAM.
+//! records. Optical duplicates use the faithful `get_coordinates_colons`
+//! parse plus the `find_duplicate_chains` re-tagging pass (per-read
+//! `original`/`duplicate` chain links with the exact swap/splice
+//! semantics). `--use-read-groups` keys the hashes by `@RG` order;
+//! `--duplicate-count` emits `dc:i`. Byte-exact vs upstream
+//! `markdup/{5,6,7,8,9,10,13,18}`. **Not yet:** `--read-coords` /
+//! `--coords-order` / `--barcode-rgx` / `--barcode-name` (regex
+//! coords/barcode; fixtures 11,12,14,15,16), markdup-17's non-canonical
+//! `@RG`/`@SQ` header order (needs raw-header output), exact `-s` stats,
+//! CRAM.
 //!
 //! Supported flags:
 //!  - `-r` — remove duplicates from the output (rather than just flagging).
@@ -86,6 +91,8 @@ struct MarkdupOptions {
     barcode_tag: Option<Tag>,
     mode: DupMode,
     supp: bool,
+    use_read_groups: bool,
+    duplicate_count: bool,
 }
 
 /// Entry point for `samtools markdup`.
@@ -103,6 +110,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut barcode_tag: Option<Tag> = None;
     let mut mode = DupMode::Template;
     let mut supp = false;
+    let mut use_read_groups = false;
+    let mut duplicate_count = false;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -111,6 +120,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-r" => remove_dups = true,
             "-s" => emit_stats = true,
             "-S" => supp = true,
+            "--use-read-groups" => use_read_groups = true,
+            "--duplicate-count" => duplicate_count = true,
             "--include-fails" => include_fails = true,
             "-c" => clear_existing_dups = true,
             "-t" => duplicate_origin_tag = true,
@@ -229,6 +240,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
         barcode_tag,
         mode,
         supp,
+        use_read_groups,
+        duplicate_count,
     };
     let result = match format.exact {
         Exact::Sam => run_sam_markdup(&input, output.as_deref(), output_fmt, pg_argv, options),
@@ -284,6 +297,34 @@ struct DuplicateMetadata {
     duplicate_type: Option<DuplicateType>,
 }
 
+/// Per-record read-group number (`--use-read-groups`): the 1-based index
+/// of the record's `RG` in the header's `@RG` order, else 0.
+fn compute_rg_of(header: &sam::Header, records: &[RecordBuf], enabled: bool) -> Vec<i32> {
+    if !enabled {
+        return vec![0; records.len()];
+    }
+    let mut rg_num: HashMap<Vec<u8>, i32> = HashMap::new();
+    for (i, id) in header.read_groups().keys().enumerate() {
+        let bytes: &[u8] = id.as_ref();
+        rg_num.insert(bytes.to_vec(), i as i32 + 1);
+    }
+    records
+        .iter()
+        .map(|r| {
+            r.data()
+                .get(&Tag::from([b'R', b'G']))
+                .and_then(|v| match v {
+                    Value::String(s) => {
+                        let b: &[u8] = s.as_ref();
+                        rg_num.get(b).copied()
+                    }
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
 fn run_bam_markdup(
     input: &Path,
     output: Option<&Path>,
@@ -307,7 +348,8 @@ fn run_bam_markdup(
     if options.clear_existing_dups {
         clear_duplicate_marks(&mut records);
     }
-    let mut stats = mark_duplicates(&mut records, options);
+    let rg_of = compute_rg_of(&header, &records, options.use_read_groups);
+    let mut stats = mark_duplicates(&mut records, options, &rg_of);
     stats.written = output_record_count(&records, options.remove_dups);
     let mut sink = open_output(output, fmt, &header)?;
     for rec in &records {
@@ -345,7 +387,8 @@ fn run_sam_markdup(
     if options.clear_existing_dups {
         clear_duplicate_marks(&mut records);
     }
-    let mut stats = mark_duplicates(&mut records, options);
+    let rg_of = compute_rg_of(&header, &records, options.use_read_groups);
+    let mut stats = mark_duplicates(&mut records, options, &rg_of);
     stats.written = output_record_count(&records, options.remove_dups);
     let mut sink = open_output(output, fmt, &header)?;
     for rec in &records {
@@ -733,7 +776,11 @@ fn pair_scores(stored: &RecordBuf, incoming: &RecordBuf) -> (i64, i64) {
 /// template get distinct keys and only corresponding mates of duplicate
 /// templates collide. Secondary/supplementary records inherit the flag
 /// from their duplicate primary by qname.
-fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> MarkdupStats {
+fn mark_duplicates(
+    records: &mut [RecordBuf],
+    options: MarkdupOptions,
+    rg_of: &[i32],
+) -> MarkdupStats {
     let mut single_hash: HashMap<KeyData, usize> = HashMap::new();
     let mut pair_hash: HashMap<KeyData, usize> = HashMap::new();
     let mut duplicate_primary_metadata: HashMap<Vec<u8>, DuplicateMetadata> = HashMap::new();
@@ -763,6 +810,8 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
     // `dup_next[x]` == upstream `x->duplicate`; `orig_link[x]` == `x->original`.
     let mut dup_next: Vec<Option<usize>> = vec![None; n_rec];
     let mut orig_link: Vec<Option<usize>> = vec![None; n_rec];
+    // `--duplicate-count`: per-read collapsed-duplicate count (incl self).
+    let mut dc: Vec<i64> = vec![1; n_rec];
 
     let supp = options.supp;
     // Marks `dup_idx` as a duplicate of `orig_idx`, recording origin/type.
@@ -810,8 +859,8 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
         stats.examined += 1;
 
         if has_mate(&records[i]) {
-            let pair_key = make_pair_key(&records[i], options.mode, options.barcode_tag, 0);
-            let single_key = make_single_key(&records[i], options.barcode_tag, 0);
+            let pair_key = make_pair_key(&records[i], options.mode, options.barcode_tag, rg_of[i]);
+            let single_key = make_single_key(&records[i], options.barcode_tag, rg_of[i]);
             stats.paired += 1;
 
             // Single hash: a true singleton already stored loses to this pair.
@@ -835,6 +884,7 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
                         if check_chain {
                             chain_new_wins(&mut dup_next, &mut orig_link, i, j);
                         }
+                        dc[i] += 1;
                         single_hash.insert(single_key.clone(), i);
                     }
                 }
@@ -876,7 +926,10 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
                         }
                     }
                     if swap {
+                        dc[i] += dc[j];
                         pair_hash.insert(pair_key, i);
+                    } else {
+                        dc[j] += 1;
                     }
                     stats.duplicate_pair += 1;
                     if dtype.is_some_and(DuplicateType::is_optical) {
@@ -886,7 +939,7 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
             }
         } else {
             // Single (or effectively single) reads.
-            let single_key = make_single_key(&records[i], options.barcode_tag, 0);
+            let single_key = make_single_key(&records[i], options.barcode_tag, rg_of[i]);
             stats.single += 1;
             match single_hash.get(&single_key).copied() {
                 None => {
@@ -908,6 +961,7 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
                         if check_chain {
                             chain_keep_wins(&mut dup_next, &mut orig_link, j, i);
                         }
+                        dc[j] += 1;
                     } else {
                         let old_s = calc_score(&records[j]);
                         let new_s = calc_score(&records[i]);
@@ -931,7 +985,10 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
                             }
                         }
                         if swap {
+                            dc[i] += dc[j];
                             single_hash.insert(single_key, i);
+                        } else {
+                            dc[j] += 1;
                         }
                         stats.duplicate_single += 1;
                         if dtype.is_some_and(DuplicateType::is_optical) {
@@ -1143,7 +1200,7 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
     // Upstream supplementary pass (`-S` only): supplementary, secondary, and
     // unmapped records whose qname seeded `dup_hash` inherit the flag.
     if options.supp {
-        for record in records {
+        for record in records.iter_mut() {
             let flag = record.flags().bits() as u32;
             if flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY | BAM_FUNMAP) == 0 {
                 continue;
@@ -1166,6 +1223,17 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
                 {
                     stats.duplicate_non_primary_optical += 1;
                 }
+            }
+        }
+    }
+
+    // `--duplicate-count`: emit `dc:i` on every final non-duplicate read
+    // (after all marking, incl. the supplementary pass).
+    if options.duplicate_count {
+        for (idx, rec) in records.iter_mut().enumerate() {
+            if rec.flags().bits() as u32 & BAM_FDUP == 0 {
+                rec.data_mut()
+                    .insert(Tag::from([b'd', b'c']), Value::Int32(dc[idx] as i32));
             }
         }
     }

@@ -6392,6 +6392,19 @@ fn markdup_matches_upstream_test_markdup_fixtures() {
             "10_optical_chain",
             "10_optical_chain.expected.sam",
         ),
+        (
+            &[
+                "--mode",
+                "t",
+                "-t",
+                "--duplicate-count",
+                "--barcode-tag",
+                "BC",
+                "-S",
+            ],
+            "18_primary_duplicate_count",
+            "18_primary_duplicate_count.expected.sam",
+        ),
     ];
     for (flags, stem, expected) in cases {
         let inp = d.join("markdup").join(format!("{stem}.sam"));
