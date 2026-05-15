@@ -7805,3 +7805,93 @@ fn addreplacerg_matches_upstream_group() {
         );
     }
 }
+
+/// Drives the entire upstream `test/consensus/consensus.reg` harness
+/// in-process: every `INIT` line builds its BAM via `view` (with the
+/// `--write-index`), then every `P <name> ... consensus <args>` line is
+/// run and its output compared byte-for-byte to
+/// `test/consensus/expected/<name>`. Locks all 77 cases: simple +
+/// bayesian/recall, fasta/fastq/pileup, -a/-aa, -r, -T/--ref-qual,
+/// --min-MQ/--min-BQ, show-del/ins, and glued short options.
+#[test]
+fn consensus_matches_upstream_consensus_reg() {
+    use samtools_rs::commands::{consensus, view};
+    let dir = fixtures_dir().join("consensus");
+    let tmp = tmp_dir("consensus-reg");
+    // Stage the input SAM/FA(/fai) so relative names in the .reg resolve.
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let p = e.unwrap().path();
+        if matches!(
+            p.extension().and_then(|s| s.to_str()),
+            Some("sam") | Some("fa") | Some("fai")
+        ) {
+            std::fs::copy(&p, tmp.join(p.file_name().unwrap())).unwrap();
+        }
+    }
+    // Rewrite a bare relative fixture token to its staged abs path.
+    let abs = |t: &str| -> String {
+        if t.ends_with(".bam") || t.ends_with(".sam") || t.ends_with(".fa") || t.ends_with(".fai") {
+            tmp.join(t).to_str().unwrap().to_string()
+        } else {
+            t.to_string()
+        }
+    };
+    let reg = std::fs::read_to_string(dir.join("consensus.reg")).unwrap();
+    let mut n = 0usize;
+    for line in reg.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("INIT ") {
+            // INIT x $samtools view --write-index A.sam -o B.bam
+            let toks: Vec<&str> = rest.split_whitespace().collect();
+            let i = toks.iter().position(|&t| t == "view").unwrap();
+            let args: Vec<String> = toks[i + 1..].iter().map(|t| abs(t)).collect();
+            let a: Vec<&str> = args.iter().map(String::as_str).collect();
+            assert_eq!(
+                exit_to_u8(view::main(&argv("view", &a))),
+                0,
+                "INIT failed: {line}"
+            );
+        } else if let Some(rest) = line.strip_prefix("P ") {
+            // P <name> $samtools consensus $PARAM <args...>
+            // A few lines tee through a shell pipeline
+            // (`-o cons.tmp; cat cons.tmp; rm cons.tmp`); keep only the
+            // segment before the first `;` and drop its trailing
+            // `-o/--output cons.tmp` so we can supply our own `-o`.
+            let head = rest.split(';').next().unwrap();
+            let toks: Vec<&str> = head.split_whitespace().collect();
+            let name = toks[0];
+            let ci = toks.iter().position(|&t| t == "consensus").unwrap();
+            let out = tmp.join(format!("got.{name}"));
+            let mut args: Vec<String> = toks[ci + 1..]
+                .iter()
+                .filter(|&&t| t != "$PARAM")
+                .map(|t| abs(t))
+                .collect();
+            if matches!(args.last().map(String::as_str), Some(s) if s.ends_with("cons.tmp"))
+                && matches!(
+                    args.get(args.len().wrapping_sub(2)).map(String::as_str),
+                    Some("-o") | Some("--output")
+                )
+            {
+                args.truncate(args.len() - 2);
+            }
+            args.push("-o".into());
+            args.push(out.to_str().unwrap().to_string());
+            let a: Vec<&str> = args.iter().map(String::as_str).collect();
+            assert_eq!(
+                exit_to_u8(consensus::main(&argv("consensus", &a))),
+                0,
+                "consensus exit nonzero: {name} args={a:?}"
+            );
+            let got = std::fs::read(&out).unwrap();
+            let exp = std::fs::read(dir.join("expected").join(name)).unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                String::from_utf8_lossy(&exp),
+                "consensus.reg case {name} differs"
+            );
+            n += 1;
+        }
+    }
+    assert_eq!(n, 77, "expected 77 consensus.reg P-cases, ran {n}");
+}
