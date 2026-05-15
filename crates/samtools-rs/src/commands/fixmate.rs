@@ -173,7 +173,8 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
             _ => {
                 if opts.input.is_none() {
                     opts.input = Some(PathBuf::from(arg));
-                } else if opts.output.is_none() {
+                } else if opts.output.is_none() && s != "-" {
+                    // A `-` output operand means stdout (output stays None).
                     opts.output = Some(PathBuf::from(arg));
                 }
             }
@@ -559,11 +560,7 @@ fn update_mate_aux_tags(target: &mut RecordBuf, mate: &RecordBuf) {
         return;
     }
 
-    target.data_mut().insert(
-        mc_tag,
-        Value::String(BString::from(format_cigar(mate.cigar()))),
-    );
-
+    // Upstream `bam_mate.c` adds MQ before MC.
     if let Some(mapping_quality) = mate.mapping_quality() {
         target
             .data_mut()
@@ -571,6 +568,11 @@ fn update_mate_aux_tags(target: &mut RecordBuf, mate: &RecordBuf) {
     } else {
         target.data_mut().remove(&mq_tag);
     }
+
+    target.data_mut().insert(
+        mc_tag,
+        Value::String(BString::from(format_cigar(mate.cigar()))),
+    );
 }
 
 fn format_cigar(cigar: &sam::alignment::record_buf::Cigar) -> String {
