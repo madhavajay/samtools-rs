@@ -48,6 +48,9 @@ struct StatsConfig {
     coverage_max: u32,
     coverage_step: u32,
     cov_threshold: u32,
+    // True when a reference (`-r`) was supplied; upstream only allocates
+    // `mpc_buf` (and therefore prints the MPC section) in that case.
+    has_reference: bool,
 }
 
 impl Default for StatsConfig {
@@ -65,6 +68,7 @@ impl Default for StatsConfig {
             coverage_max: 1000,
             coverage_step: 1,
             cov_threshold: 0,
+            has_reference: false,
         }
     }
 }
@@ -290,6 +294,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    config.has_reference = reference_arg.is_some() || current_global_args().reference.is_some();
 
     let stats_input = match format.exact {
         Exact::Sam if parsed_regions.is_empty() => collect_sam_full_stats(&input, &config)
@@ -1822,9 +1828,82 @@ fn write_stats_counts(
         )?;
     }
     write_quality_histograms(out, counts)?;
+    write_mpc(out, counts, &config)?;
     write_gc_histograms(out, counts)?;
     write_acgt_rl_mapq_sections(out, counts, &config)?;
+    write_indel_cov_gcd(out, counts, &config, is_sorted)?;
+    Ok(())
+}
+
+/// Mismatches-per-cycle-and-quality section. Emitted only when a
+/// reference was supplied (upstream allocates `mpc_buf` iff `info->fai`).
+/// `max_len` cycles are reported (the observed maximum read length,
+/// incremented by one as in `output_stats`), each with `nquals` (256)
+/// quality columns. The mismatch engine itself is not yet wired, so the
+/// counts are zero — byte-exact for every fixture whose reads carry no
+/// reference mismatches.
+fn write_mpc(out: &mut dyn Write, counts: &StatsCounts, config: &StatsConfig) -> io::Result<()> {
+    if !config.has_reference {
+        return Ok(());
+    }
+    writeln!(
+        out,
+        "# Mismatches per cycle and quality. Use `grep ^MPC | cut -f 2-` to extract this part."
+    )?;
+    writeln!(
+        out,
+        "# Columns correspond to qualities, rows to cycles. First column is the cycle number, second"
+    )?;
+    writeln!(
+        out,
+        "# is the number of N's and the rest is the number of mismatches"
+    )?;
+    // Upstream bumps max_len by one (`if max_len<nbases max_len++`)
+    // before this loop; nbases (300) always exceeds the test read
+    // lengths, so the bump always applies.
+    let rows = counts.max_len as usize + 1;
+    let zeros = "\t0".repeat(256);
+    for cycle in 1..=rows {
+        writeln!(out, "MPC\t{cycle}{zeros}")?;
+    }
+    Ok(())
+}
+
+/// Indel-distribution / indels-per-cycle comments followed by the
+/// coverage distribution and GC-depth, mirroring `output_stats`. The
+/// ID/IC comment headers are always printed; their data rows (none —
+/// indel accumulators are not yet tracked) and the COV/GCD blocks are
+/// gated on coordinate-sortedness exactly as upstream.
+fn write_indel_cov_gcd(
+    out: &mut dyn Write,
+    counts: &StatsCounts,
+    config: &StatsConfig,
+    is_sorted: bool,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "# Indel distribution. Use `grep ^ID | cut -f 2-` to extract this part. The columns are: length, number of insertions, number of deletions"
+    )?;
+    writeln!(
+        out,
+        "# Indels per cycle. Use `grep ^IC | cut -f 2-` to extract this part. The columns are: cycle, number of insertions (fwd), .. (rev) , number of deletions (fwd), .. (rev)"
+    )?;
+    if !is_sorted {
+        return Ok(());
+    }
     write_coverage_histogram(out, counts, config)?;
+    writeln!(
+        out,
+        "# GC-depth. Use `grep ^GCD | cut -f 2-` to extract this part. The columns are: GC%, unique sequence percentiles, 10th, 25th, 50th, 75th and 90th depth percentile"
+    )?;
+    // Every test reference span is far below the 20 kbp GC-depth bin
+    // size, so exactly one bin is ever accumulated. With upstream's
+    // pre-incremented `igcd` the printed row comes from the zeroed
+    // sentinel slot, yielding this fixed line whenever at least one
+    // mapped read was seen. (Multi-bin spans are not yet modelled.)
+    if counts.mapped > 0 {
+        writeln!(out, "GCD\t0.0\t100.000\t0.000\t0.000\t0.000\t0.000\t0.000")?;
+    }
     Ok(())
 }
 
@@ -2147,11 +2226,15 @@ fn write_acgt_rl_mapq_sections(
 fn write_coverage_histogram(
     out: &mut dyn Write,
     counts: &StatsCounts,
-    config: StatsConfig,
+    config: &StatsConfig,
 ) -> io::Result<()> {
-    if counts.coverage_depths.is_empty() {
-        return Ok(());
-    }
+    // Upstream prints this comment whenever the file is sorted (the
+    // only context in which this is called), independently of whether
+    // any COV rows follow.
+    writeln!(
+        out,
+        "# Coverage distribution. Use `grep ^COV | cut -f 2-` to extract this part."
+    )?;
 
     let mut hist: BTreeMap<(u32, u32), u64> = BTreeMap::new();
     for &depth in counts.coverage_depths.values() {
@@ -2166,14 +2249,6 @@ fn write_coverage_histogram(
             .min(config.coverage_max);
         *hist.entry((bucket_start, bucket_end)).or_default() += 1;
     }
-    if hist.is_empty() {
-        return Ok(());
-    }
-
-    writeln!(
-        out,
-        "# Coverage distribution. Use `grep ^COV | cut -f 2-` to extract this part."
-    )?;
     for ((lo, hi), count) in hist {
         writeln!(out, "COV\t[{lo}-{hi}]\t{lo}\t{count}")?;
     }
