@@ -2057,6 +2057,50 @@ fn fastq_dash_t_and_dash_cap_t_combine_aux_tags() {
 }
 
 #[test]
+fn fastq_interleaves_read1_read2_when_paths_alias() {
+    let tmp = tmp_dir("fastq-interleave");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("o.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:queryname\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "pair1\t65\tchr1\t1\t60\t4M\t=\t5\t8\tACGT\t!!!!\n",
+            "pair1\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tTGCA\t####\n",
+            "pair2\t65\tchr1\t1\t60\t4M\t=\t5\t8\tAAAA\t****\n",
+            "pair2\t129\tchr1\t5\t60\t4M\t=\t1\t-8\tCCCC\t&&&&\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-N",
+                "-1",
+                out.to_str().unwrap(),
+                "-2",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        concat!(
+            "@pair1/1\nACGT\n+\n!!!!\n",
+            "@pair1/2\nTGCA\n+\n####\n",
+            "@pair2/1\nAAAA\n+\n****\n",
+            "@pair2/2\nCCCC\n+\n&&&&\n",
+        )
+    );
+}
+
+#[test]
 fn fastq_routes_r1_only_singletons_to_singleton_output() {
     let tmp = tmp_dir("fastq-r1-singleton");
     let sam = tmp.join("in.sam");

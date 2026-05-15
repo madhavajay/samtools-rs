@@ -453,17 +453,29 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
         };
 
-        if let Some(path) = read1_output.as_ref()
-            && let Err(e) = write_text_file(path, &split.read1)
-        {
-            print_error_errno(sub_name, format!("open/write {}", path.display()), &e);
-            return ExitCode::from(1);
-        }
-        if let Some(path) = read2_output.as_ref()
-            && let Err(e) = write_text_file(path, &split.read2)
-        {
-            print_error_errno(sub_name, format!("open/write {}", path.display()), &e);
-            return ExitCode::from(1);
+        let paired_share_path = match (read1_output.as_ref(), read2_output.as_ref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        if paired_share_path && let Some(path) = read1_output.as_ref() {
+            let interleaved = interleave_paired_records(&split.read1, &split.read2);
+            if let Err(e) = write_text_file(path, &interleaved) {
+                print_error_errno(sub_name, format!("open/write {}", path.display()), &e);
+                return ExitCode::from(1);
+            }
+        } else {
+            if let Some(path) = read1_output.as_ref()
+                && let Err(e) = write_text_file(path, &split.read1)
+            {
+                print_error_errno(sub_name, format!("open/write {}", path.display()), &e);
+                return ExitCode::from(1);
+            }
+            if let Some(path) = read2_output.as_ref()
+                && let Err(e) = write_text_file(path, &split.read2)
+            {
+                print_error_errno(sub_name, format!("open/write {}", path.display()), &e);
+                return ExitCode::from(1);
+            }
         }
         if let Some(path) = singleton_output.as_ref() {
             let payload = if singleton_only {
@@ -1219,6 +1231,45 @@ impl GroupedSplitWriter {
 
         self.best_score = [0; 3];
     }
+}
+
+/// Interleaves matched paired records: pair `k` from `read1` is written
+/// before pair `k` from `read2`. Both buffers must contain the same number
+/// of records (one record per name-grouped paired flush). Records are
+/// delimited by 4 lines each: header, sequence, `+` separator, quality
+/// (FASTQ) or 2 lines (FASTA: header, sequence).
+fn interleave_paired_records(read1: &[u8], read2: &[u8]) -> Vec<u8> {
+    let r1 = split_fastx_records(read1);
+    let r2 = split_fastx_records(read2);
+    let n = r1.len().min(r2.len());
+    let mut out =
+        Vec::with_capacity(read1.len() + read2.len() + 2 * (r1.len() + r2.len() - 2 * n) * 4);
+    for i in 0..n {
+        out.extend_from_slice(r1[i]);
+        out.extend_from_slice(r2[i]);
+    }
+    for record in &r1[n..] {
+        out.extend_from_slice(record);
+    }
+    for record in &r2[n..] {
+        out.extend_from_slice(record);
+    }
+    out
+}
+
+fn split_fastx_records(text: &[u8]) -> Vec<&[u8]> {
+    let mut records = Vec::new();
+    let mut start = 0;
+    for (i, &b) in text.iter().enumerate() {
+        if b == b'\n' && i + 1 < text.len() && matches!(text[i + 1], b'@' | b'>') {
+            records.push(&text[start..=i]);
+            start = i + 1;
+        }
+    }
+    if start < text.len() {
+        records.push(&text[start..]);
+    }
+    records
 }
 
 fn render_fastq_record_with_aux_to_vec<R>(
