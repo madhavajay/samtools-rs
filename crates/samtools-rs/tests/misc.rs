@@ -10,9 +10,9 @@ use std::sync::Mutex;
 use htslib_rs::bam;
 use htslib_rs::sam;
 use samtools_rs::commands::{
-    addreplacerg, bedcov, calmd, cat, checksum, depad, faidx, fastq, fixmate, flagstat, fqidx,
-    idxstats, import, index, mpileup, reference, reheader, reset, rmdup, samples, sort, split,
-    view,
+    addreplacerg, bedcov, calmd, cat, checksum, consensus, depad, faidx, fastq, fixmate, flagstat,
+    fqidx, idxstats, import, index, mpileup, reference, reheader, reset, rmdup, samples, sort,
+    split, view,
 };
 use samtools_rs::header_text;
 use samtools_rs::run as samtools_run;
@@ -6588,4 +6588,94 @@ fn view_star_region_selects_unplaced_reads() {
         .collect();
     assert_eq!(body.len(), 2);
     assert!(body.iter().all(|l| l.split('\t').nth(2) == Some("*")));
+}
+
+#[test]
+fn consensus_simple_matches_upstream_fixtures() {
+    // TODO-NEXT #1 wiring: `samtools consensus --mode simple` on the
+    // htslib-rs pileup engine, byte-exact vs test/consensus/expected/*.
+    let dir = fixtures_dir()
+        .parent()
+        .unwrap()
+        .join("test")
+        .join("consensus");
+    let sam = dir.join("consen1.sam");
+    let tmp = tmp_dir("consensus");
+
+    let cases: &[(&[&str], &str)] = &[
+        (&["-m", "simple", "-c", "0.6"], "1.out"),
+        (&["-m", "simple", "-c", "0.6", "--show-del", "yes"], "2.out"),
+        (&["-m", "simple", "-c", "0.6", "--show-ins", "no"], "3.out"),
+        (
+            &[
+                "-m",
+                "simple",
+                "-c",
+                "0.6",
+                "--show-del",
+                "yes",
+                "--show-ins",
+                "no",
+            ],
+            "4.out",
+        ),
+        (&["-f", "fastq", "-m", "simple", "-c", "0.6"], "1q.out"),
+        (
+            &[
+                "-f",
+                "fastq",
+                "-m",
+                "simple",
+                "-c",
+                "0.6",
+                "--show-del",
+                "yes",
+            ],
+            "2q.out",
+        ),
+        (
+            &[
+                "-f",
+                "fastq",
+                "-m",
+                "simple",
+                "-c",
+                "0.6",
+                "--show-ins",
+                "no",
+            ],
+            "3q.out",
+        ),
+        (&["-f", "pileup", "-m", "simple", "-c", "0.6"], "1p.out"),
+        (
+            &["-f", "fastq", "-m", "simple", "--call-fract", "0.600"],
+            "1q.out",
+        ),
+        (
+            &["-f", "fastq", "-m", "simple", "--call-fract", "0.601"],
+            "5q.out",
+        ),
+        (
+            &["-f", "pileup", "-m", "simple", "--call-fract", "0.601"],
+            "5p.out",
+        ),
+    ];
+
+    for (i, (args, expected)) in cases.iter().enumerate() {
+        let out = tmp.join(format!("c{i}"));
+        let mut a: Vec<&str> = args.to_vec();
+        a.push("-o");
+        a.push(out.to_str().unwrap());
+        a.push(sam.to_str().unwrap());
+        assert_eq!(
+            exit_to_u8(consensus::main(&argv("consensus", &a))),
+            0,
+            "case {expected}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(dir.join("expected").join(expected)).unwrap(),
+            "case {expected} args={args:?}"
+        );
+    }
 }
