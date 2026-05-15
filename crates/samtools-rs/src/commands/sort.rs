@@ -57,7 +57,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 name_sort = true;
             }
             "-o" | "--output" => {
-                output = iter.next().map(PathBuf::from);
+                output = match iter.next().and_then(|a| a.to_str()) {
+                    // `-o -` means stdout (output stays None).
+                    Some("-") | None => None,
+                    Some(p) => Some(PathBuf::from(p)),
+                };
             }
             "-t" => {
                 let Some(v) = iter.next().and_then(|a| a.to_str()) else {
@@ -244,11 +248,7 @@ pub(crate) fn run_sort(
     if let Some(tag) = tag_sort {
         records.sort_by(|a, b| compare_by_tag(a, b, tag, name_sort));
     } else if name_sort {
-        records.sort_by(|a, b| {
-            let an = name_key(a);
-            let bn = name_key(b);
-            an.cmp(&bn)
-        });
+        records.sort_by(name_cmp);
     } else {
         // Coordinate sort: by (reference_sequence_id, alignment_start).
         records.sort_by(|a, b| {
@@ -257,37 +257,45 @@ pub(crate) fn run_sort(
         });
     }
 
-    // Update @HD SO to reflect new sort order so downstream consumers can
-    // tell. (Header is otherwise preserved verbatim.)
-    if let Some(tag) = tag_sort {
-        set_sort_order(
-            &mut header,
-            "unsorted",
-            Some(&format!(
+    // Sort-order tags for @HD.
+    let (so, ss): (String, Option<String>) = if let Some(tag) = tag_sort {
+        (
+            "unsorted".to_string(),
+            Some(format!(
                 "unsorted:{}{}:{}",
                 tag[0] as char,
                 tag[1] as char,
                 if name_sort {
-                    "queryname:lexicographical"
+                    "queryname:natural"
                 } else {
                     "coordinate"
                 }
             )),
-        );
+        )
+    } else if name_sort {
+        (
+            "queryname".to_string(),
+            Some("queryname:natural".to_string()),
+        )
     } else {
-        set_sort_order(
-            &mut header,
-            if name_sort { "queryname" } else { "coordinate" },
-            None,
-        );
-    }
+        ("coordinate".to_string(), None)
+    };
+    set_sort_order(&mut header, &so, ss.as_deref());
 
+    // Emit the *raw* input header (preserving @SQ/@RG field order, @CO,
+    // etc. — noodles' canonical writer reorders @RG fields) with the @HD
+    // SO/SS applied and the samtools @PG appended.
+    let mut header_text = apply_hd_sort_order(
+        &crate::header_text::read_raw_header_text_with_format(input, format.exact)?,
+        &so,
+        ss.as_deref(),
+    );
     if let Some(argv) = pg_argv {
-        header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
+        header_text = crate::pg::add_samtools_pg(&header_text, argv).map_err(io::Error::other)?;
     }
 
     {
-        let mut writer = open_output(output, fmt, &header)?;
+        let mut writer = open_output(output, fmt, &header, &header_text)?;
         for rec in &records {
             writer.write_record(&header, rec)?;
         }
@@ -370,12 +378,76 @@ fn name_key(r: &RecordBuf) -> Vec<u8> {
     r.name().map(|s| s.to_vec()).unwrap_or_default()
 }
 
+/// Port of `bam_sort.c`'s `strnum_cmp` natural-order comparison: runs of
+/// digits compare numerically (leading zeros skipped, then by length,
+/// then by first differing digit); everything else byte-wise.
+fn strnum_cmp(a: &[u8], b: &[u8]) -> Ordering {
+    let (mut ia, mut ib) = (0usize, 0usize);
+    let is_digit = |c: u8| c.is_ascii_digit();
+    while ia < a.len() && ib < b.len() {
+        let (ca, cb) = (a[ia], b[ib]);
+        if !is_digit(ca) || !is_digit(cb) {
+            if ca != cb {
+                return ca.cmp(&cb);
+            }
+            ia += 1;
+            ib += 1;
+        } else {
+            while ia < a.len() && a[ia] == b'0' {
+                ia += 1;
+            }
+            while ib < b.len() && b[ib] == b'0' {
+                ib += 1;
+            }
+            while ia < a.len() && ib < b.len() && is_digit(a[ia]) && a.get(ia) == b.get(ib) {
+                ia += 1;
+                ib += 1;
+            }
+            let diff =
+                a.get(ia).copied().unwrap_or(0) as i32 - b.get(ib).copied().unwrap_or(0) as i32;
+            while ia < a.len() && ib < b.len() && is_digit(a[ia]) && is_digit(b[ib]) {
+                ia += 1;
+                ib += 1;
+            }
+            if ia < a.len() && is_digit(a[ia]) {
+                return Ordering::Greater;
+            } else if ib < b.len() && is_digit(b[ib]) {
+                return Ordering::Less;
+            } else if diff != 0 {
+                return diff.cmp(&0);
+            }
+        }
+    }
+    let ra = ia < a.len();
+    let rb = ib < b.len();
+    if ra {
+        Ordering::Greater
+    } else if rb {
+        Ordering::Less
+    } else {
+        Ordering::Equal
+    }
+}
+
+/// `bam_sort.c` QueryName secondary key:
+/// `((f&0xc0)<<8)|((f&0x100)<<3)|((f&0x800)>>3)` — READ1, READ2,
+/// (primary), SUPPLEMENTARY, SECONDARY.
+fn qname_flag_key(r: &RecordBuf) -> u32 {
+    let f = u32::from(u16::from(r.flags()));
+    ((f & 0xc0) << 8) | ((f & 0x100) << 3) | ((f & 0x800) >> 3)
+}
+
+/// Full `bam_sort.c` QueryName comparator.
+fn name_cmp(a: &RecordBuf, b: &RecordBuf) -> Ordering {
+    strnum_cmp(&name_key(a), &name_key(b)).then_with(|| qname_flag_key(a).cmp(&qname_flag_key(b)))
+}
+
 fn compare_by_tag(a: &RecordBuf, b: &RecordBuf, tag: [u8; 2], name_sort: bool) -> Ordering {
     tag_sort_value(a, tag)
         .cmp(&tag_sort_value(b, tag))
         .then_with(|| {
             if name_sort {
-                name_key(a).cmp(&name_key(b))
+                name_cmp(a, b)
             } else {
                 coordinate_key(a).cmp(&coordinate_key(b))
             }
@@ -519,15 +591,55 @@ impl SortSink for SamStdout {
     }
 }
 
+/// Replaces/sets the `@HD` line's `SO:`/`SS:` fields in raw header text,
+/// preserving every other line and field verbatim (so `@RG`/`@SQ`/`@CO`
+/// keep their original byte form). Inserts an `@HD` if absent.
+fn apply_hd_sort_order(raw: &str, so: &str, ss: Option<&str>) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut had_hd = false;
+    for line in raw.lines() {
+        if line.starts_with("@HD") {
+            had_hd = true;
+            let mut fields: Vec<&str> = line
+                .split('\t')
+                .filter(|f| !f.starts_with("SO:") && !f.starts_with("SS:"))
+                .collect();
+            let mut nl = fields.join("\t");
+            if fields.is_empty() {
+                nl.push_str("@HD");
+            }
+            nl.push_str(&format!("\tSO:{so}"));
+            if let Some(ss) = ss {
+                nl.push_str(&format!("\tSS:{ss}"));
+            }
+            lines.push(nl);
+            let _ = &mut fields;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !had_hd {
+        let hd = match ss {
+            Some(ss) => format!("@HD\tVN:1.6\tSO:{so}\tSS:{ss}"),
+            None => format!("@HD\tVN:1.6\tSO:{so}"),
+        };
+        lines.insert(0, hd);
+    }
+    let mut s = lines.join("\n");
+    s.push('\n');
+    s
+}
+
 fn open_output(
     out: Option<&Path>,
     fmt: OutFmt,
     header: &sam::Header,
+    header_text: &str,
 ) -> io::Result<Box<dyn SortSink>> {
     match (out, fmt) {
         (Some(p), OutFmt::Sam) => {
             let mut file = File::create(p)?;
-            crate::sam_render::write_header(&mut file, header)?;
+            file.write_all(header_text.as_bytes())?;
             Ok(Box::new(SamFile(file)))
         }
         (Some(p), OutFmt::Bam) => {
@@ -538,7 +650,7 @@ fn open_output(
         }
         (None, OutFmt::Sam) => {
             let mut stdout = io::stdout();
-            crate::sam_render::write_header(&mut stdout, header)?;
+            stdout.write_all(header_text.as_bytes())?;
             Ok(Box::new(SamStdout(stdout)))
         }
         (None, OutFmt::Bam) => {

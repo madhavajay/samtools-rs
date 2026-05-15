@@ -137,7 +137,45 @@ fn sort_cram_input_uses_top_level_reference() {
         .map(|line| line.split('\t').next().unwrap())
         .collect();
     assert!(!names.is_empty());
-    assert!(names.windows(2).all(|w| w[0] <= w[1]));
+    // Upstream `-n` uses natural (`strnum_cmp`) order, not lexical, so
+    // assert the output equals its natural-sorted self.
+    let natural = |x: &&str, y: &&str| -> std::cmp::Ordering {
+        let (a, b) = (x.as_bytes(), y.as_bytes());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < a.len() && j < b.len() {
+            if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+                let (s, t) = (i, j);
+                while i < a.len() && a[i].is_ascii_digit() {
+                    i += 1;
+                }
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let na = std::str::from_utf8(&a[s..i])
+                    .unwrap()
+                    .trim_start_matches('0');
+                let nb = std::str::from_utf8(&b[t..j])
+                    .unwrap()
+                    .trim_start_matches('0');
+                match na.len().cmp(&nb.len()).then_with(|| na.cmp(nb)) {
+                    std::cmp::Ordering::Equal => {}
+                    o => return o,
+                }
+            } else {
+                match a[i].cmp(&b[j]) {
+                    std::cmp::Ordering::Equal => {
+                        i += 1;
+                        j += 1;
+                    }
+                    o => return o,
+                }
+            }
+        }
+        a.len().cmp(&b.len())
+    };
+    let mut sorted = names.clone();
+    sorted.sort_by(natural);
+    assert_eq!(names, sorted);
 }
 
 #[test]
@@ -177,7 +215,9 @@ fn sort_sam_input_by_name_to_sam_output() {
         .map(|line| line.split('\t').next().unwrap().to_string())
         .collect();
     assert_eq!(names, ["a", "z"]);
-    assert!(text.contains("@HD\tVN:1.6\tSO:queryname\n"));
+    // Upstream `-n` emits SS:queryname:natural (verified vs
+    // sort/name.sort.expected.sam).
+    assert!(text.contains("@HD\tVN:1.6\tSO:queryname\tSS:queryname:natural\n"));
 }
 
 #[test]
@@ -335,9 +375,7 @@ fn sort_tag_with_name_sort_uses_name_secondary() {
         .map(|line| line.split('\t').next().unwrap().to_string())
         .collect();
     assert_eq!(names, ["b", "a", "z"]);
-    assert!(
-        text.starts_with("@HD\tVN:1.6\tSO:unsorted\tSS:unsorted:RG:queryname:lexicographical\n")
-    );
+    assert!(text.starts_with("@HD\tVN:1.6\tSO:unsorted\tSS:unsorted:RG:queryname:natural\n"));
 }
 
 #[test]
