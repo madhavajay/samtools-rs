@@ -1325,6 +1325,9 @@ fn run_bam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
         } else {
             htslib_rs::alignment_compat::view_bam_as_sam_text(io::Cursor::new(input), None)?
         };
+        // Records came from binary; fix noodles' plain-decimal float
+        // spelling to htslib's `%g` form (header lines pass through).
+        let text = crate::sam_render::fix_sam_text(&text);
         let mut out = open_text_output(opts)?;
         let mut unselected = open_unselected_text_output(opts)?;
         if opts.header == HeaderMode::Include {
@@ -1783,8 +1786,10 @@ fn write_records_as_sam<W: Write>(
                     )?
                 }
             };
-            // For BAM input we already have SAM text. Apply filters
-            // line-by-line if any are set.
+            // For BAM input we already have SAM text. Records came from
+            // binary, so fix noodles' plain-decimal float spelling to
+            // htslib's `%g` form, then apply filters line-by-line.
+            let text = crate::sam_render::fix_sam_text(&text);
             write_sam_text_records_split(out, unselected, text.as_bytes(), opts)
         }
         Exact::Cram => {
@@ -1816,6 +1821,8 @@ fn write_records_as_sam<W: Write>(
                     )?
                 }
             };
+            // CRAM records came from binary; fix float spelling.
+            let text = crate::sam_render::fix_sam_text(&text);
             write_sam_text_records_split(out, unselected, text.as_bytes(), opts)
         }
         _ => Err(io::Error::new(
@@ -1987,7 +1994,11 @@ fn record_to_sam_line(header: &sam::Header, record: &RecordBuf) -> io::Result<Ve
     if buf.last() == Some(&b'\n') {
         buf.pop();
     }
-    Ok(buf)
+    // noodles spells `f32` aux values as plain decimals; rewrite `:f:`
+    // scalars and `B:f,` arrays to htslib's `%g` form for byte parity.
+    let line =
+        std::str::from_utf8(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(crate::sam_render::fix_sam_aux_floats(line).into_bytes())
 }
 
 fn write_prepared_sam_record_line<W: Write + ?Sized>(

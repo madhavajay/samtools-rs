@@ -5,7 +5,37 @@
 //! htslib uses `%g`-style scientific notation with a signed two-digit
 //! exponent. [`fix_sam_aux_floats`] post-processes a serialized SAM record
 //! line so `:f:` scalars and `B:f,` arrays match htslib's spelling, which
-//! the upstream `test.pl` fixtures expect.
+//! the upstream `test.pl` fixtures expect. [`write_record`] is the drop-in
+//! replacement for `sam::io::Writer::write_alignment_record` that applies
+//! that fix.
+
+use std::io::{self, Write};
+
+use htslib_rs::sam::{self, alignment::RecordBuf};
+
+/// Writes one alignment record as a SAM text line to `out`, applying
+/// [`fix_sam_aux_floats`] so float aux fields match htslib's spelling.
+/// Drop-in replacement for `sam::io::Writer::write_alignment_record`
+/// followed by the writer's own newline.
+pub fn write_record<W: Write + ?Sized>(
+    out: &mut W,
+    header: &sam::Header,
+    record: &RecordBuf,
+) -> io::Result<()> {
+    use sam::alignment::io::Write as _;
+
+    let mut buf = Vec::new();
+    {
+        let mut w = sam::io::Writer::new(&mut buf);
+        w.write_alignment_record(header, record)?;
+    }
+    // noodles terminates the record with '\n'; fix the line, re-add it.
+    let line = std::str::from_utf8(&buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        .trim_end_matches('\n');
+    out.write_all(fix_sam_aux_floats(line).as_bytes())?;
+    out.write_all(b"\n")
+}
 
 /// Formats a single `f32` aux value the way htslib's `%g`/`kputd` does:
 /// scientific notation with a signed, ≥2-digit exponent outside the
@@ -28,6 +58,30 @@ pub fn format_htslib_exponent(n: f32) -> String {
     };
     let value = exponent.parse::<i32>().unwrap_or(0);
     format!("{mantissa}e{value:+03}")
+}
+
+/// Applies [`fix_sam_aux_floats`] to every record line of a SAM text
+/// block (multiple `\n`-terminated lines). Header lines (`@`-prefixed)
+/// and empty lines pass through untouched. Use this on SAM text produced
+/// from binary records (BAM/CRAM → SAM) to match htslib's float spelling.
+pub fn fix_sam_text(text: &str) -> String {
+    if !text.contains(":f:") && !text.contains(":B:f,") {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for piece in text.split_inclusive('\n') {
+        let nl = piece.ends_with('\n');
+        let body = piece.strip_suffix('\n').unwrap_or(piece);
+        if body.starts_with('@') || body.is_empty() {
+            out.push_str(body);
+        } else {
+            out.push_str(&fix_sam_aux_floats(body));
+        }
+        if nl {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Reformats float-bearing aux fields in a serialized SAM record line so
