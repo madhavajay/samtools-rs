@@ -6377,6 +6377,33 @@ fn stats_matches_upstream_stat_fixtures() {
         );
     }
 
+    // stat/15: unpaired read with a 60000D deletion against the
+    // mpileup `ce.fa` reference — exercises the upstream `order`
+    // (unpaired => first fragment) and the `nindels` (>300) ID cap.
+    {
+        let ce_fa = fixtures_dir().join("mpileup").join("ce.fa");
+        let out = tmp.join("15.stats.expected");
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &[
+                    "-r",
+                    &p(&ce_fa),
+                    "-o",
+                    &p(&out),
+                    &p(&stat.join("15.big_del.sam")),
+                ]
+            ))),
+            0,
+            "stats 15"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            std::fs::read_to_string(stat.join("15.stats.expected")).unwrap(),
+            "stats 15 byte-exact",
+        );
+    }
+
     // `-S RG` split cases: stdout matches `<n>.stats.expected` and each
     // per-RG `<input>_<rg>.bamstat` matches its `.expected.bamstat`
     // (both modulo the three stripped header lines). The input is copied

@@ -33,6 +33,9 @@ use crate::version::SAMTOOLS_VERSION;
 
 /// Upstream `stats.c` `stats->ngc` — GC-fraction histogram array size.
 const NGC: usize = 200;
+/// Upstream `stats->nindels` (init = `nbases` = 300, never grown):
+/// indels longer than this are excluded from the ID distribution.
+const NINDELS: usize = 300;
 
 #[derive(Clone, Debug)]
 struct StatsConfig {
@@ -1175,18 +1178,23 @@ impl StatsCounts {
             }
 
             let seq_len_u32 = seq_len as u32;
+            // Upstream `order`: unpaired => first fragment.
+            let order_first =
+                flag & BAM_FPAIRED == 0 || (flag & BAM_FREAD1 != 0 && flag & BAM_FREAD2 == 0);
+            let order_last =
+                flag & BAM_FPAIRED != 0 && flag & BAM_FREAD2 != 0 && flag & BAM_FREAD1 == 0;
             if seq_len_u32 > 0 {
                 self.total_len += u64::from(seq_len_u32);
                 if seq_len_u32 > self.max_len {
                     self.max_len = seq_len_u32;
                 }
-                if flag & BAM_FREAD1 != 0 {
+                if order_first {
                     self.total_len_1st += u64::from(seq_len_u32);
                     if seq_len_u32 > self.max_len_1st {
                         self.max_len_1st = seq_len_u32;
                     }
                 }
-                if flag & BAM_FREAD2 != 0 {
+                if order_last {
                     self.total_len_2nd += u64::from(seq_len_u32);
                     if seq_len_u32 > self.max_len_2nd {
                         self.max_len_2nd = seq_len_u32;
@@ -1200,10 +1208,10 @@ impl StatsCounts {
                 for cycle in 0..seq_len_u32 as usize {
                     self.qual_sum += 255;
                     self.qual_count += 1;
-                    if flag & BAM_FREAD1 != 0 {
+                    if order_first {
                         increment_quality_hist(&mut self.first_qual_hist, cycle, 255);
                     }
-                    if flag & BAM_FREAD2 != 0 {
+                    if order_last {
                         increment_quality_hist(&mut self.last_qual_hist, cycle, 255);
                     }
                 }
@@ -1214,10 +1222,10 @@ impl StatsCounts {
                     if q > self.max_qual {
                         self.max_qual = q;
                     }
-                    if flag & BAM_FREAD1 != 0 {
+                    if order_first {
                         increment_quality_hist(&mut self.first_qual_hist, cycle, q);
                     }
-                    if flag & BAM_FREAD2 != 0 {
+                    if order_last {
                         increment_quality_hist(&mut self.last_qual_hist, cycle, q);
                     }
                 }
@@ -1249,9 +1257,9 @@ impl StatsCounts {
                 if hi >= NGC {
                     hi = NGC - 1;
                 }
-                let tgt = if flag & BAM_FREAD1 != 0 {
+                let tgt = if order_first {
                     Some(&mut self.first_gc_hist)
-                } else if flag & BAM_FREAD2 != 0 {
+                } else if order_last {
                     Some(&mut self.last_gc_hist)
                 } else {
                     None
@@ -1285,10 +1293,6 @@ impl StatsCounts {
                         self.read_lengths.resize(read_len + 1, 0);
                     }
                     self.read_lengths[read_len] += 1;
-                    let order_first = flag & BAM_FPAIRED == 0
-                        || (flag & BAM_FREAD1 != 0 && flag & BAM_FREAD2 == 0);
-                    let order_last =
-                        flag & BAM_FPAIRED != 0 && flag & BAM_FREAD2 != 0 && flag & BAM_FREAD1 == 0;
                     if order_first {
                         if read_len >= self.read_lengths_1st.len() {
                             self.read_lengths_1st.resize(read_len + 1, 0);
@@ -1459,7 +1463,9 @@ impl StatsCounts {
                         }
                     }
                     icycle += ncig_i;
-                    bump(&mut self.insertions_len, ncig - 1);
+                    if ncig <= NINDELS {
+                        bump(&mut self.insertions_len, ncig - 1);
+                    }
                 }
                 Kind::Deletion => {
                     let idx = if is_fwd {
@@ -1475,7 +1481,9 @@ impl StatsCounts {
                     } else if order == 2 {
                         bump(&mut self.del_cycles_2nd, idx as usize);
                     }
-                    bump(&mut self.deletions_len, ncig - 1);
+                    if ncig <= NINDELS {
+                        bump(&mut self.deletions_len, ncig - 1);
+                    }
                 }
                 Kind::Skip | Kind::HardClip | Kind::Pad => {}
                 _ => icycle += ncig_i,
@@ -1706,14 +1714,20 @@ impl StatsCounts {
         } else {
             self.unmapped += 1;
         }
+        // Upstream `order`: unpaired reads are first fragments; paired
+        // reads are first/last by the READ1/READ2 bits (both-or-neither
+        // counts as "other", excluded from read1/read2).
+        let order_first =
+            flag & BAM_FPAIRED == 0 || (flag & BAM_FREAD1 != 0 && flag & BAM_FREAD2 == 0);
+        let order_last =
+            flag & BAM_FPAIRED != 0 && flag & BAM_FREAD2 != 0 && flag & BAM_FREAD1 == 0;
+        if order_first {
+            self.read1 += 1;
+        } else if order_last {
+            self.read2 += 1;
+        }
         if flag & BAM_FPAIRED != 0 {
             self.paired += 1;
-            if flag & BAM_FREAD1 != 0 {
-                self.read1 += 1;
-            }
-            if flag & BAM_FREAD2 != 0 {
-                self.read2 += 1;
-            }
             if flag & BAM_FPROPER_PAIR != 0 {
                 self.proper_paired += 1;
             }
