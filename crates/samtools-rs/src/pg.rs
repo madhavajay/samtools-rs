@@ -90,10 +90,18 @@ pub fn add_pg(header_text: &str, options: PgOptions<'_>) -> Result<String, Strin
 }
 
 fn push_pg_line(output: &mut String, id: &str, pp: Option<&str>, options: &PgOptions<'_>) {
+    // Field order matches upstream `sam_hdr_add_pg`: ID, PN, PP, VN, CL.
+    // (Upstream places PP before VN/CL; the test harness strips `\tVN:.*`
+    // for version-independent comparison, so PP must precede VN.)
     output.push_str("@PG\tID:");
     output.push_str(id);
     output.push_str("\tPN:");
     output.push_str(options.name);
+
+    if let Some(pp) = pp {
+        output.push_str("\tPP:");
+        output.push_str(pp);
+    }
 
     if let Some(version) = options.version {
         output.push_str("\tVN:");
@@ -103,11 +111,6 @@ fn push_pg_line(output: &mut String, id: &str, pp: Option<&str>, options: &PgOpt
     if let Some(command_line) = options.command_line {
         output.push_str("\tCL:");
         output.push_str(command_line);
-    }
-
-    if let Some(pp) = pp {
-        output.push_str("\tPP:");
-        output.push_str(pp);
     }
 
     output.push('\n');
