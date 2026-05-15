@@ -4520,7 +4520,7 @@ fn reset_no_pg_skips_adding_reset_program_entry() {
 }
 
 #[test]
-fn reset_reject_pg_removes_program_chain_from_id() {
+fn reset_reject_pg_removes_named_pg_and_all_subsequent() {
     let tmp = tmp_dir("reset-reject-pg");
     let sam = tmp.join("in.sam");
     let out = tmp.join("reset.sam");
@@ -4553,10 +4553,138 @@ fn reset_reject_pg_removes_program_chain_from_id() {
         0
     );
 
+    // Upstream `reset.c:223`: `--reject-PG ID` keeps @PG lines until the
+    // first matching ID, then drops it and *every subsequent @PG*
+    // ("from this PG onwards"). bwa_index is the first @PG, so all
+    // three input @PG are dropped; only the added samtools @PG remains.
     let text = std::fs::read_to_string(out).unwrap();
     assert!(!text.contains("@PG\tID:bwa_index"));
     assert!(!text.contains("@PG\tID:bwa_aln"));
-    assert!(text.contains("@PG\tID:qc"));
+    assert!(!text.contains("@PG\tID:qc"));
+    assert!(text.contains("@PG\tID:samtools"));
+}
+
+#[test]
+fn reset_matches_upstream_test_reset_fixtures() {
+    use samtools_rs::commands::reset;
+    // Byte-exact vs upstream test_reset (harness `hskip=1` drops the
+    // first output line, `ignore_pg_header` strips @PG): -o SAM from a
+    // SAM input, -o SAM from a BAM input, and --no-RG; plus the
+    // reject.1 / reject.2 @PG-count assertions.
+    let d = fixtures_dir();
+    let tmp = tmp_dir("reset-fixtures");
+    // hskip=1 + strip @PG
+    let norm = |s: &str| -> String {
+        s.lines()
+            .skip(1)
+            .filter(|l| !l.starts_with("@PG\t"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    let exp_norm = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.starts_with("@PG\t"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    let cases: &[(&[&str], &str, &str)] = &[
+        (
+            &["--dupflag", "-o", "@OUT@", "dat/mpileup.1.sam"],
+            "@OUT@",
+            "reset/basic.output.mp.1.expected",
+        ),
+        (
+            &["--dupflag", "-o", "@OUT@", "dat/test_input_1_a.bam"],
+            "@OUT@",
+            "reset/basic.bam.input.expected",
+        ),
+        (
+            &[
+                "--dupflag",
+                "--reject-PG",
+                "bwa_index",
+                "dat/mpileup.1.sam",
+                "--no-RG",
+                "-o",
+                "@OUT@",
+            ],
+            "@OUT@",
+            "reset/output.nRG.1.expected",
+        ),
+    ];
+    for (i, (args, _, expected)) in cases.iter().enumerate() {
+        let out = tmp.join(format!("r{i}.sam"));
+        let v: Vec<OsString> = std::iter::once(OsString::from("reset"))
+            .chain(args.iter().map(|a| {
+                OsString::from(if *a == "@OUT@" {
+                    out.to_str().unwrap().to_string()
+                } else if a.starts_with("dat/") || a.starts_with("reset/") {
+                    d.join(a).to_str().unwrap().to_string()
+                } else {
+                    a.to_string()
+                })
+            }))
+            .collect();
+        assert_eq!(exit_to_u8(reset::main(&v)), 0, "{expected}");
+        assert_eq!(
+            norm(&std::fs::read_to_string(&out).unwrap()),
+            exp_norm(&std::fs::read_to_string(d.join(expected)).unwrap()),
+            "reset {expected}"
+        );
+    }
+
+    // reject.1: count of the added samtools @PG line.
+    let o = tmp.join("rej1.sam");
+    assert_eq!(
+        exit_to_u8(reset::main(&argv(
+            "reset",
+            &[
+                "--dupflag",
+                "--reject-PG",
+                "bwa_index",
+                d.join("dat/mpileup.1.sam").to_str().unwrap(),
+                "-o",
+                o.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let txt = std::fs::read_to_string(&o).unwrap();
+    let n = txt
+        .lines()
+        .filter(|l| l.starts_with("@PG\tID:samtools\tPN:samtools"))
+        .count();
+    assert_eq!(
+        n.to_string(),
+        std::fs::read_to_string(d.join("reset/reject.1.expected"))
+            .unwrap()
+            .trim()
+    );
+
+    // reject.2: total @PG count after positional "onwards" removal.
+    let o = tmp.join("rej2.sam");
+    assert_eq!(
+        exit_to_u8(reset::main(&argv(
+            "reset",
+            &[
+                "--dupflag",
+                "--reject-PG",
+                "sam_to_fixed_bam",
+                d.join("dat/mpileup.1.sam").to_str().unwrap(),
+                "-o",
+                o.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let txt = std::fs::read_to_string(&o).unwrap();
+    let n = txt.lines().filter(|l| l.starts_with("@PG\tID:")).count();
+    assert_eq!(
+        n.to_string(),
+        std::fs::read_to_string(d.join("reset/reject.2.expected"))
+            .unwrap()
+            .trim()
+    );
 }
 
 #[test]
