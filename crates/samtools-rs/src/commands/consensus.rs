@@ -54,6 +54,11 @@ struct Config {
     show_del: bool,
     show_ins: bool,
     line_len: usize,
+    /// `-T`/`--reference` sequences (upper-cased), keyed by name;
+    /// fills uncovered positions with the reference base.
+    ref_seqs: Option<BTreeMap<String, Vec<u8>>>,
+    /// `--ref-qual`: quality assigned to ref-filled positions.
+    ref_qual: u8,
     // Bayesian-mode (`--mode bayesian`/default) parameters.
     mode_simple: bool,
     default_qual: u8,
@@ -83,6 +88,8 @@ impl Default for Config {
             show_del: false,
             show_ins: true,
             line_len: 70,
+            ref_seqs: None,
+            ref_qual: 0,
             mode_simple: false, // upstream default is bayesian/recall
             default_qual: 10,
             cons_cutoff: 10,
@@ -123,6 +130,35 @@ fn parse_region_spec(spec: &str) -> Option<(String, usize, usize)> {
             Some((name.to_string(), b.max(1), e))
         }
     }
+}
+
+/// Load every reference sequence (upper-cased) keyed by name.
+fn load_ref_seqs(path: &std::path::Path) -> io::Result<BTreeMap<String, Vec<u8>>> {
+    use htslib_rs::fasta;
+    let reader = File::open(path).map(io::BufReader::new)?;
+    let mut reader = fasta::io::Reader::new(reader);
+    let mut map = BTreeMap::new();
+    for result in reader.records() {
+        let record = result?;
+        let name = String::from_utf8_lossy(record.name()).into_owned();
+        let mut seq = record.sequence().as_ref().to_vec();
+        seq.make_ascii_uppercase();
+        map.insert(name, seq);
+    }
+    Ok(map)
+}
+
+/// Base + quality for an uncovered position: the reference base at
+/// `pos1` (1-based) with `--ref-qual` when `-T` is given, else `N`/0.
+fn gap_base(cfg: &Config, name: &str, pos1: usize) -> (u8, u32) {
+    if let Some(rs) = &cfg.ref_seqs
+        && let Some(seq) = rs.get(name)
+        && pos1 >= 1
+        && pos1 - 1 < seq.len()
+    {
+        return (seq[pos1 - 1], u32::from(cfg.ref_qual));
+    }
+    (b'N', 0)
 }
 
 /// Entry point for `samtools consensus`.
@@ -237,7 +273,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     cfg.region = parse_region_spec(spec);
                 }
             }
-            "-@" | "--threads" | "-T" | "--reference" => {
+            "-T" | "--reference" => {
+                if let Some(p) = iter.next() {
+                    cfg.ref_seqs = load_ref_seqs(std::path::Path::new(p)).ok();
+                }
+            }
+            "--ref-qual" => {
+                cfg.ref_qual = iter
+                    .next()
+                    .and_then(|a| a.to_str())
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            }
+            "-@" | "--threads" => {
                 let _ = iter.next();
             }
             _ if s.starts_with('-') && s != "-" => { /* tolerate */ }
@@ -593,7 +641,8 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
                         _ => clen,
                     };
                     for p in (last + 1)..=span_end {
-                        let _ = writeln!(pileup_rows, "{prev}\t{p}\t0\t0\tN\t0\t*\t*");
+                        let gb = gap_base(cfg, prev, p).0 as char;
+                        let _ = writeln!(pileup_rows, "{prev}\t{p}\t0\t0\t{gb}\t0\t*\t*");
                     }
                 }
                 pp_cur_ref = Some(col.reference_name.clone());
@@ -601,7 +650,12 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
                     .entry(col.reference_name.clone())
                     .or_insert_with(|| cfg.region.as_ref().map_or(0, |(_, b, _)| b - 1));
                 for p in (*last + 1)..col.position {
-                    let _ = writeln!(pileup_rows, "{}\t{p}\t0\t0\tN\t0\t*\t*", col.reference_name);
+                    let gb = gap_base(cfg, &col.reference_name, p).0 as char;
+                    let _ = writeln!(
+                        pileup_rows,
+                        "{}\t{p}\t0\t0\t{gb}\t0\t*\t*",
+                        col.reference_name
+                    );
                 }
                 *last = col.position;
             }
@@ -641,9 +695,10 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
             // Fill an interior gap [last_pos+1, pos) with N/qual0 when
             // `pos > last_pos && (last_pos > 0 || all_bases)`.
             if col.position > rs.last_pos && (rs.last_pos > 0 || cfg.all_bases > 0) {
-                for _ in (rs.last_pos + 1)..col.position {
-                    rs.seq.push(b'N');
-                    rs.qual.push(0);
+                for p in (rs.last_pos + 1)..col.position {
+                    let (gb, gq) = gap_base(cfg, &col.reference_name, p);
+                    rs.seq.push(gb);
+                    rs.qual.push(gq);
                 }
             }
             rs.seq.push(cb);
@@ -703,7 +758,8 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
             _ => clen,
         };
         for p in (last + 1)..=span_end {
-            let _ = writeln!(pileup_rows, "{prev}\t{p}\t0\t0\tN\t0\t*\t*");
+            let gb = gap_base(cfg, prev, p).0 as char;
+            let _ = writeln!(pileup_rows, "{prev}\t{p}\t0\t0\t{gb}\t0\t*\t*");
         }
     }
 
@@ -719,7 +775,8 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
             .find(|(n, _)| n == rn)
             .map_or(*re, |(_, l)| *l);
         for p in *rb..=(*re).min(clen) {
-            let _ = writeln!(pileup_rows, "{rn}\t{p}\t0\t0\tN\t0\t*\t*");
+            let gb = gap_base(cfg, rn, p).0 as char;
+            let _ = writeln!(pileup_rows, "{rn}\t{p}\t0\t0\t{gb}\t0\t*\t*");
         }
     }
 
@@ -771,11 +828,14 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
                 Some((_, b, e)) => e.min(&contig_len).saturating_sub(b - 1),
                 None => contig_len,
             };
+            // s[0] maps to genome position `base` (region beg, else 1).
+            let base = cfg.region.as_ref().map_or(1, |(_, b, _)| *b);
             let mut s = rs.seq.clone();
             let mut q = rs.qual.clone();
             while s.len() < len {
-                s.push(b'N');
-                q.push(0);
+                let (gb, gq) = gap_base(cfg, name, base + s.len());
+                s.push(gb);
+                q.push(gq);
             }
             s.truncate(len);
             q.truncate(len);
