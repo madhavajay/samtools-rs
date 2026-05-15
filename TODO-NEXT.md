@@ -51,18 +51,7 @@ fixed in `fixmate`/`markdup`/`rmdup`). So upstream byte-exact now:
 
 **Precisely-characterized remaining blockers** (each a large port, not a
 quick fix — verified by probing):
-- `merge` → the deferred `@RG`/`@PG` header-reconciliation rework
-  (we reject ID conflicts; upstream `-s SEED` random-suffixes).
-  **De-risked this batch:** the PRNG is glibc's POSIX 48-bit LCG
-  (`X0=(seed<<16)|0x330E`, `X=(0x5DEECE66D*X+0xB) mod 2^48`,
-  `lrand48()=X>>17`); verified that for `-s 1` the suffix loop
-  (`prefix-%08lX` of `lrand48()`, gen_unique_id tries the bare prefix
-  first with no draw) yields exactly the merge/2 fixture suffixes
-  (055424A4 3A2CCEF5 .. 7EC68B3F). **Only remaining work:** faithfully
-  port the deterministic gen_unique_id call ORDER through
-  `finish_merged_header`/`trans_tbl_add_{rg,pg}` (per-file, @RG then
-  @PG-chain, bare-prefix-first) — multi-hundred-LOC but no longer any
-  PRNG unknowns. **Primitive DONE:** `crate::rand48` (`Rand48` +
+- `merge` → ✅ **DONE**: @RG/@PG `-s SEED` reconciliation implemented (crate::rand48 + raw-header), byte-exact vs upstream merge/{2,4,7}. Remaining: `-r`/`-cp` options only. **Primitive DONE:** `crate::rand48` (`Rand48` +
   `gen_unique_id`) is implemented, tested, and fixture-verified.
   **Turn-key remaining steps:** (a) capture the `-s` seed in
   `merge.rs` (line ~105, currently discarded) → `Rand48::new(seed)`;
