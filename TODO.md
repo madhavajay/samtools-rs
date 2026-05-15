@@ -28,18 +28,19 @@ In-flight PRs (samtools-rs-only, ready for review/merge):
   Brings `bam2fq/{1,2,3,4,6,7,9,11}.{1,2,s}.fq.expected` upstream fixtures to byte parity for SAM input.
 - PR #10, https://github.com/madhavajay/samtools-rs/pull/10, branch `view-n-qname-filter` — `view -N FILE` / `--qname-file FILE` allow/deny qname list with `^FILE` negation; wired into the shared `line_passes` filter pass.
 - PR #11, https://github.com/madhavajay/samtools-rs/pull/11, branch `view-r-rg-filter` (stacked on PR #10) — `view -r STR` / `-R FILE` accumulating read-group ID filter plus `-n` exclude-no-RG.
+- PR #13, https://github.com/madhavajay/samtools-rs/pull/13, branch `view-d-aux-tag-filter` (stacked on PR #11) — `view -d TAG[:VAL]` / `-D TAG:FILE` aux-tag presence/value filtering with shared-tag validation.
 
-Latest known validation (against the tip of PR #11):
-- Rust tests: 406 passing.
+Latest known validation (against the tip of PR #13):
+- Rust tests: 407 passing.
 - Full gate: `cargo fmt --all --check`, `cargo clippy -p samtools-rs --all-targets -- -D warnings`, `cargo test -p samtools-rs`, and `cargo test -p samtools-rs -- --list | rg ': test$' | wc -l` all green.
-- New focused tests added across PRs: `fastq_index_files_extract_from_barcode_tag`, `fastq_routes_r1_only_singletons_to_singleton_output`, `fastq_dash_t_and_dash_cap_t_combine_aux_tags`, `fastq_interleaves_read1_read2_when_paths_alias`, `view_qname_file_filters_records_by_name`, and `view_r_and_dash_cap_r_filter_by_read_group`.
+- New focused tests added across PRs: `fastq_index_files_extract_from_barcode_tag`, `fastq_routes_r1_only_singletons_to_singleton_output`, `fastq_dash_t_and_dash_cap_t_combine_aux_tags`, `fastq_interleaves_read1_read2_when_paths_alias`, `view_qname_file_filters_records_by_name`, `view_r_and_dash_cap_r_filter_by_read_group`, and `view_d_and_dash_cap_d_filter_by_aux_tag`.
 
 Estimated whole-project completion:
-- Roughly 58–63% complete toward the full `samtools` replacement goal once the four in-flight PRs land.
-- Rationale: core workspace/subcommand layout, common I/O, many read/write/index/file-operation/statistics/editing commands, the upstream-style fastq split routing, several view filter slices, and 406 Rust tests are in place. The remaining risk is concentrated in byte-for-byte upstream parity for the higher-complexity subcommands (view binary aux mutation, sort external merge, markdup/stats per-cycle, full checksum/reference/depad), pileup-dependent commands, full CRAM streaming, and large external algorithms.
+- Roughly 60–65% complete toward the full `samtools` replacement goal once the five in-flight PRs land.
+- Rationale: core workspace/subcommand layout, common I/O, many read/write/index/file-operation/statistics/editing commands, the upstream-style fastq split routing, an extended view filter suite (qname/RG/aux-tag), and 407 Rust tests are in place. The remaining risk is concentrated in byte-for-byte upstream parity for the higher-complexity subcommands (view binary aux mutation, sort external merge, markdup/stats per-cycle, full checksum/reference/depad), pileup-dependent commands, full CRAM streaming, and large external algorithms.
 
 What to do next:
-1. Land PRs #8–#11 in order (#8, #10, #9, #11; or any order — they touch independent subcommands and PR #11 just bases on PR #10).
+1. Land PRs #8–#13 in order (#8, #10, #9, #11, #13; #12 is documentation-only and merges any time).
 2. Pick the next bounded slice from **Remaining tractable samtools-rs-only items** below.
 3. Run the full gate, update `TODO.md`, `docs/subcommand-coverage.md`, and `docs/test-status.md`, then commit, push, and open the next PR.
 
