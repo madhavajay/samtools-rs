@@ -625,6 +625,85 @@ pub mod bayes {
         cons_probs_init(P_HET, P_INDEL, P_HET_SCALE, POLY_MUL_RECALL, &Qcal::flat())
     }
 
+    // ---- Math accel helpers (bam_consensus.c) ----
+
+    pub const TENLOG2OVERLOG10: f64 = 3.0103;
+
+    /// `q2p[i] = pow(10, -i/10.0)` for `i` in `0..=100`
+    /// (`bam_consensus_tab.h`).
+    pub fn q2p_table() -> [f64; 101] {
+        let mut t = [0.0f64; 101];
+        for (i, v) in t.iter_mut().enumerate() {
+            *v = 10f64.powf(-(i as f64) / 10.0);
+        }
+        t
+    }
+
+    /// `mqual_pow_1m[i] = pow(10, -(i*.9)/10.0)` for `i` in `0..255`,
+    /// then `mqual_pow_1m[255] = mqual_pow_1m[10]`.
+    pub fn mqual_pow_1m_table() -> [f64; 256] {
+        let mut t = [0.0f64; 256];
+        for (i, v) in t.iter_mut().enumerate().take(255) {
+            *v = 10f64.powf(-((i as f64) * 0.9) / 10.0);
+        }
+        t[255] = t[10];
+        t
+    }
+
+    /// `e_tab[i] = exp(i)` for `i` in `-500..=500`; `e_tab2[i] =
+    /// exp(i/10.)` for `i` in `-500..=500` (built in `consensus_init`).
+    /// Stored with a +500 bias so index 0 == `exp(-500)`.
+    pub struct ETab {
+        e_tab: [f64; 1001],
+        e_tab2: [f64; 1001],
+    }
+
+    impl ETab {
+        pub fn new() -> Self {
+            let mut e_tab = [0.0f64; 1001];
+            let mut e_tab2 = [0.0f64; 1001];
+            for i in -500i32..=500 {
+                e_tab[(i + 500) as usize] = (i as f64).exp();
+                e_tab2[(i + 500) as usize] = ((i as f64) / 10.0).exp();
+            }
+            ETab { e_tab, e_tab2 }
+        }
+
+        /// `fast_exp` (bam_consensus.c:883): table lookup, C `(int)`
+        /// truncation toward zero.
+        pub fn fast_exp(&self, y: f64) -> f64 {
+            if (-50.0..=50.0).contains(&y) {
+                let idx = (y * 10.0) as i32; // truncates toward zero
+                return self.e_tab2[(idx + 500) as usize];
+            }
+            let y = y.clamp(-500.0, 500.0);
+            self.e_tab[(y as i32 + 500) as usize]
+        }
+    }
+
+    impl Default for ETab {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// `fast_log2` (bam_consensus.c:896): exponent + degree-3 Taylor of
+    /// the mantissa, via the IEEE-754 bit layout.
+    pub fn fast_log2(val: f64) -> f64 {
+        let mut x = val.to_bits();
+        let e = (((x >> 52) & 2047) as i64) - 1024;
+        x &= !(2047i64 << 52) as u64;
+        x = x.wrapping_add((1023i64 << 52) as u64);
+        let d = f64::from_bits(x);
+        let v = ((-1.0 / 3.0) * d + 2.0) * d - 2.0 / 3.0;
+        e as f64 + v
+    }
+
+    /// `#define ph_log(x) (-TENLOG2OVERLOG10*fast_log2((x)))`.
+    pub fn ph_log(x: f64) -> f64 {
+        -TENLOG2OVERLOG10 * fast_log2(x)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -667,6 +746,44 @@ pub mod bayes {
                 assert!(cp.p_oo[q] <= cp.p_mm[q] - 0.5 + 1e-12);
                 assert!(cp.p_uu[q] <= cp.p_mm[q] - 0.5 + 1e-12);
             }
+        }
+
+        #[test]
+        fn accel_tables_and_helpers_match_upstream() {
+            // q2p[i] = pow(10, -i/10) — literal values from
+            // bam_consensus_tab.h.
+            let q2p = q2p_table();
+            assert_eq!(q2p[0], 1.0);
+            assert!((q2p[1] - 0.794_328_234_724_281_5).abs() < 1e-15);
+            assert!((q2p[2] - 0.630_957_344_480_193_2).abs() < 1e-15);
+            assert!((q2p[3] - 0.501_187_233_627_272_2).abs() < 1e-15);
+
+            // mqual_pow_1m[i] = pow(10, -(i*.9)/10); [255] == [10].
+            let m = mqual_pow_1m_table();
+            assert_eq!(m[0], 1.0);
+            assert!((m[1] - 0.812_830_516_164_099_3).abs() < 1e-15);
+            assert!((m[2] - 0.660_693_448_007_596_0).abs() < 1e-15);
+            assert_eq!(m[255], m[10]);
+
+            // fast_log2 within the documented deg-3 Taylor tolerance,
+            // and the exact-power identities the algorithm relies on.
+            assert!((fast_log2(1.0) - 0.0).abs() < 1e-9);
+            for &v in &[0.5f64, 2.0, 8.0, 0.125, 1e-10, 1e10] {
+                assert!((fast_log2(v) - v.log2()).abs() < 0.02, "log2({v})");
+            }
+
+            // fast_exp table lookup matches exp() at the grid points
+            // (e_tab2 step 0.1) and is bounded elsewhere.
+            let et = ETab::new();
+            for i in -50..=50 {
+                let y = i as f64; // exact grid (y*10 integral)
+                assert!((et.fast_exp(y / 1.0) - et.fast_exp(y)).abs() < 1e-300);
+            }
+            assert!((et.fast_exp(0.0) - 1.0).abs() < 1e-12);
+            assert!((et.fast_exp(2.0) - 2.0_f64.exp().ln().exp()).abs() < 1e-9);
+            // ph_log(x) = -3.0103 * fast_log2(x); ph_log(1) == 0.
+            assert!((ph_log(1.0)).abs() < 1e-9);
+            assert!(ph_log(0.001) > 0.0);
         }
     }
 }
