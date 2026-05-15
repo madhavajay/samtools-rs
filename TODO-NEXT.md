@@ -71,25 +71,29 @@ quick fix — verified by probing):
   exact `-s` stats counts, CRAM, the `1..4` expect-fail cases.
 - `reset` → tested only via pipes into `sort -M -K10` (minimiser).
 - `sort` `name2` / `reset` → minimiser (`-N`/`-K`) + external merge.
-- `stats` → ✅ **17/20 fixtures DONE**: byte-exact end to end vs
-  upstream `stat/{1..10,14,15,16,17}` (CHK checksum, all SN lines +
-  comments, FFQ/LFQ with `max_qual` width, full MPC reference-mismatch
-  engine, GCF/GCL, GCC/GCT/FBC/FTC/LBC/LTC, IS, RL/FRL/LRL, MAPQ, ID/IC
-  indel engine + `nindels`=300 cap, COV, single-bin GCD; supplementary
-  handling; `-S RG`/`-P` per-tag `.bamstat`; `-I` read-group filter;
-  upstream unpaired-read `order`; `--ref-stats` RFS with and without a
-  reference). **Remaining (region/target subsystem — the next entry
-  point):** stat/11,12 region-restricted `bases mapped (cigar)` +
-  coverage (upstream `collect_stats` `if(stats->regions)` branch at
-  stats.c:1308-1331 with the `chunks`/`reg_from`/`reg_to` overlap
-  correction from `is_in_regions` stats.c:2030 and the chunk
-  subtraction at stats.c:1150-1170); stat/18,19 region-restricted RFS
-  (the `else` branch of `collect_refstats` stats.c:2536-2596:
-  `name:start-end`, `reflen=min(end-start+1, seqlen)`, GC over the
-  clipped interval); stat/13 barcode BCC/QTQ sections (`-g`/barcode
-  tags, `collect_barcode_stats` stats.c:1189+); multi-bin (>20 kbp)
-  GC-depth; exact pileup-backed COV; CRAM without explicit reference
-  (blocked on the htslib-rs CRAM all-record iterator).
+- `stats` → ✅ **19/20 fixtures DONE**: byte-exact end to end vs
+  upstream `stat/{1..11,13,14,15,16,17,18,19}` (CHK checksum, all SN
+  lines + comments, FFQ/LFQ with `max_qual` width + reverse-strand
+  quality orientation, full MPC reference-mismatch engine, GCF/GCL,
+  GCC/GCT/FBC/FTC/LBC/LTC, region-clipped `bases mapped (cigar)`,
+  barcode BCC/QTQ, IS, RL/FRL/LRL, MAPQ, ID/IC indel engine +
+  `nindels`=300 cap, COV, single-bin GCD; supplementary handling;
+  `-S RG`/`-P` per-tag `.bamstat`; `-I` read-group filter; streaming
+  `-t` BAM path; upstream unpaired-read `order`; `--ref-stats` RFS
+  with/without reference incl. region-merged targets). **Remaining —
+  only stat/12 (paired-overlap):** the overlap variant is 2 SN lines
+  from exact — `insert size average`/`standard deviation` under `-t`
+  must exclude pairs whose mate falls outside the target (ours counts
+  the in-region read B's isize 323; upstream's region path defers
+  isize via the per-pair `read_pairs`/`pair_t` chunk machinery so only
+  the fully-in-region A-C pair's 180 is counted). The `-p`/
+  `--remove-overlaps` `nooverlap` variants additionally need the
+  paired-overlap chunk subtraction (`is_in_regions` chunks
+  stats.c:2030, the round-buffer pair finalisation + the
+  `nbases_mapped_cigar -= (pmax-pmin)` correction at stats.c:1140-1170).
+  Plus (non-fixture-blocking): multi-bin (>20 kbp) GC-depth, exact
+  pileup-backed COV, CRAM without explicit reference (blocked on the
+  htslib-rs CRAM all-record iterator).
 - `ampliconclip` → ✅ **DONE**: full port, byte-exact vs the entire
   upstream `test_ampliconclip` harness (10 SAM + 3 primer-count TSVs).
 - `ampliconstats` (`amplicon_stats.c`, 1776 LOC) → ✅ **DONE**:
