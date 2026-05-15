@@ -167,6 +167,11 @@ struct Opts {
     /// `^FILE` to negate). Records whose qname appears in the set pass;
     /// `^FILE` flips to exclude. `None` means the filter is disabled.
     qname_filter: Option<QnameFilter>,
+    /// `-r STR` / `-R FILE` — accumulated read-group IDs. Records whose
+    /// `RG:Z:` aux value is in the set pass. Empty means the filter is off.
+    read_groups: HashSet<Vec<u8>>,
+    /// `-n` — exclude records that have no `RG:Z:` aux tag at all.
+    exclude_no_rg: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +185,20 @@ impl QnameFilter {
         let contained = self.names.contains(qname);
         if self.negate { !contained } else { contained }
     }
+}
+
+/// Walk a SAM record line and return the `RG:Z:` value, or `None` if not
+/// present. Skips the first 11 mandatory fields.
+fn extract_rg_value(line: &[u8]) -> Option<&[u8]> {
+    for (i, field) in line.split(|&b| b == b'\t').enumerate() {
+        if i < 11 {
+            continue;
+        }
+        if field.len() >= 5 && field.starts_with(b"RG:Z:") {
+            return Some(&field[5..]);
+        }
+    }
+    None
 }
 
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -407,6 +426,36 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
                     .map(|s| s.as_bytes().to_vec())
                     .collect();
                 opts.qname_filter = Some(QnameFilter { negate, names });
+                i += 1;
+            }
+            "-r" | "--read-group" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .and_then(|a| a.to_str())
+                    .ok_or_else(|| ParseError::Err("missing value for -r".into()))?;
+                opts.read_groups.insert(v.as_bytes().to_vec());
+                i += 1;
+            }
+            "-R" | "--read-group-file" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .and_then(|a| a.to_str())
+                    .ok_or_else(|| ParseError::Err("missing value for -R".into()))?;
+                let text = std::fs::read_to_string(v).map_err(|e| {
+                    ParseError::Err(format!("failed to read -R value \"{}\": {}", v, e))
+                })?;
+                for line in text.lines() {
+                    let id = line.split_ascii_whitespace().next().unwrap_or(line);
+                    if !id.is_empty() {
+                        opts.read_groups.insert(id.as_bytes().to_vec());
+                    }
+                }
+                i += 1;
+            }
+            "-n" => {
+                opts.exclude_no_rg = true;
                 i += 1;
             }
             "-e" | "--expr" => {
@@ -1685,6 +1734,8 @@ fn has_filters(opts: &Opts) -> bool {
         || opts.exclude_all_flags != 0
         || opts.min_mapq != 0
         || opts.qname_filter.is_some()
+        || !opts.read_groups.is_empty()
+        || opts.exclude_no_rg
 }
 
 fn has_sanitizer(opts: &Opts) -> bool {
@@ -1924,6 +1975,22 @@ fn line_passes(line: &[u8], opts: &Opts) -> bool {
         && !qfilter.matches(qname)
     {
         return false;
+    }
+    if !opts.read_groups.is_empty() || opts.exclude_no_rg {
+        let rg = extract_rg_value(line);
+        match rg {
+            None if opts.exclude_no_rg => return false,
+            None => {
+                if !opts.read_groups.is_empty() {
+                    return false;
+                }
+            }
+            Some(value) => {
+                if !opts.read_groups.is_empty() && !opts.read_groups.contains(value) {
+                    return false;
+                }
+            }
+        }
     }
     record_passes(flag, mapq, opts)
 }

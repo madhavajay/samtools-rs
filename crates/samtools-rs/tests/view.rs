@@ -147,6 +147,80 @@ fn view_qname_file_filters_records_by_name() {
 }
 
 #[test]
+fn view_r_and_dash_cap_r_filter_by_read_group() {
+    let tmp = tmp_dir("rg-filter");
+    let input = tmp.join("in.sam");
+    let rg_file = tmp.join("rgs.txt");
+    let out_one = tmp.join("one.sam");
+    let out_many = tmp.join("many.sam");
+    let out_no_rg = tmp.join("no_rg.sam");
+
+    std::fs::write(
+        &input,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:grp1\tSM:s1\n",
+            "@RG\tID:grp2\tSM:s2\n",
+            "@RG\tID:grp3\tSM:s3\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:grp1\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\tRG:Z:grp2\n",
+            "c\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\t****\tRG:Z:grp3\n",
+            "d\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t&&&&\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(&rg_file, "grp1\ngrp3\n").unwrap();
+
+    assert_eq!(
+        run(&[
+            "-r",
+            "grp2",
+            "-o",
+            out_one.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+    let one = std::fs::read_to_string(&out_one).unwrap();
+    assert!(one.contains("\nb\t") || one.starts_with("b\t"));
+    assert!(!one.contains("\na\t") && !one.starts_with("a\t"));
+    assert!(!one.contains("\nc\t") && !one.starts_with("c\t"));
+    assert!(!one.contains("\nd\t") && !one.starts_with("d\t"));
+
+    assert_eq!(
+        run(&[
+            "-R",
+            rg_file.to_str().unwrap(),
+            "-o",
+            out_many.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+    let many = std::fs::read_to_string(&out_many).unwrap();
+    assert!(many.contains("a\t"));
+    assert!(!many.contains("\nb\t") && !many.starts_with("b\t"));
+    assert!(many.contains("c\t"));
+    assert!(!many.contains("\nd\t") && !many.starts_with("d\t"));
+
+    assert_eq!(
+        run(&[
+            "-n",
+            "-o",
+            out_no_rg.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]),
+        0
+    );
+    let no_rg = std::fs::read_to_string(&out_no_rg).unwrap();
+    assert!(no_rg.contains("a\t"));
+    assert!(no_rg.contains("b\t"));
+    assert!(no_rg.contains("c\t"));
+    assert!(!no_rg.contains("\nd\t") && !no_rg.starts_with("d\t"));
+}
+
+#[test]
 fn view_filter_unmapped_succeeds() {
     let p = fixtures_dir().join("view.001.sam");
     // -f 4 (require unmapped) should succeed; output may be empty or contain
