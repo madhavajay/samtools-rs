@@ -606,10 +606,7 @@ fn coverage_sam_input_supports_region_restriction() {
 
     let text = std::fs::read_to_string(out).unwrap();
     let rows: Vec<_> = text.lines().filter(|line| !line.starts_with('#')).collect();
-    assert_eq!(
-        rows,
-        ["chr1\t3\t5\t2\t3\t100.000000\t1.666667\t24.000000\t45.000000"]
-    );
+    assert_eq!(rows, ["chr1\t3\t5\t2\t3\t100\t1.66667\t24\t45"]);
 }
 
 #[test]
@@ -646,7 +643,7 @@ fn coverage_flag_filters_match_default_exclusion_controls() {
     );
     assert_eq!(
         std::fs::read_to_string(&default_out).unwrap(),
-        "chr1\t1\t8\t2\t4\t50.000000\t0.500000\t40.000000\t60.000000\n"
+        "chr1\t1\t8\t2\t4\t50\t0.5\t40\t60\n"
     );
 
     assert_eq!(
@@ -665,7 +662,7 @@ fn coverage_flag_filters_match_default_exclusion_controls() {
     );
     assert_eq!(
         std::fs::read_to_string(&include_dup_out).unwrap(),
-        "chr1\t1\t8\t3\t5\t62.500000\t0.750000\t40.000000\t60.000000\n"
+        "chr1\t1\t8\t3\t5\t62.5\t0.75\t40\t60\n"
     );
 
     assert_eq!(
@@ -686,7 +683,7 @@ fn coverage_flag_filters_match_default_exclusion_controls() {
     );
     assert_eq!(
         std::fs::read_to_string(&only_dup_out).unwrap(),
-        "chr1\t1\t8\t1\t2\t25.000000\t0.250000\t40.000000\t60.000000\n"
+        "chr1\t1\t8\t1\t2\t25\t0.25\t40\t60\n"
     );
 
     assert_eq!(
@@ -705,7 +702,7 @@ fn coverage_flag_filters_match_default_exclusion_controls() {
     );
     assert_eq!(
         std::fs::read_to_string(exclude_reverse_out).unwrap(),
-        "chr1\t1\t8\t2\t3\t37.500000\t0.500000\t40.000000\t60.000000\n"
+        "chr1\t1\t8\t2\t3\t37.5\t0.5\t40\t60\n"
     );
 }
 
@@ -743,7 +740,7 @@ fn coverage_reads_input_paths_from_bam_list() {
 
     assert_eq!(
         std::fs::read_to_string(out).unwrap(),
-        "chr1\t1\t8\t4\t4\t50.000000\t1.000000\t40.000000\t60.000000\n"
+        "chr1\t1\t8\t4\t4\t50\t1\t40\t60\n"
     );
 }
 
@@ -780,7 +777,7 @@ fn coverage_min_read_len_filters_short_alignments() {
 
     assert_eq!(
         std::fs::read_to_string(out).unwrap(),
-        "chr1\t1\t8\t1\t4\t50.000000\t0.500000\t40.000000\t60.000000\n"
+        "chr1\t1\t8\t1\t4\t50\t0.5\t40\t60\n"
     );
 }
 
@@ -831,11 +828,11 @@ fn coverage_max_depth_caps_reported_depth_metrics() {
 
     assert_eq!(
         std::fs::read_to_string(default_out).unwrap(),
-        "chr1\t1\t4\t3\t4\t100.000000\t3.000000\t40.000000\t60.000000\n"
+        "chr1\t1\t4\t3\t4\t100\t3\t40\t60\n"
     );
     assert_eq!(
         std::fs::read_to_string(capped_out).unwrap(),
-        "chr1\t1\t4\t3\t4\t100.000000\t1.000000\t40.000000\t60.000000\n"
+        "chr1\t1\t4\t3\t4\t100\t1\t40\t60\n"
     );
 }
 
@@ -925,11 +922,7 @@ fn coverage_cram_region_uses_top_level_reference() {
     );
 
     let text = std::fs::read_to_string(out).unwrap();
-    assert!(
-        text.contains(
-            "CHROMOSOME_II\t2980\t2980\t1\t1\t100.000000\t1.000000\t35.000000\t60.000000\n"
-        )
-    );
+    assert!(text.contains("CHROMOSOME_II\t2980\t2980\t1\t1\t100\t1\t35\t60\n"));
 }
 
 #[test]
