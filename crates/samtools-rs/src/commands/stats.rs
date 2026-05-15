@@ -885,6 +885,15 @@ struct StatsCounts {
     qual_count: u64,
     first_qual_hist: Vec<[u64; 256]>,
     last_qual_hist: Vec<[u64; 256]>,
+    // Per-cycle ACGTNO counts [a,c,g,t,n,other]; `acgt_rc` is
+    // read-oriented (reverse reads complemented).
+    acgt_1st: Vec<[u64; 6]>,
+    acgt_2nd: Vec<[u64; 6]>,
+    acgt_rc: Vec<[u64; 6]>,
+    read_lengths: Vec<u64>,
+    read_lengths_1st: Vec<u64>,
+    read_lengths_2nd: Vec<u64>,
+    mapping_qualities: Vec<u64>,
     // Upstream `gc_1st`/`gc_2nd`: fixed `ngc`-sized GC-fraction arrays.
     first_gc_hist: Vec<u64>,
     last_gc_hist: Vec<u64>,
@@ -1066,6 +1075,90 @@ impl StatsCounts {
                     for slot in h.iter_mut().take(hi).skip(lo) {
                         *slot += 1;
                     }
+                }
+            }
+
+            // Read-length / mapq histograms + per-cycle ACGT (upstream
+            // `stats.c`: read_len = unclipped length; mapq for
+            // !(UNMAP|SEC|SUPP|QCFAIL|DUP); per-cycle ACGT for originals).
+            {
+                let reverse = flag & BAM_FREVERSE != 0;
+                use sam::alignment::record::cigar::op::Kind as CKind;
+                let hard: u32 = rec
+                    .cigar()
+                    .iter()
+                    .flatten()
+                    .filter(|op| op.kind() == CKind::HardClip)
+                    .map(|op| op.len() as u32)
+                    .sum();
+                let read_len = (seq_len_u32 + hard) as usize;
+                if read_len > 0 && flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY) == 0 {
+                    if read_len >= self.read_lengths.len() {
+                        self.read_lengths.resize(read_len + 1, 0);
+                    }
+                    self.read_lengths[read_len] += 1;
+                    let order_first = flag & BAM_FPAIRED == 0
+                        || (flag & BAM_FREAD1 != 0 && flag & BAM_FREAD2 == 0);
+                    let order_last =
+                        flag & BAM_FPAIRED != 0 && flag & BAM_FREAD2 != 0 && flag & BAM_FREAD1 == 0;
+                    if order_first {
+                        if read_len >= self.read_lengths_1st.len() {
+                            self.read_lengths_1st.resize(read_len + 1, 0);
+                        }
+                        self.read_lengths_1st[read_len] += 1;
+                    }
+                    if order_last {
+                        if read_len >= self.read_lengths_2nd.len() {
+                            self.read_lengths_2nd.resize(read_len + 1, 0);
+                        }
+                        self.read_lengths_2nd[read_len] += 1;
+                    }
+                    if order_first || order_last {
+                        let seq = rec.sequence();
+                        let sl = seq.len();
+                        if self.acgt_1st.len() < sl {
+                            self.acgt_1st.resize(sl, [0; 6]);
+                        }
+                        if self.acgt_2nd.len() < sl {
+                            self.acgt_2nd.resize(sl, [0; 6]);
+                        }
+                        if self.acgt_rc.len() < sl {
+                            self.acgt_rc.resize(sl, [0; 6]);
+                        }
+                        for (i, b) in seq.iter().enumerate() {
+                            let cyc = if reverse { sl - i - 1 } else { i };
+                            let (idx, rc): (usize, usize) = match b.to_ascii_uppercase() {
+                                b'A' => (0, if reverse { 3 } else { 0 }),
+                                b'C' => (1, if reverse { 2 } else { 1 }),
+                                b'G' => (2, if reverse { 1 } else { 2 }),
+                                b'T' => (3, if reverse { 0 } else { 3 }),
+                                b'N' => (4, 6),
+                                _ => (5, 6),
+                            };
+                            if order_last {
+                                self.acgt_2nd[cyc][idx] += 1;
+                            } else {
+                                self.acgt_1st[cyc][idx] += 1;
+                            }
+                            if rc < 6 {
+                                self.acgt_rc[cyc][rc] += 1;
+                            }
+                        }
+                    }
+                }
+                if flag
+                    & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY | BAM_FQCFAIL | BAM_FDUP)
+                    == 0
+                {
+                    let mapq = rec
+                        .mapping_quality()
+                        .and_then(Result::ok)
+                        .map(u8::from)
+                        .unwrap_or(255) as usize;
+                    if self.mapping_qualities.is_empty() {
+                        self.mapping_qualities = vec![0; 256];
+                    }
+                    self.mapping_qualities[mapq] += 1;
                 }
             }
 
@@ -1542,6 +1635,7 @@ fn write_stats_counts(
     }
     write_quality_histograms(out, counts)?;
     write_gc_histograms(out, counts)?;
+    write_acgt_rl_mapq_sections(out, counts)?;
     write_coverage_histogram(out, counts, config)?;
     Ok(())
 }
@@ -1663,6 +1757,167 @@ fn write_gc_histogram(out: &mut dyn Write, label: &str, hist: &[u64]) -> io::Res
             hist[prev]
         )?;
         prev = ibase;
+    }
+    Ok(())
+}
+
+/// Upstream `stats.c` GCC/GCT/FBC/FTC/LBC/LTC + RL/FRL/LRL + MAPQ
+/// sections (reference-independent). `MPC`, `IS`, and `GCD` need the
+/// reference-mismatch / per-size / GC-depth engines and are not yet
+/// emitted.
+fn write_acgt_rl_mapq_sections(out: &mut dyn Write, c: &StatsCounts) -> io::Result<()> {
+    let max_len = c.acgt_1st.len().max(c.acgt_2nd.len()).max(c.acgt_rc.len());
+    let g1 = |a: &[[u64; 6]], i: usize| -> [u64; 6] { a.get(i).copied().unwrap_or([0; 6]) };
+    let pct = |x: u64, s: u64| -> f64 {
+        if s == 0 {
+            0.0
+        } else {
+            100.0 * x as f64 / s as f64
+        }
+    };
+
+    writeln!(
+        out,
+        "# ACGT content per cycle. Use `grep ^GCC | cut -f 2-` to extract this part. The columns are: cycle; A,C,G,T base counts as a percentage of all A/C/G/T bases [%]; and N and O counts as a percentage of all A/C/G/T bases [%]"
+    )?;
+    for i in 0..max_len {
+        let a = g1(&c.acgt_1st, i);
+        let b = g1(&c.acgt_2nd, i);
+        let s = a[0] + a[1] + a[2] + a[3] + b[0] + b[1] + b[2] + b[3];
+        if s == 0 {
+            continue;
+        }
+        writeln!(
+            out,
+            "GCC\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+            i + 1,
+            pct(a[0] + b[0], s),
+            pct(a[1] + b[1], s),
+            pct(a[2] + b[2], s),
+            pct(a[3] + b[3], s),
+            pct(a[4] + b[4], s),
+            pct(a[5] + b[5], s)
+        )?;
+    }
+
+    writeln!(
+        out,
+        "# ACGT content per cycle, read oriented. Use `grep ^GCT | cut -f 2-` to extract this part. The columns are: cycle; A,C,G,T base counts as a percentage of all A/C/G/T bases [%]"
+    )?;
+    for i in 0..max_len {
+        let r = g1(&c.acgt_rc, i);
+        let s = r[0] + r[1] + r[2] + r[3];
+        if s == 0 {
+            continue;
+        }
+        writeln!(
+            out,
+            "GCT\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+            i + 1,
+            pct(r[0], s),
+            pct(r[1], s),
+            pct(r[2], s),
+            pct(r[3], s)
+        )?;
+    }
+
+    writeln!(
+        out,
+        "# ACGT content per cycle for first fragments. Use `grep ^FBC | cut -f 2-` to extract this part. The columns are: cycle; A,C,G,T base counts as a percentage of all A/C/G/T bases [%]; and N and O counts as a percentage of all A/C/G/T bases [%]"
+    )?;
+    let (mut ta, mut tc, mut tg, mut tt, mut tn) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for i in 0..max_len {
+        let a = g1(&c.acgt_1st, i);
+        let s = a[0] + a[1] + a[2] + a[3];
+        ta += a[0];
+        tc += a[1];
+        tg += a[2];
+        tt += a[3];
+        tn += a[4];
+        if s != 0 {
+            writeln!(
+                out,
+                "FBC\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+                i + 1,
+                pct(a[0], s),
+                pct(a[1], s),
+                pct(a[2], s),
+                pct(a[3], s),
+                pct(a[4], s),
+                pct(a[5], s)
+            )?;
+        }
+    }
+    writeln!(
+        out,
+        "# ACGT raw counters for first fragments. Use `grep ^FTC | cut -f 2-` to extract this part. The columns are: A,C,G,T,N base counters"
+    )?;
+    writeln!(out, "FTC\t{}\t{}\t{}\t{}\t{}", ta, tc, tg, tt, tn)?;
+
+    writeln!(
+        out,
+        "# ACGT content per cycle for last fragments. Use `grep ^LBC | cut -f 2-` to extract this part. The columns are: cycle; A,C,G,T base counts as a percentage of all A/C/G/T bases [%]; and N and O counts as a percentage of all A/C/G/T bases [%]"
+    )?;
+    let (mut ta, mut tc, mut tg, mut tt, mut tn) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for i in 0..max_len {
+        let a = g1(&c.acgt_2nd, i);
+        let s = a[0] + a[1] + a[2] + a[3];
+        ta += a[0];
+        tc += a[1];
+        tg += a[2];
+        tt += a[3];
+        tn += a[4];
+        if s != 0 {
+            writeln!(
+                out,
+                "LBC\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+                i + 1,
+                pct(a[0], s),
+                pct(a[1], s),
+                pct(a[2], s),
+                pct(a[3], s),
+                pct(a[4], s),
+                pct(a[5], s)
+            )?;
+        }
+    }
+    writeln!(
+        out,
+        "# ACGT raw counters for last fragments. Use `grep ^LTC | cut -f 2-` to extract this part. The columns are: A,C,G,T,N base counters"
+    )?;
+    writeln!(out, "LTC\t{}\t{}\t{}\t{}\t{}", ta, tc, tg, tt, tn)?;
+
+    let rl = |label: &str, h: &[u64], out: &mut dyn Write| -> io::Result<()> {
+        for (len, &cnt) in h.iter().enumerate() {
+            if len >= 1 && cnt > 0 {
+                writeln!(out, "{}\t{}\t{}", label, len, cnt)?;
+            }
+        }
+        Ok(())
+    };
+    writeln!(
+        out,
+        "# Read lengths. Use `grep ^RL | cut -f 2-` to extract this part. The columns are: read length, count"
+    )?;
+    rl("RL", &c.read_lengths, out)?;
+    writeln!(
+        out,
+        "# Read lengths - first fragments. Use `grep ^FRL | cut -f 2-` to extract this part. The columns are: read length, count"
+    )?;
+    rl("FRL", &c.read_lengths_1st, out)?;
+    writeln!(
+        out,
+        "# Read lengths - last fragments. Use `grep ^LRL | cut -f 2-` to extract this part. The columns are: read length, count"
+    )?;
+    rl("LRL", &c.read_lengths_2nd, out)?;
+    writeln!(
+        out,
+        "# Mapping qualities for reads !(UNMAP|SECOND|SUPPL|QCFAIL|DUP). Use `grep ^MAPQ | cut -f 2-` to extract this part. The columns are: mapq, count"
+    )?;
+    for (q, &cnt) in c.mapping_qualities.iter().enumerate() {
+        if cnt > 0 {
+            writeln!(out, "MAPQ\t{}\t{}", q, cnt)?;
+        }
     }
     Ok(())
 }
