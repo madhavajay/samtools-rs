@@ -2356,28 +2356,26 @@ fn insert_size_mean_sd(isize_hist: &BTreeMap<u64, u64>, main_bulk: f64) -> (f64,
 }
 
 fn write_quality_histograms(out: &mut dyn Write, counts: &StatsCounts) -> io::Result<()> {
-    if !counts.first_qual_hist.is_empty() {
-        writeln!(
-            out,
-            "# First Fragment Qualities. Use `grep ^FFQ | cut -f 2-` to extract this part."
-        )?;
-        writeln!(
-            out,
-            "# Columns correspond to qualities and rows to cycles. First column is the cycle number."
-        )?;
-        write_quality_histogram(out, "FFQ", &counts.first_qual_hist, counts.qual_cols())?;
-    }
-    if !counts.last_qual_hist.is_empty() {
-        writeln!(
-            out,
-            "# Last Fragment Qualities. Use `grep ^LFQ | cut -f 2-` to extract this part."
-        )?;
-        writeln!(
-            out,
-            "# Columns correspond to qualities and rows to cycles. First column is the cycle number."
-        )?;
-        write_quality_histogram(out, "LFQ", &counts.last_qual_hist, counts.qual_cols())?;
-    }
+    // Upstream prints these comment headers unconditionally (the data
+    // rows are conditional on observed cycles).
+    writeln!(
+        out,
+        "# First Fragment Qualities. Use `grep ^FFQ | cut -f 2-` to extract this part."
+    )?;
+    writeln!(
+        out,
+        "# Columns correspond to qualities and rows to cycles. First column is the cycle number."
+    )?;
+    write_quality_histogram(out, "FFQ", &counts.first_qual_hist, counts.qual_cols())?;
+    writeln!(
+        out,
+        "# Last Fragment Qualities. Use `grep ^LFQ | cut -f 2-` to extract this part."
+    )?;
+    writeln!(
+        out,
+        "# Columns correspond to qualities and rows to cycles. First column is the cycle number."
+    )?;
+    write_quality_histogram(out, "LFQ", &counts.last_qual_hist, counts.qual_cols())?;
     Ok(())
 }
 
@@ -2398,20 +2396,17 @@ fn write_quality_histogram(
 }
 
 fn write_gc_histograms(out: &mut dyn Write, counts: &StatsCounts) -> io::Result<()> {
-    if !counts.first_gc_hist.is_empty() {
-        writeln!(
-            out,
-            "# GC Content of first fragments. Use `grep ^GCF | cut -f 2-` to extract this part."
-        )?;
-        write_gc_histogram(out, "GCF", &counts.first_gc_hist)?;
-    }
-    if !counts.last_gc_hist.is_empty() {
-        writeln!(
-            out,
-            "# GC Content of last fragments. Use `grep ^GCL | cut -f 2-` to extract this part."
-        )?;
-        write_gc_histogram(out, "GCL", &counts.last_gc_hist)?;
-    }
+    // Upstream prints both comment headers unconditionally.
+    writeln!(
+        out,
+        "# GC Content of first fragments. Use `grep ^GCF | cut -f 2-` to extract this part."
+    )?;
+    write_gc_histogram(out, "GCF", &counts.first_gc_hist)?;
+    writeln!(
+        out,
+        "# GC Content of last fragments. Use `grep ^GCL | cut -f 2-` to extract this part."
+    )?;
+    write_gc_histogram(out, "GCL", &counts.last_gc_hist)?;
     Ok(())
 }
 

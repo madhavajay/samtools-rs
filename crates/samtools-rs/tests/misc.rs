@@ -6424,6 +6424,27 @@ fn stats_matches_upstream_stat_fixtures() {
             );
         }
     }
+
+    // `-I <rg>` read-group filter on an indexed BAM (stat/14), incl.
+    // grp3 which matches no reads (empty FFQ/LFQ/GCF/GCL but their
+    // comment headers are still emitted, as upstream).
+    let bam = stat.join("11_target.bam");
+    for rg in ["s1", "grp2", "grp3"] {
+        let out = tmp.join(format!("14.rg.{rg}"));
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &["-I", rg, "-o", &p(&out), &p(&bam)]
+            ))),
+            0,
+            "stats -I {rg}"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            std::fs::read_to_string(stat.join(format!("14.rg.{rg}.expected"))).unwrap(),
+            "stats -I {rg} byte-exact",
+        );
+    }
 }
 
 #[test]
