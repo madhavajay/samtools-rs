@@ -1757,6 +1757,12 @@ fn sort_matches_upstream_test_sort_fixtures() {
             "dat/test_input_1_a.bam",
             "sort/tag.rg.n.sort.expected.sam",
         ),
+        // Exercises SAM `AS:I:` (uint32) aux integer-synonym tolerance.
+        (
+            &["-t", "AS", "-m", "10M"],
+            "dat/test_input_1_d.sam",
+            "sort/tag.as.sort.expected.sam",
+        ),
     ];
     for (args, input, expected) in cases {
         let out = tmp.join(expected.replace('/', "_"));
