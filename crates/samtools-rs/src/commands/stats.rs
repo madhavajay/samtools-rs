@@ -991,6 +991,10 @@ struct StatsCounts {
     max_len_2nd: u32,
     qual_sum: u64,
     qual_count: u64,
+    // Highest quality value observed (incl. the 0xFF/255 stored for `*`
+    // quality), driving the FFQ/LFQ/MPC column count exactly as
+    // upstream's `max_qual` (+1 unless it would reach `nquals`=256).
+    max_qual: u8,
     first_qual_hist: Vec<[u64; 256]>,
     last_qual_hist: Vec<[u64; 256]>,
     // Per-cycle ACGTNO counts [a,c,g,t,n,other]; `acgt_rc` is
@@ -1192,6 +1196,7 @@ impl StatsCounts {
             let quals: Vec<u8> = rec.quality_scores().iter().flatten().collect();
             if quals.is_empty() && seq_len_u32 > 0 {
                 // `*` quality: HTSlib stores 0xFF per base.
+                self.max_qual = 255;
                 for cycle in 0..seq_len_u32 as usize {
                     self.qual_sum += 255;
                     self.qual_count += 1;
@@ -1206,6 +1211,9 @@ impl StatsCounts {
                 for (cycle, q) in quals.iter().copied().enumerate() {
                     self.qual_sum += u64::from(q);
                     self.qual_count += 1;
+                    if q > self.max_qual {
+                        self.max_qual = q;
+                    }
                     if flag & BAM_FREAD1 != 0 {
                         increment_quality_hist(&mut self.first_qual_hist, cycle, q);
                     }
@@ -1568,6 +1576,14 @@ impl StatsCounts {
 
     fn is_coordinate_sorted(&self) -> bool {
         !self.sort_order_violation
+    }
+
+    /// Number of quality columns emitted in FFQ/LFQ/MPC, mirroring
+    /// upstream's `if (max_qual+1 < nquals) max_qual++;` then
+    /// `iqual <= max_qual` (so `max_qual + 1` columns).
+    fn qual_cols(&self) -> usize {
+        let m = self.max_qual as usize;
+        (if m + 1 < 256 { m + 1 } else { m }) + 1
     }
 
     fn update_sort_order(&mut self, tid: usize, pos: usize) {
@@ -2218,15 +2234,16 @@ fn write_mpc(out: &mut dyn Write, counts: &StatsCounts, config: &StatsConfig) ->
     // before this loop; nbases (300) always exceeds the test read
     // lengths, so the bump always applies.
     let rows = counts.max_len as usize + 1;
-    let zeros = "\t0".repeat(256);
+    let cols = counts.qual_cols().min(256);
+    let zeros = "\t0".repeat(cols);
     let mut line = String::new();
     for cycle in 1..=rows {
         match counts.mpc_buf.get(cycle - 1) {
-            Some(row) if row.iter().any(|&v| v != 0) => {
+            Some(row) if row[..cols].iter().any(|&v| v != 0) => {
                 line.clear();
                 use std::fmt::Write as _;
                 let _ = write!(line, "MPC\t{cycle}");
-                for v in row {
+                for v in &row[..cols] {
                     let _ = write!(line, "\t{v}");
                 }
                 writeln!(out, "{line}")?;
@@ -2348,7 +2365,7 @@ fn write_quality_histograms(out: &mut dyn Write, counts: &StatsCounts) -> io::Re
             out,
             "# Columns correspond to qualities and rows to cycles. First column is the cycle number."
         )?;
-        write_quality_histogram(out, "FFQ", &counts.first_qual_hist)?;
+        write_quality_histogram(out, "FFQ", &counts.first_qual_hist, counts.qual_cols())?;
     }
     if !counts.last_qual_hist.is_empty() {
         writeln!(
@@ -2359,7 +2376,7 @@ fn write_quality_histograms(out: &mut dyn Write, counts: &StatsCounts) -> io::Re
             out,
             "# Columns correspond to qualities and rows to cycles. First column is the cycle number."
         )?;
-        write_quality_histogram(out, "LFQ", &counts.last_qual_hist)?;
+        write_quality_histogram(out, "LFQ", &counts.last_qual_hist, counts.qual_cols())?;
     }
     Ok(())
 }
@@ -2368,10 +2385,11 @@ fn write_quality_histogram(
     out: &mut dyn Write,
     label: &str,
     hist: &[[u64; 256]],
+    cols: usize,
 ) -> io::Result<()> {
     for (cycle, row) in hist.iter().enumerate() {
         write!(out, "{}\t{}", label, cycle + 1)?;
-        for count in row {
+        for count in &row[..cols.min(256)] {
             write!(out, "\t{}", count)?;
         }
         writeln!(out)?;
