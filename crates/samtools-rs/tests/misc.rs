@@ -2101,6 +2101,46 @@ fn fastq_interleaves_read1_read2_when_paths_alias() {
 }
 
 #[test]
+fn fastq_repeated_dash_d_unions_same_tag_values() {
+    let tmp = tmp_dir("fastq-d-union");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.fq");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:4\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tNM:i:13\n",
+            "b\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\tNM:i:14\n",
+            "c\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\t****\tNM:i:0\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "-n",
+                "-d",
+                "NM:13",
+                "-d",
+                "NM:14",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("@a\n"));
+    assert!(text.contains("@b\n"));
+    assert!(!text.contains("@c\n"));
+}
+
+#[test]
 fn fastq_routes_r1_only_singletons_to_singleton_output() {
     let tmp = tmp_dir("fastq-r1-singleton");
     let sam = tmp.join("in.sam");

@@ -68,6 +68,35 @@ impl AuxSelection {
     }
 }
 
+/// Merge a new `-d` / `-D` filter into the existing list. Upstream rejects
+/// repeated invocations with different tag names; same-tag invocations
+/// union their value sets so `-d NM:13 -d NM:14` keeps records with
+/// `NM:i:{13,14}`. A presence-only filter (`-d TAG`) "wins" if combined
+/// with any value filter on the same tag (records pass on presence alone).
+fn merge_tag_filter(filters: &mut Vec<TagFilter>, new_filter: TagFilter) -> Result<(), String> {
+    if let Some(existing) = filters.iter_mut().find(|f| f.tag == new_filter.tag) {
+        match (&mut existing.values, new_filter.values) {
+            (Some(existing_set), Some(new_set)) => existing_set.extend(new_set),
+            (Some(_), None) => existing.values = None,
+            (None, _) => {}
+        }
+        return Ok(());
+    }
+    if let Some(other) = filters.iter().next()
+        && other.tag != new_filter.tag
+    {
+        return Err(format!(
+            "different tag \"{}{}\" specified after \"{}{}\"",
+            char::from(new_filter.tag[0]),
+            char::from(new_filter.tag[1]),
+            char::from(other.tag[0]),
+            char::from(other.tag[1]),
+        ));
+    }
+    filters.push(new_filter);
+    Ok(())
+}
+
 /// Union-merges `extra` into `selection`. `None` becomes `Tags(extra)`;
 /// `All` is unchanged; `Tags(existing)` extends with non-duplicate tags
 /// from `extra`. Matches upstream's accumulating `-t` / `-T` behavior.
@@ -182,7 +211,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     return ExitCode::from(1);
                 };
                 match parse_tag_filter(raw) {
-                    Ok(filter) => tag_filters.push(filter),
+                    Ok(filter) => {
+                        if let Err(e) = merge_tag_filter(&mut tag_filters, filter) {
+                            print_error(sub_name, e);
+                            return ExitCode::from(1);
+                        }
+                    }
                     Err(e) => {
                         print_error(sub_name, e);
                         return ExitCode::from(1);
@@ -195,7 +229,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     return ExitCode::from(1);
                 };
                 match parse_tag_filter_file(raw) {
-                    Ok(filter) => tag_filters.push(filter),
+                    Ok(filter) => {
+                        if let Err(e) = merge_tag_filter(&mut tag_filters, filter) {
+                            print_error(sub_name, e);
+                            return ExitCode::from(1);
+                        }
+                    }
                     Err(e) => {
                         print_error(sub_name, e);
                         return ExitCode::from(1);
