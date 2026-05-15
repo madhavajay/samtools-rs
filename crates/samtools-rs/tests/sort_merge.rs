@@ -1322,6 +1322,56 @@ fn collate_rejects_output_file_with_stdout() {
 }
 
 #[test]
+fn collate_matches_upstream_test_collate_fixtures() {
+    // Byte-exact (modulo the harness-stripped @PG) vs the entire
+    // upstream test_collate harness: -o (==collate.expected), positional
+    // prefix, fast `-f`, and fast `-f -r 4` (ring-eviction deferral).
+    let d = fixtures_dir();
+    let tmp = tmp_dir("collate-fixtures");
+    let np = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.starts_with("@PG\t"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    let din = d.join("dat/test_input_1_d.sam");
+    let fin = d.join("collate/fast_collate.sam");
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["--output-fmt=sam", "-o", "@OUT@", "@DIN@"],
+            "collate/collate.expected.sam",
+        ),
+        (
+            &["--output-fmt=sam", "-f", "@FIN@", "-o", "@OUT@"],
+            "collate/1_fast_collate.sam.expected",
+        ),
+        (
+            &["--output-fmt=sam", "-f", "-r", "4", "@FIN@", "-o", "@OUT@"],
+            "collate/2_fast_collate_with_tmp_used.sam.expected",
+        ),
+    ];
+    for (i, (args, expected)) in cases.iter().enumerate() {
+        let out = tmp.join(format!("c{i}.sam"));
+        let v: Vec<OsString> = std::iter::once(OsString::from("collate"))
+            .chain(args.iter().map(|a| {
+                OsString::from(match *a {
+                    "@OUT@" => out.to_str().unwrap().to_string(),
+                    "@DIN@" => din.to_str().unwrap().to_string(),
+                    "@FIN@" => fin.to_str().unwrap().to_string(),
+                    other => other.to_string(),
+                })
+            }))
+            .collect();
+        assert_eq!(exit_to_u8(collate::main(&v)), 0, "{expected}");
+        assert_eq!(
+            np(&std::fs::read_to_string(&out).unwrap()),
+            np(&std::fs::read_to_string(d.join(expected)).unwrap()),
+            "collate {expected}"
+        );
+    }
+}
+
+#[test]
 fn collate_fast_mode_pairs_primary_reads_and_drops_supplementary() {
     let tmp = tmp_dir("collate-fast");
     let sam = tmp.join("in.sam");
