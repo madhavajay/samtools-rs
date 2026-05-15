@@ -781,7 +781,37 @@ fn run(cfg: &Config, input: &PathBuf) -> io::Result<()> {
     }
 
     if cfg.format == Format::Pileup {
-        writer.write_all(&pileup_rows)?;
+        if cfg.all_bases >= 2 {
+            // `-aa`: every header @SQ in header order; contigs with no
+            // produced rows become full-length empty-row blocks.
+            let text = String::from_utf8_lossy(&pileup_rows);
+            let mut by: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+            for ln in text.lines() {
+                if let Some(rn) = ln.split('\t').next() {
+                    by.entry(rn).or_default().push(ln);
+                }
+            }
+            let mut out = String::new();
+            for (rn, len) in &ref_lens {
+                match by.get(rn.as_str()) {
+                    Some(lines) => {
+                        for l in lines {
+                            out.push_str(l);
+                            out.push('\n');
+                        }
+                    }
+                    None => {
+                        for p in 1..=*len {
+                            let gb = gap_base(cfg, rn, p).0 as char;
+                            out.push_str(&format!("{rn}\t{p}\t0\t0\t{gb}\t0\t*\t*\n"));
+                        }
+                    }
+                }
+            }
+            writer.write_all(out.as_bytes())?;
+        } else {
+            writer.write_all(&pileup_rows)?;
+        }
         return writer.flush();
     }
 
