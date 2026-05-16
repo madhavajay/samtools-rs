@@ -394,28 +394,43 @@ Everything else is ordinary samtools-rs porting + Phases 4–5.
 > `compression_method`/`uncompressed_size` and `src.len()` =
 > compressed size (`pub read_block`, `pub mod block`).
 >
-> **(b) Remaining = the `cram-size` port itself** (~679 LOC), now
-> fully unblocked. Crux/plan, in order:
-> 1. content_id → data-series name map from
->    `CompressionHeader::data_series_encodings()` (DS→external block
->    id) + `tag_encodings()` (tag `XY`+type → e.g. `AMc`/`BQZ`); 0 =
->    `CORE`; embedded_ref id from the slice header.
-> 2. The **CRAM method-parameter decoder** (the bulk of the LOC):
->    noodles `CompressionMethod` is coarse (Gzip/Bzip2/Rans4x8/
->    RansNx16/…) but cram-size needs the *detailed* spelling
->    (`gzip` vs `gzip-min`, `bzip2-6`, `r4x16-o0`, `rNx16-cat`,
->    `rNx16-xo0`, …) decoded from the compressed block's first
->    parameter bytes (rANS order/format byte; gzip level heuristic).
-> 3. Aggregate blocks by content_id (normal) / by (content_id,
->    method) (verbose); compact method-flag string (first-seen
->    distinct chars) for normal; `BLOCK %8s %12d %12d %6.2f%% %-6s
->    %s` formatting; summary (containers/slices/sequences/bases/
->    total file size/format overhead).
-> 4. `-e` "Container encodings" dump from the public
->    encodings/preservation map (the codec ID arithmetic).
+> **(b2) method-detail decoder — ✅ DONE** (`f05e364`):
+> `cram_size::method` ports htslib `cram_expand_method` + samtools
+> `comp_method2expanded` + the verbatim `comp_method2char`/
+> `comp_method2str` tables (53-entry space); 5 unit tests cover the
+> table anchors + gzip/bzip2/rANS4x8/rANSNx16/arith decode paths.
+> `Coarse` is the coarse method; map noodles `block::CompressionMethod`
+> → `Coarse` at the call site.
+>
+> **(b) Remaining `cram-size` sub-steps** (ordinary port; all noodles
+> accessors confirmed present & public):
+> 1. **content_id → data-series map**: iterate the 28 typed
+>    `DataSeriesEncodings` getters (DS→`[u8;2]` via the
+>    `DataSeries` `TryFrom<[u8;2]>` table, reversed) extracting block
+>    content ids from the `Integer`/`Byte`/`ByteArray` codecs
+>    (`External{block_content_id}`, `ByteArrayStop{block_content_id}`,
+>    `ByteArrayLength{len_encoding,value_encoding}` recurse; Huffman →
+>    CORE); `TagEncodings = HashMap<ContentId, Encoding<ByteArray>>`
+>    keyed by the 3-byte tag id (`>>16,>>8&0xff,&0xff` → e.g. `AMc`).
+> 2. **block walk**: `Reader::read_container` loop; per container
+>    `header().record_count()`/`base_count()`/`landmarks()`,
+>    `compression_header()`, `blocks()` (filter to
+>    `ContentType::{CoreData,ExternalData}`; CoreData → "CORE" key);
+>    `slices()[].header().embedded_reference_bases_block_content_id()`
+>    → `ref_seq_blk`. Skip the empty EOF container.
+> 3. **normal/verbose formatting**: aggregate by content_id (normal:
+>    one row, compact `comp_method2char` string ordered by descending
+>    csize, ` %6.2f%% %-7s`) / by (content_id,method) (verbose:
+>    `%-11s`); ratio `100*(c+1e-4)/(u+1e-4)`, `>999%` clamp; rows
+>    sorted by content_id ascending (CORE first); ` embedded_ref`
+>    suffix; summary block.
+> 4. `-e` "Container encodings" dump (`cram_describe_encodings`
+>    format: `\t<code>\t<CODEC>(...)`, EXTERNAL(id)/HUFFMAN(codes,
+>    lengths)/BYTE_ARRAY_STOP(stop,id)/BYTE_ARRAY_LEN(len_codec,
+>    val_codec)).
 > Verify byte-exact vs `test/cram_size/cram_size.reg`
 > (`normal.out`/`verbose.out`/`encodings.out`). Then `reference -e`
-> reuses the same block walk.
+> reuses the same block walk + embedded-ref id.
 
 - **noodles fork:** ✅ full inventory surface public
   (compression-header encodings + `Container::blocks()`).
