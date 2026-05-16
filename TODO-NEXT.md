@@ -51,7 +51,11 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
 - **#5** ✅ done — `idxstats`/`flagstat` on CRAM without an explicit
   reference, via the synthesizing-reference summary (`4aea535` /
   `5f871a5`); byte-exact vs the BAM equivalents.
-- **#3, #4, #7** assessed (large or possibly out-of-scope; #7 aux
+- **#4** 🟢 mostly done — binary `@PG` for `view` SAM→BAM, SAM→CRAM,
+  and BAM→BAM (`5f9c643`/`741e368`/`0604d24`, htslib-rs `96e9e46`);
+  remaining: CRAM-input + filtered/region binary-copy sub-paths.
+- **#3** ⛔ blocked on noodles-cram `pub(crate)` internals (decision
+  required). **#7** assessed (#7 aux
   mutation is functionally unblocked via `RecordBuf` — and an
   order-preserving `aux_del`/`aux_set_append` now exists in `fixmate`,
   the exact `bam_aux_del`+`bam_aux_append` semantics #7 wanted).
@@ -380,19 +384,30 @@ single-session work.
 - **samtools-rs tests:** upstream `test/cram_size/cram_size.reg`
   (`normal.out`/`verbose.out`/`encodings.out`).
 
-### 4. `sam_hdr_add_pg` through the binary header
+### 4. `@PG` through the binary header — 🟢 mostly DONE
 
-- **htslib-rs:** programmatic `@PG` chain insertion with `PP` linkage that
-  writes through the **binary** BAM/CRAM header path (SAM-text `@PG` is
-  already handled in `samtools-rs::pg`; binary writers are htslib-rs
-  internal, so the chain insert must live there).
-- **htslib-rs tests:** round-trip a header through a BAM and a CRAM writer
-  and assert the inserted `@PG` (ID/PN/PP/VN/CL order, PP chaining).
-- **samtools-rs wiring:** `view` default `@PG` / `--no-PG` for BAM/CRAM
-  binary output (and any other binary-output command relying on
-  htslib-rs-internal writers).
-- **samtools-rs tests:** `view -b`/`-C` `@PG` + `--no-PG` integration tests;
-  re-check `test.pl` groups that assert on binary `@PG`.
+> **Done** (`5f9c643`/`741e368`/`0604d24` + htslib-rs `96e9e46`):
+> `view` injects the samtools `@PG` into the **binary** header for
+> **SAM-input → BAM**, **SAM-input → CRAM**, and **BAM-input → BAM**
+> (the common, no-filter/no-region path) — `--no-PG` (or no captured
+> argv) stays a no-op / fast path. Done at the samtools-rs level:
+> `sam_bytes_with_pg` injects into the SAM-text header before
+> SAM→binary conversion across every SAM-input sub-path; BAM→BAM uses
+> the new htslib-rs `write_bam_from_path_transforming_header` (header
+> serialized → SAM text → `apply_pg_to_header` → parsed back; records
+> streamed unchanged, `PP`-chained correctly). Tests
+> `view_b_embeds_pg_in_binary_bam_header` (SAM→BAM + BAM→BAM),
+> `view_c_embeds_pg_in_binary_cram_header` (SAM→CRAM), and htslib-rs
+> `write_bam_from_path_transforming_header_rewrites_header_keeps_records`.
+> Note: upstream `test_view` deliberately uses `--no-PG` for binary
+> comparisons, so this is correctness/completeness, locked by the
+> samtools-rs integration tests rather than an upstream fixture.
+>
+> **Remaining (smaller):** CRAM-*input* → binary output, and the
+> filtered/region BAM/CRAM binary-copy sub-paths
+> (`write_bam_matching_filter_from_path`,
+> `write_cram_*_from_*_path_with_reference`) — each would need an
+> analogous header-transform variant; lower-frequency, no fixture.
 
 ### 5. CRAM `idxstats`/`flagstat` without an explicit reference — ✅ DONE
 
@@ -565,8 +580,8 @@ single-session work.
 
 1. **#1 Pileup iterator** — by far the biggest unlock (≈5 subcommands).
 2. **#2 CRAM all-record iterator** — closes several CRAM-without-region gaps.
-3. **#4** — small, well-scoped htslib-rs addition (binary `@PG`).
-   (#5 ✅ done, #6 ✅ done.)
+3. (#4 🟢 mostly done — binary `@PG` for SAM→BAM/CRAM + BAM→BAM;
+   #5 ✅ done, #6 ✅ done.)
 4. **#7–#12** — incremental hardening / correctness.
 
 ## Out of scope here (NOT library-blocked — large samtools-rs ports)
