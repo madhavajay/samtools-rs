@@ -248,7 +248,8 @@ samtools-rs status legend:
 ### phase
 
 - **C source:** `phase.c`
-- **samtools-rs status:** ⬜
+- **HTSlib APIs used:** pileup, revised MAQ error model (`errmod_cal`), SAM/BAM/CRAM read/write, optional reference-backed CRAM decoding
+- **samtools-rs status:** ✅ — faithful port of heterozygote discovery, local haplotype dynamic programming, fragment phasing, ambiguity masks, optional chimera fixing, site-list controls, and split-BAM output (`-b` prefix). Supports `-Q`/`--min-BQ`, `-q`, `-k`, `-D`, `-F`, `-A`, `-l`, `-e`, `--no-PG`, and reference-backed CRAM via `-f`/`--reference`. Upstream ships no `test_phase` fixtures, so coverage is focused Rust unit tests for phase-set marker/evidence output, min-baseQ filtering, and split-BAM creation.
 
 ### depad / pad2unpad
 
