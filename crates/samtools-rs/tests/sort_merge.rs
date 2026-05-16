@@ -1867,6 +1867,13 @@ fn sort_matches_upstream_test_sort_fixtures() {
             "dat/test_input_1_b.bam",
             "sort/name2.sort.expected.sam",
         ),
+        // `--template-coordinate`: RG→library lookup, MC-derived mate
+        // unclipped coords, MI, is_upper_of_pair; @HD GO:query.
+        (
+            &["--template-coordinate", "-m", "10M"],
+            "sort/template-coordinate.sort.sam",
+            "sort/template-coordinate.sort.expected.sam",
+        ),
     ];
     for (args, input, expected) in cases {
         let out = tmp.join(expected.replace('/', "_"));

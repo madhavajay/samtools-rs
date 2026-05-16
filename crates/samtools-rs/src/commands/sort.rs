@@ -21,8 +21,15 @@
 //!  - `--write-index` — write a BAI next to coordinate-sorted BAM output.
 //!  - `-M` — minimiser sort: faithful `bam_sort.c` `worker_minhash` + `bam1_cmp_by_minhash` + `build_minhash_index` + `minhash_with_idx[_squash]` port, with `-K` kmer (default 20, clamped 1..=31), `-H` homopolymer squash, `-R` (no reverse-strand minimiser), and `-I FILE` indexed reference. Byte-identical to all three upstream `sort/minimiser-{basic,indexed,indexed-poly}.sam` fixtures.
 //!
+//!  - `-N` — name sort with lexicographical (byte `strcmp`) collation.
+//!  - `--template-coordinate` — faithful `bam_sort.c`
+//!    `template_coordinate_key` + `bam1_cmp_template_coordinate` port
+//!    (RG→library lookup, MC-derived mate unclipped coords, MI
+//!    molecular id, `is_upper_of_pair`); `@HD` gets `GO:query`.
+//!    Byte-identical to `sort/template-coordinate.sort.expected.sam`.
+//!
 //! Not yet supported: external merge (large inputs spill to disk),
-//! template-coordinate sort, CRAM output.
+//! CRAM output.
 
 use std::cmp::Ordering;
 use std::ffi::OsString;
@@ -44,6 +51,7 @@ use crate::sam_global::current_global_args;
 pub fn main(args: &[OsString]) -> ExitCode {
     let mut name_sort = false;
     let mut natural_sort = true;
+    let mut template_coordinate = false;
     let mut output: Option<PathBuf> = None;
     let mut output_fmt = OutFmt::Bam;
     let mut input: Option<PathBuf> = None;
@@ -71,6 +79,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-N" => {
                 name_sort = true;
                 natural_sort = false;
+            }
+            "--template-coordinate" => {
+                template_coordinate = true;
             }
             "-o" | "--output" => {
                 output = match iter.next().and_then(|a| a.to_str()) {
@@ -255,6 +266,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         if no_pg { None } else { Some(args) },
         minhash,
         natural_sort,
+        template_coordinate,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -308,6 +320,7 @@ pub(crate) fn run_sort(
     pg_argv: Option<&[OsString]>,
     minhash: Option<MinhashOpts>,
     natural_sort: bool,
+    template_coordinate: bool,
 ) -> io::Result<()> {
     let format = sam_io::sam_open_format(input)?;
     let (mut header, mut records) = match format.exact {
@@ -323,7 +336,19 @@ pub(crate) fn run_sort(
     };
 
     let mut minhash_mapped = false;
-    if let Some(opts) = minhash.as_ref() {
+    if template_coordinate {
+        // `bam_sort.c` `template_coordinate_key` + comparator: build a
+        // per-record key (RG→library lookup, MC-derived mate unclipped
+        // coords, MI molecular id) then sort by it.
+        let lib_lookup = library_lookup(&header);
+        let mut keyed: Vec<(TemplateCoordinateKey, RecordBuf)> = Vec::with_capacity(records.len());
+        for r in records.drain(..) {
+            let key = template_coordinate_key(&r, &lib_lookup).map_err(io::Error::other)?;
+            keyed.push((key, r));
+        }
+        keyed.sort_by(|a, b| template_coordinate_cmp(&a.0, &b.0));
+        records = keyed.into_iter().map(|(_, r)| r).collect();
+    } else if let Some(opts) = minhash.as_ref() {
         // Faithful port of `bam_sort.c` `worker_minhash` +
         // `bam1_cmp_by_minhash`. Per unmapped record compute the
         // minimiser hash over its sequence (against the `-I` index when
@@ -357,19 +382,31 @@ pub(crate) fn run_sort(
         });
     }
 
-    // Sort-order tags for @HD.
-    let (so, ss): (String, Option<String>) = if minhash.is_some() {
+    // Sort-order tags for @HD (SO, optional GO, optional SS).
+    let (so, go, ss): (String, Option<&str>, Option<String>) = if template_coordinate {
+        (
+            "unsorted".to_string(),
+            Some("query"),
+            Some("unsorted:template-coordinate".to_string()),
+        )
+    } else if minhash.is_some() {
         if minhash_mapped {
             (
                 "coordinate".to_string(),
+                None,
                 Some("coordinate:minhash".to_string()),
             )
         } else {
-            ("unsorted".to_string(), Some("unsorted:minhash".to_string()))
+            (
+                "unsorted".to_string(),
+                None,
+                Some("unsorted:minhash".to_string()),
+            )
         }
     } else if let Some(tag) = tag_sort {
         (
             "unsorted".to_string(),
+            None,
             Some(format!(
                 "unsorted:{}{}:{}",
                 tag[0] as char,
@@ -388,6 +425,7 @@ pub(crate) fn run_sort(
     } else if name_sort {
         (
             "queryname".to_string(),
+            None,
             Some(
                 if natural_sort {
                     "queryname:natural"
@@ -398,16 +436,17 @@ pub(crate) fn run_sort(
             ),
         )
     } else {
-        ("coordinate".to_string(), None)
+        ("coordinate".to_string(), None, None)
     };
-    set_sort_order(&mut header, &so, ss.as_deref());
+    set_sort_order(&mut header, &so, go, ss.as_deref());
 
     // Emit the *raw* input header (preserving @SQ/@RG field order, @CO,
     // etc. — noodles' canonical writer reorders @RG fields) with the @HD
-    // SO/SS applied and the samtools @PG appended.
+    // SO/GO/SS applied and the samtools @PG appended.
     let mut header_text = apply_hd_sort_order(
         &crate::header_text::read_raw_header_text_with_format(input, format.exact)?,
         &so,
+        go,
         ss.as_deref(),
     );
     if let Some(argv) = pg_argv {
@@ -1091,6 +1130,278 @@ fn compare_by_tag(
         .then_with(|| name_key(a).cmp(&name_key(b)))
 }
 
+// ----- `samtools sort --template-coordinate` -----
+
+/// `bam_sort.c` `lookup_libraries`: `@RG ID` → `LB` (only RGs with an
+/// `LB` tag are recorded).
+fn library_lookup(header: &sam::Header) -> std::collections::HashMap<Vec<u8>, Vec<u8>> {
+    let mut m = std::collections::HashMap::new();
+    for (id, rg) in header.read_groups() {
+        const LB: [u8; 2] = [b'L', b'B'];
+        if let Some(lb) = rg.other_fields().get(&LB) {
+            let id_bytes: Vec<u8> = id.to_string().into_bytes();
+            let lb_bytes: Vec<u8> = lb.to_string().into_bytes();
+            m.insert(id_bytes, lb_bytes);
+        }
+    }
+    m
+}
+
+fn rb_aux_text(r: &RecordBuf, tag: [u8; 2]) -> Option<Vec<u8>> {
+    use sam::alignment::record_buf::data::field::Value;
+    match r.data().get(&tag) {
+        Some(Value::String(s)) | Some(Value::Hex(s)) => Some(s.to_vec()),
+        _ => None,
+    }
+}
+
+fn cigar_ops(r: &RecordBuf) -> Vec<(char, i64)> {
+    use sam::alignment::record::cigar::op::Kind;
+    r.cigar()
+        .as_ref()
+        .iter()
+        .map(|op| {
+            let c = match op.kind() {
+                Kind::Match => 'M',
+                Kind::Insertion => 'I',
+                Kind::Deletion => 'D',
+                Kind::Skip => 'N',
+                Kind::SoftClip => 'S',
+                Kind::HardClip => 'H',
+                Kind::Pad => 'P',
+                Kind::SequenceMatch => '=',
+                Kind::SequenceMismatch => 'X',
+            };
+            (c, op.len() as i64)
+        })
+        .collect()
+}
+
+/// `bam.c` `unclipped_start`: `pos0 - leading S/H + 1`.
+fn unclipped_start(pos0: i64, cig: &[(char, i64)]) -> i64 {
+    let mut clipped = 0;
+    for &(c, n) in cig {
+        if c == 'S' || c == 'H' {
+            clipped += n;
+        } else {
+            break;
+        }
+    }
+    pos0 - clipped + 1
+}
+
+/// `bam.c` `unclipped_end`: `bam_endpos + trailing S/H`.
+fn unclipped_end(pos0: i64, cig: &[(char, i64)]) -> i64 {
+    let mut rlen = 0;
+    for &(c, n) in cig {
+        if matches!(c, 'M' | 'D' | 'N' | '=' | 'X') {
+            rlen += n;
+        }
+    }
+    let mut clipped = 0;
+    for &(c, n) in cig.iter().rev() {
+        if c == 'S' || c == 'H' {
+            clipped += n;
+        } else {
+            break;
+        }
+    }
+    pos0 + rlen + clipped
+}
+
+/// Parse the leading run of a SAM CIGAR string into `(op, len)` pairs.
+fn parse_cigar_str(cigar: &[u8]) -> Vec<(char, i64)> {
+    let mut out = Vec::new();
+    let mut num: i64 = 0;
+    let mut seen = false;
+    for &b in cigar {
+        if b == b'*' {
+            break;
+        }
+        if b.is_ascii_digit() {
+            num = num * 10 + i64::from(b - b'0');
+            seen = true;
+        } else {
+            out.push((b as char, if seen { num } else { 1 }));
+            num = 0;
+            seen = false;
+        }
+    }
+    out
+}
+
+/// `bam.c` `unclipped_other_start`: `mpos0 - leading S/H + 1`.
+fn unclipped_other_start(op0: i64, mc: &[u8]) -> i64 {
+    let mut clipped = 0;
+    for &(c, n) in parse_cigar_str(mc).iter() {
+        if c == 'S' || c == 'H' {
+            clipped += n;
+        } else {
+            break;
+        }
+    }
+    op0 - clipped + 1
+}
+
+/// `bam.c` `unclipped_other_end`: `mpos0 + refpos`, where `refpos` sums
+/// `M/D/N/=/X` and post-initial-clip `S/H`.
+fn unclipped_other_end(op0: i64, mc: &[u8]) -> i64 {
+    let mut refpos = 0;
+    let mut skip = true;
+    for (c, n) in parse_cigar_str(mc) {
+        match c {
+            'M' | 'D' | 'N' | '=' | 'X' => {
+                refpos += n;
+                skip = false;
+            }
+            'S' | 'H' if !skip => {
+                refpos += n;
+            }
+            _ => {}
+        }
+    }
+    op0 + refpos
+}
+
+struct TemplateCoordinateKey {
+    tid1: i32,
+    tid2: i32,
+    pos1: i64,
+    pos2: i64,
+    neg1: bool,
+    neg2: bool,
+    library: Vec<u8>,
+    mid: Vec<u8>,
+    name: Vec<u8>,
+    is_upper_of_pair: bool,
+}
+
+fn template_coordinate_key(
+    r: &RecordBuf,
+    lib_lookup: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
+) -> Result<TemplateCoordinateKey, String> {
+    let flags = r.flags();
+    let mut tid1 = i32::MAX;
+    let mut tid2 = i32::MAX;
+    let mut pos1 = i64::MAX;
+    let mut pos2 = i64::MAX;
+    let mut neg1 = false;
+    let mut neg2 = false;
+
+    let library = match rb_aux_text(r, [b'R', b'G']) {
+        Some(rg) => lib_lookup.get(&rg).cloned().unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let name = r.name().map(|n| n.to_vec()).unwrap_or_default();
+
+    let cig = cigar_ops(r);
+    if !flags.is_unmapped() {
+        tid1 = r.reference_sequence_id().map(|t| t as i32).unwrap_or(-1);
+        neg1 = flags.is_reverse_complemented();
+        let pos0 = r.alignment_start().map(usize::from).unwrap_or(1) as i64 - 1;
+        pos1 = if neg1 {
+            unclipped_end(pos0, &cig)
+        } else {
+            unclipped_start(pos0, &cig)
+        };
+    }
+    if flags.is_segmented() && !flags.is_mate_unmapped() {
+        let mc = rb_aux_text(r, [b'M', b'C'])
+            .ok_or_else(|| "no MC tag. Please run samtools fixmate on file first.".to_string())?;
+        tid2 = r
+            .mate_reference_sequence_id()
+            .map(|t| t as i32)
+            .unwrap_or(-1);
+        neg2 = flags.is_mate_reverse_complemented();
+        let mpos0 = r.mate_alignment_start().map(usize::from).unwrap_or(1) as i64 - 1;
+        pos2 = if neg2 {
+            unclipped_other_end(mpos0, &mc)
+        } else {
+            unclipped_other_start(mpos0, &mc)
+        };
+    }
+    let mid = rb_aux_text(r, [b'M', b'I']).unwrap_or_default();
+
+    // is_upper_of_pair + canonicalising swap.
+    let is_upper_of_pair = if tid1 < tid2
+        || (tid1 == tid2 && pos1 < pos2)
+        || (tid1 == tid2 && pos1 == pos2 && !neg1)
+    {
+        false
+    } else {
+        std::mem::swap(&mut tid1, &mut tid2);
+        std::mem::swap(&mut pos1, &mut pos2);
+        std::mem::swap(&mut neg1, &mut neg2);
+        true
+    };
+
+    Ok(TemplateCoordinateKey {
+        tid1,
+        tid2,
+        pos1,
+        pos2,
+        neg1,
+        neg2,
+        library,
+        mid,
+        name,
+        is_upper_of_pair,
+    })
+}
+
+/// `bam_sort.c` `template_coordinate_key_compare_mid`: ignore a trailing
+/// `/<single char>`, then compare; the shorter prefix sorts first.
+fn compare_mid(m1: &[u8], m2: &[u8]) -> Ordering {
+    let trim = |m: &[u8]| -> usize {
+        let l = m.len();
+        if l >= 2 && m[l - 2] == b'/' { l - 2 } else { l }
+    };
+    let (len1, len2) = (trim(m1), trim(m2));
+    let shortest = len1.min(len2);
+    let mut i = 0;
+    while i < shortest && m1[i] == m2[i] {
+        i += 1;
+    }
+    if i == len1 && i < len2 {
+        Ordering::Less
+    } else if i == len2 && i < len1 {
+        Ordering::Greater
+    } else if i == len1 && i == len2 {
+        Ordering::Equal
+    } else {
+        m1[i].cmp(&m2[i])
+    }
+}
+
+/// `bam_sort.c` `bam1_cmp_template_coordinate`.
+fn template_coordinate_cmp(a: &TemplateCoordinateKey, b: &TemplateCoordinateKey) -> Ordering {
+    a.tid1
+        .cmp(&b.tid1)
+        .then_with(|| a.tid2.cmp(&b.tid2))
+        .then_with(|| a.pos1.cmp(&b.pos1))
+        .then_with(|| a.pos2.cmp(&b.pos2))
+        // neg == true sorts first.
+        .then_with(|| match (a.neg1, b.neg1) {
+            (x, y) if x == y => Ordering::Equal,
+            (true, _) => Ordering::Less,
+            _ => Ordering::Greater,
+        })
+        .then_with(|| match (a.neg2, b.neg2) {
+            (x, y) if x == y => Ordering::Equal,
+            (true, _) => Ordering::Less,
+            _ => Ordering::Greater,
+        })
+        .then_with(|| a.library.cmp(&b.library))
+        .then_with(|| compare_mid(&a.mid, &b.mid))
+        .then_with(|| a.name.cmp(&b.name))
+        // is_upper_of_pair: a upper & b not → greater.
+        .then_with(|| match (a.is_upper_of_pair, b.is_upper_of_pair) {
+            (x, y) if x == y => Ordering::Equal,
+            (true, _) => Ordering::Greater,
+            _ => Ordering::Less,
+        })
+}
+
 #[derive(Clone, Debug)]
 enum TagSortValue {
     Missing,
@@ -1166,12 +1477,21 @@ fn tag_sort_value(record: &RecordBuf, tag: [u8; 2]) -> TagSortValue {
     }
 }
 
-fn set_sort_order(header: &mut sam::Header, so: &str, ss: Option<&str>) {
+fn set_sort_order(header: &mut sam::Header, so: &str, go: Option<&str>, ss: Option<&str>) {
     use bstr::BString;
+    use sam::header::record::value::map::header::tag::GROUP_ORDER;
     use sam::header::record::value::map::{self, Map};
     if let Some(hd) = header.header_mut() {
         hd.other_fields_mut()
             .insert(map::header::tag::SORT_ORDER, BString::from(so));
+        match go {
+            Some(go) => {
+                hd.other_fields_mut().insert(GROUP_ORDER, BString::from(go));
+            }
+            None => {
+                hd.other_fields_mut().shift_remove(&GROUP_ORDER);
+            }
+        }
         match ss {
             Some(ss) => {
                 hd.other_fields_mut()
@@ -1186,6 +1506,9 @@ fn set_sort_order(header: &mut sam::Header, so: &str, ss: Option<&str>) {
         let mut hd: Map<map::Header> = Map::default();
         hd.other_fields_mut()
             .insert(map::header::tag::SORT_ORDER, BString::from(so));
+        if let Some(go) = go {
+            hd.other_fields_mut().insert(GROUP_ORDER, BString::from(go));
+        }
         if let Some(ss) = ss {
             hd.other_fields_mut()
                 .insert(map::header::tag::SUBSORT_ORDER, BString::from(ss));
@@ -1230,7 +1553,7 @@ impl SortSink for SamStdout {
 /// Replaces/sets the `@HD` line's `SO:`/`SS:` fields in raw header text,
 /// preserving every other line and field verbatim (so `@RG`/`@SQ`/`@CO`
 /// keep their original byte form). Inserts an `@HD` if absent.
-fn apply_hd_sort_order(raw: &str, so: &str, ss: Option<&str>) -> String {
+fn apply_hd_sort_order(raw: &str, so: &str, go: Option<&str>, ss: Option<&str>) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut had_hd = false;
     for line in raw.lines() {
@@ -1238,13 +1561,16 @@ fn apply_hd_sort_order(raw: &str, so: &str, ss: Option<&str>) -> String {
             had_hd = true;
             let mut fields: Vec<&str> = line
                 .split('\t')
-                .filter(|f| !f.starts_with("SO:") && !f.starts_with("SS:"))
+                .filter(|f| !f.starts_with("SO:") && !f.starts_with("GO:") && !f.starts_with("SS:"))
                 .collect();
             let mut nl = fields.join("\t");
             if fields.is_empty() {
                 nl.push_str("@HD");
             }
             nl.push_str(&format!("\tSO:{so}"));
+            if let Some(go) = go {
+                nl.push_str(&format!("\tGO:{go}"));
+            }
             if let Some(ss) = ss {
                 nl.push_str(&format!("\tSS:{ss}"));
             }
@@ -1255,9 +1581,10 @@ fn apply_hd_sort_order(raw: &str, so: &str, ss: Option<&str>) -> String {
         }
     }
     if !had_hd {
+        let go = go.map(|g| format!("\tGO:{g}")).unwrap_or_default();
         let hd = match ss {
-            Some(ss) => format!("@HD\tVN:1.6\tSO:{so}\tSS:{ss}"),
-            None => format!("@HD\tVN:1.6\tSO:{so}"),
+            Some(ss) => format!("@HD\tVN:1.6\tSO:{so}{go}\tSS:{ss}"),
+            None => format!("@HD\tVN:1.6\tSO:{so}{go}"),
         };
         lines.insert(0, hd);
     }

@@ -124,6 +124,7 @@ where
             None,
             None,
             true,
+            false,
         )?;
         Some(sorted_bam)
     } else {
@@ -253,6 +254,7 @@ where
         None,
         None,
         true,
+        false,
     )
 }
 
