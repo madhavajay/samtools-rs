@@ -516,6 +516,156 @@ mod cid2ds {
     }
 }
 
+/// `-e` "Container encodings" dump (`cram_describe_encodings` +
+/// `cram_codec_describe`, `cram_codecs.c`).
+mod describe {
+    use htslib_rs::cram::container::CompressionHeader;
+    use htslib_rs::cram::container::compression_header::data_series_encodings::DataSeries;
+    use htslib_rs::cram::container::compression_header::encoding::Encoding;
+    use htslib_rs::cram::container::compression_header::encoding::codec::{
+        Byte, ByteArray, Integer,
+    };
+
+    fn int_desc(c: &Integer) -> String {
+        match c {
+            Integer::External { block_content_id } => format!("EXTERNAL(id={block_content_id})"),
+            Integer::Huffman { alphabet, bit_lens } => huffman(alphabet, bit_lens),
+            Integer::Beta { offset, len } => format!("BETA(offset={offset},nbits={len})"),
+            Integer::Gamma { offset } => format!("GAMMA(offset={offset})"),
+            Integer::Subexp { offset, k } => format!("SUBEXP(offset={offset},k={k})"),
+            Integer::Golomb { offset, m } => format!("GOLOMB(offset={offset},m={m})"),
+            Integer::GolombRice { offset, log2_m } => {
+                format!("GOLOMB_RICE(offset={offset},log2m={log2_m})")
+            }
+        }
+    }
+    fn byte_desc(c: &Byte) -> String {
+        match c {
+            Byte::External { block_content_id } => format!("EXTERNAL(id={block_content_id})"),
+            Byte::Huffman { alphabet, bit_lens } => huffman(alphabet, bit_lens),
+        }
+    }
+    fn ba_desc(c: &ByteArray) -> String {
+        match c {
+            ByteArray::ByteArrayStop {
+                stop_byte,
+                block_content_id,
+            } => format!("BYTE_ARRAY_STOP(stop={stop_byte},id={block_content_id})"),
+            ByteArray::ByteArrayLength {
+                len_encoding,
+                value_encoding,
+            } => format!(
+                "BYTE_ARRAY_LEN(len_codec={{{}}},val_codec={{{}}}",
+                int_desc(len_encoding.get()),
+                byte_desc(value_encoding.get())
+            ),
+        }
+    }
+    fn huffman(alphabet: &[i32], bit_lens: &[u32]) -> String {
+        let mut s = String::from("HUFFMAN(codes={");
+        for (i, a) in alphabet.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&a.to_string());
+        }
+        s.push_str("},lengths={");
+        for (i, l) in bit_lens.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&l.to_string());
+        }
+        s.push_str("})");
+        s
+    }
+
+    /// One "Container encodings" block (no trailing blank line).
+    pub fn container_encodings(ch: &CompressionHeader) -> String {
+        let dse = ch.data_series_encodings();
+        let mut out = String::from("Container encodings\n");
+        let mut line = |code: &str, desc: String| {
+            out.push('\t');
+            out.push_str(code);
+            out.push('\t');
+            out.push_str(&desc);
+            out.push('\n');
+        };
+        // `cram_DS_ID` order (cram_external.c:226-256).
+        macro_rules! di {
+            ($code:literal, $e:expr) => {
+                if let Some(e) = $e {
+                    line($code, int_desc(Encoding::get(e)));
+                }
+            };
+        }
+        macro_rules! db {
+            ($code:literal, $e:expr) => {
+                if let Some(e) = $e {
+                    line($code, byte_desc(Encoding::get(e)));
+                }
+            };
+        }
+        macro_rules! da {
+            ($code:literal, $e:expr) => {
+                if let Some(e) = $e {
+                    line($code, ba_desc(Encoding::get(e)));
+                }
+            };
+        }
+        da!("RN", dse.names());
+        db!("QS", dse.quality_scores());
+        da!("IN", dse.insertion_bases());
+        da!("SC", dse.soft_clip_bases());
+        di!("BF", dse.bam_flags());
+        di!("CF", dse.cram_flags());
+        di!("AP", dse.alignment_starts());
+        di!("RG", dse.read_group_ids());
+        di!("MQ", dse.mapping_qualities());
+        di!("NS", dse.mate_reference_sequence_ids());
+        di!("MF", dse.mate_flags());
+        di!("TS", dse.template_lengths());
+        di!("NP", dse.mate_alignment_starts());
+        di!("NF", dse.mate_distances());
+        di!("RL", dse.read_lengths());
+        di!("FN", dse.feature_counts());
+        db!("FC", dse.feature_codes());
+        di!("FP", dse.feature_position_deltas());
+        di!("DL", dse.deletion_lengths());
+        db!("BA", dse.bases());
+        db!("BS", dse.base_substitution_codes());
+        di!("TL", dse.tag_set_ids());
+        di!("RI", dse.reference_sequence_ids());
+        di!("RS", dse.reference_skip_lengths());
+        di!("PD", dse.padding_lengths());
+        di!("HC", dse.hard_clip_lengths());
+        da!("BB", dse.stretches_of_bases());
+        da!("QQ", dse.stretches_of_quality_scores());
+        let _ = (DataSeries::ReservedTc, DataSeries::ReservedTn); // legacy, unused
+        // Tags follow in htslib `tag_encoding_map` order: 32 buckets,
+        // `CRAM_MAP(a,b) = (a*3+b) & 31` on the two tag letters, with
+        // prepend insertion (so reverse insertion order within a
+        // bucket), iterated bucket 0..31. The `IndexMap` preserves
+        // the compression-header insertion order this depends on.
+        const N: usize = 32;
+        let mut buckets: Vec<Vec<(i64, &_)>> = vec![Vec::new(); N];
+        for (tag_id, enc) in ch.tag_encodings() {
+            let d = *tag_id as i64;
+            let c0 = (d >> 16) & 0xff;
+            let c1 = (d >> 8) & 0xff;
+            let b = ((c0 * 3 + c1) & (N as i64 - 1)) as usize;
+            // prepend → newest first within the bucket
+            buckets[b].insert(0, (d, enc));
+        }
+        for bucket in &buckets {
+            for (d, enc) in bucket {
+                line(&super::cid2ds::code_str(*d), ba_desc(Encoding::get(enc)));
+            }
+        }
+        out
+    }
+}
+
 /// Entry point for `samtools cram-size`.
 pub fn main(args: &[OsString]) -> ExitCode {
     use htslib_rs::cram::container::block::{CompressionMethod, ContentType};
@@ -554,15 +704,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
         crate::diagnostics::print_error("cram-size", "an input CRAM file is required");
         return ExitCode::from(1);
     };
-    if encodings {
-        // The `-e` "Container encodings" dump depends on htslib's
-        // exact internal codec-iteration order; deferred.
-        crate::diagnostics::print_error(
-            "cram-size",
-            "-e/--encodings is not yet supported in samtools-rs",
-        );
-        return ExitCode::from(1);
-    }
+    // `-e`: a "Container encodings" block is emitted per container
+    // (during the walk), then the normal report follows.
+    let mut enc_text = String::new();
 
     let file_size = match std::fs::metadata(&input) {
         Ok(m) => m.len() as i64,
@@ -625,6 +769,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
 
         if let Ok(ch) = container.compression_header() {
             cid2ds::build(&mut cid2ds, &ch);
+            if encodings {
+                enc_text.push_str(&describe::container_encodings(&ch));
+                enc_text.push('\n');
+            }
         }
         for slice in container.slices() {
             let Ok(slice) = slice else { continue };
@@ -662,8 +810,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     }
 
-    // Report.
+    // Report. With `-e`, the per-container "Container encodings"
+    // blocks precede the normal block table + summary.
     let mut out = String::new();
+    out.push_str(&enc_text);
     out.push_str(&format!(
         "#   Content_ID  Uncomp.size    Comp.size   Ratio Method{}  Data_series\n",
         if verbose { "    " } else { "" }

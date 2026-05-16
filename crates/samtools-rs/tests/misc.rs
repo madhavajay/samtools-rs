@@ -8019,7 +8019,11 @@ fn cram_size_matches_upstream_cram_size_reg() {
     let cram = dir.join("mpileup.1.cram");
     let tmp = tmp_dir("cram-size");
 
-    for (args, expected) in [(vec![], "normal.out"), (vec!["-v"], "verbose.out")] {
+    for (args, expected) in [
+        (vec![], "normal.out"),
+        (vec!["-v"], "verbose.out"),
+        (vec!["-e"], "encodings.out"),
+    ] {
         let out = tmp.join(expected);
         let mut a: Vec<&str> = vec!["cram-size"];
         a.extend_from_slice(&args);
