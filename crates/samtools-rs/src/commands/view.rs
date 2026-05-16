@@ -1105,6 +1105,11 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                         dst_file,
                     )?;
                 } else if opts.regions.is_empty() {
+                    // CRAM-input binary @PG not yet wired: routing
+                    // through the SAM-text reader regresses on CRAMs
+                    // noodles can't re-decode with an external
+                    // reference (the same limitation behind #2/#3).
+                    // Keep the faithful direct binary copy.
                     if let Some(expr) = filter.as_deref() {
                         htslib_rs::alignment_compat::write_cram_records_matching_filter_as_bam_from_path_with_reference(
                             input, reference, expr, dst_file,
@@ -1236,6 +1241,24 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                         reference,
                         dst_file,
                     )?;
+                } else if !opts.no_pg && opts.argv.is_some() {
+                    let text = if let Some(expr) = filter.as_deref() {
+                        htslib_rs::alignment_compat::view_bam_as_sam_text_matching_filter_from_path(
+                            input, expr,
+                        )?
+                    } else {
+                        htslib_rs::alignment_compat::view_bam_as_sam_text_from_path_with_limit(
+                            input, None,
+                        )?
+                    };
+                    let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(
+                        io::Cursor::new(sam_bytes_with_pg(text.as_bytes(), opts)?),
+                    ));
+                    htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
+                        &mut reader,
+                        reference,
+                        dst_file,
+                    )?;
                 } else if let Some(expr) = filter.as_deref() {
                     htslib_rs::alignment_compat::write_cram_matching_filter_from_bam_path_with_reference(
                         input, reference, expr, dst_file,
@@ -1261,6 +1284,24 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                     let filtered = filtered_sam_text(text.as_bytes(), opts)?;
                     let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(
                         io::Cursor::new(sam_bytes_with_pg(&filtered, opts)?),
+                    ));
+                    htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
+                        &mut reader,
+                        reference,
+                        dst_file,
+                    )?;
+                } else if !opts.no_pg && opts.argv.is_some() {
+                    let text = if let Some(expr) = filter.as_deref() {
+                        htslib_rs::alignment_compat::view_bam_regions_as_sam_text_matching_filter_from_path(
+                            input, &regions, expr,
+                        )?
+                    } else {
+                        htslib_rs::alignment_compat::view_bam_regions_as_sam_text_from_path(
+                            input, &regions,
+                        )?
+                    };
+                    let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(
+                        io::Cursor::new(sam_bytes_with_pg(text.as_bytes(), opts)?),
                     ));
                     htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
                         &mut reader,
