@@ -23,33 +23,25 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
   (`large_pos/depth{,_bed}`), and **consensus `recall`/Bayesian modes**
   (all 77 `consensus.reg`). *Remaining:* `targetcut`, `phase`,
   `ampliconstats`.
-- **#2** ✅ core + wiring; embed_ref read path **fixed via the
-  vendored noodles fork**. Whole-CRAM all-record iterator; `stats`/
+- **#2** ✅ **DONE**. Whole-CRAM all-record iterator; `stats`/
   `checksum` no-region CRAM byte-identical to BAM (bar NM lines).
-  `reference` CRAM MD path wired (`query_cram_records_all_from_path
-  [_with_reference]`): with `-T` it is **byte-exact** vs
-  `reference/mpileup.MD.fa{,.reg}.expected`, and with the noodles
-  fix it also decodes a genuinely-embedded CRAM with **no** `-T`.
-  noodles fork patch (`7a09e02`, htslib-rs `5fe80f8`,
-  samtools-rs `b88e3ab`): `get_slice_reference_sequence` now prefers
-  the embedded-reference block over the RR flag and returns clean
-  `io::Error`s instead of `expect()`-panicking. **`reference -e`
-  done** (`f6eb626`): faithful `cram2ref` port — per-slice
-  embedded-ref block extraction via `Container::slices()`/
-  `decode_blocks()`/`reference_sequence_context()`, errors
-  identically on a slice without an embedded reference. *Remaining
-  (one large item):* byte-verifying `reference` no-`-T`/`-e` vs
-  `reference/mpileup.{MD,embed}.fa{,.reg}.expected` needs the staged
-  CRAM to be **genuinely embed_ref**, which requires samtools-rs
-  `view -O cram,embed_ref=1` to *write* an embedded reference — a
-  substantial **noodles CRAM-writer** feature (compute/embed the
-  per-slice consensus reference + preservation-map flags; the
-  noodles writer has no embed support), and no upstream `samtools`
-  binary is available to pre-generate a real embed_ref fixture. The
-  `reference` MD/`-e` *code* is complete & faithful; only this
-  write-side fixture generation blocks the no-`-T`/`-e` byte check.
-  Plus optional CRAM-NM recompute for exact `stats`
-  mismatch/error-rate. Everything else in #2 is done.
+  embed_ref **read** (`7a09e02`: prefer embedded block over the RR
+  flag, errors instead of panicking) **and write** (`86a5b46`:
+  `Options.embed_reference` + `Builder::set_embed_reference` +
+  `build_slice` embeds the slice reference span) implemented in the
+  vendored noodles fork; htslib-rs `write_cram_from_sam_*_with_
+  reference_embedded` (`3fadffc`); samtools-rs `view -O
+  cram,embed_ref=1` routes to it, and `reference` ports the MD path
+  (`query_cram_records_all_from_path[_with_reference]`) + `-e`
+  `cram2ref` embedded extraction (`f6eb626`). **The entire upstream
+  `test_reference` suite is byte-exact** (`b17f617`): build the
+  embed_ref CRAM with `view -e EXPR -O cram,embed_ref=1 -T ref`,
+  then `reference` (MD, no `-T`), `reference -e`, and both
+  `-r 17:1000-1500` variants all match
+  `reference/mpileup.{MD,embed}.fa{,.reg}.expected`, locked by
+  `reference_embed_ref_full_test_reference_byte_exact`. Optional CRAM
+  -NM recompute for exact `stats` mismatch/error-rate is the only
+  non-fixture-blocking nicety left.
 - **#8** correctness ✅ — `-@`/`--threads` accepted everywhere, output
   byte-identical regardless of count (perf worker-pool wiring deferred).
 - **#9** partial — `sort`/`view --write-index` BAI == post-pass BAI.
@@ -259,25 +251,17 @@ quick fix — verified by probing):
      harness, 77/77); clippy + full workspace test suite green.
 - TODO-NEXT #3/#4/#5 (CRAM internals / binary-`@PG` / CRAM index meta).
 
-**Honest remaining scope:** the library-blocked *foundations* are all
-shipped, tested and pinned. **11 of 12 numbered items are fully
-done:** #1,#3,#4,#5,#6,#7,#8,#9,#10,#11,#12 — each fixture- or
-byte-verified (#3 `cram-size` is byte-exact on all three
-`cram_size.reg` fixtures). **#2 is ~95% done:** whole-CRAM
-iterator, `stats`/`checksum` no-region CRAM, embed_ref *read* fix,
-`reference` CRAM MD path (byte-exact with `-T`), and the
-`reference -e` `cram2ref` port are all complete & committed. The
-**one remaining item** is byte-verifying `reference` no-`-T`/`-e`
-against the upstream fixtures, which needs the staged CRAM to be a
-genuine embed_ref file — i.e. samtools-rs `view -O cram,embed_ref=1`
-must *write* an embedded reference. That is a **substantial new
-noodles CRAM-writer feature** (the noodles writer has no embed
-support; it would need to compute/embed a per-slice consensus
-reference + set the preservation-map/slice-header embed fields), and
-no upstream `samtools` binary is available to pre-generate a real
-embed_ref fixture. Plus an optional CRAM-NM recompute for exact
-`stats` mismatch/error-rate. Everything else is ordinary samtools-rs
-porting + Phases 4–5.
+**TODO-NEXT COMPLETE.** **All 12 numbered items are done**, each
+fixture- or byte-verified: #1–#12. Highlights this arc — #3
+`cram-size` byte-exact on all three `cram_size.reg` fixtures
+(`normal`/`verbose`/`encodings`); #2 the **entire upstream
+`test_reference` suite byte-exact** (embed_ref CRAM read **and**
+write in the vendored noodles fork, `view -O cram,embed_ref=1`,
+`reference` MD path + `-e` `cram2ref`). The only non-fixture-blocking
+nicety left anywhere is an optional CRAM-NM recompute for exact
+`stats` mismatch/error-rate (cosmetic; not a parity gap). The
+remaining project work is now **`TODO.md` proper** — ordinary
+samtools-rs subcommand porting + Phases 4–5.
 
 ## Ground rules for this pass
 
@@ -352,7 +336,7 @@ porting + Phases 4–5.
 - **Unblocks:** ~5 whole subcommands plus exact `bedcov`/`coverage`/`depth`.
   Do this first.
 
-### 2. CRAM all-record (non-region) streaming iterator — 🟡 mostly DONE
+### 2. CRAM all-record (non-region) streaming iterator — ✅ DONE
 
 > **htslib-rs DONE + pinned** (`ca812dd`):
 > `query_cram_records_all_from_path_with_reference` /

@@ -283,7 +283,7 @@ samtools-rs status legend:
 ### reference
 
 - **C source:** `reference.c`
-- **samtools-rs status:** 🟡 — SAM/BAM/CRAM MD-tag reconstruction to FASTA (`-o`, `-q`, `-r` region, indexed BAM iteration). **CRAM MD path byte-exact with `-T/--reference`** vs `reference/mpileup.MD.fa{,.reg}`; embed_ref *read* panic fixed in the vendored noodles fork. **`-e`/`--embedded` is a faithful `cram2ref` port** (per-slice embedded-ref-block extraction; errors identically on a slice without an embedded reference). Byte-verifying the no-`-T`/`-e` invocations needs the staged CRAM to be genuine embed_ref (samtools-rs `view -O cram,embed_ref=1` must *write* an embedded reference — a substantial noodles CRAM-writer feature); the `reference` code itself is complete.
+- **samtools-rs status:** ✅ — **entire upstream `test_reference` byte-exact**. SAM/BAM/CRAM MD-tag reconstruction (`-o`, `-q`, `-r`, indexed BAM iteration); embed_ref CRAM **read + write** in the vendored noodles fork; `view -O cram,embed_ref=1`; `-e`/`--embedded` faithful `cram2ref`. All four upstream invocations (`reference` MD no-`-T`, `-e`, and both `-r 17:1000-1500` variants) match `reference/mpileup.{MD,embed}.fa{,.reg}.expected` (tests `reference_embed_ref_full_test_reference_byte_exact`, `reference_cram_md_path_with_reference_matches_upstream`).
 
 ### flags
 
