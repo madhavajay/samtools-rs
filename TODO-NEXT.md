@@ -388,15 +388,37 @@ Everything else is ordinary samtools-rs porting + Phases 4–5.
 > inventory surface `cram-size` needs. htslib-rs 136 tests green,
 > samtools-rs workspace gate clean.
 >
-> **Remaining:** (a) expose per-block size/method metadata
-> (`Block`/`decode_blocks` currently drop it); (b) port `cram-size`
-> (~679 LOC C: block table, "Container encodings" with the codec
-> ID arithmetic, method-flag strings, ratios, summary) against the
-> new surface; verify byte-exact vs `test/cram_size/cram_size.reg`
-> (`normal.out`/`verbose.out`/`encodings.out`). Then `reference -e`.
+> **(a) per-block size/method metadata — ✅ DONE** (noodles
+> `5118fdc`, htslib-rs `249039c`): `pub Container::blocks()` returns
+> every raw block in stored order with `content_type`/`content_id`/
+> `compression_method`/`uncompressed_size` and `src.len()` =
+> compressed size (`pub read_block`, `pub mod block`).
+>
+> **(b) Remaining = the `cram-size` port itself** (~679 LOC), now
+> fully unblocked. Crux/plan, in order:
+> 1. content_id → data-series name map from
+>    `CompressionHeader::data_series_encodings()` (DS→external block
+>    id) + `tag_encodings()` (tag `XY`+type → e.g. `AMc`/`BQZ`); 0 =
+>    `CORE`; embedded_ref id from the slice header.
+> 2. The **CRAM method-parameter decoder** (the bulk of the LOC):
+>    noodles `CompressionMethod` is coarse (Gzip/Bzip2/Rans4x8/
+>    RansNx16/…) but cram-size needs the *detailed* spelling
+>    (`gzip` vs `gzip-min`, `bzip2-6`, `r4x16-o0`, `rNx16-cat`,
+>    `rNx16-xo0`, …) decoded from the compressed block's first
+>    parameter bytes (rANS order/format byte; gzip level heuristic).
+> 3. Aggregate blocks by content_id (normal) / by (content_id,
+>    method) (verbose); compact method-flag string (first-seen
+>    distinct chars) for normal; `BLOCK %8s %12d %12d %6.2f%% %-6s
+>    %s` formatting; summary (containers/slices/sequences/bases/
+>    total file size/format overhead).
+> 4. `-e` "Container encodings" dump from the public
+>    encodings/preservation map (the codec ID arithmetic).
+> Verify byte-exact vs `test/cram_size/cram_size.reg`
+> (`normal.out`/`verbose.out`/`encodings.out`). Then `reference -e`
+> reuses the same block walk.
 
-- **noodles fork:** ✅ compression-header inventory public; still
-  need block size/method exposure.
+- **noodles fork:** ✅ full inventory surface public
+  (compression-header encodings + `Container::blocks()`).
 - **samtools-rs wiring:** `cram-size` (port pending); `reference -e`.
 - **samtools-rs tests:** upstream `test/cram_size/cram_size.reg`
   (`normal.out`/`verbose.out`/`encodings.out`).
