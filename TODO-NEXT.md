@@ -418,25 +418,35 @@ Everything else is ordinary samtools-rs porting + Phases 4–5.
 >    `ContentType::{CoreData,ExternalData}`; CoreData → "CORE" key);
 >    `slices()[].header().embedded_reference_bases_block_content_id()`
 >    → `ref_seq_blk`. Skip the empty EOF container.
-> 3. **normal/verbose formatting**: aggregate by content_id (normal:
->    one row, compact `comp_method2char` string ordered by descending
->    csize, ` %6.2f%% %-7s`) / by (content_id,method) (verbose:
->    `%-11s`); ratio `100*(c+1e-4)/(u+1e-4)`, `>999%` clamp; rows
->    sorted by content_id ascending (CORE first); ` embedded_ref`
->    suffix; summary block.
-> 4. `-e` "Container encodings" dump (`cram_describe_encodings`
->    format: `\t<code>\t<CODEC>(...)`, EXTERNAL(id)/HUFFMAN(codes,
->    lengths)/BYTE_ARRAY_STOP(stop,id)/BYTE_ARRAY_LEN(len_codec,
->    val_codec)).
-> Verify byte-exact vs `test/cram_size/cram_size.reg`
-> (`normal.out`/`verbose.out`/`encodings.out`). Then `reference -e`
-> reuses the same block walk + embedded-ref id.
+> 3. **normal/verbose formatting — ✅ DONE** (`c02a4b8`, noodles
+>    `9b7b3af`, htslib-rs `e12e878`): block walk + `cram_cid2ds` +
+>    aggregation + the exact formatting (compact `comp_method2char`
+>    string desc-by-csize / `%-11s` verbose, ratio
+>    `100*(c+1e-4)/(u+1e-4)` + `>999%` clamp, content_id-ascending
+>    with CORE first, ` embedded_ref` once after the method loop,
+>    summary). **`samtools cram-size [-v] mpileup.1.cram` is
+>    byte-exact** vs `cram_size/expected/{normal,verbose}.out`;
+>    integration test `cram_size_matches_upstream_cram_size_reg`.
+> 4. `-e` "Container encodings" dump — **remaining**. Describe
+>    formats decoded (EXTERNAL(id=N), HUFFMAN(codes={..},lengths=
+>    {..}), BYTE_ARRAY_STOP(stop=S,id=N), BYTE_ARRAY_LEN(len_codec=
+>    {..},val_codec={..} — single trailing `}`)); DS iteration order
+>    is the fixed `cram_DS_ID` order (RN QS IN SC BF CF AP RG MQ NS
+>    MF TS NP NF RL FN FC FP DL BA BS TL RI RS PD HC BB QQ …).
+>    **Blocked sub-step:** htslib then emits the **tag** encodings in
+>    the compression header's tag-map *insertion* order, but noodles
+>    `TagEncodings = HashMap` does not preserve it → a minimal noodles
+>    fork patch to expose tag-encoding order (e.g. `IndexMap`/`Vec`)
+>    is needed before `encodings.out` can be byte-exact. `-e` errors
+>    cleanly until then. Then `reference -e` reuses the block walk.
 
-- **noodles fork:** ✅ full inventory surface public
-  (compression-header encodings + `Container::blocks()`).
-- **samtools-rs wiring:** `cram-size` (port pending); `reference -e`.
-- **samtools-rs tests:** upstream `test/cram_size/cram_size.reg`
-  (`normal.out`/`verbose.out`/`encodings.out`).
+- **noodles fork:** ✅ inventory surface public (compression-header
+  encodings + `Container::blocks()`); ⏳ tag-encoding order
+  preservation for `-e`.
+- **samtools-rs:** ✅ `cram-size` default + `-v` byte-exact; ⏳ `-e`
+  (encodings) + `reference -e`.
+- **samtools-rs tests:** `cram_size_matches_upstream_cram_size_reg`
+  (`normal.out`/`verbose.out`); `encodings.out` pending.
 
 ### 4. `@PG` through the binary header — 🟢 DONE for all decodable paths
 

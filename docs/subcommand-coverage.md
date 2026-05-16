@@ -263,8 +263,8 @@ samtools-rs status legend:
 
 - **C source:** `cram_size.c`
 - **HTSlib APIs used:** CRAM internal block/container/codec inspection
-- **htslib-rs coverage:** ❌ — explicitly out-of-scope in `htslib-rs`. May need to drop this subcommand or expose minimal CRAM internals.
-- **samtools-rs status:** ⬜
+- **htslib-rs coverage:** ✅ — the vendored noodles fork exposes `Container::blocks()` (raw per-block content_id/type/method/sizes) + the public `CompressionHeader` encodings/preservation-map inventory.
+- **samtools-rs status:** 🟡 — default and `-v` (verbose) reports are **byte-exact** vs the upstream `test/cram_size/cram_size.reg` fixtures (`normal.out`, `verbose.out`): faithful `cram_expand_method`/`comp_method2expanded` method decoder, block walk, `cram_cid2ds` content_id→data-series map, aggregation, and summary. Test `cram_size_matches_upstream_cram_size_reg`. The `-e` "Container encodings" dump is the remaining sub-step (needs noodles tag-encoding-order preservation; errors cleanly until then).
 
 ### checksum
 
