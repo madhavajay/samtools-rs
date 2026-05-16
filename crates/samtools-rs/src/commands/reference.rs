@@ -7,7 +7,7 @@
 //! `-e` byte-exact fixture (`reference/mpileup.embed.fa.expected`)
 //! additionally needs samtools-rs `view -O cram,embed_ref=1` to
 //! *write* an embedded reference (the regenerated test CRAM is
-//! reference-compressed) — TODO-NEXT #2's embed_ref-write tail; the
+//! reference-compressed) — completed library batch #2's embed_ref-write tail; the
 //! `-e` extraction itself is a faithful `cram2ref` port (it errors
 //! identically on a slice without an embedded reference).
 
@@ -195,7 +195,7 @@ fn reference_path(input: &Path, opts: &ReferenceOptions, writer: &mut dyn Write)
 /// container and noodles decodes full SEQ with no external reference;
 /// `update_refs` then reconstructs the reference from MD:Z + CIGAR +
 /// SEQ exactly as the SAM/BAM paths do. The `-e` embedded-extraction
-/// mode still needs CRAM container internals (TODO-NEXT #3).
+/// mode still needs CRAM container internals (completed library batch #3).
 fn reference_cram_path(
     input: &Path,
     opts: &ReferenceOptions,

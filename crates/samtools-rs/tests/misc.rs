@@ -7319,7 +7319,7 @@ fn mpileup_overlap_removal_matches_upstream_out5() {
 #[test]
 fn index_bam_without_so_coordinate_header() {
     // Upstream `samtools index` indexes coordinate-ordered BAMs whose
-    // header omits `@HD SO:coordinate` (TODO-NEXT #6).
+    // header omits `@HD SO:coordinate` (completed library batch #6).
     let tmp = tmp_dir("index-no-so");
     let bam = tmp.join("test_input_1_a.bam");
     std::fs::copy(fixtures_dir().join("dat").join("test_input_1_a.bam"), &bam).unwrap();
@@ -7333,7 +7333,7 @@ fn index_bam_without_so_coordinate_header() {
 
 #[test]
 fn view_dot_region_means_whole_file() {
-    // HTSlib region grammar: `.` == everything (TODO-NEXT #10).
+    // HTSlib region grammar: `.` == everything (completed library batch #10).
     let bam = fixtures_dir().join("dat").join("test_input_1_a.bam");
     let tmp = tmp_dir("view-dot");
     let with_dot = tmp.join("dot.txt");
@@ -7380,7 +7380,7 @@ fn view_dot_region_means_whole_file() {
 
 #[test]
 fn view_large_chrom_csi_region_matches_upstream() {
-    // TODO-NEXT #12: ref2 is 541556283 bp (> 2^29). With a header-aware
+    // completed library batch #12: ref2 is 541556283 bp (> 2^29). With a header-aware
     // CSI, `view large_chrom.bam ref2` and `ref2:1-541556283` must both
     // produce dat/large_chrom.out without panicking.
     let tmp = tmp_dir("large-chrom");
@@ -7428,7 +7428,7 @@ fn view_large_chrom_csi_region_matches_upstream() {
 
 #[test]
 fn threads_flag_is_byte_identical_for_view_and_sort() {
-    // TODO-NEXT #8: `-@ N` must not change output bytes (worker-pool
+    // completed library batch #8: `-@ N` must not change output bytes (worker-pool
     // wiring is perf-only). `--no-PG` isolates payload from the @PG CL
     // string, which legitimately embeds the thread arg.
     let tmp = tmp_dir("threads");
@@ -7484,7 +7484,7 @@ fn threads_flag_is_byte_identical_for_view_and_sort() {
 
 #[test]
 fn stats_cram_without_region_matches_bam_seq_quality() {
-    // TODO-NEXT #2: no-region CRAM stats now use the full-record iterator,
+    // completed library batch #2: no-region CRAM stats now use the full-record iterator,
     // so sequence-length/quality/length SN lines match the BAM equivalent
     // (NM-derived `mismatches`/`error rate` excepted — CRAM has no NM).
     use samtools_rs::commands::stats;
@@ -7534,7 +7534,7 @@ fn stats_cram_without_region_matches_bam_seq_quality() {
 
 #[test]
 fn checksum_cram_matches_bam_via_all_record_iterator() {
-    // TODO-NEXT #2: whole-CRAM checksum via the htslib-rs all-record
+    // completed library batch #2: whole-CRAM checksum via the htslib-rs all-record
     // iterator must equal the BAM checksum (checksum is order-agnostic).
     let _g = GLOBAL_ARGS_LOCK.lock().unwrap();
     let bam = htslib_fixtures_dir().join("range.bam");
@@ -7579,7 +7579,7 @@ fn checksum_cram_matches_bam_via_all_record_iterator() {
 
 #[test]
 fn view_write_index_matches_post_pass_index() {
-    // TODO-NEXT #9: `view --write-index` BAM output must produce a BAI
+    // completed library batch #9: `view --write-index` BAM output must produce a BAI
     // byte-identical to a separate `samtools index` pass.
     let bam = htslib_fixtures_dir().join("range.bam");
     let tmp = tmp_dir("view-write-index");
@@ -7620,7 +7620,7 @@ fn view_write_index_matches_post_pass_index() {
 #[test]
 fn view_star_region_selects_unplaced_reads() {
     // HTSlib region grammar: `*` selects only unplaced (RNAME `*`) reads
-    // (TODO-NEXT #10). Verified for SAM-text + count output.
+    // (completed library batch #10). Verified for SAM-text + count output.
     let tmp = tmp_dir("view-star");
     let sam = tmp.join("un.sam");
     std::fs::write(
@@ -7665,7 +7665,7 @@ fn view_star_region_selects_unplaced_reads() {
 
 #[test]
 fn consensus_simple_matches_upstream_fixtures() {
-    // TODO-NEXT #1 wiring: `samtools consensus --mode simple` on the
+    // completed library batch #1 wiring: `samtools consensus --mode simple` on the
     // htslib-rs pileup engine, byte-exact vs test/consensus/expected/*.
     let dir = fixtures_dir()
         .parent()
@@ -7755,7 +7755,7 @@ fn consensus_simple_matches_upstream_fixtures() {
 
 #[test]
 fn coverage_matches_upstream_tabular_fixtures() {
-    // TODO-NEXT #1: exact coverage — `%g`/`%.3g` formatting, min_depth
+    // completed library batch #1: exact coverage — `%g`/`%.3g` formatting, min_depth
     // gating of meandepth/meanbaseq, and pileup-arrival row ordering.
     use samtools_rs::commands::coverage;
     let d = fixtures_dir();
@@ -7821,7 +7821,7 @@ fn coverage_matches_upstream_tabular_fixtures() {
 
 #[test]
 fn depth_large_pos_matches_upstream() {
-    // TODO-NEXT #1: sparse depth (no OOM on LN:10001009800) + whitespace
+    // completed library batch #1: sparse depth (no OOM on LN:10001009800) + whitespace
     // BED parsing — upstream large_pos depth fixtures byte-exact.
     use samtools_rs::commands::depth;
     let d = fixtures_dir().join("large_pos");
@@ -7866,7 +7866,7 @@ fn depth_large_pos_matches_upstream() {
 
 #[test]
 fn fixmate_matches_upstream_group() {
-    // TODO.md §13 / TODO-NEXT #7: full upstream test_fixmate group
+    // TODO.md §13 / completed library batch #7: full upstream test_fixmate group
     // byte-exact (modulo @PG, which the harness strips). Exercises
     // del-then-append aux ordering (MQ/MC/ct) and MC:Z:* semantics.
     use samtools_rs::commands::fixmate;
@@ -8059,8 +8059,8 @@ fn consensus_matches_upstream_consensus_reg() {
 }
 
 /// `samtools cram-size` default and `-v` reports are byte-exact vs
-/// the upstream `test/cram_size/cram_size.reg` fixtures (TODO-NEXT
-/// #3). The `-e` "Container encodings" mode is a separate sub-step.
+/// the upstream `test/cram_size/cram_size.reg` fixtures (completed
+/// library batch #3). The `-e` "Container encodings" mode is included.
 #[test]
 fn cram_size_matches_upstream_cram_size_reg() {
     let dir = fixtures_dir().join("cram_size");
@@ -8095,7 +8095,7 @@ fn cram_size_matches_upstream_cram_size_reg() {
 /// `view -e EXPR -O cram,embed_ref=1 -T ref`, then all four
 /// `samtools reference` invocations (MD path / `-e` embedded, with
 /// and without `-r`) are byte-exact vs the upstream fixtures —
-/// TODO-NEXT #2 complete (embed_ref read+write + cram2ref).
+/// completed library batch #2 complete (embed_ref read+write + cram2ref).
 #[test]
 fn reference_embed_ref_full_test_reference_byte_exact() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();

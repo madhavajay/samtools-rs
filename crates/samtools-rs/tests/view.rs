@@ -2159,7 +2159,7 @@ fn view_u_unselected_routes_into_bam_output_for_sam_input() {
 }
 
 /// `view -b in.sam` must embed the samtools `@PG` in the **binary**
-/// BAM header (TODO-NEXT #4 / TODO.md). Round-trip via `view -h`:
+/// BAM header (completed library batch #4 / TODO.md). Round-trip via `view -h`:
 /// without `--no-PG` the BAM carries a `PN:samtools` `@PG`; with
 /// `--no-PG` it does not. Records are unaffected.
 #[test]
@@ -2299,7 +2299,7 @@ fn view_b_embeds_pg_in_binary_bam_header() {
 
 /// The SAM-text-intermediate binary paths (here: `view -b -z`
 /// sanitizer on BAM input) also inject the samtools `@PG` into the
-/// binary BAM header (TODO-NEXT #4).
+/// binary BAM header (completed library batch #4).
 #[test]
 fn view_b_sanitizer_bam_path_embeds_pg() {
     let tmp = tmp_dir("view-b-sanitize-pg");
@@ -2356,7 +2356,7 @@ fn view_b_sanitizer_bam_path_embeds_pg() {
 /// BAM-input filter and region binary copies inject the samtools
 /// `@PG` (routed via the SAM-text path when `@PG` is wanted),
 /// suppressed by `--no-PG` which keeps the fast binary copy
-/// (TODO-NEXT #4).
+/// (completed library batch #4).
 #[test]
 fn view_b_bam_filter_and_region_paths_embed_pg() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
@@ -2453,7 +2453,7 @@ fn view_b_bam_filter_and_region_paths_embed_pg() {
 }
 
 /// `view -C` (SAM->CRAM) likewise embeds the samtools `@PG` in the
-/// CRAM header unless `--no-PG` (TODO-NEXT #4).
+/// CRAM header unless `--no-PG` (completed library batch #4).
 #[test]
 fn view_c_embeds_pg_in_binary_cram_header() {
     // Uses the same known-good fixtures as the other SAM->CRAM tests.

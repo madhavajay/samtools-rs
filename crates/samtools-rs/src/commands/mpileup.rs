@@ -20,7 +20,7 @@
 //! (`-B --ff`) and `mpileup.out.5` (overlap).
 //!
 //! **Parity gap (tracked):** BAQ recomputation (HTSlib default, disabled
-//! with `-B`; needs TODO-NEXT #11) is not yet applied, so a handful of
+//! with `-B`; needs completed library batch #11) is not yet applied, so a handful of
 //! base-quality characters differ on non-`-B` inputs (depths and read
 //! bases match exactly — see `mpileup.out.1`).
 

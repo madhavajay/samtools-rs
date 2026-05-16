@@ -4,26 +4,26 @@ Goal: build a pure Rust replacement for the `samtools` C program with full subco
 
 ## Active Goal
 
-**`TODO-NEXT.md` is COMPLETE (all 12 library/infra items done,
-byte/fixture-verified, committed).** The earlier samtools-only
-constraint no longer applies: minimal patches to the **owned vendored
-noodles fork** (`madhavajay/noodles`, an `htslib-rs` submodule) are
-sanctioned by the Ground rule's "(and carry minimal patches)" clause,
-and every htslib-rs / noodles gap has been closed that way (pins
-bumped). The remaining project work is **only the two fixtureless
-subcommands `phase` + `targetcut`** (no upstream `test/*` expected
-outputs → faithful ports verifiable by unit tests, not the byte-exact
-harness) and **Phase 4/5 polish**. Per-subcommand integration tests
-and the byte-exact upstream harness already cover every other
-subcommand.
+**The library/infra blocker batch is complete and folded into this
+file.** All 12 htslib-rs / vendored-noodles work items are
+byte/fixture-verified, committed, pinned, and summarized below under
+**Completed Library / Infra Batch**. The separate planning file was
+removed so `TODO.md` is now the single source of truth.
+
+The remaining project work is **only the two fixtureless subcommands
+`phase` + `targetcut`** (no upstream `test/*` expected outputs →
+faithful ports verifiable by unit tests, not the byte-exact harness)
+and **Phase 4/5 polish**. Per-subcommand integration tests and the
+byte-exact upstream harness already cover every other subcommand.
 
 ## Current Handoff — 2026-05-17
 
-> **`TODO-NEXT.md` COMPLETE (12/12).** All library/infra blockers
-> resolved via the owned vendored noodles fork; every upstream-fixtured
-> subcommand byte-exact vs its full harness. Only `phase` +
-> `targetcut` (no upstream fixtures) and Phase 4/5 polish remain.
-> The dated narrative below this banner is historical.
+> **Library/infra batch COMPLETE (12/12) and rolled into `TODO.md`.**
+> All blockers resolved via htslib-rs plus the owned vendored noodles
+> fork; every upstream-fixtured subcommand is byte-exact vs its full
+> harness. Only `phase` + `targetcut` (no upstream fixtures) and Phase
+> 4/5 polish remain. The dated narrative below this banner is
+> historical.
 
 Merged baseline:
 - PR #7, https://github.com/madhavajay/samtools-rs/pull/7, is merged into `main`.
@@ -46,8 +46,9 @@ Merged PRs (samtools-rs-only, consolidated via PR #16 `integration-all-prs` → 
 - PR #14, https://github.com/madhavajay/samtools-rs/pull/14, branch `addreplacerg-default-rg` (from `main`, two commits) — `addreplacerg` defaults to the first header `@RG` ID when neither `-r`/`-R` is given, upstream `@RG` header reconciliation (`-r` + `overwrite_all` strips other `@RG` lines; `-w` overwrites a same-ID line), and `-R ID` rejection when the ID is absent from the header. Brings the whole upstream `test_addrprg` group (`addrprg/{1,2,3,4,5}`, #3 = expected failure) to parity modulo `@PG`.
 - PR #15, https://github.com/madhavajay/samtools-rs/pull/15, branch `reheader-parity` (from `main`) — reorders the shared `pg::push_pg_line` output to upstream's `@PG` field order `ID, PN, PP, VN, CL`. Benefits every command that inserts a samtools `@PG`; the upstream harness strips `\tVN:.*`, so `PP` must precede `VN`. Brings the `reheader/{1,4}` header section to parity after harness reordering.
 
-Active working branch (not yet merged): `work-sam-float-renderer` (off `main`).
-Landed slices on this branch:
+Historical working branch: `work-sam-float-renderer` (merged via the
+samtools-rs-only batch).
+Landed slices on that branch:
 - Shared `sam_render` module with htslib-style aux float formatting.
 - `view` BAM/CRAM→SAM aux float spelling via `sam_render`.
 - `split` SAM output routed through `sam_render::write_record`.
@@ -66,11 +67,7 @@ Landed slices on this branch:
 - **`view --library` / `-l`:** resolves `@RG LB:STR` → RG-ID set from
   the header (path + SAM/BAM/CRAM stdin) and filters records by
   `RG:Z:` membership. New test:
-  `view_dash_l_filters_by_read_group_library`. (`merge -s SEED` was
-  examined and skipped: it's already accepted/consumed, and its only
-  upstream effect — random RG/PG-ID collision suffixing — would require
-  reworking merge header reconciliation, out of scope for a bounded
-  slice.)
+  `view_dash_l_filters_by_read_group_library`.
 - **`samples -i` custom-index resolution:** `-X` index path now
   resolves an exact file, a directory holding the index, or a prefix
   (matching `sam_index_load3`). New test:
@@ -83,7 +80,7 @@ Landed slices on this branch:
   shares the SAM/BAM `update` chokepoint, so `--remove-dups` already
   excludes `BAM_FDUP` records from histograms there. New test:
   `stats_remove_dups_excludes_duplicates_on_cram_region_path`. The
-  no-region CRAM summarize path remains blocked on the htslib-rs CRAM
+  no-region CRAM path was later unblocked by the completed htslib-rs
   all-record iterator.
 - **`fastq` index × name-grouping (complete):** one index record per
   qname-group, htslib-exact CASAVA barcode normalization
@@ -94,17 +91,16 @@ Landed slices on this branch:
   `fastq_casava_barcode_propagates_from_r1_to_r2_mate`.
 
 Batch status: **all "Remaining tractable samtools-rs-only items" are now
-done or explicitly deferred** (only `merge -s SEED`, whose sole upstream
-effect needs a merge header-reconciliation rework — a substantial
-samtools-rs effort, not a bounded slice). Per the **Active Goal**, the
-remaining actionable work requires htslib-rs / noodles changes (see
-*Items blocked …* below); this samtools-only pass stops here. Final
-validation on `work-sam-float-renderer`: `cargo fmt --all --check`,
+done.** The one item deferred during this historical branch,
+`merge -s SEED`, was later completed with upstream-style seeded
+`@RG`/`@PG` reconciliation and is now byte-exact vs the upstream merge
+fixtures. Per the **Active Goal**, the remaining actionable work moved
+to the now-completed library/infra batch summarized below. Final
+validation on `work-sam-float-renderer`:
+`cargo fmt --all --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, and
 `cargo test --workspace` (**2601 passing, 0 failing**) all green; the
-upstream `bam2fq/{5,8,10,12}` fixtures now match byte-for-byte. Next:
-open one PR for this branch, get CI green, merge to `main`, then a new
-working branch (the next batch is htslib-rs/noodles-blocked work).
+upstream `bam2fq/{5,8,10,12}` fixtures now match byte-for-byte.
 
 Latest known validation (on `main` at `b312c99`, post-merge):
 - Rust tests: 416 `samtools-rs` passing, 0 failing (`cargo test --workspace`: 2587 passing).
@@ -113,7 +109,7 @@ Latest known validation (on `main` at `b312c99`, post-merge):
 
 Estimated whole-project completion:
 - **Roughly 95%+** toward the full `samtools` replacement goal. All 12
-  `TODO-NEXT.md` library/infra items are done and committed, and every
+  library/infra blocker items are done and committed, and every
   upstream-fixtured subcommand is byte-exact vs its entire harness:
   `consensus` (77/77 `consensus.reg`), `sort` (all `test_sort` incl.
   minimiser/template-coordinate), `cram-size` (3/3), `reference` (all
@@ -140,23 +136,23 @@ fragmented anti-pattern; #16 consolidated them — keep it to one large PR
 branch going forward.)
 
 What to do next:
-1. Create one working branch off `main` for the next batch of bounded slices.
-2. Land each slice from **Remaining tractable samtools-rs-only items** below as its own commit on that branch, running the full gate (`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`) green after every commit, and updating `TODO.md`, `docs/subcommand-coverage.md`, and `docs/test-status.md` as you go.
-3. Open a single PR for the whole batch, get CI green, merge to `main`, then start the next working branch.
+1. Merge the current top-level pin/documentation PR once CI is green.
+2. Start one short-lived branch from synced `main` for either `phase`, `targetcut`, or Phase 4/5 parity hardening.
+3. Keep the full gate green after every commit (`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`) and update `TODO.md`, `docs/subcommand-coverage.md`, and `docs/test-status.md` as work lands.
 
-Remaining tractable samtools-rs-only items (no htslib-rs / noodles changes required):
+Completed samtools-rs-only batch (no htslib-rs / noodles changes required):
 - ~~**SAM aux float formatting — remaining commands.**~~ **Done.** The shared `samtools_rs::sam_render` module (`format_aux_float`, `format_htslib_exponent`, `fix_sam_aux_floats`, `fix_sam_text`, `write_record`, `write_header`) now backs every noodles-`sam::io::Writer` SAM-output path: `view`, `split`, plus `reheader` SAM→SAM, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, `markdup`, and `cat` (their `SamFile`/`SamStdout`/`Sam*Sink` sinks now wrap a plain `File`/`Stdout` and render through `sam_render`). So every SAM-text output path emits htslib `%g`-style float aux spelling. Regression covered by `sort_sam_output_uses_htslib_float_aux_spelling` plus the existing `view`/`split` fixtures.
 - ~~**`fastq` index extraction × name-grouping interaction.**~~ **Done.** `emit_index_files` dedupes to **one index record per adjacent qname-group** (matching upstream `flush_rec` → `output_index`). The CASAVA barcode field is normalized exactly like htslib `fastq_format1` (`casava_barcode_field`: absent/non-sequence-first → `0`; otherwise non-alpha → `+`, lowercase → upper, e.g. `ac-gt` → `AC+GT`), `-i` index records carry the ` <rnum>:<filt>:0:<barcode>` CASAVA comment, and `GroupedSplitWriter` now **propagates the group barcode across mates** so an R2 (or other) record lacking its own `BC` gets the R1 mate's barcode in its CASAVA comment (`fill_casava_barcode`; upstream `bam_fastq.c:952`). **`bam2fq/{5,8,10,12}` now match byte-for-byte on every output (`1.fq`/`2.fq`/`s.fq` and the index/`bc` files).** New tests: `fastq_index_emits_one_record_per_qname_group_with_casava_comment`, `fastq_casava_barcode_propagates_from_r1_to_r2_mate` (plus the 45 existing fastq tests still green).
 - ~~**`view --library` (`-l`)** library filter via `@RG LB:` aux lookup.~~ **Done.** `view -l STR` / `--library STR` resolves the requested library to the set of `@RG` IDs whose `LB:` equals STR (scanned from the input header for path, SAM/BAM/CRAM stdin), then a record passes iff its `RG:Z:` value is in that set (no-RG / non-matching RG excluded, matching upstream `bam_get_library`). Regression: `view_dash_l_filters_by_read_group_library`.
 - ~~**`view -X` legacy custom-index synopsis**~~ **Done.** `view -X` / `--customized-index` accepts the legacy synopsis where the second positional is the explicit index path (`view -X in.bam in.bam.bai [region…]`); accepted as a no-op (our region queries build/find the index themselves), matching `idxstats -X`. Regression: `view_dash_cap_x_accepts_legacy_custom_index_synopsis`.
-- **`merge -s SEED`** — *deferred (not a bounded slice).* The option is already parsed and its value consumed. Upstream's only use of the seed is `hts_srand48` feeding `lrand48()` for random `@RG`/`@PG`-ID collision suffixes during header merge (`bam_sort.c:408`). Our merge reconciles headers by *rejecting* ID conflicts rather than random-suffixing, so the seed has no observable effect until that suffixing path is implemented — a header-reconciliation rework, larger than a bounded slice.
+- ~~**`merge -s SEED`** seeded header reconciliation.~~ **Done.** The later merge parity batch ports upstream-style seeded `@RG`/`@PG` collision suffixing, plus `-r` filename read groups and `-c`/`-p` combine modes. The upstream `merge/{2,4,5,6,7}` fixtures are byte-exact modulo `@PG`; regression: `merge_reconciles_rg_pg_byte_exact_vs_upstream`.
 - ~~**`samples` BAM index path verification**~~ **Done.** `samples -i` with a custom `-X` index path now mirrors `sam_index_load3`: an exact index file, a *directory* holding the index (`<dir>/<data-name>.bai`), or a suffix-less prefix all resolve via the shared `locate_associated_index` resolver, so index files at non-default locations register `Y`. Regression: `samples_custom_index_directory_reports_index_presence` (and the existing exact-file/pair test still passes).
 - ~~**`addreplacerg --output-fmt=cram`** with a `-T` reference~~ **Done.** `addreplacerg` accepts `-O cram` / `--output-fmt cram` / `--output-fmt=cram` and `-T`/`--reference[=]FILE`; SAM/BAM input → CRAM output spools rewritten records to a temp BAM and converts via the shared `write_cram_from_bam_path_with_reference` (the `.fai` is built if missing). CRAM output without `-T` errors. Regression: `addreplacerg_writes_cram_output_with_reference`.
-- ~~**`stats -d` / `--remove-dups` edge cases**~~ **Done (tractable part).** The CRAM *region* path iterates real records through the same `update_record_with_targets` → `update` chokepoint as SAM/BAM, which already gates all histogram/seq/quality accumulation on `self.total` increasing (and `--remove-dups` filters `BAM_FDUP` before `total` is bumped). Verified end-to-end by `stats_remove_dups_excludes_duplicates_on_cram_region_path` (SAM→CRAM→indexed→region stats with/without `-d`). The CRAM *no-region* path uses the `summarize_cram_records_from_path_with_reference` summary path, which discards per-record seq/quality — that remains **blocked on the htslib-rs CRAM all-record iterator** (already tracked in the blocked list).
+- ~~**`stats -d` / `--remove-dups` edge cases**~~ **Done.** The CRAM *region* path iterates real records through the same `update_record_with_targets` → `update` chokepoint as SAM/BAM, which already gates all histogram/seq/quality accumulation on `self.total` increasing (and `--remove-dups` filters `BAM_FDUP` before `total` is bumped). Verified end-to-end by `stats_remove_dups_excludes_duplicates_on_cram_region_path` (SAM→CRAM→indexed→region stats with/without `-d`). The CRAM no-region path was later unblocked by the htslib-rs all-record iterator; only optional CRAM NM recompute for exact mismatch/error-rate parity remains as a non-fixture-blocking nicety.
 
 Items previously blocked on htslib-rs / noodles extensions — **ALL
-RESOLVED** (via `TODO-NEXT.md` #1–#12; the "htslib-rs Extensions
-Needed" list at the end of this file is fully checked off):
+RESOLVED** (see **Completed Library / Infra Batch** below; the
+"htslib-rs Extensions Needed" list is fully checked off):
 - ~~pileup-dependent commands~~ — pileup iterator done (#1); `mpileup`/
   `consensus`/`coverage`/`bedcov`/`depth` byte-exact (`consensus`
   77/77); `ampliconstats` done; only `phase`/`targetcut` remain
@@ -171,7 +167,24 @@ Needed" list at the end of this file is fully checked off):
 
 ## Progress Snapshot
 
-**Phases 0–2 complete; Waves A/B/C/D substantially complete and byte-exact for the upstream-fixtured subcommands. `TODO-NEXT.md` is COMPLETE — all 12 numbered library/infra items done, byte/fixture-verified and committed (pileup iterator, CRAM all-record iterator, CRAM container/codec inventory → `cram-size`, binary `@PG`, aux mutation, threads, write-index, SO-less index, region grammar, BAQ, large-ref CSI, embed_ref read+write).** Subcommands now byte-exact vs their entire upstream harness include: `consensus` (all 77 `consensus.reg`), `sort` (all `test_sort`), `cram-size` (all 3), `reference` (all `test_reference`), `calmd` (`test_calmd`), `stats`, `markdup`, `ampliconclip`, `ampliconstats`, `merge`, `fixmate`, `addreplacerg`, `reset`, plus `coverage`/`bedcov`/`depth`/`mpileup` tabular suites. **Remaining: only `phase` (`phase.c`, 843 LOC) and `targetcut` (`cut_target.c`, 257 LOC) — neither has upstream test fixtures (dense numerical HMM / errmod ports, verifiable only by faithful port + unit tests, not the byte-exact harness) — plus Phase 4/5 polish (per-subcommand integration tests largely already in place; thread/exit-code/perf triage).**
+**Phases 0–2 complete; Waves A/B/C/D substantially complete and
+byte-exact for the upstream-fixtured subcommands. The completed
+library/infra batch delivered all 12 numbered blockers
+byte/fixture-verified and committed: pileup iterator, CRAM all-record
+iterator, CRAM container/codec inventory for `cram-size`, binary `@PG`,
+aux mutation, threads, write-index, SO-less index, region grammar, BAQ,
+large-ref CSI, and embed_ref read+write.** Subcommands now byte-exact
+vs their entire upstream harness include: `consensus` (all 77
+`consensus.reg`), `sort` (all `test_sort`), `cram-size` (all 3),
+`reference` (all `test_reference`), `calmd` (`test_calmd`), `stats`,
+`markdup`, `ampliconclip`, `ampliconstats`, `merge`, `fixmate`,
+`addreplacerg`, `reset`, plus `coverage`/`bedcov`/`depth`/`mpileup`
+tabular suites. **Remaining: only `phase` (`phase.c`, 843 LOC) and
+`targetcut` (`cut_target.c`, 257 LOC) — neither has upstream test
+fixtures (dense numerical HMM / errmod ports, verifiable only by
+faithful port + unit tests, not the byte-exact harness) — plus Phase
+4/5 polish (per-subcommand integration tests largely already in place;
+thread/exit-code/perf triage).**
 
 Subcommands shipped (30 of ~40):
 - ✅ byte-parity verified: `flags`, `quickcheck`, `dict`
@@ -214,9 +227,10 @@ Progress snapshot PR chain:
 
 ### Current Goal Constraint
 
-See **Active Goal** above: this pass is samtools-rs-only. Underlying-library
-blockers belong at the end of this file, and the pass stops when those are the
-only actionable tasks left.
+See **Active Goal** above: underlying-library blockers are complete and
+summarized in this file. New HTSlib-shaped API gaps should still be
+implemented in `htslib-rs` first and consumed from `samtools-rs` after
+the dependent htslib-rs commit is merged and pinned.
 
 ### BioScript VNtyper Native API Status
 
@@ -333,7 +347,7 @@ These are used by nearly every subcommand and must exist before subcommands can 
 - [x] **BAM flag bits + parse/format** (`samtools-rs/src/bam_flag.rs`): the `BAM_F*` constants plus `bam_str2flag` / `bam_flag2str` equivalents. Used by `flags` and (later) `view` / `flagstat`.
 - [x] **Raw header text extractor** (`samtools-rs/src/header_text.rs`): preserves original `@`-line order for SAM, BAM, and CRAM inputs. Required by `head`, `view -h`, `samples`, etc. — noodles' canonical writer reorders headers, which breaks byte parity.
 - [~] **BAM sanitizer** (`samtools-rs/src/sanitize.rs`): partial port of `samtools.h`'s `FIX_*` flags and `bam_sanitize_options`, including upstream reset semantics for `all` / `none` / `off`, `cigarx` implying `cigdup`, and the parser's special `on` behavior. Record-level mutation now covers position/unmap correction, mapping-quality reset, unmapped CIGAR clearing, NM/MD/CG/SM aux stripping, overhang CIGAR trimming, CIGAR `=`/`X` conversion, and duplicate CIGAR op merging; `fixmate`, `checksum`, and `view -z` consume the shared parser/mutator, with `fixmate` matching the upstream `fixmate/sanitize.sam.expected` fixture under `--no-PG`. **Pending:** broaden edge-case parity against upstream sanitizer fixtures and direct binary-record sanitizer paths where text roundtrips are currently used.
-- [~] **@PG add helper** (`samtools-rs/src/pg.rs`): shared helper now builds raw-header `@PG` lines with HTSlib-style argv stringification, generated unique IDs, and upstream `sam_hdr_add_pg` field order `ID, PN, PP, VN, CL` (PP precedes VN/CL so the upstream harness' `s/\tVN:.*//` normalization keeps `PP`), with `PP` links for terminal program chains. `cat`, `split`, `reheader`, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, and `view`'s SAM-output paths (file-input header-only, SAM output with `-h`, plus BAM/CRAM stdin SAM/header-only) use it for default output headers and honor `--no-PG`. The upstream `reheader/{1,4}` header section now matches after harness reordering. **Pending:** integrate `pg::add_samtools_pg_to_header` into `view`'s binary BAM/CRAM output paths (currently emitted by `htslib-rs` internal writers — see *htslib-rs Extensions Needed*) and verify byte-parity against upstream `sam_hdr_add_pg` for complex merge/split/reheader cases.
+- [~] **@PG add helper** (`samtools-rs/src/pg.rs`): shared helper now builds raw-header `@PG` lines with HTSlib-style argv stringification, generated unique IDs, and upstream `sam_hdr_add_pg` field order `ID, PN, PP, VN, CL` (PP precedes VN/CL so the upstream harness' `s/\tVN:.*//` normalization keeps `PP`), with `PP` links for terminal program chains. `cat`, `split`, `reheader`, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, and `view`'s SAM-output paths (file-input header-only, SAM output with `-h`, plus BAM/CRAM stdin SAM/header-only) use it for default output headers and honor `--no-PG`. The upstream `reheader/{1,4}` header section now matches after harness reordering. Binary `@PG` is wired for every `view` input→binary path that noodles can decode (SAM→BAM/CRAM, BAM→BAM/CRAM including plain/filter/region/sanitizer). **Pending:** CRAM-input→binary header transform remains on the direct-copy path until the remaining noodles CRAM decode limitation is addressed; continue verifying complex merge/split/reheader `@PG` chains.
 - [x] **Aux-tag list parser** (`samtools-rs/src/aux_list.rs`): port `parse_aux_list` from `sam_utils.c`. Used by `view`, `reset`, `fastq`, and future aux-aware commands.
 - [~] **BED index** (`samtools-rs/src/bedidx.rs`): shared BED parser/index now stores 0-based half-open intervals by reference, skips comments/UCSC metadata, emits HTSlib-style 1-based inclusive region strings, supports overlap queries, and is used by `view -L`, `depth -b`, `bedcov`, and native `view_bed`. **Pending:** interval-tree acceleration/parity with `bedidx.c`, stricter upstream diagnostics where needed, and integration into `ampliconclip` and future `mpileup`.
 - [~] **Reference helpers** (`samtools-rs/src/reference.rs`): shared FASTA helper now derives associated `.fai` paths, builds missing FASTA indexes through `htslib-rs::faidx_compat`, loads `(SN, LN)` dictionaries, and matches candidate FASTA references against BAM/CRAM `@SQ` dictionaries for `samples -f/-F`. **Pending:** mmap/FASTA sequence cache, common `--reference` option plumbing, CRAM reference resolution, and integration into `calmd`, `consensus`, `mpileup`, `phase`, and `import`.
@@ -394,15 +408,15 @@ The waves are ordered to land foundational machinery first (read/write/index) an
 - [~] `coverage` (`coverage.c`) — per-reference/`-r` region `numreads`, `covbases`, `coverage`, `meandepth`, `meanbaseq`, and `meanmapq` via CIGAR walks for SAM, BAM, and reference-backed indexed CRAM. `--min-depth` thresholds covered-base counts, `-Q`/`--min-BQ` filters low-quality bases, `-q`/`--min-MQ` filters reads, `-b`/`--bam-list` expands input filename lists, `--ff`/`--excl-flags` replaces the default filter-out flags, `--rf`/`--incl-flags` requires at least one selected flag, `-l`/`--min-read-len` filters short alignments, `-d` caps per-position depth for reported coverage/depth metrics, and multiple inputs aggregate into one row per reference/region. `-m`/`--histogram` (with `-A`/`--ascii` and `-D`/`--plot-depth` routed through the same path) emits a 10-row ASCII histogram with `-w`/`--n-bins` controlling the column count. **Byte-exact** vs the entire upstream `test_coverage` tabular suite (`coverage/{1..5}.expected`, incl. multi-input and `-Q`/`-q`): C `printf %g`/`%.3g` formatting (`c_printf_g`, `coverage.c:211`), `min_depth`-gated `meandepth`/`meanbaseq` accumulators (per-position baseq vecs), and pileup-arrival reference row ordering. Test `coverage_matches_upstream_tabular_fixtures`. **Pending:** byte-parity for the UTF-8 box-drawing histogram + sidebar, `-D` true depth-plot, CRAM without explicit reference.
 - [~] `bedcov` (`bedcov.c`) — total aligned-base coverage per BED region, walking each record's CIGAR for SAM, BAM, and reference-backed indexed CRAM. `-Q` mapq filter, `-g`/`-G` filter-mask controls, `-j` deletion/refskip skipping, `-H` output headers, `-c` read-count columns, and `-d` depth-threshold columns are supported. **Byte-exact** vs all four upstream `test_bedcov` fixtures (`bedcov/bedcov{,_j,_gG,_c}.expected`), including attached `-g512 -G2048`. **Pending:** none for the tabular suite; CRAM without explicit reference.
 - [~] `stats` (`stats.c` + `stats_isize.c`, 123k + 8k) — `SN` (Summary Numbers) section plus FFQ/LFQ first/last fragment quality histograms, GCF/GCL first/last fragment GC histograms, and approximate CIGAR-walk COV coverage histograms for SAM, BAM, and reference-backed CRAM region paths, including record-backed `-I`/`--id` read-group/sample filtering, `-f`/`--required-flag`, `-F`/`--filtering-flag`, `-i`/`--insert-size` insert-size cap, `-m`/`--most-inserts` insert-size bulk selection, `-l`/`--read-length`, `-q`/`--trim-quality` BWA trim counting, `-c`/`--coverage MIN,MAX,STEP` COV binning, and `-g`/`--cov-threshold` target percentage lines with target-region validation. SAM and BAM iterate records directly to populate sequence-length, quality, GC, CIGAR, NM, COV, and runtime coordinate-order accumulators (CRAM non-region remains on the `summarize_*` summary path and therefore reports zeros for those fields, with `is sorted` still falling back to header `SO`). The emitted lines now cover: raw total / filtered / sequences / runtime is sorted / 1st & last fragments / mapped / mapped+paired / unmapped / properly paired / paired / duplicated / MQ0 / QC-failed / non-primary / supplementary / total length / total first & last fragment length / bases mapped / bases mapped (cigar) / mismatches (NM aux) / error rate / average length & per-fragment / maximum length & per-fragment / bases trimmed / average quality / singletons / insert size mean & stddev / inward, outward, and other oriented pair counts / pairs on different chromosomes / percentage of properly paired reads / target bases / target genome coverage above threshold. SAM, indexed BAM, and reference-backed CRAM positional region arguments and `-t` target files restrict the summary and COV positions, with overlapping BAM/CRAM regions de-duplicated. `-d` / `--remove-dups` filters duplicate-marked primary records and their quality/GC/COV histogram contributions. Missing CRAM references fail cleanly. **Pending:** exact pileup-backed COV byte parity, per-cycle, BAQ, CRAM non-region read-group/read-length/trim-quality filtering, and CRAM non-region sequence-length/quality/GC/COV stats (requires a CRAM all-record iterator in `htslib-rs`).
-- [~] `mpileup` (`bam_plcmd.c`, 49k) — default **text** pileup implemented on the new `htslib-rs::alignment_compat` pileup iterator (`pileup_from_alignment_paths_with[_reference]_and_options` + `PileupColumn`/`PileupRead`). Supports multi-input + `-b` list (incl. `file://`), `-f` reference (plain or bgzipped, for the ref-base column and CRAM decode), `-r region` (incl. attached `-r17:1-2` form), `-Q`/`--min-BQ` (default 13), `-q`/`--min-MQ`, `--ff`/`--excl-flags` (mask **replace**, default `0x704`), `--rf`/`--incl-flags`, `-A`/`--count-orphans`, `-x`/`--ignore-overlaps`, `-o`. Faithful `pileup_seq` byte encoding (`.`/`,`, upper/lower mismatch, `^`+mapq head, `$` tail, `*` deletion, `<`/`>` ref-skip, `+`/`-` indels), HTSlib `MPLP_SMART_OVERLAPS` overlap removal and `MPLP_NO_ORPHAN` orphan filter (both in the htslib-rs pileup engine), and the `[mpileup] N samples in M input files` stderr line. **Byte parity:** upstream `mpileup.out.3` (`-B --ff 0x14`) and `mpileup.out.5` (overlap) match exactly; `mpileup.out.1` matches on depth + read bases (a few quality chars differ only where HTSlib applies BAQ). Integration tests `mpileup_minus_b_ff_matches_upstream_out3`, `mpileup_overlap_removal_matches_upstream_out5`. **Pending:** BAQ-adjusted qualities (TODO-NEXT #11), `@RG`-`SM` sample grouping (currently one sample per file), VCF/BCF (`-g`/`-v`) output, `-a`/`-aa` all-positions, base-modification columns, per-position mods/qpos/qname extra columns, CRAM-without-index-via-region efficiency.
+- [~] `mpileup` (`bam_plcmd.c`, 49k) — default **text** pileup implemented on the new `htslib-rs::alignment_compat` pileup iterator (`pileup_from_alignment_paths_with[_reference][_and_options]` + `PileupColumn`/`PileupRead`). Supports multi-input + `-b` list (incl. `file://`), `-f` reference (plain or bgzipped, for the ref-base column and CRAM decode), `-r region` (incl. attached `-r17:1-2` form), `-Q`/`--min-BQ` (default 13), `-q`/`--min-MQ`, `--ff`/`--excl-flags` (mask **replace**, default `0x704`), `--rf`/`--incl-flags`, `-A`/`--count-orphans`, `-x`/`--ignore-overlaps`, `-o`. Faithful `pileup_seq` byte encoding (`.`/`,`, upper/lower mismatch, `^`+mapq head, `$` tail, `*` deletion, `<`/`>` ref-skip, `+`/`-` indels), HTSlib `MPLP_SMART_OVERLAPS` overlap removal and `MPLP_NO_ORPHAN` orphan filter (both in the htslib-rs pileup engine), and the `[mpileup] N samples in M input files` stderr line. **Byte parity:** upstream `mpileup.out.3` (`-B --ff 0x14`) and `mpileup.out.5` (overlap) match exactly; `mpileup.out.1` matches on depth + read bases (a few quality chars differ only where HTSlib applies BAQ). Integration tests `mpileup_minus_b_ff_matches_upstream_out3`, `mpileup_overlap_removal_matches_upstream_out5`. **Pending:** BAQ-adjusted qualities from the completed BAQ/probaln surface, `@RG`-`SM` sample grouping (currently one sample per file), VCF/BCF (`-g`/`-v`) output, `-a`/`-aa` all-positions, base-modification columns, per-position mods/qpos/qname extra columns, CRAM-without-index-via-region efficiency.
 - [x] `consensus` (`bam_consensus.c`, 126k, + `consensus_pileup.c`) — **byte-exact vs ALL 77 `test/consensus/consensus.reg` cases**: both `--mode simple` (freq/score) and the default `bayesian`/`recall` Gap5 model (`calculate_consensus_gap5` + the `consensus_init` probability tables / `fast_exp`/`fast_log2`/`ph_log` math, fed by the htslib-rs pileup `nm_init` precompute `PileupRead::bayes_poly`/`bayes_nm_local`), fasta/fastq/pileup, `-a`/`-aa`, `-r`, `-T`/`--ref-qual`, `--min-MQ`/`--min-BQ`, show-del/ins, glued short options. In-process harness test `consensus_matches_upstream_consensus_reg` (77/77).
 - [ ] `phase` (`phase.c`) — heterozygote phasing.
 - [~] `depad` / `pad2unpad` (`padding.c`) — SAM input with `-T` padded FASTA reference and `-s` SAM output converts padded reference columns to unpadded coordinates/CIGAR (`I`/`P`) and matches the upstream `depad.001` fixture with `--no-PG`. **Pending:** BAM input/output, CRAM, binary output modes (`-u`/`-1`), and full upstream `test_depad` parity.
 - [~] `ampliconstats` (`amplicon_stats.c`, 1776 LOC) — **faithful port**. Per-ref BED (file order, strand), `count_amplicon`/`bed2amplicon`, ±`pos-margin` position→amplicon lookup, `accumulate_stats` (flag filter, qname read-pair overlap removal, `depth_all`/`depth_valid`, `nreads`/`nbases`/`coverage`, `amp_dist` via TLEN±`tlen-adjust`, `tcoord` freq map), `append_lstats` (sum+sum² s.d.), full `dump_stats` (`SS`/`AMPLICON`/`F·`/`C·` incl. `depth_bin` RLE, `TCOORD` ≥ `tcoord-min-count`, `FAMP`, `COMBINED` MEAN/STDDEV). `-S`/`-c`/`-t`/`-d d1,d2,d3`/`-m`/`-D`/`-b`/`-a`/`-l`/`-f`/`-F`/`-o`. **Byte-exact vs the entire upstream `test_ampliconstats` harness** (`stats`, `stats_mixed`, `stats_partial`, modulo the harness-stripped version/command-line lines); test `ampliconstats_matches_upstream_test_ampliconstats_fixtures`. **Pending:** `--tcoord-bin` aggregation, CRAM, `--use-sample-name`.
 - [x] `cram-size` (`cram_size.c`) — **byte-exact vs the entire upstream `test/cram_size/cram_size.reg`** (`normal.out`, `verbose.out`, `encodings.out`). Faithful `cram_expand_method`/`comp_method2expanded` method decoder + verbatim tables, `Container::blocks()` walk, `cram_cid2ds` content_id→data-series map, normal (aggregate-by-cid) / `-v` (by cid+method) reports with the exact `BLOCK …%6.2f%% %-Ns` formatting + ratio/`>999%`/summary, and `-e` `cram_describe_encodings`/`cram_codec_describe` with htslib's exact DS + `tag_encoding_map` ordering. Built on the vendored-noodles CRAM inventory surface (`CompressionHeader` encodings public, `Container::blocks()`, ordered `TagEncodings`). Test `cram_size_matches_upstream_cram_size_reg` (all 3).
-- [~] `checksum` (`bam_checksum.c`, 47k) — default order-agnostic checksum output for SAM/BAM input is implemented, including `-o`, `-f`/`-F`/`-b`, `-c`, `-N`, `-q`, `-v`, `-T`, `-O`, `-P`, `-C`, `-M`, `-B`, `-a` field-selection shorthand with upstream-style sanitizer defaults, `-z`/`--sanitize` record mutation, `-m` checksum-output merging for default/position/CIGAR/mate-column reports, selected and wildcard/exclusion aux-tag hashing for scalar/string/array tags with canonical integer encoding, read-group grouping, and Rust tests matching upstream `chk1.1.expected` and `chk1.3.expected` after the harness' checksum path-line normalization. **Pending:** CRAM input (needs htslib-rs CRAM all-record iterator) and full upstream `test_checksum`.
+- [~] `checksum` (`bam_checksum.c`, 47k) — default order-agnostic checksum output for SAM/BAM input is implemented, including `-o`, `-f`/`-F`/`-b`, `-c`, `-N`, `-q`, `-v`, `-T`, `-O`, `-P`, `-C`, `-M`, `-B`, `-a` field-selection shorthand with upstream-style sanitizer defaults, `-z`/`--sanitize` record mutation, `-m` checksum-output merging for default/position/CIGAR/mate-column reports, selected and wildcard/exclusion aux-tag hashing for scalar/string/array tags with canonical integer encoding, read-group grouping, CRAM whole-file input via the htslib-rs all-record iterator, and Rust tests matching upstream `chk1.1.expected` and `chk1.3.expected` after the harness' checksum path-line normalization. **Pending:** full upstream `test_checksum`.
 - [x] `samples` (`bam_samples.c`) — list `@RG SM:` samples across inputs. Header-driven dedup, `-T TAG`, `-o`, `-h`, `-i` index-presence column, `-f`/`-F` FASTA dictionary matching, stdin path lists, `-X` custom index pairs, and CRAM headers are implemented.
-- [~] `reference` (`reference.c`) — SAM/BAM MD-tag reconstruction to FASTA is implemented, including `-o`, `-q`, basic `-r region` output, and indexed BAM region iteration when an associated BAI/CSI is present. **Pending:** embedded-reference CRAM mode (`-e`, blocked on CRAM container/block internals), CRAM input MD path (needs CRAM all-record iteration/reference handling), and full upstream `test_reference` parity.
+- [x] `reference` (`reference.c`) — SAM/BAM/CRAM MD-tag reconstruction to FASTA, indexed BAM `-r`, `-o`/`-q`, embedded-reference CRAM read/write support, and `reference -e` embedded extraction are implemented. **Byte-exact vs the entire upstream `test_reference` suite**, including MD path, embed_ref extraction, and both `-r 17:1000-1500` variants; tests `reference_embed_ref_full_test_reference_byte_exact` and `reference_cram_md_path_with_reference_matches_upstream`.
 - [x] `flags` (`bam_flags.c`) — explain a numeric BAM flag. Byte-for-byte parity with upstream.
 
 ## Phase 4: Test Harness Integration
@@ -422,40 +436,37 @@ The waves are ordered to land foundational machinery first (read/write/index) an
 - [ ] **Performance triage**: measure each subcommand on a representative dataset vs C samtools. Goal is "within 2x" initially; performance fixes come after parity.
 - [ ] **Bench harness**: criterion or custom timing harness under `benches/` for `view`, `sort`, `markdup`, `stats`, `mpileup`.
 
-## htslib-rs Extensions Needed (rolling list) — ✅ ALL RESOLVED
+## Completed Library / Infra Batch — ✅ ALL RESOLVED
 
-**Every entry below is DONE.** Tracked and completed as `TODO-NEXT.md`
-items #1–#12 (all 12 byte- or fixture-verified, committed, with the
-htslib-rs / vendored-noodles-fork pins bumped). The "CRAM internals"
-and "CRAM all-record iterator" gaps were closed via minimal patches to
-the **owned vendored noodles fork** (`madhavajay/noodles`, htslib-rs
-submodule) per the Ground rule's "(and carry minimal patches)" clause.
-Kept for historical traceability:
+All 12 library/infra blockers are complete, byte/fixture-verified, and
+included in the current htslib-rs pin. The CRAM internals and
+embed_ref gaps were closed with minimal patches to the **owned vendored
+noodles fork** (`madhavajay/noodles`, an htslib-rs submodule), then
+consumed from htslib-rs and samtools-rs. This section is the rolled-up
+record of the deleted planning file.
 
-- [x] **`sam_hdr_add_pg`** — binary `@PG` for `view` SAM→BAM/CRAM + BAM→BAM (TODO-NEXT #4).
-- [x] **`bam_aux_update_*`** — aux mutation via `RecordBuf`; all parity consumers byte-exact (TODO-NEXT #7).
-- [x] **`sam_pileup` / `bam_plp_*` API surface** — pileup iterator (TODO-NEXT #1); unlocked mpileup/consensus/coverage/bedcov/depth.
-- [x] **`hts_set_threads`** — `-@` accepted, byte-identical output (TODO-NEXT #8).
-- [x] **`auto_index` / index save during write** — `sort`/`view`/`merge --write-index` BAI == post-pass, byte-verified (TODO-NEXT #9).
-- [x] **Indexing BAMs without `@HD SO:coordinate`** — DONE (TODO-NEXT #6, htslib-rs `530b27c`).
-- [x] **CRAM internals for `cram-size`** — full inventory surface in the vendored noodles fork; `cram-size` byte-exact on all 3 fixtures (TODO-NEXT #3).
-- [x] **`htslib-rs::region`** — `*`/`.` grammar done (TODO-NEXT #10).
-- [x] **`probaln_glocal` and BAQ recalculation** — verified + `calmd` BAM output (TODO-NEXT #11).
-- [x] **CRAM all-record iterator** — `query_cram_records_all_from_path[_with_reference]`; `stats`/`checksum` no-region CRAM, `reference` MD path, embed_ref read+write (TODO-NEXT #2).
+- [x] **#1 pileup iterator** — `htslib_rs::alignment_compat` exposes `PileupColumn` / `PileupRead` plus `PileupOptions` with flag/mapq filters, smart overlap removal, and orphan filtering. It unlocked byte-exact `consensus` (77/77), `coverage`, `bedcov`, `depth`, `mpileup` core text cases, and `ampliconstats`; only fixtureless `phase`/`targetcut` remain.
+- [x] **#2 CRAM all-record iterator + embed_ref read/write** — `query_cram_records_all_from_path[_with_reference]` supports no-region CRAM iteration. `stats` / `checksum` no-region CRAM, `reference` MD path, embedded-reference reads, and `view -O cram,embed_ref=1` writes are wired; the full upstream `test_reference` suite is byte-exact.
+- [x] **#3 CRAM container/block/codec inventory** — vendored noodles exposes the needed compression-header/block surfaces and ordered tag encodings. `cram-size`, `cram-size -v`, and `cram-size -e` are byte-exact vs all three `cram_size.reg` fixtures.
+- [x] **#4 binary `@PG`** — `view` injects binary `@PG` for every decodable input→binary path: SAM→BAM/CRAM and BAM→BAM/CRAM, including plain/filter/region/sanitizer paths. CRAM-input direct-copy paths remain intentionally direct until the remaining noodles CRAM limitation is removed.
+- [x] **#5 CRAM `idxstats` / `flagstat` without explicit reference** — htslib-rs synthesizes an all-`N` reference repository from CRAM header `@SQ` lines so reference-independent flag/tid summaries decode without user `-T`; outputs match BAM equivalents.
+- [x] **#6 index BAMs without `@HD SO:coordinate`** — htslib-rs BAI building no longer rejects missing sort-order headers; `samtools index` works on the affected fixtures.
+- [x] **#7 aux mutation** — mutable `RecordBuf` aux access/removal/insertion covers all parity consumers: `addreplacerg`, `ampliconclip`, `fixmate`, and `calmd` paths are byte-exact where fixture-backed. Optional true in-place binary-resize primitives are performance-only.
+- [x] **#8 threads** — `-@` / `--threads` are accepted through the relevant command paths and produce byte-identical output independent of count. Actual worker-pool performance wiring remains Phase 5/perf work.
+- [x] **#9 write-index** — `sort --write-index`, `view --write-index`, and `merge --write-index` produce BAI files byte-identical to a post-pass `samtools index` build. CSI/CRAI auto-write and true inline index emission are perf/streaming follow-ups.
+- [x] **#10 region grammar** — `.` and `*` region semantics are implemented for the upstream-tested SAM/count paths (`view_dot_region_means_whole_file`, `view_star_region_selects_unplaced_reads`). Binary `*` output shares the remaining binary-filter limitations.
+- [x] **#11 BAQ / `probaln_glocal`** — htslib-rs BAQ/probaln surfaces are verified against realn fixtures, and `calmd -uAr` BAM output is wired and accepted by the upstream `test_calmd` path. Remaining BAQ work is command-level parity such as mpileup BAQ-adjusted qualities.
+- [x] **#12 large-reference CSI robustness** — htslib-rs auto-sizes CSI depth from the largest reference, fixing `large_chrom.bam ref2` / `ref2:1-541556283` without a noodles patch; output is byte-exact vs `dat/large_chrom.out`.
 
-## noodles Extensions Needed (rolling list)
+Resolved noodles-adjacent items:
 
-Keep these at the end during the current samtools-only pass. Do not modify the
-noodles submodule for these blockers until explicitly switching back to
-underlying-library work.
-
-- [x] **CSI query robustness for very large references/regions** — **DONE** (TODO-NEXT #12, htslib-rs `8372873`). Root cause was `build_bam_csi_with_min_shift` using a fixed CSI depth of 5; it now auto-sizes depth from the largest reference via `alignment_csi_depth_for_header` (as the SAM-CSI builder already did). `samtools view large_chrom.bam ref2` and `ref2:1-541556283` are byte-exact vs `dat/large_chrom.out`, no panic / no `invalid end bound`. Fixed entirely in `htslib-rs` — **noodles unpatched**.
-- [~] **SAM aux float formatting (`f:` scalars and `B:f` arrays)** — RESOLVED via samtools-rs option (b): `samtools_rs::sam_render` reuses the htslib-style `format_aux_float` / `format_htslib_exponent` and adds `fix_sam_aux_floats` / `fix_sam_text` (post-process noodles SAM text) plus `write_record` / `write_header` (drop-in for noodles `sam::io::Writer`). Wired into `view` (all binary→SAM text paths + `record_to_sam_line`) and `split` SAM output, bringing `reheader/1` (via `… | view -h`) and `split.expected.grp{1,2}.sam` to byte parity. Remaining commands (`reheader` SAM→SAM, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, `markdup`, `cat`) still write through noodles directly — tracked as a bounded follow-up in the *Remaining tractable items*. The noodles-side option (a) is no longer required.
+- [x] **CSI query robustness for very large references/regions** — fixed entirely in htslib-rs; noodles unpatched.
+- [x] **SAM aux float formatting (`f:` scalars and `B:f` arrays)** — resolved in samtools-rs via `sam_render` helpers now used by every SAM-text output path; no noodles-side patch required.
 
 ## Submodule Pinning
 
 - [x] Pin `samtools/` to a specific upstream release tag once Phase 0 lands (record tag + commit in `README.md` and `version.rs`). Current pin: upstream tag `1.23.1`, commit `6efb9b6da35224cf804921dedecf9fb8f411365d`.
-- [x] Pin `htslib-rs/` to a known-green commit when Phase 0 lands. Current pin: `61e6e72f14f251e0849e8fe87a420eff374892af` (merged TODO-NEXT #1-#12 library/infra blockers, with vendored noodles PR #6 merged; prior: `f61801c`, `3fadffc`, `8372873`, `530b27c`, `ca812dd`, `9cf30b3`, `e25f392`, `5b25622`, `da4d331`, `6bd6fb0`, `88bd29f`).
+- [x] Pin `htslib-rs/` to a known-green commit when Phase 0 lands. Current pin: `61e6e72f14f251e0849e8fe87a420eff374892af` (merged all 12 completed library/infra blockers, with vendored noodles PR #6 merged; prior: `f61801c`, `3fadffc`, `8372873`, `530b27c`, `ca812dd`, `9cf30b3`, `e25f392`, `5b25622`, `da4d331`, `6bd6fb0`, `88bd29f`).
 
 ## Repository Map (target end state)
 

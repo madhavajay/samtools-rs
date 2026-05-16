@@ -2,7 +2,7 @@
 //!
 //! This is a partial port of `bam_checksum.c`. It supports SAM/BAM input for
 //! the default checksum columns and common filters, plus CRAM input via the
-//! htslib-rs whole-CRAM all-record iterator (TODO-NEXT #2; needs the global
+//! htslib-rs whole-CRAM all-record iterator (completed library batch #2; needs the global
 //! `--reference`).
 
 use std::collections::BTreeMap;
@@ -373,7 +373,7 @@ fn checksum_path(input: &Path, opts: &ChecksumOptions, writer: &mut dyn Write) -
                 }
             }
             Exact::Cram => {
-                // TODO-NEXT #2: whole-CRAM via the htslib-rs all-record
+                // completed library batch #2: whole-CRAM via the htslib-rs all-record
                 // iterator, decoded against the global --reference.
                 let Some(reference) = crate::sam_global::current_global_args().reference else {
                     return Err(io::Error::new(

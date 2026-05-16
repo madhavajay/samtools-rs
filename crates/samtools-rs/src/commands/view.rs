@@ -809,7 +809,7 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
             "--help" => return Err(ParseError::Usage),
             // Thread count: accepted and recorded. Output is byte-identical
             // regardless of the value (worker-pool wiring is a perf-only
-            // follow-up — TODO-NEXT #8); `-@ N`, `-@N`, `--threads N`.
+            // follow-up — completed library batch #8); `-@ N`, `-@N`, `--threads N`.
             "-@" | "--threads" => {
                 i += 1;
                 let _ = args

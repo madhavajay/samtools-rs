@@ -1915,7 +1915,7 @@ fn sort_matches_upstream_test_sort_fixtures() {
 
 #[test]
 fn merge_reconciles_rg_pg_byte_exact_vs_upstream() {
-    // TODO-NEXT merge: `merge -s 1` @RG/@PG PRNG reconciliation +
+    // completed library batch merge: `merge -s 1` @RG/@PG PRNG reconciliation +
     // raw-header preservation, byte-exact vs upstream test_merge
     // fixtures (modulo @PG, which the harness strips).
     let d = fixtures_dir();

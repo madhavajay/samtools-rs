@@ -318,7 +318,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     enum StatsInput {
         // Retained for the SAM/BAM/CRAM `AlignmentRecordSummary` fallback
         // shape; no longer produced now that no-region CRAM uses the
-        // full-record iterator (TODO-NEXT #2).
+        // full-record iterator (completed library batch #2).
         #[allow(dead_code)]
         Summaries(Vec<AlignmentRecordSummary>),
         Counts(Box<StatsCounts>),
@@ -1227,7 +1227,7 @@ fn collect_bam_region_stats(
 
 /// Whole-CRAM (no region) stats using the htslib-rs all-record iterator,
 /// so sequence-length/quality/GC/COV/NM accumulate like the BAM path
-/// (TODO-NEXT #2) instead of the seq/quality-discarding `summarize_*` path.
+/// (completed library batch #2) instead of the seq/quality-discarding `summarize_*` path.
 fn collect_cram_full_stats(
     input: &PathBuf,
     reference: PathBuf,
