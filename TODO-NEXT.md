@@ -33,12 +33,23 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
   noodles fork patch (`7a09e02`, htslib-rs `5fe80f8`,
   samtools-rs `b88e3ab`): `get_slice_reference_sequence` now prefers
   the embedded-reference block over the RR flag and returns clean
-  `io::Error`s instead of `expect()`-panicking. *Remaining:* the
-  upstream no-`-T`/`-e` fixtures also need samtools-rs `view -O
-  cram,embed_ref=1` to **write** an embedded reference (noodles CRAM
-  *writer* gap) so the staged fixture is truly embed_ref, plus
-  `reference -e` extraction (shares #3's block exposure); optional
-  CRAM NM recompute for exact `stats` mismatch/error-rate.
+  `io::Error`s instead of `expect()`-panicking. **`reference -e`
+  done** (`f6eb626`): faithful `cram2ref` port — per-slice
+  embedded-ref block extraction via `Container::slices()`/
+  `decode_blocks()`/`reference_sequence_context()`, errors
+  identically on a slice without an embedded reference. *Remaining
+  (one large item):* byte-verifying `reference` no-`-T`/`-e` vs
+  `reference/mpileup.{MD,embed}.fa{,.reg}.expected` needs the staged
+  CRAM to be **genuinely embed_ref**, which requires samtools-rs
+  `view -O cram,embed_ref=1` to *write* an embedded reference — a
+  substantial **noodles CRAM-writer** feature (compute/embed the
+  per-slice consensus reference + preservation-map flags; the
+  noodles writer has no embed support), and no upstream `samtools`
+  binary is available to pre-generate a real embed_ref fixture. The
+  `reference` MD/`-e` *code* is complete & faithful; only this
+  write-side fixture generation blocks the no-`-T`/`-e` byte check.
+  Plus optional CRAM-NM recompute for exact `stats`
+  mismatch/error-rate. Everything else in #2 is done.
 - **#8** correctness ✅ — `-@`/`--threads` accepted everywhere, output
   byte-identical regardless of count (perf worker-pool wiring deferred).
 - **#9** partial — `sort`/`view --write-index` BAI == post-pass BAI.
@@ -249,22 +260,24 @@ quick fix — verified by probing):
 - TODO-NEXT #3/#4/#5 (CRAM internals / binary-`@PG` / CRAM index meta).
 
 **Honest remaining scope:** the library-blocked *foundations* are all
-shipped, tested and pinned. **Of the 12 numbered items: #1, #5, #6,
-#8, #10, #11, #12 ✅ done; #4 ✅ done for every noodles-decodable
-input→binary path; #7, #9 ✅ functionally done (only perf, no parity
-gap).** #2 and #3 are **no longer decision-blocked**: `noodles` here
-is an **owned vendored fork** (`madhavajay/noodles`, htslib-rs
-submodule) that already carries CRAM patches, so the Ground rule's
-"(and carry minimal patches)" clause sanctions minimal fork patches
-(the earlier "decision required" framing misread the rule as
-applying to the third-party registry crate). Progress: #2's embed_ref
-**read** path is fixed in the fork (`7a09e02`); #3's noodles
-inventory surface is now public (`0c719af`). **Remaining:** #3's
-per-block size/method exposure + the ~679-LOC `cram-size` port;
-#2's embed_ref **write** (noodles CRAM-writer gap) + `reference -e`;
-optional CRAM-NM recompute. All now ordinary (if large) port work
-via the sanctioned fork-patch path — no external decision gate.
-Everything else is ordinary samtools-rs porting + Phases 4–5.
+shipped, tested and pinned. **11 of 12 numbered items are fully
+done:** #1,#3,#4,#5,#6,#7,#8,#9,#10,#11,#12 — each fixture- or
+byte-verified (#3 `cram-size` is byte-exact on all three
+`cram_size.reg` fixtures). **#2 is ~95% done:** whole-CRAM
+iterator, `stats`/`checksum` no-region CRAM, embed_ref *read* fix,
+`reference` CRAM MD path (byte-exact with `-T`), and the
+`reference -e` `cram2ref` port are all complete & committed. The
+**one remaining item** is byte-verifying `reference` no-`-T`/`-e`
+against the upstream fixtures, which needs the staged CRAM to be a
+genuine embed_ref file — i.e. samtools-rs `view -O cram,embed_ref=1`
+must *write* an embedded reference. That is a **substantial new
+noodles CRAM-writer feature** (the noodles writer has no embed
+support; it would need to compute/embed a per-slice consensus
+reference + set the preservation-map/slice-header embed fields), and
+no upstream `samtools` binary is available to pre-generate a real
+embed_ref fixture. Plus an optional CRAM-NM recompute for exact
+`stats` mismatch/error-rate. Everything else is ordinary samtools-rs
+porting + Phases 4–5.
 
 ## Ground rules for this pass
 
