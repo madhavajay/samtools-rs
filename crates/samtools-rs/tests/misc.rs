@@ -3,7 +3,7 @@
 
 use std::ffi::OsString;
 use std::io::{BufReader, Cursor};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Mutex;
 
@@ -55,6 +55,60 @@ fn tmp_dir(name: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("samtools-rs-misc-{}-{}", name, std::process::id()));
     std::fs::create_dir_all(&p).unwrap();
     p
+}
+
+fn fasta_region(path: &Path, name: &str, start: usize, end: usize) -> String {
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut current_name = None;
+    let mut seq = String::new();
+
+    for line in text.lines() {
+        if let Some(header) = line.strip_prefix('>') {
+            current_name = Some(header.split_whitespace().next().unwrap_or(""));
+            continue;
+        }
+
+        if current_name == Some(name) {
+            seq.push_str(line);
+        }
+    }
+
+    let slice = &seq[start - 1..end];
+    let mut out = format!(">{name}:{start}-{end} length: {}\n", end - start + 1);
+    for chunk in slice.as_bytes().chunks(60) {
+        out.push_str(std::str::from_utf8(chunk).unwrap());
+        out.push('\n');
+    }
+    out
+}
+
+fn build_reference_embed_ref_cram(tmp: &Path) -> PathBuf {
+    let d = fixtures_dir();
+    let sam = d.join("dat/mpileup.1.sam");
+    let refa = d.join("dat/mpileup.ref.fa");
+    let cram = tmp.join("mpileup.1.tmp.cram");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "view",
+                "--no-PG",
+                "-e",
+                "pos<1000||pos>1200",
+                "-O",
+                "cram,embed_ref=1",
+                "-T",
+                refa.to_str().unwrap(),
+                "-o",
+                cram.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+
+    cram
 }
 
 fn argv(name: &str, rest: &[&str]) -> Vec<OsString> {
@@ -881,30 +935,28 @@ fn reference_region_uses_indexed_bam_query_path() {
     );
 }
 
-/// `samtools reference` MD path on CRAM input. The upstream
-/// `test_reference` CRAM fixture is `embed_ref=1`; noodles-cram 0.93.0
-/// can't decode an embedded reference, so a `--reference` is required
-/// to reconstruct SEQ. With it, the MD2ref output is byte-exact vs the
-/// upstream `mpileup.MD.fa{,.reg}` fixtures (whole-file + region).
-/// (The no-reference / `-e` invocations stay blocked on noodles CRAM
-/// embed_ref / container internals — see TODO-NEXT #2/#3.)
+/// `samtools reference` MD path on CRAM input. Builds the upstream
+/// `test_reference` embed_ref CRAM in a temp dir, then checks the
+/// external-reference MD2ref output byte-exactly against the committed
+/// upstream `mpileup.MD.fa` fixture (whole-file + region).
 #[test]
 fn reference_cram_md_path_with_reference_matches_upstream() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let d = fixtures_dir();
-    let cram = d.join("reference/mpileup.1.tmp.cram");
     let refa = d.join("dat/mpileup.ref.fa");
     let tmp = tmp_dir("reference-cram-md");
+    let cram = build_reference_embed_ref_cram(&tmp);
+    let expected_full = d.join("reference/mpileup.MD.fa.expected");
 
-    let cases: [(&[&str], &str); 2] = [
-        (&[], "reference/mpileup.MD.fa.expected"),
+    let cases: Vec<(&[&str], String)> = vec![
+        (&[], std::fs::read_to_string(&expected_full).unwrap()),
         (
             &["-r", "17:1000-1500"],
-            "reference/mpileup.MD.fa.reg.tmp.expected",
+            fasta_region(&expected_full, "17", 1000, 1500),
         ),
     ];
-    for (extra, expected) in cases {
-        let out = tmp.join(expected.replace('/', "_"));
+    for (i, (extra, expected)) in cases.into_iter().enumerate() {
+        let out = tmp.join(format!("reference_md_{i}.fa"));
         let mut a: Vec<String> = vec![
             "samtools".into(),
             "--reference".into(),
@@ -925,8 +977,8 @@ fn reference_cram_md_path_with_reference_matches_upstream() {
         );
         assert_eq!(
             std::fs::read_to_string(&out).unwrap(),
-            std::fs::read_to_string(d.join(expected)).unwrap(),
-            "{expected} must be byte-exact"
+            expected,
+            "reference MD case {i} must be byte-exact"
         );
     }
 }
@@ -8048,45 +8100,25 @@ fn cram_size_matches_upstream_cram_size_reg() {
 fn reference_embed_ref_full_test_reference_byte_exact() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let d = fixtures_dir();
-    let sam = d.join("dat/mpileup.1.sam");
-    let refa = d.join("dat/mpileup.ref.fa");
     let tmp = tmp_dir("reference-embed");
-    let cram = tmp.join("mpileup.1.tmp.cram");
+    let cram = build_reference_embed_ref_cram(&tmp);
+    let md_full = d.join("reference/mpileup.MD.fa.expected");
+    let embed_full = d.join("reference/mpileup.embed.fa.expected");
 
-    assert_eq!(
-        exit_to_u8(samtools_run(argv(
-            "samtools",
-            &[
-                "view",
-                "--no-PG",
-                "-e",
-                "pos<1000||pos>1200",
-                "-O",
-                "cram,embed_ref=1",
-                "-T",
-                refa.to_str().unwrap(),
-                "-o",
-                cram.to_str().unwrap(),
-                sam.to_str().unwrap(),
-            ],
-        ))),
-        0
-    );
-
-    let cases: [(&[&str], &str); 4] = [
-        (&[], "reference/mpileup.MD.fa.expected"),
-        (&["-e"], "reference/mpileup.embed.fa.expected"),
+    let cases: Vec<(&[&str], String)> = vec![
+        (&[], std::fs::read_to_string(&md_full).unwrap()),
+        (&["-e"], std::fs::read_to_string(&embed_full).unwrap()),
         (
             &["-r", "17:1000-1500"],
-            "reference/mpileup.MD.fa.reg.tmp.expected",
+            fasta_region(&md_full, "17", 1000, 1500),
         ),
         (
             &["-r", "17:1000-1500", "-e"],
-            "reference/mpileup.embed.fa.reg.tmp.expected",
+            fasta_region(&embed_full, "17", 1000, 1500),
         ),
     ];
-    for (extra, expected) in cases {
-        let out = tmp.join(expected.replace('/', "_"));
+    for (i, (extra, expected)) in cases.into_iter().enumerate() {
+        let out = tmp.join(format!("reference_embed_{i}.fa"));
         let mut a: Vec<String> = vec!["samtools".into(), "reference".into(), "-q".into()];
         a.extend(extra.iter().map(|s| s.to_string()));
         a.push(cram.to_str().unwrap().into());
@@ -8101,8 +8133,8 @@ fn reference_embed_ref_full_test_reference_byte_exact() {
         );
         assert_eq!(
             std::fs::read_to_string(&out).unwrap(),
-            std::fs::read_to_string(d.join(expected)).unwrap(),
-            "{expected} must be byte-exact"
+            expected,
+            "reference embed case {i} must be byte-exact"
         );
     }
 }
