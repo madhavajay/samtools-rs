@@ -185,7 +185,8 @@ samtools-rs status legend:
 ### targetcut
 
 - **C source:** `cut_target.c`
-- **samtools-rs status:** ⬜
+- **HTSlib APIs used:** pileup, revised MAQ error model (`errmod_cal`), optional reference-backed BAQ realignment
+- **samtools-rs status:** ✅ — faithful port of the upstream pileup consensus, revised MAQ error-model scoring, and two-state target HMM. Supports `-Q`, `-i`, `-0`, `-1`, `-2`, `-f`/`--reference`, and `-o`; SAM/BAM input works via the htslib-rs pileup engine, and CRAM requires `-f`. Upstream ships no `test_targetcut` fixtures, so coverage is focused Rust unit tests for long supported interval emission, min-baseQ filtering, and attached scoring-option parsing. Optional exact `sam_prob_realn` BAQ side effects for `-f` remain a non-fixture polish item shared with the broader BAQ parity work.
 
 ### reset
 

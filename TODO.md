@@ -10,19 +10,19 @@ byte/fixture-verified, committed, pinned, and summarized below under
 **Completed Library / Infra Batch**. The separate planning file was
 removed so `TODO.md` is now the single source of truth.
 
-The remaining project work is **only the two fixtureless subcommands
-`phase` + `targetcut`** (no upstream `test/*` expected outputs →
-faithful ports verifiable by unit tests, not the byte-exact harness)
-and **Phase 4/5 polish**. Per-subcommand integration tests and the
-byte-exact upstream harness already cover every other subcommand.
+The remaining project work is **only the fixtureless subcommand
+`phase`** (no upstream `test/*` expected outputs → faithful port
+verifiable by unit tests, not the byte-exact harness) and **Phase 4/5
+polish**. Per-subcommand integration tests and the byte-exact upstream
+harness already cover every other subcommand.
 
 ## Current Handoff — 2026-05-17
 
 > **Library/infra batch COMPLETE (12/12) and rolled into `TODO.md`.**
 > All blockers resolved via htslib-rs plus the owned vendored noodles
 > fork; every upstream-fixtured subcommand is byte-exact vs its full
-> harness. Only `phase` + `targetcut` (no upstream fixtures) and Phase
-> 4/5 polish remain. The dated narrative below this banner is
+> harness. Only `phase` (no upstream fixtures) and Phase 4/5 polish
+> remain. The dated narrative below this banner is
 > historical.
 
 Merged baseline:
@@ -118,8 +118,8 @@ Estimated whole-project completion:
   `addreplacerg`, `reset`, `split`, `view`, `idxstats`/`flagstat`
   (incl. CRAM-no-ref), plus the `coverage`/`bedcov`/`depth`/`mpileup`
   tabular suites.
-- Remaining risk is confined to: `phase`/`targetcut` (no upstream
-  fixtures — faithful ports only), the optional non-parity niceties
+- Remaining risk is confined to: `phase` (no upstream fixtures —
+  faithful port only), the optional non-parity niceties
   (CRAM-NM recompute for exact `stats` error-rate; UTF-8 `coverage`
   histogram; mpileup BAQ quals/VCF; external-merge perf), and Phase
   4/5 (exit-code/thread/perf triage; the per-subcommand integration
@@ -136,8 +136,8 @@ fragmented anti-pattern; #16 consolidated them — keep it to one large PR
 branch going forward.)
 
 What to do next:
-1. Merge the current top-level pin/documentation PR once CI is green.
-2. Start one short-lived branch from synced `main` for either `phase`, `targetcut`, or Phase 4/5 parity hardening.
+1. Merge the `targetcut` PR once CI is green.
+2. Start one short-lived branch from synced `main` for either `phase` or Phase 4/5 parity hardening.
 3. Keep the full gate green after every commit (`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`) and update `TODO.md`, `docs/subcommand-coverage.md`, and `docs/test-status.md` as work lands.
 
 Completed samtools-rs-only batch (no htslib-rs / noodles changes required):
@@ -155,7 +155,7 @@ RESOLVED** (see **Completed Library / Infra Batch** below; the
 "htslib-rs Extensions Needed" list is fully checked off):
 - ~~pileup-dependent commands~~ — pileup iterator done (#1); `mpileup`/
   `consensus`/`coverage`/`bedcov`/`depth` byte-exact (`consensus`
-  77/77); `ampliconstats` done; only `phase`/`targetcut` remain
+  77/77); `ampliconstats` and `targetcut` done; only `phase` remains
   (no fixtures).
 - ~~`stats`/`checksum` CRAM no-region~~ — CRAM all-record iterator
   done (#2); wired.
@@ -179,12 +179,12 @@ vs their entire upstream harness include: `consensus` (all 77
 `reference` (all `test_reference`), `calmd` (`test_calmd`), `stats`,
 `markdup`, `ampliconclip`, `ampliconstats`, `merge`, `fixmate`,
 `addreplacerg`, `reset`, plus `coverage`/`bedcov`/`depth`/`mpileup`
-tabular suites. **Remaining: only `phase` (`phase.c`, 843 LOC) and
-`targetcut` (`cut_target.c`, 257 LOC) — neither has upstream test
-fixtures (dense numerical HMM / errmod ports, verifiable only by
-faithful port + unit tests, not the byte-exact harness) — plus Phase
+tabular suites. **Remaining: only `phase` (`phase.c`, 843 LOC) —
+there are no upstream test fixtures, so it is verifiable only by a
+faithful port + unit tests, not the byte-exact harness — plus Phase
 4/5 polish (per-subcommand integration tests largely already in place;
-thread/exit-code/perf triage).**
+thread/exit-code/perf triage).** `targetcut` (`cut_target.c`, 257 LOC)
+is now ported with focused unit tests.
 
 Subcommands shipped (30 of ~40):
 - ✅ byte-parity verified: `flags`, `quickcheck`, `dict`
@@ -196,14 +196,14 @@ history; current truth in the banner + Progress Snapshot above):
 - ~~BAM aux-tag mutation~~ — done; all parity consumers byte-exact.
 - ~~pileup iterator in htslib-rs~~ — done (#1); `mpileup`/`consensus`
   (77/77) / `ampliconstats` / pileup-based `bedcov`/`coverage`/`depth`
-  byte-exact. Only `phase`/`targetcut` remain (no upstream fixtures).
+  byte-exact. Only `phase` remains (no upstream fixtures).
 - ~~CRAM all-record iterator~~ — done (#2); `stats`/`checksum`
   no-region CRAM + `reference` MD path wired.
 - ~~Other complex algorithms~~ — `cram-size` ✅ (3/3), `reference` ✅
   (full `test_reference`, embed_ref read+write), `checksum`/`markdup`/
   `sort` (incl. minimiser + template-coordinate) byte-exact. The only
-  not-fully-ported subcommands are `phase` + `targetcut` (no
-  fixtures); `depad` BAM/CRAM and a few non-parity niceties remain
+  not-fully-ported subcommand is `phase` (no fixtures); `depad`
+  BAM/CRAM and a few non-parity niceties remain
   cosmetic.
 
 htslib-rs extensions landed during this work:
@@ -398,7 +398,7 @@ The waves are ordered to land foundational machinery first (read/write/index) an
 - [x] `markdup` (`bam_markdup.c`, 89k) — **faithful upstream key/score port**. SE/PE duplicate marking for SAM/BAM. PE reads build the upstream `make_pair_key` (template default + `--mode s` sequence; unclipped coords from CIGAR & `MC` tag; `R_LE`/`R_RI` left/right discriminator so a template's two mates get distinct keys and only corresponding mates of duplicate templates collide) plus a shared `make_single_key`; the kept read of a colliding key is the one with the higher `calc_score` = Σ(base qual ≥ 15) + `ms` mate-score tag, with the QCFAIL-asymmetry override and qname `strcmp` tie-break. `-S` seeds a qname `dup_hash` from marked-duplicate reads carrying `SA`/`XA` or an unmapped mate and flags matching supplementary/secondary/unmapped records (gated on `-S`, as upstream). `-b`/`--barcode-tag`, `-c`, `-t` `do` tags, `-d` `dt:Z:SQ|LB` with the full `find_duplicate_chains` optical re-tagging (per-read `original`/`duplicate` chain links + `check_chain_against_original` + `check_duplicate_chain`), `get_coordinates_colons` optical-name parse, `--use-read-groups` (rg-keyed), `--duplicate-count` (`dc:i`), `--include-fails`, `-m`/`--mode t|s`, `-r`, `-s`, `-O`, `-o`, regex `--read-coords`/`--coords-order`/`--barcode-rgx`/`--barcode-name` (via the `regex` crate; capture-span-bounded coord parse), raw-header SAM output (preserves input `@RG`/`@SQ` order), `@PG`/`--no-PG`. **Byte-exact vs the ENTIRE upstream `test_markdup` SAM harness — `markdup/{5..18}.expected.sam` (all 14 fixtures)**; test `markdup_matches_upstream_test_markdup_fixtures`. **Pending:** exact `-s` stats counts, CRAM, the `1..4` expect-fail error-message cases.
 - [~] `rmdup` (`bam_rmdup.c` + `bam_rmdupse.c`) — single-end and paired-end duplicate removal for BAM and SAM inputs. SE records are keyed by `(tid, pos, reverse-flag)`; PE records pair by qname and are keyed by the canonical pair of `(tid, pos, strand)` triples, retaining the highest MAPQ/combined MAPQ record or pair. `-s`/`-S` force single-end treatment. Default `@PG` insertion via `pg::add_samtools_pg_to_header` and `--no-PG` are supported. **Pending:** CRAM, full upstream deprecated-command parity.
 - [~] `calmd` / `fillmd` (`bam_md.c`) — SAM, BAM, and reference-backed CRAM input can emit SAM text with MD/NM tags recomputed against a FASTA reference via CIGAR/reference walking. BAQ paths (`-r`, `-r -e`, `-E`) are wired through `htslib_rs::alignment_compat::recalculate_baq_*` and `apply_existing_baq_from_sam_path` for SAM input, and `-d` drops existing `BQ` tags from the SAM-text output. Default `@PG` insertion via `pg::add_samtools_pg` (text-level) and `--no-PG` are supported. **Pending:** BAM/CRAM output, BAM/CRAM BAQ paths, `-A`/`-C cap`, full upstream MD/BAQ parity.
-- [ ] `targetcut` (`cut_target.c`) — fosmid pool target cutting.
+- [x] `targetcut` (`cut_target.c`) — fosmid pool target cutting. Faithful port of the upstream pileup consensus + revised MAQ error-model scoring + two-state target HMM; supports `-Q`, `-i`, `-0`, `-1`, `-2`, `-f`/`--reference`, and `-o`. Upstream ships no fixture group, so coverage is focused Rust unit tests: long supported interval emission, min-baseQ filtering, and attached scoring-option parsing.
 - [x] `reset` (`reset.c`) — strip alignment fields (`tid`/`pos`/`cigar`/`mate_*`/`template_length`) for BAM and SAM inputs, set MAPQ to `0`, drop a default set of aligner aux tags (NM, MD, AS, XS, SA, MC, MQ, NH, HI, ms), clear `PROPER_PAIR`/`SECONDARY`/`SUPPLEMENTARY`/`REVERSE`/`MATE_REVERSE`, set `UNMAPPED`, set `MATE_UNMAPPED` for paired reads, reverse-restore reverse-strand sequence/quality, preserve duplicate flags with `--dupflag`, remove read-group headers/tags with `--no-RG`, remove program header chains with `--reject-PG`, add a new samtools `@PG` chain entry by default (via the shared `pg::add_samtools_pg_to_header` helper), suppress the new `@PG` with `--no-PG` while preserving existing entries (matching upstream's `noPGentry` semantics), accept SAM/BAM input from stdin/no positional input/`-`, and tolerate legacy SAM `@HD VN:1` headers. `-x`/`--keep-tag` honored, with `--no-RG` taking precedence over keeping `RG`. **Order-preserving aux drop** (input field order, HTSlib `bam_aux_del` semantics) + **raw-header SAM output** (keep `@HD`, drop `@SQ`/`@CO`, `@RG` verbatim, `--reject-PG` removes the named `@PG` + its `PP`-chain descendants) + format inferred from the `-o` extension (`sam_open_mode`: SAM unless `.bam`). `--reject-PG` uses the upstream positional rule (`reset.c:223`: keep `@PG` until the first matching `ID`, drop it and all subsequent `@PG`). **Byte-exact vs every tested upstream `reset` fixture: `basic.1.mp.1` (reset\|view, stdin, file), `basic.output.mp.1` (`-o` SAM in), `basic.bam.input` (`-o` BAM in), `output.nRG.1` (`--no-RG`), `reject.1`, `reject.2`** (harness `hskip=1` + `ignore_pg_header`); test `reset_matches_upstream_test_reset_fixtures`. **Pending:** CRAM I/O.
 - [~] `ampliconclip` (`bam_ampliconclip.c`, 40k) — **faithful port**. Per-reference BED primer sites (sorted by `right`), `matching_clip_site` (binary-search + `--tolerance`/`--strand` overlap pick), `bam_trim_left`/`bam_trim_right` soft/hard clip (CIGAR/POS/SEQ/QUAL rewrite, hardclip merge, full-consume→empty), `active_query_len`-gated `--filter-len`/`--fail-len`/`--unmap-len`, `--both-ends`, `--original` (`OA` tag), `--keep-tag` (default deletes `NM`/`MD`, order-preserving), `--clipped`, `--no-excluded`, `--rejects-file`, `--primer-counts` TSV, `-f` stats, `-o`/`-O sam|bam`, `-b`, raw-header `@HD SO:coordinate→unknown`, default `@PG`/`--no-PG`. **Byte-exact vs the entire upstream `test_ampliconclip` harness** (10 SAM fixtures + 3 primer-counts TSVs); test `ampliconclip_matches_upstream_test_ampliconclip_fixtures`. **Pending:** CRAM, BGZF block fast path, the unused `3_multi_ref_both_clip` edge.
 
@@ -445,7 +445,7 @@ noodles fork** (`madhavajay/noodles`, an htslib-rs submodule), then
 consumed from htslib-rs and samtools-rs. This section is the rolled-up
 record of the deleted planning file.
 
-- [x] **#1 pileup iterator** — `htslib_rs::alignment_compat` exposes `PileupColumn` / `PileupRead` plus `PileupOptions` with flag/mapq filters, smart overlap removal, and orphan filtering. It unlocked byte-exact `consensus` (77/77), `coverage`, `bedcov`, `depth`, `mpileup` core text cases, and `ampliconstats`; only fixtureless `phase`/`targetcut` remain.
+- [x] **#1 pileup iterator** — `htslib_rs::alignment_compat` exposes `PileupColumn` / `PileupRead` plus `PileupOptions` with flag/mapq filters, smart overlap removal, and orphan filtering. It unlocked byte-exact `consensus` (77/77), `coverage`, `bedcov`, `depth`, `mpileup` core text cases, `ampliconstats`, and the fixtureless `targetcut`; only fixtureless `phase` remains.
 - [x] **#2 CRAM all-record iterator + embed_ref read/write** — `query_cram_records_all_from_path[_with_reference]` supports no-region CRAM iteration. `stats` / `checksum` no-region CRAM, `reference` MD path, embedded-reference reads, and `view -O cram,embed_ref=1` writes are wired; the full upstream `test_reference` suite is byte-exact.
 - [x] **#3 CRAM container/block/codec inventory** — vendored noodles exposes the needed compression-header/block surfaces and ordered tag encodings. `cram-size`, `cram-size -v`, and `cram-size -e` are byte-exact vs all three `cram_size.reg` fixtures.
 - [x] **#4 binary `@PG`** — `view` injects binary `@PG` for every decodable input→binary path: SAM→BAM/CRAM and BAM→BAM/CRAM, including plain/filter/region/sanitizer paths. CRAM-input direct-copy paths remain intentionally direct until the remaining noodles CRAM limitation is removed.
