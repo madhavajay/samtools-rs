@@ -412,7 +412,24 @@ fn merge_write_index_builds_bai_for_coordinate_bam_output() {
         .collect();
     assert_eq!(exit_to_u8(merge::main(&argv)), 0);
     assert!(out.exists());
-    assert!(tmp.join("merged.bam.bai").exists());
+    let written_bai = tmp.join("merged.bam.bai");
+    assert!(written_bai.exists());
+
+    // #9 deliverable: the writer-produced index must be
+    // byte-identical to a separate post-pass `samtools index`.
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let copy = tmp.join("merged.copy.bam");
+    std::fs::copy(&out, &copy).unwrap();
+    let idx_argv: Vec<OsString> = ["samtools", "index", copy.to_str().unwrap()]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    assert_eq!(exit_to_u8(samtools_run(idx_argv)), 0);
+    assert_eq!(
+        std::fs::read(&written_bai).unwrap(),
+        std::fs::read(tmp.join("merged.copy.bam.bai")).unwrap(),
+        "merge --write-index BAI must equal a post-pass samtools index BAI"
+    );
 }
 
 #[test]
