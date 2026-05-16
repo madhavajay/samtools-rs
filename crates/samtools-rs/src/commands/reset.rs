@@ -76,7 +76,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 if let Some(v) = iter.next().and_then(|a| a.to_str()) {
                     if let Some(rest) = v.strip_prefix('^') {
                         match parse_aux_list(rest) {
-                            Ok(tags) => keep_only = Some(tags),
+                            Ok(tags) => merge_keep_tags(&mut keep_only, tags),
                             Err(e) => {
                                 print_error("reset", format!("invalid -x value \"{rest}\": {e}"));
                                 return ExitCode::from(1);
@@ -96,7 +96,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "--keep-tag" | "--keep-tags" => {
                 if let Some(v) = iter.next().and_then(|a| a.to_str()) {
                     match parse_aux_list(v) {
-                        Ok(tags) => keep_only = Some(tags),
+                        Ok(tags) => merge_keep_tags(&mut keep_only, tags),
                         Err(e) => {
                             print_error("reset", format!("invalid --keep-tag value \"{v}\": {e}"));
                             return ExitCode::from(1);
@@ -199,6 +199,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn merge_keep_tags(keep_only: &mut Option<HashSet<AuxTag>>, tags: HashSet<AuxTag>) {
+    keep_only.get_or_insert_with(HashSet::new).extend(tags);
 }
 
 #[derive(Clone, Copy)]
@@ -310,9 +314,10 @@ fn run_reset_bam_reader<R>(
 where
     R: Read,
 {
-    let mut header = reader.read_header()?;
-    reset_header(&mut header, settings)?;
-    let mut sink = open_output(output, fmt, &header, raw_header)?;
+    let header = reader.read_header()?;
+    let mut output_header = header.clone();
+    reset_header(&mut output_header, settings)?;
+    let mut sink = open_output(output, fmt, &output_header, raw_header)?;
 
     let mut record = RecordBuf::default();
     loop {
@@ -321,7 +326,7 @@ where
             break;
         }
         reset_record(&mut record, settings);
-        sink.write_record(&header, &record)?;
+        sink.write_record(&output_header, &record)?;
     }
     Ok(())
 }
@@ -379,9 +384,10 @@ fn run_reset_sam_reader<R>(
 where
     R: BufRead,
 {
-    let mut header = reader.read_header()?;
-    reset_header(&mut header, settings)?;
-    let mut sink = open_output(output, fmt, &header, raw_header)?;
+    let header = reader.read_header()?;
+    let mut output_header = header.clone();
+    reset_header(&mut output_header, settings)?;
+    let mut sink = open_output(output, fmt, &output_header, raw_header)?;
 
     loop {
         let mut record = RecordBuf::default();
@@ -389,12 +395,16 @@ where
             break;
         }
         reset_record(&mut record, settings);
-        sink.write_record(&header, &record)?;
+        sink.write_record(&output_header, &record)?;
     }
     Ok(())
 }
 
 fn reset_header(header: &mut sam::Header, settings: &ResetSettings<'_>) -> io::Result<()> {
+    *header.header_mut() = Some(Default::default());
+    header.reference_sequences_mut().clear();
+    header.comments_mut().clear();
+
     if settings.remove_read_groups {
         header.read_groups_mut().clear();
     }
@@ -722,6 +732,8 @@ mod tests {
 
         let text = std::fs::read_to_string(&tmp).unwrap();
         let _ = std::fs::remove_file(&tmp);
+        assert!(text.starts_with("@HD\tVN:1.6\n"));
+        assert!(!text.contains("@SQ\t"));
         let record = text.lines().find(|line| !line.starts_with('@')).unwrap();
         let fields: Vec<_> = record.split('\t').collect();
         assert_eq!(fields[1], "77");
