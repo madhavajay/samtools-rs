@@ -122,6 +122,7 @@ where
             sort_command::OutFmt::Bam,
             false,
             None,
+            None,
         )?;
         Some(sorted_bam)
     } else {
@@ -248,6 +249,7 @@ where
         None,
         sort_command::OutFmt::Bam,
         false,
+        None,
         None,
     )
 }

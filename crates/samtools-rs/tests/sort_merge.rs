@@ -1957,3 +1957,80 @@ fn merge_reconciles_rg_pg_byte_exact_vs_upstream() {
         );
     }
 }
+
+/// Upstream `test_sort` minimiser case (`sort/minimiser-basic.sam`):
+/// `samtools reset --dupflag dat/auto_indexed.tmp.bam | samtools sort
+/// -m 10M -M -K10 -O SAM`. The minimiser sort must reorder the
+/// unmapped reads by their 62-bit minhash key and reverse-complement
+/// the records whose reverse-strand minimiser wins. We assert the
+/// alignment records are byte-identical to the upstream fixture (the
+/// point of the test) and that the `@HD` carries `SS:unsorted:minhash`.
+/// (`reset` BAM-output still keeps `@SQ` / `@HD VN:1.0` rather than
+/// upstream's dropped `@SQ` + `VN:1.6`; that header-fidelity gap is a
+/// separate `reset` follow-up and is intentionally excluded here.)
+#[test]
+fn sort_minimiser_basic_records_match_upstream() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("sort-minimiser-basic");
+    let dir = fixtures_dir();
+    let src = dir.join("dat").join("mpileup.1.sam");
+    let ai = tmp.join("auto_indexed.tmp.bam");
+    let reset_bam = tmp.join("reset.bam");
+    let got = tmp.join("got.sam");
+
+    let run = |args: &[&str]| {
+        let argv: Vec<OsString> = std::iter::once(OsString::from("samtools"))
+            .chain(args.iter().map(OsString::from))
+            .collect();
+        assert_eq!(exit_to_u8(samtools_run(argv)), 0, "args={args:?}");
+    };
+    run(&[
+        "view",
+        "--write-index",
+        "-o",
+        ai.to_str().unwrap(),
+        src.to_str().unwrap(),
+    ]);
+    run(&[
+        "reset",
+        "--dupflag",
+        "-o",
+        reset_bam.to_str().unwrap(),
+        ai.to_str().unwrap(),
+    ]);
+    run(&[
+        "sort",
+        "-m",
+        "10M",
+        "-M",
+        "-K10",
+        "-O",
+        "SAM",
+        "-o",
+        got.to_str().unwrap(),
+        reset_bam.to_str().unwrap(),
+    ]);
+
+    let got_text = std::fs::read_to_string(&got).unwrap();
+    let exp_text = std::fs::read_to_string(dir.join("sort").join("minimiser-basic.sam")).unwrap();
+    let recs = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.starts_with('@'))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    assert_eq!(
+        recs(&got_text),
+        recs(&exp_text),
+        "minimiser-sorted alignment records must be byte-identical to upstream"
+    );
+
+    let hd = got_text
+        .lines()
+        .find(|l| l.starts_with("@HD"))
+        .expect("@HD line");
+    assert!(
+        hd.contains("SO:unsorted") && hd.contains("SS:unsorted:minhash"),
+        "@HD must carry the minhash sort order, got: {hd}"
+    );
+}
