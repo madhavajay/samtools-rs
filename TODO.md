@@ -110,21 +110,17 @@ Latest known validation (on `main` at `b312c99`, post-merge):
 - New focused tests added across PRs: `fastq_index_files_extract_from_barcode_tag`, `fastq_routes_r1_only_singletons_to_singleton_output`, `fastq_dash_t_and_dash_cap_t_combine_aux_tags`, `fastq_interleaves_read1_read2_when_paths_alias`, `fastq_repeated_dash_d_unions_same_tag_values`, `fasta_reverse_strand_record_reverse_complemented_in_output`, `view_qname_file_filters_records_by_name`, `view_r_and_dash_cap_r_filter_by_read_group`, `view_d_and_dash_cap_d_filter_by_aux_tag`, `addreplacerg_defaults_to_first_header_rg_and_preserves_lines`, `addreplacerg_r_overwrite_all_removes_other_header_rg_lines`, and `addreplacerg_dash_cap_r_unknown_id_is_rejected`.
 
 Estimated whole-project completion:
-- **Roughly 95%+** toward the full `samtools` replacement goal. All 12
-  library/infra blocker items are done and committed, and every
-  upstream-fixtured subcommand is byte-exact vs its entire harness:
-  `consensus` (77/77 `consensus.reg`), `sort` (all `test_sort` incl.
-  minimiser/template-coordinate), `cram-size` (3/3), `reference` (all
-  `test_reference` incl. embed_ref read+write), `calmd`, `stats`,
-  `markdup`, `ampliconclip`, `ampliconstats`, `merge`, `fixmate`,
-  `addreplacerg`, `reset`, `split`, `view`, `idxstats`/`flagstat`
-  (incl. CRAM-no-ref), plus the `coverage`/`bedcov`/`depth`/`mpileup`
-  tabular suites.
-- Remaining risk is confined to: the optional non-parity niceties
-  (CRAM-NM recompute for exact `stats` error-rate; UTF-8 `coverage`
-  histogram; mpileup BAQ quals/VCF; external-merge perf), and Phase
-  4/5 (exit-code/thread/perf triage; the per-subcommand integration
-  tests are already in place).
+- **Not done.** The library/infra blockers and Phase 3 command
+  implementation are complete, and a growing set of upstream groups is
+  byte-exact, but the full upstream harness is still advisory. The exact
+  source of truth is `docs/test-status.md`: rows marked `passing` can be
+  promoted into the required subset; rows marked `partial` still need
+  command-level parity work, exclusions, or explicit follow-up rationale.
+- Current required gates cover the stable parity subset in
+  `scripts/run-passing-parity-subset.py` plus the stable regression files in
+  `scripts/run-passing-regression-subset.py`. Remaining project work is Phase
+  4/5: promote more full harness groups, resolve the partial rows, and finish
+  exit-code/thread/perf triage before removing the advisory harness `|| true`.
 
 ### Workflow rule: one large PR branch at a time
 
@@ -174,21 +170,22 @@ library/infra batch delivered all 12 numbered blockers
 byte/fixture-verified and committed: pileup iterator, CRAM all-record
 iterator, CRAM container/codec inventory for `cram-size`, binary `@PG`,
 aux mutation, threads, write-index, SO-less index, region grammar, BAQ,
-large-ref CSI, and embed_ref read+write.** Subcommands now byte-exact
-vs their entire upstream harness include: `consensus` (all 77
-`consensus.reg`), `sort` (all `test_sort`), `cram-size` (all 3),
-`reference` (all `test_reference`), `calmd` (`test_calmd`), `stats`,
-`markdup`, `ampliconclip`, `ampliconstats`, `merge`, `fixmate`,
-`addreplacerg`, `reset`, plus `coverage`/`bedcov`/`depth`/`mpileup`
-tabular suites. `phase` (`phase.c`, 843 LOC) and `targetcut`
-(`cut_target.c`, 257 LOC) are now ported with focused unit tests because
-upstream ships no fixture groups for them. **Remaining: Phase 4/5 polish
-(per-subcommand integration tests largely already in place;
-thread/exit-code/perf triage).**
+large-ref CSI, and embed_ref read+write.** Stable upstream groups/regression
+files include: `consensus` (all 77 `consensus.reg`), `sort` (all
+`test_sort`), `cram-size` (all 3), `reference` (all `test_reference`),
+`head` (all `test_head`), `collate`, `calmd`, `idxstats`, `quickcheck`,
+`markdup`, `bedcov`, `ampliconclip`, and `ampliconstats`. Other commands have
+substantial Rust coverage and partial upstream fixture parity, but remain
+tracked as `partial` until their full `test.pl` groups pass or are explicitly
+excluded. `phase` (`phase.c`, 843 LOC) and `targetcut` (`cut_target.c`, 257
+LOC) are now ported with focused unit tests because upstream ships no fixture
+groups for them. **Remaining: Phase 4/5 full-harness promotion and polish
+(per-subcommand integration tests largely already in place; thread, exit-code,
+and perf triage).**
 
 Subcommands shipped (31 of ~40):
-- ✅ byte-parity verified: `flags`, `quickcheck`, `dict`
-- ✅ functional with partial-feature notes: `head`, `index`, `idxstats`, `samples` (incl. `-i`, `-f`, `-X`, stdin path lists), `flagstat`, `faidx`/`fqidx`
+- ✅ byte-parity verified: `flags`, `quickcheck`, `dict`, `head`
+- ✅ functional with partial-feature notes: `index`, `idxstats`, `samples` (incl. `-i`, `-f`, `-X`, stdin path lists), `flagstat`, `faidx`/`fqidx`
 - 🟡 partial implementation: `view` (SAM↔SAM, SAM→BAM/CRAM, count/header, region queries, `-f/-F/-G/-q` filters, `-L` BED, `-e` filter expression, `-x/--keep-tag` aux strip, `-z` sanitizer mutation, `-p`/`-U` for SAM-input binary output, SAM-output `@PG`/`--no-PG`), `cat` (SAM/BAM record-level concat, `-h`, `-b FILE` input lists, `-r region` for indexed BAM, `@PG`/`--no-PG`), `reheader` (SAM/BAM with `-c` filter, `@PG`/`--no-PG`), `fastq`/`fasta`/`bam2fq` (including `-O` original-quality tags, `-v INT` missing-quality defaults, `-U`/`--UMI-tag` UMI read-name suffixes, and `-i`/`--barcode-tag` CASAVA barcode fields), `split` (with `--no-PG`, `--write-index`), `sort` (in-memory coordinate/name/tag for SAM/BAM/reference-backed CRAM + `@PG`/`--no-PG`), `merge` (in-memory coordinate/name/tag + differing `@SQ` union/remap + `-R region`/`-L BED` + `@PG`/`--no-PG`), `collate` (in-memory name grouping plus `-f` fast primary-pair mode, `-n INT` temp-count compatibility, and legacy positional output prefixes for SAM/BAM/reference-backed CRAM + `@PG`/`--no-PG`), `import`, `rmdup` (single-end + paired-end + `@PG`/`--no-PG`), `markdup` (single-end + paired-end + barcode key + optical-distance `dt` tags + QCFAIL inclusion control + `--mode` compatibility + secondary/supplementary qname propagation + `-r`/`-s`/`-O`/`-o`/`@PG`/`--no-PG`), `bedcov` (CIGAR-walk), `coverage` (CIGAR-walk + ASCII histogram), `depth`, `addreplacerg` (SAM/BAM `-O sam|bam`, `overwrite_all` default, `@PG`/`--no-PG`), `fixmate` (name-sorted BAM/SAM, coordinate-sort rejection, mate TLEN recalculation, MC/MQ, `-m` mate-score tags, `-c` template-CIGAR `ct` tags, default sanitizer mutation, `-r` mode, `@PG`/`--no-PG`), `reset` (alignment field clear, default aux strip, `--reject-PG`/`--no-RG`/`--no-PG` matching upstream `noPGentry` semantics, `@PG` insertion), `depad`/`pad2unpad` (SAM `-T` padded reference to `-s` SAM output), `stats` (extensive SN coverage plus `-f`/`-F` flag filters, `-i` insert-size cap, `-m` insert-size bulk selection, `-l` read-length filtering, `-q` BWA trim counting, FFQ/LFQ quality histograms, GCF/GCL GC histograms, and approximate COV coverage histogram), `calmd`/`fillmd` (SAM/BAM/reference-backed CRAM text MD/NM + SAM BAQ paths + `-d` + `@PG`/`--no-PG`), `reference` (SAM/BAM MD-tag reconstruction + indexed BAM `-r` + `-o`/`-q`)
 
 Remaining subcommands and their blockers — **resolved** (kept for
@@ -422,7 +419,7 @@ The waves are ordered to land foundational machinery first (read/write/index) an
 
 ## Phase 4: Test Harness Integration
 
-- [~] **Parity gate setup**: confirmed the pinned upstream harness does not honor `-e samtools=<rust-binary-path>` for most commands because it constructs commands from `$$opts{bin}/samtools` after option parsing. CI now stages the Rust binary at the ignored `samtools/samtools` path, runs a required filtered `test.pl` copy for the stable subset maintained in `scripts/run-passing-parity-subset.py` (including `test_sort`, whose `auto_indexed.tmp.bam` prerequisite is staged by the helper, and `test_bedcov`), runs a required `regression.sh` subset for `consensus.reg` and `cram_size.reg` via `scripts/run-passing-regression-subset.py`, and still runs the full `cd samtools && perl test/test.pl || true` harness as an advisory watch. **Pending:** promote additional stable groups/regression files into the required subsets and remove the full-harness `|| true` once the remaining tracked groups pass or are explicitly excluded.
+- [~] **Parity gate setup**: confirmed the pinned upstream harness does not honor `-e samtools=<rust-binary-path>` for most commands because it constructs commands from `$$opts{bin}/samtools` after option parsing. CI now stages the Rust binary at the ignored `samtools/samtools` path, runs a required filtered `test.pl` copy for the stable subset maintained in `scripts/run-passing-parity-subset.py` (including `test_head`, `test_sort`, whose `auto_indexed.tmp.bam` prerequisite is staged by the helper, and `test_bedcov`), runs a required `regression.sh` subset for `consensus.reg` and `cram_size.reg` via `scripts/run-passing-regression-subset.py`, and still runs the full `cd samtools && perl test/test.pl || true` harness as an advisory watch. **Pending:** promote additional stable groups/regression files into the required subsets and remove the full-harness `|| true` once the remaining tracked groups pass or are explicitly excluded.
 - [ ] **`@PG` handling**: where upstream expected outputs include `@PG` lines with a specific VN that we cannot reproduce, set `ignore_pg_header => 1` in those tests. Avoid touching the actual expected output files.
 - [x] **Status ledger**: `docs/test-status.md` tracks the upstream `test.pl` groups as `passing` / `partial` / `not-yet-ported` / `blocked`, including why CI still runs the parity harness with `|| true`.
 - [~] **Run progressively**: as each subcommand lands in Phase 3, enable its `test_<name>` or `.reg` file in CI when the group is stable in the upstream harness environment. The required subsets now run stable lists from `scripts/run-passing-parity-subset.py` and `scripts/run-passing-regression-subset.py`; additional passing/partial rows are still tracked in the status ledger and exercised by the advisory full harness.
