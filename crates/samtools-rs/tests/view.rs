@@ -2297,6 +2297,62 @@ fn view_b_embeds_pg_in_binary_bam_header() {
     );
 }
 
+/// The SAM-text-intermediate binary paths (here: `view -b -z`
+/// sanitizer on BAM input) also inject the samtools `@PG` into the
+/// binary BAM header (TODO-NEXT #4).
+#[test]
+fn view_b_sanitizer_bam_path_embeds_pg() {
+    let tmp = tmp_dir("view-b-sanitize-pg");
+    let sam = tmp.join("in.sam");
+    std::fs::write(
+        &sam,
+        "@HD\tVN:1.6\n@SQ\tSN:c1\tLN:10\nr1\t0\tc1\t1\t60\t4M\t*\t0\t0\tACGT\tIIII\n",
+    )
+    .unwrap();
+    let bam = tmp.join("in.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            "--no-PG",
+            sam.to_str().unwrap(),
+            "-o",
+            bam.to_str().unwrap(),
+        ]),
+        0
+    );
+    // BAM input + sanitizer -> BAM output (SAM-text intermediate path).
+    let out = tmp.join("out.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            "-z",
+            "all",
+            bam.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ]),
+        0
+    );
+    let hdr = tmp.join("h.sam");
+    assert_eq!(
+        run(&[
+            "-H",
+            "--no-PG",
+            out.to_str().unwrap(),
+            "-o",
+            hdr.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(
+        std::fs::read_to_string(&hdr)
+            .unwrap()
+            .lines()
+            .any(|l| l.starts_with("@PG") && l.contains("PN:samtools")),
+        "sanitizer BAM->BAM path must inject the samtools @PG"
+    );
+}
+
 /// `view -C` (SAM->CRAM) likewise embeds the samtools `@PG` in the
 /// CRAM header unless `--no-PG` (TODO-NEXT #4).
 #[test]

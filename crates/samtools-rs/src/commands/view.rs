@@ -1005,7 +1005,7 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                     };
                     let filtered = filtered_sam_text(text.as_bytes(), opts)?;
                     htslib_rs::alignment_compat::write_bam_from_sam_reader(
-                        BufReader::new(io::Cursor::new(filtered)),
+                        BufReader::new(io::Cursor::new(sam_bytes_with_pg(&filtered, opts)?)),
                         dst_file,
                     )?;
                 } else if opts.regions.is_empty() {
@@ -1064,7 +1064,7 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                     };
                     let filtered = filtered_sam_text(text.as_bytes(), opts)?;
                     htslib_rs::alignment_compat::write_bam_from_sam_reader(
-                        BufReader::new(io::Cursor::new(filtered)),
+                        BufReader::new(io::Cursor::new(sam_bytes_with_pg(&filtered, opts)?)),
                         dst_file,
                     )?;
                 } else if opts.regions.is_empty() {
@@ -1191,8 +1191,9 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                         )?
                     };
                     let filtered = filtered_sam_text(text.as_bytes(), opts)?;
-                    let mut reader =
-                        htslib_rs::sam::io::Reader::new(BufReader::new(io::Cursor::new(filtered)));
+                    let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(
+                        io::Cursor::new(sam_bytes_with_pg(&filtered, opts)?),
+                    ));
                     htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
                         &mut reader,
                         reference,
@@ -1221,8 +1222,9 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                         )?
                     };
                     let filtered = filtered_sam_text(text.as_bytes(), opts)?;
-                    let mut reader =
-                        htslib_rs::sam::io::Reader::new(BufReader::new(io::Cursor::new(filtered)));
+                    let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(
+                        io::Cursor::new(sam_bytes_with_pg(&filtered, opts)?),
+                    ));
                     htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
                         &mut reader,
                         reference,
@@ -1250,8 +1252,9 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                         )?
                     };
                     let filtered = filtered_sam_text(text.as_bytes(), opts)?;
-                    let mut reader =
-                        htslib_rs::sam::io::Reader::new(BufReader::new(io::Cursor::new(filtered)));
+                    let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(
+                        io::Cursor::new(sam_bytes_with_pg(&filtered, opts)?),
+                    ));
                     htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
                         &mut reader,
                         reference,
@@ -1280,8 +1283,9 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                         )?
                     };
                     let filtered = filtered_sam_text(text.as_bytes(), opts)?;
-                    let mut reader =
-                        htslib_rs::sam::io::Reader::new(BufReader::new(io::Cursor::new(filtered)));
+                    let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(
+                        io::Cursor::new(sam_bytes_with_pg(&filtered, opts)?),
+                    ));
                     htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
                         &mut reader,
                         reference,
@@ -1408,7 +1412,7 @@ fn run_sam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
                 )?;
                 let filtered = filtered_sam_text(text.as_bytes(), opts)?;
                 htslib_rs::alignment_compat::write_bam_from_sam_reader(
-                    BufReader::new(io::Cursor::new(filtered)),
+                    BufReader::new(io::Cursor::new(sam_bytes_with_pg(&filtered, opts)?)),
                     dst_file,
                 )?;
             } else {
@@ -1450,8 +1454,9 @@ fn run_sam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
                     expr,
                 )?;
                 let filtered = filtered_sam_text(text.as_bytes(), opts)?;
-                let mut reader =
-                    htslib_rs::sam::io::Reader::new(BufReader::new(io::Cursor::new(filtered)));
+                let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(io::Cursor::new(
+                    sam_bytes_with_pg(&filtered, opts)?,
+                )));
                 htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
                     &mut reader,
                     reference,
