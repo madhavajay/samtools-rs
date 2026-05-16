@@ -1,13 +1,8 @@
 //! samtools subcommand implementations. One module per subcommand, each
 //! exposing a `pub fn main(args: &[OsString]) -> ExitCode` entry point.
 //!
-//! Subcommands not yet implemented return exit code 2 after writing a
-//! `not yet implemented` notice to stderr via [`not_implemented`]. The
-//! dispatcher in [`crate::dispatch`] is the single source of truth for which
-//! subcommands exist; modules listed there must exist here.
-
-use std::io::{self, Write};
-use std::process::ExitCode;
+//! The dispatcher in [`crate::dispatch`] is the single source of truth for
+//! which subcommands exist; modules listed there must exist here.
 
 pub mod addreplacerg;
 pub mod ampliconclip;
@@ -48,16 +43,3 @@ pub mod split;
 pub mod stats;
 pub mod targetcut;
 pub mod view;
-
-/// Stub used by subcommands that have not been ported yet. Writes a
-/// `not yet implemented` line to stderr (prefixed with the subcommand name,
-/// matching upstream's `[subcommand] message` convention) and returns
-/// exit code 2.
-pub(crate) fn not_implemented(name: &str) -> ExitCode {
-    let _ = writeln!(
-        io::stderr(),
-        "samtools {}: subcommand not yet implemented in samtools-rs",
-        name
-    );
-    ExitCode::from(2)
-}
