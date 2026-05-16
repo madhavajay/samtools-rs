@@ -903,11 +903,14 @@ fn flagstat_cram_uses_top_level_reference() {
 }
 
 #[test]
-fn flagstat_cram_without_reference_fails_cleanly() {
+fn flagstat_cram_without_reference_succeeds() {
+    // flagstat only inspects flags (reference-independent in CRAM), so
+    // it now works without `--reference` via the synthesizing path,
+    // matching `samtools flagstat foo.cram`.
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let cram = htslib_fixtures_dir().join("range.cram");
 
-    assert_ne!(
+    assert_eq!(
         exit_to_u8(samtools_run(argv(
             "samtools",
             &["flagstat", cram.to_str().unwrap()],
@@ -988,11 +991,16 @@ fn idxstats_cram_uses_top_level_reference() {
 }
 
 #[test]
-fn idxstats_cram_without_reference_fails_cleanly() {
+fn idxstats_cram_without_reference_succeeds() {
+    // idxstats needs only per-record reference id + flags
+    // (reference-independent in CRAM), so it now works without
+    // `--reference` via the synthesizing path. (Byte-exact counts vs
+    // the BAM equivalent are proven by the htslib-rs unit test
+    // `cram_summaries_without_reference_match_bam_flags_and_tids`.)
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let cram = htslib_fixtures_dir().join("range.cram");
 
-    assert_ne!(
+    assert_eq!(
         exit_to_u8(samtools_run(argv(
             "samtools",
             &["idxstats", cram.to_str().unwrap()],
