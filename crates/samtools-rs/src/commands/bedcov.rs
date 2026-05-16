@@ -205,7 +205,7 @@ where
 
     for line in reader.lines() {
         let line = line?;
-        let trimmed = line.trim_end();
+        let trimmed = line.trim_end_matches('\r');
         if trimmed.is_empty() {
             continue;
         }
@@ -599,6 +599,27 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "#chrom\tchromStart\tchromEnd\tT1\ta.bam_cov\n"
+        );
+    }
+
+    #[test]
+    fn writes_bedcov_header_preserves_empty_fourth_column() {
+        let mut out = Vec::new();
+        let bams = vec![PathBuf::from("a.bam")];
+        let opts = super::BedcovOpts::default();
+
+        write_bedcov_header(
+            &mut out,
+            Some("#chrom\tchromStart\tchromEnd\t"),
+            0,
+            &bams,
+            &opts,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "#chrom\tchromStart\tchromEnd\t\ta.bam_cov\n"
         );
     }
 

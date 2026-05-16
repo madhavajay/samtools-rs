@@ -24,6 +24,7 @@ DEFAULT_GROUPS = [
     "test_idxstat",
     "test_quickcheck",
     "test_markdup",
+    "test_bedcov",
     "test_ampliconclip",
     "test_ampliconstats",
 ]
