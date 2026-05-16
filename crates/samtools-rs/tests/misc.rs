@@ -7532,7 +7532,7 @@ fn view_write_index_matches_post_pass_index() {
     let bam = htslib_fixtures_dir().join("range.bam");
     let tmp = tmp_dir("view-write-index");
     let auto = tmp.join("auto.bam");
-    let post = tmp.join("post.bam");
+    let post_bai = tmp.join("post.bam.bai");
 
     assert_eq!(
         exit_to_u8(view::main(&argv(
@@ -7547,23 +7547,19 @@ fn view_write_index_matches_post_pass_index() {
         ))),
         0
     );
+    let auto_bai = auto.with_extension("bam.bai");
+    assert!(auto_bai.exists(), "view --write-index did not write a .bai");
+    let auto_bytes = std::fs::read(&auto_bai).unwrap();
+
     assert_eq!(
-        exit_to_u8(view::main(&argv(
-            "view",
-            &["-b", "-o", post.to_str().unwrap(), bam.to_str().unwrap()]
+        exit_to_u8(index::main(&argv(
+            "index",
+            &[auto.to_str().unwrap(), post_bai.to_str().unwrap()]
         ))),
         0
     );
     assert_eq!(
-        exit_to_u8(index::main(&argv("index", &[post.to_str().unwrap()]))),
-        0
-    );
-
-    let auto_bai = auto.with_extension("bam.bai");
-    let post_bai = post.with_extension("bam.bai");
-    assert!(auto_bai.exists(), "view --write-index did not write a .bai");
-    assert_eq!(
-        std::fs::read(&auto_bai).unwrap(),
+        auto_bytes,
         std::fs::read(&post_bai).unwrap(),
         "--write-index BAI must equal the post-pass BAI"
     );
@@ -8091,8 +8087,7 @@ fn reference_embed_ref_full_test_reference_byte_exact() {
     ];
     for (extra, expected) in cases {
         let out = tmp.join(expected.replace('/', "_"));
-        let mut a: Vec<String> =
-            vec!["samtools".into(), "reference".into(), "-q".into()];
+        let mut a: Vec<String> = vec!["samtools".into(), "reference".into(), "-q".into()];
         a.extend(extra.iter().map(|s| s.to_string()));
         a.push(cram.to_str().unwrap().into());
         a.push("-o".into());
