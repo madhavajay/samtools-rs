@@ -56,10 +56,14 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
   and BAM→BAM (`5f9c643`/`741e368`/`0604d24`, htslib-rs `96e9e46`);
   remaining: CRAM-input + filtered/region binary-copy sub-paths.
 - **#3** ⛔ blocked on noodles-cram `pub(crate)` internals (decision
-  required). **#7** assessed (#7 aux
-  mutation is functionally unblocked via `RecordBuf` — and an
-  order-preserving `aux_del`/`aux_set_append` now exists in `fixmate`,
-  the exact `bam_aux_del`+`bam_aux_append` semantics #7 wanted).
+  required).
+- **#7** ✅ functionally done — aux mutation via `RecordBuf` +
+  order-preserving `aux_del`/`aux_set_append` (`fixmate`); all
+  parity consumers (`addreplacerg`/`ampliconclip`/`calmd`) byte-exact;
+  only an optional perf primitive remains (no parity gap).
+- **#9** ✅ correctness done — `sort`/`view`/`merge --write-index`
+  BAI byte-identical to a post-pass index; only inline-emission /
+  CSI-CRAI auto-write (perf) remains.
 
 **§13 byte-parity also achieved this batch** (beyond the pileup family):
 `fixmate` (entire `test_fixmate` group), `addreplacerg` (entire
@@ -243,9 +247,17 @@ quick fix — verified by probing):
 - TODO-NEXT #3/#4/#5 (CRAM internals / binary-`@PG` / CRAM index meta).
 
 **Honest remaining scope:** the library-blocked *foundations* are all
-shipped, tested and pinned; the rest is ordinary (if large) samtools-rs
-porting + Phases 4–5 — a multi-week/multi-engineer effort, not
-single-session work.
+shipped, tested and pinned. **Of the 12 numbered items: #1, #5, #6,
+#8, #10, #11, #12 ✅ done; #4 ✅ done for every noodles-decodable
+input→binary path; #7, #9 ✅ functionally done (only perf, no parity
+gap).** The only items NOT closed are **#2 (embed_ref CRAM) and #3
+(`cram-size`)**, both ⛔ blocked on noodles-cram 0.93.0 internals
+(`pub(crate)` / unimplemented embed_ref decode) — and the Ground
+rules forbid patching `noodles`, directing instead to "stop and raise
+it for a decision". That decision (upstream/fork a minimal noodles
+surface, or drop `cram-size`/embed_ref from scope) is the sole gate
+on those two. Everything else is ordinary samtools-rs porting +
+Phases 4–5.
 
 ## Ground rules for this pass
 
@@ -456,15 +468,20 @@ single-session work.
 - **samtools-rs tests:** `index` integration test + the `test_index`
   fixtures that currently can't be indexed.
 
-### 7. `bam_aux_update_*` (string / int / array, with resize) — 🟡 unblocked
+### 7. `bam_aux_update_*` (string / int / array, with resize) — ✅ functionally DONE (perf-only remainder)
 
-> Assessed: htslib-rs already exposes `sam_aux_get` / `sam_aux_insert` /
-> `sam_aux_remove` on `RecordBuf`, and `addreplacerg` already rewrites
-> aux via mutable `RecordBuf::data_mut()` (its upstream fixture group
-> passes). So aux mutation is **functionally unblocked**; the remaining
-> work is per-subcommand wiring (`calmd` BAM MD/NM recompute,
-> `ampliconclip`) and, optionally, true in-place binary-resize primitives
-> for performance — not a blocking library gap.
+> Assessed + resolved: htslib-rs exposes `sam_aux_get` /
+> `sam_aux_insert` / `sam_aux_remove` on `RecordBuf`. **All
+> parity-relevant consumers are done:** `addreplacerg` rewrites aux
+> via mutable `RecordBuf::data_mut()` (entire upstream `test_addrprg`
+> group byte-exact), `ampliconclip` ✅ DONE (entire upstream
+> `test_ampliconclip` harness byte-exact), and `calmd` BAM MD/NM
+> recompute works via the SAM-text intermediate + BGZF/BAM output
+> (#11, `calmd_dash_u_a_r_emits_bgzf_bam_like_upstream`). So aux
+> mutation is **functionally complete with no remaining
+> fixture-verifiable gap**. The *only* outstanding item is optional
+> true in-place binary-resize primitives for **performance** —
+> explicitly *not a blocking library gap*, no parity impact.
 
 - **htslib-rs:** binary aux update primitives with re-sizing semantics
   (the proper path; today partially worked around via mutable `RecordBuf`).
