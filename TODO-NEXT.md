@@ -73,17 +73,18 @@ quick fix — verified by probing):
   `--coords-order`/`--barcode-rgx`/`--barcode-name` (regex crate;
   capture-span-bounded coord parse), raw-header SAM output. Remaining:
   exact `-s` stats counts, CRAM, the `1..4` expect-fail cases.
-- `sort -M` minimiser → 🟡 **basic (non-indexed) DONE** (`e9e1717`):
-  faithful `worker_minhash` + `bam1_cmp_by_minhash` port (fwd/rev
-  strand, `-H` squash, `-R`, `-K` kmer); the upstream
-  `reset --dupflag | sort -m 10M -M -K10 -O SAM` pipeline produces
-  alignment records **byte-identical** to `sort/minimiser-basic.sam`
-  (569/569), locked by `sort_minimiser_basic_records_match_upstream`.
+- `sort -M` minimiser → ✅ **basic (non-indexed) DONE end-to-end**
+  (`e9e1717` + `1a2c9d4`): faithful `worker_minhash` +
+  `bam1_cmp_by_minhash` port (fwd/rev strand, `-H` squash, `-R`, `-K`
+  kmer), plus the `reset.c:307-324` fresh-header rebuild (`@HD VN:1.6`
+  + `@RG`, no `@SQ`, for SAM **and** BAM output). The upstream
+  `reset --dupflag | sort -m 10M -M -K10 -O SAM` pipeline is now
+  **byte-identical** to `sort/minimiser-basic.sam` under the harness'
+  `ignore_pg_header` — full `@HD`/`@RG` header **and** all 569 records
+  — locked by `sort_minimiser_basic_records_match_upstream`.
   *Remaining:* `-I` indexed-reference variants
   (`minimiser-indexed{,-poly}.sam` — needs `build_minhash_index` +
-  `minhash_with_idx[_squash]`), and the `reset` BAM-output header gap
-  (upstream drops `@SQ` and emits `@HD VN:1.6`; we keep `@SQ` /
-  `VN:1.0`) for the full end-to-end fixture.
+  `minhash_with_idx[_squash]`).
 - `sort` `name2` / `reset` → `-N` natural-sort toggle + external merge.
 - `stats` → ✅ **DONE — all 20 fixture groups byte-exact** (stat/1–19
   plus the four stat/12 `-t`/`-p` variants), incl. the `-p`/

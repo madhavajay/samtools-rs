@@ -191,7 +191,7 @@ samtools-rs status legend:
 
 - **C source:** `reset.c`
 - **HTSlib APIs used:** record iteration, aux-tag stripping, flag/CIGAR/pos resets
-- **samtools-rs status:** 🟡 — BAM and SAM reset paths clear alignment fields, default aux tags, and alignment-dependent flags; reverse-strand sequence/quality re-reversal, `-x`/`--keep-tag`, `--no-RG`, `--reject-PG`, `--dupflag`, default `@PG`, and `--no-PG` are supported. CRAM remains.
+- **samtools-rs status:** 🟡 — BAM and SAM reset paths clear alignment fields, default aux tags, and alignment-dependent flags; reverse-strand sequence/quality re-reversal, `-x`/`--keep-tag`, `--no-RG`, `--reject-PG`, `--dupflag`, default `@PG`, and `--no-PG` are supported. The output header is rebuilt faithfully per `reset.c:307-324` — a fresh `@HD VN:1.6` + verbatim `@RG`/`@PG` (no `@SQ`/`@CO`), for SAM **and** BAM output. CRAM remains.
 
 ### ampliconclip
 
