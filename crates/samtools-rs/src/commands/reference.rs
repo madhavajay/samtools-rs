@@ -184,15 +184,62 @@ fn reference_path(input: &Path, opts: &ReferenceOptions, writer: &mut dyn Write)
             dump_refs(writer, &refs, target.as_ref(), opts.quiet)
         }
         Exact::Bam => reference_bam_path(input, opts, writer),
-        Exact::Cram => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "CRAM reference reconstruction is blocked on CRAM all-record/container APIs",
-        )),
+        Exact::Cram => reference_cram_path(input, opts, writer),
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "only SAM and BAM input are currently supported",
         )),
     }
+}
+
+/// `reference` MD path for CRAM input. The fixture CRAMs are built
+/// with `embed_ref=1`, so the embedded reference travels in the
+/// container and noodles decodes full SEQ with no external reference;
+/// `update_refs` then reconstructs the reference from MD:Z + CIGAR +
+/// SEQ exactly as the SAM/BAM paths do. The `-e` embedded-extraction
+/// mode still needs CRAM container internals (TODO-NEXT #3).
+fn reference_cram_path(
+    input: &Path,
+    opts: &ReferenceOptions,
+    writer: &mut dyn Write,
+) -> io::Result<()> {
+    if opts.embedded {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "CRAM embedded-reference extraction (-e) needs CRAM container internals",
+        ));
+    }
+    let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
+    let mut refs = init_refs(&header);
+    let target = opts
+        .region
+        .as_ref()
+        .map(|region| region_target(&header, region))
+        .transpose()?;
+    // noodles-cram 0.93.0 does not decode an embedded reference
+    // (`embed_ref`) — it treats the slice as requiring an external
+    // reference and panics on an empty repository — so the MD path
+    // needs a `--reference` to reconstruct SEQ. The upstream
+    // no-reference / `-e` embed_ref fixtures stay blocked on
+    // noodles CRAM container internals (TODO-NEXT #2/#3).
+    let records = match crate::sam_global::current_global_args().reference {
+        Some(reference) => {
+            htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+                input, reference,
+            )?
+        }
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "CRAM reference reconstruction needs -T/--reference \
+                 (noodles cannot decode embedded-reference CRAM)",
+            ));
+        }
+    };
+    for record in records {
+        update_refs(&header, &mut refs, &record, target.as_ref())?;
+    }
+    dump_refs(writer, &refs, target.as_ref(), opts.quiet)
 }
 
 fn reference_bam_path(

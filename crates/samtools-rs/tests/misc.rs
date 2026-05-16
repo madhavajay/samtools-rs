@@ -881,6 +881,56 @@ fn reference_region_uses_indexed_bam_query_path() {
     );
 }
 
+/// `samtools reference` MD path on CRAM input. The upstream
+/// `test_reference` CRAM fixture is `embed_ref=1`; noodles-cram 0.93.0
+/// can't decode an embedded reference, so a `--reference` is required
+/// to reconstruct SEQ. With it, the MD2ref output is byte-exact vs the
+/// upstream `mpileup.MD.fa{,.reg}` fixtures (whole-file + region).
+/// (The no-reference / `-e` invocations stay blocked on noodles CRAM
+/// embed_ref / container internals — see TODO-NEXT #2/#3.)
+#[test]
+fn reference_cram_md_path_with_reference_matches_upstream() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let d = fixtures_dir();
+    let cram = d.join("reference/mpileup.1.tmp.cram");
+    let refa = d.join("dat/mpileup.ref.fa");
+    let tmp = tmp_dir("reference-cram-md");
+
+    let cases: [(&[&str], &str); 2] = [
+        (&[], "reference/mpileup.MD.fa.expected"),
+        (
+            &["-r", "17:1000-1500"],
+            "reference/mpileup.MD.fa.reg.tmp.expected",
+        ),
+    ];
+    for (extra, expected) in cases {
+        let out = tmp.join(expected.replace('/', "_"));
+        let mut a: Vec<String> = vec![
+            "samtools".into(),
+            "--reference".into(),
+            refa.to_str().unwrap().into(),
+            "reference".into(),
+            "-q".into(),
+        ];
+        a.extend(extra.iter().map(|s| s.to_string()));
+        a.push(cram.to_str().unwrap().into());
+        a.push("-o".into());
+        a.push(out.to_str().unwrap().into());
+        assert_eq!(
+            exit_to_u8(samtools_run(
+                a.iter().map(std::ffi::OsString::from).collect()
+            )),
+            0,
+            "args={a:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(d.join(expected)).unwrap(),
+            "{expected} must be byte-exact"
+        );
+    }
+}
+
 #[test]
 fn flagstat_cram_uses_top_level_reference() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
