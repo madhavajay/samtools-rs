@@ -384,30 +384,37 @@ single-session work.
 - **samtools-rs tests:** upstream `test/cram_size/cram_size.reg`
   (`normal.out`/`verbose.out`/`encodings.out`).
 
-### 4. `@PG` through the binary header — 🟢 mostly DONE
+### 4. `@PG` through the binary header — 🟢 DONE for all decodable paths
 
-> **Done** (`5f9c643`/`741e368`/`0604d24` + htslib-rs `96e9e46`):
-> `view` injects the samtools `@PG` into the **binary** header for
-> **SAM-input → BAM**, **SAM-input → CRAM**, and **BAM-input → BAM**
-> (the common, no-filter/no-region path) — `--no-PG` (or no captured
-> argv) stays a no-op / fast path. Done at the samtools-rs level:
-> `sam_bytes_with_pg` injects into the SAM-text header before
-> SAM→binary conversion across every SAM-input sub-path; BAM→BAM uses
-> the new htslib-rs `write_bam_from_path_transforming_header` (header
-> serialized → SAM text → `apply_pg_to_header` → parsed back; records
-> streamed unchanged, `PP`-chained correctly). Tests
-> `view_b_embeds_pg_in_binary_bam_header` (SAM→BAM + BAM→BAM),
-> `view_c_embeds_pg_in_binary_cram_header` (SAM→CRAM), and htslib-rs
-> `write_bam_from_path_transforming_header_rewrites_header_keeps_records`.
-> Note: upstream `test_view` deliberately uses `--no-PG` for binary
-> comparisons, so this is correctness/completeness, locked by the
-> samtools-rs integration tests rather than an upstream fixture.
+> **Done** (`5f9c643`/`741e368`/`0604d24`/`85ae235`/`45083ce`/
+> `3274a59` + htslib-rs `96e9e46`): `view` injects the samtools `@PG`
+> into the **binary** header for **every input→binary path whose
+> source noodles can decode**:
+> - **SAM → BAM** and **SAM → CRAM** — all sub-paths (plain, split
+>   `-p`/`-U`, filter, filter+rewrite, sanitizer) via
+>   `sam_bytes_with_pg` on the SAM-text header before conversion.
+> - **BAM → BAM** — plain (htslib-rs
+>   `write_bam_from_path_transforming_header`: header→SAM-text→
+>   `apply_pg_to_header`→parsed back, records streamed unchanged,
+>   `PP`-chained), filter/region (SAM-text reader path), sanitizer.
+> - **BAM → CRAM** — plain/filter/region/sanitizer (SAM-text path).
 >
-> **Remaining (smaller):** CRAM-*input* → binary output, and the
-> filtered/region BAM/CRAM binary-copy sub-paths
-> (`write_bam_matching_filter_from_path`,
-> `write_cram_*_from_*_path_with_reference`) — each would need an
-> analogous header-transform variant; lower-frequency, no fixture.
+> `--no-PG` (or no captured argv) keeps the fast direct binary copy
+> everywhere. Tests `view_b_embeds_pg_in_binary_bam_header`,
+> `view_b_sanitizer_bam_path_embeds_pg`,
+> `view_b_bam_filter_and_region_paths_embed_pg`,
+> `view_c_embeds_pg_in_binary_cram_header`, and htslib-rs
+> `write_bam_from_path_transforming_header_rewrites_header_keeps_records`.
+> Upstream `test_view` deliberately uses `--no-PG` for binary
+> comparisons, so this is correctness/completeness locked by the
+> samtools-rs integration tests, not an upstream fixture.
+>
+> **Remaining = CRAM-*input* → binary output only**, intentionally
+> left on the faithful **direct** binary copy: routing it through the
+> SAM-text reader regresses on CRAMs noodles cannot re-decode with an
+> external reference — the **same noodles limitation behind #2/#3**
+> (decision-required, no noodles patch). A header-transform variant
+> for the CRAM writers would need that noodles fix first.
 
 ### 5. CRAM `idxstats`/`flagstat` without an explicit reference — ✅ DONE
 
