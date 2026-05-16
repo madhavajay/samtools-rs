@@ -34,10 +34,11 @@
 use std::cmp::Ordering;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Cursor, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use flate2::read::MultiGzDecoder;
 use htslib_rs::bam;
 use htslib_rs::bgzf;
 use htslib_rs::format::Exact;
@@ -204,29 +205,15 @@ pub fn main(args: &[OsString]) -> ExitCode {
             _ => {
                 if input.is_none() {
                     input = Some(PathBuf::from(arg));
+                } else {
+                    print_error(
+                        "sort",
+                        format!("unexpected extra positional argument `{}`", s),
+                    );
+                    return ExitCode::from(1);
                 }
             }
         }
-    }
-
-    let Some(input) = input else {
-        let _ = print_usage();
-        return ExitCode::from(1);
-    };
-
-    let format = match sam_io::sam_open_format(&input) {
-        Ok(f) => f,
-        Err(e) => {
-            print_error("sort", e.to_string());
-            return ExitCode::from(1);
-        }
-    };
-    if !matches!(format.exact, Exact::Sam | Exact::Bam | Exact::Cram) {
-        print_error(
-            "sort",
-            "only SAM, BAM, and reference-backed CRAM input are currently supported",
-        );
-        return ExitCode::from(1);
     }
 
     let write_index = local_write_index || current_global_args().write_index;
@@ -257,7 +244,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
 
     match run_sort(
-        &input,
+        input.as_deref(),
         output.as_deref(),
         name_sort,
         tag_sort,
@@ -311,7 +298,7 @@ pub(crate) struct MinhashOpts {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_sort(
-    input: &Path,
+    input: Option<&Path>,
     output: Option<&Path>,
     name_sort: bool,
     tag_sort: Option<[u8; 2]>,
@@ -322,18 +309,7 @@ pub(crate) fn run_sort(
     natural_sort: bool,
     template_coordinate: bool,
 ) -> io::Result<()> {
-    let format = sam_io::sam_open_format(input)?;
-    let (mut header, mut records) = match format.exact {
-        Exact::Sam => read_sam_records(input)?,
-        Exact::Bam => read_bam_records(input)?,
-        Exact::Cram => read_cram_records(input)?,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "only SAM, BAM, and reference-backed CRAM input are currently supported",
-            ));
-        }
-    };
+    let (mut header, mut records, raw_header_text) = read_input_records(input)?;
 
     let mut minhash_mapped = false;
     if template_coordinate {
@@ -443,12 +419,7 @@ pub(crate) fn run_sort(
     // Emit the *raw* input header (preserving @SQ/@RG field order, @CO,
     // etc. — noodles' canonical writer reorders @RG fields) with the @HD
     // SO/GO/SS applied and the samtools @PG appended.
-    let mut header_text = apply_hd_sort_order(
-        &crate::header_text::read_raw_header_text_with_format(input, format.exact)?,
-        &so,
-        go,
-        ss.as_deref(),
-    );
+    let mut header_text = apply_hd_sort_order(&raw_header_text, &so, go, ss.as_deref());
     if let Some(argv) = pg_argv {
         header_text = crate::pg::add_samtools_pg(&header_text, argv).map_err(io::Error::other)?;
     }
@@ -472,8 +443,88 @@ pub(crate) fn run_sort(
     Ok(())
 }
 
+fn read_input_records(input: Option<&Path>) -> io::Result<(sam::Header, Vec<RecordBuf>, String)> {
+    match input {
+        Some(input) => {
+            let format = sam_io::sam_open_format(input)?;
+            let (header, records) = match format.exact {
+                Exact::Sam => read_sam_records(input)?,
+                Exact::Bam => read_bam_records(input)?,
+                Exact::Cram => read_cram_records(input)?,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "only SAM, BAM, and reference-backed CRAM input are currently supported",
+                    ));
+                }
+            };
+            let raw_header_text =
+                crate::header_text::read_raw_header_text_with_format(input, format.exact)?;
+            Ok((header, records, raw_header_text))
+        }
+        None => {
+            let mut bytes = Vec::new();
+            io::stdin().read_to_end(&mut bytes)?;
+            if bytes.first() == Some(&b'@') {
+                let text = String::from_utf8(bytes)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let raw_header_text = raw_sam_header_text(&text);
+                let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(text)));
+                let (header, records) = read_sam_records_from_reader(&mut reader)?;
+                Ok((header, records, raw_header_text))
+            } else {
+                let raw_header_text = raw_bam_header_text_from_bytes(&bytes)?;
+                let mut reader = bam::io::Reader::new(Cursor::new(bytes));
+                let (header, records) = read_bam_records_from_reader(&mut reader)?;
+                Ok((header, records, raw_header_text))
+            }
+        }
+    }
+}
+
+fn raw_sam_header_text(text: &str) -> String {
+    let mut raw = String::new();
+    for line in text.split_inclusive('\n') {
+        if line.starts_with('@') {
+            raw.push_str(line);
+        } else {
+            break;
+        }
+    }
+    raw
+}
+
+fn raw_bam_header_text_from_bytes(bytes: &[u8]) -> io::Result<String> {
+    let mut reader = MultiGzDecoder::new(Cursor::new(bytes));
+    let mut magic = [0u8; 4];
+    reader.read_exact(&mut magic)?;
+    if &magic != b"BAM\x01" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stdin is neither SAM text nor BAM",
+        ));
+    }
+    let mut len_bytes = [0u8; 4];
+    reader.read_exact(&mut len_bytes)?;
+    let l_text = u32::from_le_bytes(len_bytes) as usize;
+    let mut text = vec![0u8; l_text];
+    reader.read_exact(&mut text)?;
+    while text.last() == Some(&0) {
+        text.pop();
+    }
+    String::from_utf8(text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
-    let mut reader = bam::io::Reader::new(File::open(input)?);
+    read_bam_records_from_reader(&mut bam::io::Reader::new(File::open(input)?))
+}
+
+fn read_bam_records_from_reader<R>(
+    reader: &mut bam::io::Reader<R>,
+) -> io::Result<(sam::Header, Vec<RecordBuf>)>
+where
+    R: Read,
+{
     let header = reader.read_header()?;
     let mut records = Vec::new();
     loop {

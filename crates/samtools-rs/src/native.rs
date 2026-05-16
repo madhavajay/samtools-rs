@@ -115,7 +115,7 @@ where
         let (_file, sorted_bam) =
             tmp_file::create_temp_file("samtools-rs-fastq-name-sort", Some("bam"))?;
         sort_command::run_sort(
-            input_bam,
+            Some(input_bam),
             Some(sorted_bam.path()),
             true,
             None,
@@ -245,7 +245,7 @@ where
     Q: AsRef<Path>,
 {
     sort_command::run_sort(
-        input_bam.as_ref(),
+        Some(input_bam.as_ref()),
         Some(output_bam.as_ref()),
         by_name,
         None,

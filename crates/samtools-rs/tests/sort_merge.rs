@@ -88,6 +88,24 @@ fn sort_write_index_builds_bai_for_coordinate_bam_output() {
 }
 
 #[test]
+fn sort_rejects_obsolete_positional_output_prefix() {
+    let tmp = tmp_dir("sort-obsolete-prefix");
+    let out_prefix = tmp.join("sortout");
+    let argv: Vec<OsString> = [
+        "sort",
+        sample_bam().to_str().unwrap(),
+        out_prefix.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+
+    assert_eq!(exit_to_u8(sort::main(&argv)), 1);
+    assert!(!out_prefix.exists());
+    assert!(!out_prefix.with_extension("bam").exists());
+}
+
+#[test]
 fn sort_name_succeeds() {
     let tmp = tmp_dir("sort2");
     let out = tmp.join("named.bam");
