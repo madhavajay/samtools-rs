@@ -84,7 +84,12 @@ quick fix — verified by probing):
   .sam` under the harness' `ignore_pg_header` — full `@HD`/`@RG`
   header **and** all 569 records — locked by
   `sort_minimiser_all_variants_match_upstream`.
-- `sort` `name2` / `reset` → `-N` natural-sort toggle + external merge.
+- `sort` → ✅ **all upstream `test_sort` fixtures byte-exact**: `-N`
+  lexicographical name sort (`name2`), `-t FI` (`tag.fi`), and
+  `--template-coordinate` (full `template_coordinate_key` +
+  `bam1_cmp_template_coordinate` + `unclipped_*` + `lookup_libraries`
+  port, `@HD GO:query`) all land byte-exact. Only external/temp-file
+  merge (large-input perf, not fixture-blocking) remains.
 - `stats` → ✅ **DONE — all 20 fixture groups byte-exact** (stat/1–19
   plus the four stat/12 `-t`/`-p` variants), incl. the `-p`/
   `--remove-overlaps` paired-overlap chunk subtraction and the f32

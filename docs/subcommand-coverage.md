@@ -100,7 +100,7 @@ samtools-rs status legend:
   - Streaming write — ✅
   - Custom per-record sort key extraction — ✅ partial for coordinate, query-name, and aux-tag keys
   - Multi-way merge — ❌
-- **samtools-rs status:** 🟡 — in-memory coordinate, query-name, aux-tag, and **minimiser (`-M`/`-K`/`-H`/`-R`/`-I`)** sort works for BAM, SAM, and reference-backed CRAM inputs. All three upstream `test_sort` minimiser pipelines (`minimiser-{basic,indexed,indexed-poly}.sam`) are byte-identical (test `sort_minimiser_all_variants_match_upstream`). Remaining: external merge, template-coordinate sort, thread/memory caps, and CRAM output.
+- **samtools-rs status:** 🟡 — in-memory coordinate, query-name (`-n` natural / `-N` lexicographical), aux-tag (`-t`), **minimiser (`-M`/`-K`/`-H`/`-R`/`-I`)**, and **`--template-coordinate`** sort work for BAM, SAM, and reference-backed CRAM inputs. **Every upstream `test_sort` fixture is byte-exact** (pos/name/name2/name3/tag.rg/tag.rg.n/tag.as/tag.fi/minimiser-{basic,indexed,indexed-poly}/template-coordinate; tests `sort_matches_upstream_test_sort_fixtures` + `sort_minimiser_all_variants_match_upstream`). Remaining: external/temp-file merge for very large inputs (perf), thread/memory caps, and CRAM output.
 
 ### merge
 
