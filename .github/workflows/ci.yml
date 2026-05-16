@@ -51,11 +51,14 @@ jobs:
       - name: Build release binary
         run: cargo build --release -p samtools-rs-cli
 
+      - name: Run passing samtools/test/test.pl subset
+        run: python3 scripts/run-passing-parity-subset.py --samtools "$GITHUB_WORKSPACE/target/release/samtools"
+
       - name: Run samtools/test/test.pl against Rust binary
         run: |
           cp "$GITHUB_WORKSPACE/target/release/samtools" "$GITHUB_WORKSPACE/samtools/samtools"
           cd samtools
           perl test/test.pl || true
-          # Note: tests are expected to fail until subcommands are implemented.
-          # This step is kept in CI as a regression watch — the exit code is
-          # intentionally not propagated yet. Phase 4 of TODO.md flips this.
+          # The passing subset above is required. The full harness still covers
+          # partial/out-of-scope rows as an advisory regression watch, so its
+          # exit code is intentionally not propagated yet.

@@ -21,11 +21,11 @@ parity audits.
 
 > **Library/infra batch COMPLETE (12/12) and rolled into `TODO.md`.**
 > All blockers resolved via htslib-rs plus the owned vendored noodles
-> fork; every upstream-fixtured subcommand is byte-exact vs its full
-> harness. `phase` and `targetcut` are also ported with focused Rust
-> unit tests because upstream ships no fixture groups for them. Only
-> Phase 4/5 polish remains. The dated narrative below this banner is
-> historical.
+> fork. Phase 3 command porting is complete, including `phase` and
+> `targetcut` with focused Rust unit tests because upstream ships no
+> fixture groups for them. Full upstream harness parity is still tracked
+> in Phase 4/5; many rows are complete, but partial rows remain. The
+> dated narrative below this banner is historical.
 
 Merged baseline:
 - PR #7, https://github.com/madhavajay/samtools-rs/pull/7, is merged into `main`.
@@ -422,10 +422,10 @@ The waves are ordered to land foundational machinery first (read/write/index) an
 
 ## Phase 4: Test Harness Integration
 
-- [~] **Parity gate setup**: confirmed the pinned upstream harness does not honor `-e samtools=<rust-binary-path>` for most commands because it constructs commands from `$$opts{bin}/samtools` after option parsing. CI now stages the Rust binary at the ignored `samtools/samtools` path and runs `cd samtools && perl test/test.pl || true` without modifying the harness. **Pending:** verify `regression.sh` and flip the parity job from advisory to required once the tracked groups pass.
+- [~] **Parity gate setup**: confirmed the pinned upstream harness does not honor `-e samtools=<rust-binary-path>` for most commands because it constructs commands from `$$opts{bin}/samtools` after option parsing. CI now stages the Rust binary at the ignored `samtools/samtools` path, runs a required filtered `test.pl` copy for the stable subset maintained in `scripts/run-passing-parity-subset.py`, and still runs the full `cd samtools && perl test/test.pl || true` harness as an advisory watch. **Pending:** verify `regression.sh`, promote additional stable groups into the required subset, and remove the full-harness `|| true` once the remaining tracked groups pass or are explicitly excluded.
 - [ ] **`@PG` handling**: where upstream expected outputs include `@PG` lines with a specific VN that we cannot reproduce, set `ignore_pg_header => 1` in those tests. Avoid touching the actual expected output files.
 - [x] **Status ledger**: `docs/test-status.md` tracks the upstream `test.pl` groups as `passing` / `partial` / `not-yet-ported` / `blocked`, including why CI still runs the parity harness with `|| true`.
-- [ ] **Run progressively**: as each subcommand lands in Phase 3, enable its `test_<name>` in CI. Disabled tests should be tracked in `docs/test-status.md` as `not-yet-ported` (NOT just commented out).
+- [~] **Run progressively**: as each subcommand lands in Phase 3, enable its `test_<name>` in CI when the group is stable in the upstream harness environment. The required subset now runs a stable group list from `scripts/run-passing-parity-subset.py`; additional passing/partial rows are still tracked in the status ledger and exercised by the advisory full harness.
 - [ ] **Rust integration tests per subcommand**: under `crates/samtools-rs/tests/<name>.rs`, write at least: happy path, error path, region/`-L`/format-flag variants, threaded variant where applicable. These run on every PR independently of the Perl gate.
 - [ ] **Compile-side test binaries**: `samtools/test/merge/test_bam_translate`, `test_rtrans_build`, `test_trans_tbl_init`, `samtools/test/split/test_*`, `samtools/test/vcf-miniview.c` — port to Rust integration tests under the relevant subcommand crate.
 
