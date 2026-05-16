@@ -24,9 +24,19 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
   (all 77 `consensus.reg`). *Remaining:* `targetcut`, `phase`,
   `ampliconstats`.
 - **#2** ✅ core + wiring — whole-CRAM all-record iterator; `stats` and
-  `checksum` no-region CRAM byte-identical to BAM (bar NM-derived lines).
-  *Remaining:* `reference` CRAM MD path (needs MD recompute); optional
-  CRAM NM recompute for exact `stats` mismatch/error-rate.
+  `checksum` no-region CRAM byte-identical to BAM (bar NM-derived
+  lines). `reference` CRAM MD path now wired
+  (`query_cram_records_all_from_path[_with_reference]`, `fefc4ff`):
+  with `-T/--reference`, `samtools reference` (whole-file + `-r`) on
+  the upstream embed_ref test CRAM is **byte-exact** vs
+  `reference/mpileup.MD.fa{,.reg}.expected`. ⛔ *Blocked on noodles:*
+  the upstream no-reference / `-e` invocations need embedded-reference
+  decoding, which **noodles-cram 0.93.0 does not implement** (it
+  treats embed_ref slices as requiring an external reference and
+  `expect()`-panics on an empty repository at
+  `io/reader/container/slice.rs:446`) — same noodles-internals family
+  as #3; raised for a decision (no noodles patch). Optional CRAM NM
+  recompute for exact `stats` mismatch/error-rate also still open.
 - **#8** correctness ✅ — `-@`/`--threads` accepted everywhere, output
   byte-identical regardless of count (perf worker-pool wiring deferred).
 - **#9** partial — `sort`/`view --write-index` BAI == post-pass BAI.

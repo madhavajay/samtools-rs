@@ -283,7 +283,7 @@ samtools-rs status legend:
 ### reference
 
 - **C source:** `reference.c`
-- **samtools-rs status:** 🟡 — SAM/BAM MD-tag reconstruction to FASTA works with `-o`, `-q`, basic `-r` region output, and indexed BAM region iteration when an associated BAI/CSI is present; CRAM input, embedded-reference extraction (`-e`), and full upstream parity remain.
+- **samtools-rs status:** 🟡 — SAM/BAM MD-tag reconstruction to FASTA works with `-o`, `-q`, `-r` region, and indexed BAM region iteration. **CRAM MD path works with `-T/--reference`** (byte-exact vs the upstream `reference/mpileup.MD.fa{,.reg}` fixtures). The upstream no-reference / `-e` embed_ref invocations are blocked on noodles-cram 0.93.0 (no embedded-reference decoding — panics on empty repository); raised for a scope decision. Full upstream parity (embedded extraction) remains.
 
 ### flags
 

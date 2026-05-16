@@ -29,7 +29,7 @@ Status values:
 
 | `test.pl` group | Status | Evidence / next work |
 | --- | --- | --- |
-| `test_reference` | partial | SAM/BAM MD-tag reference reconstruction is implemented with `-o`, `-q`, basic `-r` region output, and indexed BAM region iteration when an associated BAI/CSI is present, covered by Rust integration tests. Upstream `test_reference` uses CRAM inputs and embedded-reference mode (`-e`), which remain blocked on CRAM all-record/container internals and full parity work. |
+| `test_reference` | partial | SAM/BAM MD-tag reference reconstruction with `-o`, `-q`, `-r` region, and indexed BAM region iteration. **CRAM MD path now works with `-T/--reference`**: `samtools reference` (whole-file + `-r`) on the upstream embed_ref test CRAM is byte-exact vs `reference/mpileup.MD.fa{,.reg}.expected` (test `reference_cram_md_path_with_reference_matches_upstream`). The upstream no-reference / `-e` embed_ref invocations are **blocked on noodles-cram 0.93.0** which cannot decode an embedded reference (panics on empty repository); raised for a scope decision (TODO-NEXT #2/#3), no noodles patch. |
 | `test_bgzip` | not-yet-ported | `bgzip` is an htslib tool, not currently in the samtools-rs binary scope. Decide whether to exclude from this parity run or add an htslib-rs CLI. |
 | `test_faidx` | partial | `faidx` builds `.fai` and extracts local uncompressed regions, including `-r`, `-o`, `--length`, `faidx -f` FASTQ mode, reverse-complement `-i`, and mark-strand modes. BGZI, compressed output/indexing, and exact warning text remain. |
 | `test_fqidx` | partial | FASTQ index build and local uncompressed region extraction exist, including reverse-complement `-i` and mark-strand modes. BGZI, compressed output/indexing, and exact warning text remain. |
