@@ -23,6 +23,7 @@ DEFAULT_GROUPS = [
     "test_calmd",
     "test_idxstat",
     "test_quickcheck",
+    "test_head",
     "test_markdup",
     "test_bedcov",
     "test_ampliconclip",
