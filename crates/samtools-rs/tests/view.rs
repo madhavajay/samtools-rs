@@ -2242,3 +2242,68 @@ fn view_b_embeds_pg_in_binary_bam_header() {
             .any(|l| l.starts_with("r1\t") && l.contains("ACGT"))
     );
 }
+
+/// `view -C` (SAM->CRAM) likewise embeds the samtools `@PG` in the
+/// CRAM header unless `--no-PG` (TODO-NEXT #4).
+#[test]
+fn view_c_embeds_pg_in_binary_cram_header() {
+    // Uses the same known-good fixtures as the other SAM->CRAM tests.
+    let sam = fixtures_dir().join("view.001.sam");
+    let reference = fixtures_dir().join("view.001.fa");
+    let r = reference.to_str().unwrap();
+    let tmp = tmp_dir("view-c-pg");
+
+    // Read the CRAM header back via the htslib-rs helper (the same
+    // approach the other SAM->CRAM tests use), so the assertion is on
+    // the bytes actually stored in the binary CRAM header.
+    let cram_header = |p: &std::path::Path| -> String {
+        let text =
+            htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+                p,
+                &reference,
+                Some(0),
+            )
+            .unwrap();
+        text.lines()
+            .take_while(|l| l.starts_with('@'))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+
+    let cram = tmp.join("out.cram");
+    assert_eq!(
+        run(&[
+            "-C",
+            "-T",
+            r,
+            sam.to_str().unwrap(),
+            "-o",
+            cram.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(
+        cram_header(&cram)
+            .lines()
+            .any(|l| l.starts_with("@PG") && l.contains("PN:samtools")),
+        "binary CRAM header must carry the samtools @PG"
+    );
+
+    let cram2 = tmp.join("out.nopg.cram");
+    assert_eq!(
+        run(&[
+            "-C",
+            "--no-PG",
+            "-T",
+            r,
+            sam.to_str().unwrap(),
+            "-o",
+            cram2.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(
+        !cram_header(&cram2).contains("PN:samtools"),
+        "view -C --no-PG must not add a samtools @PG"
+    );
+}

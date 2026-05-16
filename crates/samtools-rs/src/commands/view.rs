@@ -1109,8 +1109,9 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                 if needs_split {
                     let raw = read_sam_path_bytes(input)?;
                     let (selected, unselected) = build_split_sam_text(&raw, opts)?;
-                    let mut selected_reader =
-                        htslib_rs::sam::io::Reader::new(BufReader::new(io::Cursor::new(selected)));
+                    let mut selected_reader = htslib_rs::sam::io::Reader::new(BufReader::new(
+                        io::Cursor::new(sam_bytes_with_pg(&selected, opts)?),
+                    ));
                     htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
                         &mut selected_reader,
                         &reference,
@@ -1118,7 +1119,7 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                     )?;
                     if let Some(unselected_path) = opts.unselected_output.as_deref() {
                         let mut unselected_reader = htslib_rs::sam::io::Reader::new(
-                            BufReader::new(io::Cursor::new(unselected)),
+                            BufReader::new(io::Cursor::new(sam_bytes_with_pg(&unselected, opts)?)),
                         );
                         let unselected_dst = File::create(unselected_path)?;
                         htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
@@ -1128,37 +1129,45 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                         )?;
                     }
                 } else if let Some(expr) = filter.as_deref() {
-                    if has_record_rewrite(opts) {
-                        let text =
+                    let text = if has_record_rewrite(opts) {
+                        let t =
                             htslib_rs::alignment_compat::view_sam_text_matching_filter_from_path(
                                 input, expr,
                             )?;
-                        let filtered = filtered_sam_text(text.as_bytes(), opts)?;
-                        let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(
-                            io::Cursor::new(filtered),
-                        ));
-                        htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
-                            &mut reader,
-                            reference,
-                            dst_file,
-                        )?;
+                        filtered_sam_text(t.as_bytes(), opts)?
                     } else {
-                        htslib_rs::alignment_compat::write_cram_matching_filter_from_sam_path_with_reference(
-                            input, reference, expr, dst_file,
-                        )?;
-                    }
+                        htslib_rs::alignment_compat::view_sam_text_matching_filter_from_path(
+                            input, expr,
+                        )?
+                        .into_bytes()
+                    };
+                    let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(
+                        io::Cursor::new(sam_bytes_with_pg(&text, opts)?),
+                    ));
+                    htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
+                        &mut reader,
+                        reference,
+                        dst_file,
+                    )?;
                 } else if has_filters(opts) || has_record_rewrite(opts) {
                     let filtered = filtered_sam_text_from_path(input, opts)?;
-                    let mut reader =
-                        htslib_rs::sam::io::Reader::new(BufReader::new(io::Cursor::new(filtered)));
+                    let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(
+                        io::Cursor::new(sam_bytes_with_pg(&filtered, opts)?),
+                    ));
                     htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
                         &mut reader,
                         reference,
                         dst_file,
                     )?;
                 } else {
-                    htslib_rs::alignment_compat::write_cram_from_sam_path_with_reference(
-                        input, reference, dst_file,
+                    let raw = read_sam_path_bytes(input)?;
+                    let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(
+                        io::Cursor::new(sam_bytes_with_pg(&raw, opts)?),
+                    ));
+                    htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
+                        &mut reader,
+                        reference,
+                        dst_file,
                     )?;
                 }
             }
