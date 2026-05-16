@@ -100,7 +100,7 @@ samtools-rs status legend:
   - Streaming write — ✅
   - Custom per-record sort key extraction — ✅ partial for coordinate, query-name, and aux-tag keys
   - Multi-way merge — ❌
-- **samtools-rs status:** 🟡 — in-memory coordinate, query-name, and aux-tag sort works for BAM, SAM, and reference-backed CRAM inputs; external merge, template/minimiser sorts, write-index, thread/memory caps, and CRAM output remain.
+- **samtools-rs status:** 🟡 — in-memory coordinate, query-name, aux-tag, and **non-indexed minimiser (`-M`/`-K`/`-H`/`-R`)** sort works for BAM, SAM, and reference-backed CRAM inputs. The upstream `test_sort` minimiser-basic pipeline produces alignment records byte-identical to `sort/minimiser-basic.sam` (test `sort_minimiser_basic_records_match_upstream`). Remaining: external merge, `-M -I` indexed-reference variants, template-coordinate sort, thread/memory caps, and CRAM output.
 
 ### merge
 
