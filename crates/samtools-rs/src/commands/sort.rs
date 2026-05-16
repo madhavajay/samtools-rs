@@ -19,11 +19,10 @@
 //!  - `-@`/`--threads`, `-m`/`--max-mem`, `-T`/`--temp` — accepted but ignored.
 //!  - `--no-PG` — accepted, silently ignored.
 //!  - `--write-index` — write a BAI next to coordinate-sorted BAM output.
-//!  - `-M` — minimiser sort (non-indexed): faithful `bam_sort.c` `worker_minhash` + `bam1_cmp_by_minhash` port, with `-K` kmer (default 20, clamped 1..=31), `-H` homopolymer squash, and `-R` (no reverse-strand minimiser). Alignment records are byte-identical to the upstream `sort/minimiser-basic.sam` fixture.
+//!  - `-M` — minimiser sort: faithful `bam_sort.c` `worker_minhash` + `bam1_cmp_by_minhash` + `build_minhash_index` + `minhash_with_idx[_squash]` port, with `-K` kmer (default 20, clamped 1..=31), `-H` homopolymer squash, `-R` (no reverse-strand minimiser), and `-I FILE` indexed reference. Byte-identical to all three upstream `sort/minimiser-{basic,indexed,indexed-poly}.sam` fixtures.
 //!
 //! Not yet supported: external merge (large inputs spill to disk),
-//! template-coordinate sort, minimiser `-I` indexed reference, CRAM
-//! output.
+//! template-coordinate sort, CRAM output.
 
 use std::cmp::Ordering;
 use std::ffi::OsString;
@@ -229,17 +228,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     let minhash = if minhash_mode {
-        if minhash_indexed.is_some() {
-            print_error(
-                "sort",
-                "minimiser indexed sort (-I) is not yet supported in samtools-rs sort",
-            );
-            return ExitCode::from(1);
-        }
         Some(MinhashOpts {
             kmer: minhash_kmer.clamp(1, 31),
             try_rev: minhash_try_rev,
             no_squash: minhash_no_squash,
+            indexed: minhash_indexed,
         })
     } else {
         None
@@ -286,12 +279,14 @@ pub(crate) enum OutFmt {
     Bam,
 }
 
-/// `samtools sort -M` minimiser parameters (basic, non-indexed path).
-#[derive(Clone, Copy)]
+/// `samtools sort -M` minimiser parameters.
+#[derive(Clone)]
 pub(crate) struct MinhashOpts {
     pub kmer: i32,
     pub try_rev: bool,
     pub no_squash: bool,
+    /// `-I FILE` indexed reference (built into a kmer→refpos map).
+    pub indexed: Option<PathBuf>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -319,17 +314,23 @@ pub(crate) fn run_sort(
     };
 
     let mut minhash_mapped = false;
-    if let Some(opts) = minhash {
-        // Faithful port of `bam_sort.c` `worker_minhash` (non-indexed
-        // path) + `bam1_cmp_by_minhash`. Per unmapped record compute the
-        // minimiser hash over its sequence, reverse-complement it when
-        // the reverse-strand minimiser wins, then sort unmapped records
-        // by that 62-bit key (mapped records keep coordinate order).
+    if let Some(opts) = minhash.as_ref() {
+        // Faithful port of `bam_sort.c` `worker_minhash` +
+        // `bam1_cmp_by_minhash`. Per unmapped record compute the
+        // minimiser hash over its sequence (against the `-I` index when
+        // given), reverse-complement it when the reverse-strand
+        // minimiser wins, then sort unmapped records by that 62-bit key
+        // (mapped records keep coordinate order).
         minhash_mapped = records.iter().any(|r| r.reference_sequence_id().is_some());
+        let kmer_h = match opts.indexed.as_deref() {
+            // `-w` defaults to 100 in `bam_sort.c`.
+            Some(p) => Some(build_minhash_index(p, opts.kmer, 100, opts.no_squash)?),
+            None => None,
+        };
         let mut keyed: Vec<(MinhashKey, RecordBuf)> = records
             .drain(..)
             .map(|mut r| {
-                let key = minhash_prepare(&mut r, &opts);
+                let key = minhash_prepare(&mut r, opts, kmer_h.as_ref());
                 (key, r)
             })
             .collect();
@@ -580,11 +581,20 @@ fn base_to_4bit(c: u8) -> usize {
     }
 }
 
-/// Faithful port of `bam_sort.c` `minhash` for the single-call,
-/// `*curr_pos == 0`, `end == NULL` case used by `worker_minhash` when
-/// there is no indexed reference. Returns `(minhashf, curr_pos, is_rev)`
-/// where `curr_pos = minhashpf - (kmer-1)` (as upstream stores it).
-fn minhash(seq: &[u8], kmer: i32, window: i32, try_rev: bool, no_squash: bool) -> (u64, i32, bool) {
+/// Faithful port of `bam_sort.c` `minhash` (the windowed scan).
+/// `i_start` is the C `*curr_pos` in-value; returns
+/// `(minhashf, curr_pos, is_rev, end)` where
+/// `curr_pos = minhashpf - (kmer-1)` and `end = (i_end == len)`.
+#[allow(clippy::too_many_arguments)]
+fn minhash(
+    seq: &[u8],
+    kmer: i32,
+    window: i32,
+    i_start: i32,
+    try_fwd: bool,
+    try_rev: bool,
+    no_squash: bool,
+) -> (u64, i32, bool, bool) {
     let kmer = kmer as usize;
     let len = seq.len() as i32;
     let mask: u64 = if 2 * kmer >= 64 {
@@ -595,14 +605,14 @@ fn minhash(seq: &[u8], kmer: i32, window: i32, try_rev: bool, no_squash: bool) -
     let xor = MINHASH_XOR & mask;
     let shift = 2 * (kmer as u32 - 1);
 
-    let i_start: i32 = 0;
+    let i_start = i_start.max(0);
     let i_end = i_start + window.min(len - i_start);
 
     // Forward strand.
     let mut hashf: u64 = 0;
     let mut minhashf: u64 = u64::MAX;
-    let mut minhashpf: i32 = 0;
-    {
+    let mut minhashpf: i32 = i_start;
+    if try_fwd {
         let mut last_base: i32 = -1;
         let mut i = i_start;
         let mut j = 0usize;
@@ -647,7 +657,7 @@ fn minhash(seq: &[u8], kmer: i32, window: i32, try_rev: bool, no_squash: bool) -
     if try_rev {
         let mut hashr: u64 = 0;
         let mut minhashr: u64 = u64::MAX;
-        let mut minhashpr: i32 = 0;
+        let mut minhashpr: i32 = i_start;
         let mut last_base: i32 = -1;
         let mut i = i_start;
         let mut j = 0usize;
@@ -691,7 +701,222 @@ fn minhash(seq: &[u8], kmer: i32, window: i32, try_rev: bool, no_squash: bool) -
         }
     }
 
-    (minhashf, minhashpf - (kmer as i32 - 1), is_rev)
+    (
+        minhashf,
+        minhashpf - (kmer as i32 - 1),
+        is_rev,
+        i_end == len,
+    )
+}
+
+/// `bam_sort.c` `build_minhash_index` (forward strand only): read each
+/// reference sequence from `ref_path` (FASTA), slide a `window`-wide
+/// minhash and record `hash -> tpos+pos` with the high `UNIQ_BIT` set
+/// once a hash recurs (so unique vs duplicate placements are known).
+fn build_minhash_index(
+    ref_path: &Path,
+    kmer: i32,
+    window: i32,
+    no_squash: bool,
+) -> io::Result<std::collections::HashMap<u64, u64>> {
+    use htslib_rs::fasta;
+    const UNIQ_BIT: u64 = 1 << 60;
+    let reader = File::open(ref_path).map(BufReader::new)?;
+    let mut reader = fasta::io::Reader::new(reader);
+    let mut map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut tpos: u64 = 0;
+    for result in reader.records() {
+        let record = result?;
+        let mut seq = record.sequence().as_ref().to_vec();
+        seq.make_ascii_uppercase();
+        let len = seq.len() as i32;
+        if len < window {
+            continue;
+        }
+        let mut pos: i32 = 0;
+        loop {
+            let last_pos = pos;
+            let (hashf, out_pos, _rev, end) =
+                minhash(&seq, kmer, window, pos, true, false, no_squash);
+            let key_pos = tpos.wrapping_add(out_pos as i64 as u64);
+            map.entry(hashf)
+                .and_modify(|v| *v = key_pos | UNIQ_BIT)
+                .or_insert(key_pos);
+            pos = (last_pos + kmer).max(out_pos + 1);
+            if end {
+                break;
+            }
+        }
+        tpos += seq.len() as u64;
+    }
+    Ok(map)
+}
+
+/// `bam_sort.c` `minhash_with_idx[_squash]` merged via the `squash`
+/// flag: scan the whole read, preferring hashes that are uniquely (then
+/// non-uniquely) placed in `kmer_h` over absent ones; on a hit the key
+/// becomes the reference position. Returns `(minhashf, pos, dir)`.
+fn minhash_with_idx(
+    seq: &[u8],
+    kmer: i32,
+    kmer_h: &std::collections::HashMap<u64, u64>,
+    try_rev: bool,
+    squash: bool,
+) -> (u64, i32, bool) {
+    const UNIQ_BIT: u64 = 1 << 60;
+    const UNIQ_MASK: u64 = UNIQ_BIT - 1;
+    let uniq_test = |x: u64| (x & UNIQ_BIT) == 0;
+    let kmer = kmer as usize;
+    let len = seq.len() as i32;
+    let mask: u64 = if 2 * kmer >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * kmer)) - 1
+    };
+    let xor = MINHASH_XOR & mask;
+    let shift = 2 * (kmer as u32 - 1);
+
+    // Forward.
+    let mut hashf: u64 = 0;
+    let mut minhashf = u64::MAX;
+    let mut minhashfi = u64::MAX;
+    let mut minhashfd = u64::MAX;
+    let (mut minhashpf, mut minhashpfi, mut minhashpfd) = (0i32, 0i32, 0i32);
+    let mut last_base: i32 = -1;
+    let mut i = 0i32;
+    let mut j = 0usize;
+    while j < kmer - 1 && i < len {
+        let base = base_to_4bit(seq[i as usize]);
+        if squash && base as i32 == last_base {
+            i += 1;
+            continue;
+        }
+        last_base = base as i32;
+        j += 1;
+        hashf = (hashf << 2) | MINHASH_L[base];
+        i += 1;
+    }
+    let mut found_f = 0i32;
+    while i < len {
+        let base = base_to_4bit(seq[i as usize]);
+        if squash && base as i32 == last_base {
+            i += 1;
+            continue;
+        }
+        last_base = base as i32;
+        hashf = ((hashf << 2) | MINHASH_L[base]) & mask;
+        let hashfx = hashf ^ xor;
+        let mut index = 0;
+        if (minhashfi > hashfx || (found_f < 2 && minhashfd > hashfx))
+            && let Some(&v) = kmer_h.get(&hashfx)
+        {
+            index = if uniq_test(v) { 2 } else { 1 };
+        }
+        found_f |= index;
+        match index {
+            2 => {
+                minhashfi = hashfx;
+                minhashpfi = i;
+            }
+            1 => {
+                minhashfd = hashfx;
+                minhashpfd = i;
+            }
+            _ => {
+                if minhashf > hashfx {
+                    minhashf = hashfx;
+                    minhashpf = i;
+                }
+            }
+        }
+        i += 1;
+    }
+    if minhashfi != u64::MAX {
+        minhashf = minhashfi;
+        minhashpf = minhashpfi;
+    } else if minhashfd != u64::MAX {
+        minhashf = minhashfd;
+        minhashpf = minhashpfd;
+    }
+
+    let mut dir = false;
+    if try_rev {
+        let mut hashr: u64 = 0;
+        let mut minhashr = u64::MAX;
+        let mut minhashri = u64::MAX;
+        let mut minhashrd = u64::MAX;
+        let (mut minhashpr, mut minhashpri, mut minhashprd) = (0i32, 0i32, 0i32);
+        let mut last_base: i32 = -1;
+        let mut i = 0i32;
+        let mut j = 0usize;
+        while j < kmer - 1 && i < len {
+            let base = base_to_4bit(seq[i as usize]);
+            if squash && base as i32 == last_base {
+                i += 1;
+                continue;
+            }
+            last_base = base as i32;
+            j += 1;
+            hashr = (hashr >> 2) | (MINHASH_R[base] << shift);
+            i += 1;
+        }
+        let mut found_r = 0i32;
+        while i < len {
+            let base = base_to_4bit(seq[i as usize]);
+            if squash && base as i32 == last_base {
+                i += 1;
+                continue;
+            }
+            last_base = base as i32;
+            hashr = (hashr >> 2) | (MINHASH_R[base] << shift);
+            let hashrx = hashr ^ xor;
+            let mut index = 0;
+            if (minhashri > hashrx || (found_r < 2 && minhashrd > hashrx))
+                && let Some(&v) = kmer_h.get(&hashrx)
+            {
+                index = if uniq_test(v) { 2 } else { 1 };
+            }
+            found_r |= index;
+            match index {
+                2 => {
+                    minhashri = hashrx;
+                    minhashpri = i;
+                }
+                1 => {
+                    minhashrd = hashrx;
+                    minhashprd = i;
+                }
+                _ => {
+                    if minhashr > hashrx {
+                        minhashr = hashrx;
+                        minhashpr = i;
+                    }
+                }
+            }
+            i += 1;
+        }
+        if minhashri != u64::MAX {
+            minhashr = minhashri;
+            minhashpr = minhashpri;
+        } else if minhashrd != u64::MAX {
+            minhashr = minhashrd;
+            minhashpr = minhashprd;
+        }
+        if ((minhashf > minhashr) || (found_f == 0 && found_r != 0))
+            && (found_f == 0 || found_r != 0)
+        {
+            minhashf = minhashr;
+            minhashpf = len - minhashpr + kmer as i32 - 2;
+            dir = true;
+        }
+    }
+
+    // Indexed kmer → its reference position (mask off the uniq bit).
+    if let Some(&v) = kmer_h.get(&minhashf) {
+        minhashf = v & UNIQ_MASK;
+    }
+    let out = if minhashf != u64::MAX { minhashf } else { 0 };
+    (out, minhashpf, dir)
 }
 
 /// `bam_sort.c` `reverse_complement`: reverse-complement the sequence,
@@ -742,8 +967,14 @@ fn minhash_complement(b: u8) -> u8 {
     }
 }
 
-/// `worker_minhash` (non-indexed) for one record + key extraction.
-fn minhash_prepare(r: &mut RecordBuf, opts: &MinhashOpts) -> MinhashKey {
+/// `worker_minhash` for one record + key extraction. With `kmer_h` the
+/// indexed path (`minhash_with_idx[_squash]`, `mh -= pos`) is taken;
+/// otherwise the non-indexed path (`mh += 1<<30`, `isize = 65535-pos`).
+fn minhash_prepare(
+    r: &mut RecordBuf,
+    opts: &MinhashOpts,
+    kmer_h: Option<&std::collections::HashMap<u64, u64>>,
+) -> MinhashKey {
     if let Some(tid) = r.reference_sequence_id() {
         // Mapped: keep coordinate order (bam1_cmp_core path).
         let pos = r.alignment_start().map(usize::from).unwrap_or(0) as u64; // core.pos+1
@@ -760,12 +991,24 @@ fn minhash_prepare(r: &mut RecordBuf, opts: &MinhashOpts) -> MinhashKey {
 
     let seq: Vec<u8> = r.sequence().as_ref().to_vec();
     let len = seq.len() as i32;
-    let (minhashf, curr, is_rev) = minhash(&seq, opts.kmer, len, opts.try_rev, opts.no_squash);
-    if is_rev {
-        minhash_reverse_complement(r);
-    }
-    let mh = minhashf.wrapping_add(1 << 30);
-    let isize_tb = if 65535 - curr >= 0 { 65535 - curr } else { 0 } as i64;
+    let (mh, isize_tb, is_rev) = if let Some(kmer_h) = kmer_h {
+        let (minhashf, pos, dir) =
+            minhash_with_idx(&seq, opts.kmer, kmer_h, opts.try_rev, !opts.no_squash);
+        if dir {
+            minhash_reverse_complement(r);
+        }
+        // worker_minhash indexed branch: `mh -= pos; pos = 0;`.
+        (minhashf.wrapping_sub(pos as i64 as u64), 0i64, dir)
+    } else {
+        let (minhashf, curr, is_rev, _end) =
+            minhash(&seq, opts.kmer, len, 0, true, opts.try_rev, opts.no_squash);
+        if is_rev {
+            minhash_reverse_complement(r);
+        }
+        let mh = minhashf.wrapping_add(1 << 30);
+        let isize_tb = if 65535 - curr >= 0 { 65535 - curr } else { 0 } as i64;
+        (mh, isize_tb, is_rev)
+    };
     let m = (((mh >> 31) & 0x7fff_ffff) << 31) | (mh & 0x7fff_ffff);
     MinhashKey {
         mapped: false,

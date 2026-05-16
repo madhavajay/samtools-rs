@@ -1958,16 +1958,18 @@ fn merge_reconciles_rg_pg_byte_exact_vs_upstream() {
     }
 }
 
-/// Upstream `test_sort` minimiser case (`sort/minimiser-basic.sam`):
+/// All three upstream `test_sort` minimiser cases:
 /// `samtools reset --dupflag dat/auto_indexed.tmp.bam | samtools sort
-/// -m 10M -M -K10 -O SAM`. The minimiser sort reorders the unmapped
-/// reads by their 62-bit minhash key and reverse-complements records
-/// whose reverse-strand minimiser wins; `reset` rebuilds the fresh
-/// `@HD VN:1.6` + `@RG` (no `@SQ`) header. Output is byte-identical to
-/// the upstream fixture under the harness' `ignore_pg_header` (`@PG`
-/// stripped) — header **and** all 569 records.
+/// -m 10M {-M | -M -I ref | -MH -I ref} -K10 -O SAM` →
+/// `sort/minimiser-{basic,indexed,indexed-poly}.sam`. The minimiser
+/// sort reorders the unmapped reads by their 62-bit minhash key (non-
+/// indexed, or against the `-I` reference k-mer index) and reverse-
+/// complements records whose reverse-strand minimiser wins; `reset`
+/// rebuilds the fresh `@HD VN:1.6` + `@RG` (no `@SQ`) header. Output is
+/// byte-identical to each upstream fixture under the harness'
+/// `ignore_pg_header` (`@PG` stripped) — header **and** all 569 records.
 #[test]
-fn sort_minimiser_basic_records_match_upstream() {
+fn sort_minimiser_all_variants_match_upstream() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let tmp = tmp_dir("sort-minimiser-basic");
     let dir = fixtures_dir();
@@ -1996,21 +1998,7 @@ fn sort_minimiser_basic_records_match_upstream() {
         reset_bam.to_str().unwrap(),
         ai.to_str().unwrap(),
     ]);
-    run(&[
-        "sort",
-        "-m",
-        "10M",
-        "-M",
-        "-K10",
-        "-O",
-        "SAM",
-        "-o",
-        got.to_str().unwrap(),
-        reset_bam.to_str().unwrap(),
-    ]);
-
-    let got_text = std::fs::read_to_string(&got).unwrap();
-    let exp_text = std::fs::read_to_string(dir.join("sort").join("minimiser-basic.sam")).unwrap();
+    let reference = dir.join("dat").join("mpileup.ref.fa");
     // The upstream harness compares with `ignore_pg_header => 1`
     // (strip @PG runs); everything else — @HD/@RG header and all 569
     // records — must be byte-identical.
@@ -2020,9 +2008,33 @@ fn sort_minimiser_basic_records_match_upstream() {
             .map(|l| format!("{l}\n"))
             .collect()
     };
-    assert_eq!(
-        strip_pg(&got_text),
-        strip_pg(&exp_text),
-        "minimiser-basic must be byte-identical to upstream (modulo @PG)"
-    );
+    // (extra sort args, expected fixture). All three upstream
+    // test_sort minimiser cases: non-indexed, indexed reference, and
+    // indexed + homopolymer squash (`-MH`).
+    let cases: [(&[&str], &str); 3] = [
+        (&["-M", "-K10"], "minimiser-basic.sam"),
+        (
+            &["-M", "-K10", "-I", reference.to_str().unwrap()],
+            "minimiser-indexed.sam",
+        ),
+        (
+            &["-MH", "-K10", "-I", reference.to_str().unwrap()],
+            "minimiser-indexed-poly.sam",
+        ),
+    ];
+    for (extra, expected) in cases {
+        let mut sort_args: Vec<&str> = vec!["sort", "-m", "10M"];
+        sort_args.extend_from_slice(extra);
+        sort_args.extend_from_slice(&["-O", "SAM", "-o", got.to_str().unwrap()]);
+        sort_args.push(reset_bam.to_str().unwrap());
+        run(&sort_args);
+
+        let got_text = std::fs::read_to_string(&got).unwrap();
+        let exp_text = std::fs::read_to_string(dir.join("sort").join(expected)).unwrap();
+        assert_eq!(
+            strip_pg(&got_text),
+            strip_pg(&exp_text),
+            "{expected} must be byte-identical to upstream (modulo @PG)"
+        );
+    }
 }
