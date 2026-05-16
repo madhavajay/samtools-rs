@@ -1,7 +1,9 @@
 //! `samtools depth` — per-position depth of alignments.
 //!
 //! Mirrors `main_depth` in `bam2depth.c`. Upstream uses pileup. This Rust
-//! port builds a per-reference depth vector by walking each record's CIGAR,
+//! port accumulates depth by walking each record's CIGAR into a **sparse**
+//! per-reference map (only covered positions), so very large references
+//! (e.g. the upstream `large_pos` fixture, `LN:10001009800`) do not OOM,
 //! then emits `<chr>\t<pos>\t<depth>` lines for positions with `depth >=
 //! min-depth` (default 1).
 //!
@@ -488,25 +490,43 @@ fn emit_depths(
     for (target_index, target) in first_targets.iter().enumerate() {
         let has_any = per_input_targets
             .iter()
-            .any(|targets| targets[target_index].depths.iter().any(|&d| d > 0));
+            .any(|targets| !targets[target_index].depths.is_empty());
         if !has_any && !matches!(a_mode, AMode::AllRefsAllPositions) {
             continue;
         }
-        for i in 0..target.depths.len() {
-            let depths = per_input_targets
+
+        let mut emit_offset = |off: usize| -> io::Result<()> {
+            let depths: Vec<u32> = per_input_targets
                 .iter()
-                .map(|targets| targets[target_index].depths[i]);
-            if a_mode == AMode::None && !depths.clone().any(|d| d > 0) {
-                continue;
+                .map(|targets| targets[target_index].depths.get(off))
+                .collect();
+            if a_mode == AMode::None
+                && (!depths.iter().any(|&d| d > 0) || !depths.iter().any(|&d| d >= min_depth))
+            {
+                return Ok(());
             }
-            if a_mode == AMode::None && !depths.clone().any(|d| d >= min_depth) {
-                continue;
+            write!(out, "{}\t{}", target.name, target.output_start + off)?;
+            for d in &depths {
+                write!(out, "\t{d}")?;
             }
-            write!(out, "{}\t{}", target.name, target.output_start + i)?;
-            for d in depths {
-                write!(out, "\t{}", d)?;
+            writeln!(out)
+        };
+
+        if a_mode == AMode::None {
+            // Only covered positions matter; iterate the sorted union of
+            // covered offsets across inputs (sparse — safe for huge refs).
+            let mut offsets: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+            for targets in per_input_targets {
+                offsets.extend(targets[target_index].depths.covered());
             }
-            writeln!(out)?;
+            for off in offsets {
+                emit_offset(off)?;
+            }
+        } else {
+            // `-a`/`-aa`: every position in the span.
+            for off in 0..target.depths.span() {
+                emit_offset(off)?;
+            }
         }
     }
     Ok(())
@@ -525,7 +545,7 @@ fn ensure_compatible_targets(expected: &[DepthTarget], actual: &[DepthTarget]) -
             || left.output_start != right.output_start
             || left.start0 != right.start0
             || left.end0 != right.end0
-            || left.depths.len() != right.depths.len()
+            || left.depths.span() != right.depths.span()
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -536,13 +556,50 @@ fn ensure_compatible_targets(expected: &[DepthTarget], actual: &[DepthTarget]) -
     Ok(())
 }
 
+/// Sparse per-position depth. A dense `Vec<u32>` over the reference span
+/// is infeasible for very large references (e.g. the upstream `large_pos`
+/// fixture has `LN:10001009800`, which would need ~40 GB). Only covered
+/// positions are stored.
+#[derive(Default)]
+struct Depths {
+    span: usize,
+    map: std::collections::BTreeMap<usize, u32>,
+}
+
+impl Depths {
+    fn new(span: usize) -> Self {
+        Self {
+            span,
+            map: std::collections::BTreeMap::new(),
+        }
+    }
+    fn add(&mut self, offset: usize) {
+        if offset < self.span {
+            let e = self.map.entry(offset).or_insert(0);
+            *e = e.saturating_add(1);
+        }
+    }
+    fn get(&self, offset: usize) -> u32 {
+        self.map.get(&offset).copied().unwrap_or(0)
+    }
+    fn span(&self) -> usize {
+        self.span
+    }
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+    fn covered(&self) -> impl Iterator<Item = usize> + '_ {
+        self.map.keys().copied()
+    }
+}
+
 struct DepthTarget {
     tid: usize,
     name: String,
     output_start: usize,
     start0: usize,
     end0: usize,
-    depths: Vec<u32>,
+    depths: Depths,
 }
 
 fn depth_targets(
@@ -562,7 +619,7 @@ fn depth_targets(
                     output_start: 1,
                     start0: 0,
                     end0: length,
-                    depths: vec![0u32; length],
+                    depths: Depths::new(length),
                 }
             })
             .collect())
@@ -614,7 +671,7 @@ fn depth_target_for_region(
         output_start,
         start0,
         end0,
-        depths: vec![0u32; length],
+        depths: Depths::new(length),
     })
 }
 
@@ -749,10 +806,7 @@ fn update_target_cigar(
                 let hi = op_end.min(target.end0);
                 if hi > lo {
                     for p in lo..hi {
-                        let offset = p - target.start0;
-                        if offset < target.depths.len() {
-                            target.depths[offset] = target.depths[offset].saturating_add(1);
-                        }
+                        target.depths.add(p - target.start0);
                     }
                 }
                 ref_pos = op_end;

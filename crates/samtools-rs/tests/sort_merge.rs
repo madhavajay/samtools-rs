@@ -137,7 +137,45 @@ fn sort_cram_input_uses_top_level_reference() {
         .map(|line| line.split('\t').next().unwrap())
         .collect();
     assert!(!names.is_empty());
-    assert!(names.windows(2).all(|w| w[0] <= w[1]));
+    // Upstream `-n` uses natural (`strnum_cmp`) order, not lexical, so
+    // assert the output equals its natural-sorted self.
+    let natural = |x: &&str, y: &&str| -> std::cmp::Ordering {
+        let (a, b) = (x.as_bytes(), y.as_bytes());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < a.len() && j < b.len() {
+            if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+                let (s, t) = (i, j);
+                while i < a.len() && a[i].is_ascii_digit() {
+                    i += 1;
+                }
+                while j < b.len() && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let na = std::str::from_utf8(&a[s..i])
+                    .unwrap()
+                    .trim_start_matches('0');
+                let nb = std::str::from_utf8(&b[t..j])
+                    .unwrap()
+                    .trim_start_matches('0');
+                match na.len().cmp(&nb.len()).then_with(|| na.cmp(nb)) {
+                    std::cmp::Ordering::Equal => {}
+                    o => return o,
+                }
+            } else {
+                match a[i].cmp(&b[j]) {
+                    std::cmp::Ordering::Equal => {
+                        i += 1;
+                        j += 1;
+                    }
+                    o => return o,
+                }
+            }
+        }
+        a.len().cmp(&b.len())
+    };
+    let mut sorted = names.clone();
+    sorted.sort_by(natural);
+    assert_eq!(names, sorted);
 }
 
 #[test]
@@ -177,7 +215,9 @@ fn sort_sam_input_by_name_to_sam_output() {
         .map(|line| line.split('\t').next().unwrap().to_string())
         .collect();
     assert_eq!(names, ["a", "z"]);
-    assert!(text.contains("@HD\tVN:1.6\tSO:queryname\n"));
+    // Upstream `-n` emits SS:queryname:natural (verified vs
+    // sort/name.sort.expected.sam).
+    assert!(text.contains("@HD\tVN:1.6\tSO:queryname\tSS:queryname:natural\n"));
 }
 
 #[test]
@@ -248,6 +288,7 @@ fn sort_short_output_format_consumes_value() {
     assert_eq!(exit_to_u8(sort::main(&argv)), 0);
 
     let text = std::fs::read_to_string(out).unwrap();
+    // sort (unlike merge) sets @HD SO:coordinate for a coordinate sort.
     assert!(text.starts_with("@HD\tVN:1.6\tSO:coordinate\n"));
     assert!(text.contains("\na\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n"));
 }
@@ -335,9 +376,7 @@ fn sort_tag_with_name_sort_uses_name_secondary() {
         .map(|line| line.split('\t').next().unwrap().to_string())
         .collect();
     assert_eq!(names, ["b", "a", "z"]);
-    assert!(
-        text.starts_with("@HD\tVN:1.6\tSO:unsorted\tSS:unsorted:RG:queryname:lexicographical\n")
-    );
+    assert!(text.starts_with("@HD\tVN:1.6\tSO:unsorted\tSS:unsorted:RG:queryname:natural\n"));
 }
 
 #[test]
@@ -373,7 +412,24 @@ fn merge_write_index_builds_bai_for_coordinate_bam_output() {
         .collect();
     assert_eq!(exit_to_u8(merge::main(&argv)), 0);
     assert!(out.exists());
-    assert!(tmp.join("merged.bam.bai").exists());
+    let written_bai = tmp.join("merged.bam.bai");
+    assert!(written_bai.exists());
+
+    // #9 deliverable: the writer-produced index must be
+    // byte-identical to a separate post-pass `samtools index`.
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let copy = tmp.join("merged.copy.bam");
+    std::fs::copy(&out, &copy).unwrap();
+    let idx_argv: Vec<OsString> = ["samtools", "index", copy.to_str().unwrap()]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    assert_eq!(exit_to_u8(samtools_run(idx_argv)), 0);
+    assert_eq!(
+        std::fs::read(&written_bai).unwrap(),
+        std::fs::read(tmp.join("merged.copy.bam.bai")).unwrap(),
+        "merge --write-index BAI must equal a post-pass samtools index BAI"
+    );
 }
 
 #[test]
@@ -410,13 +466,17 @@ fn merge_sam_inputs_to_sam_output() {
     assert_eq!(exit_to_u8(merge::main(&argv)), 0);
 
     let text = std::fs::read_to_string(out).unwrap();
-    let names: Vec<_> = text
+    let mut names: Vec<_> = text
         .lines()
         .filter(|line| !line.starts_with('@'))
         .map(|line| line.split('\t').next().unwrap().to_string())
         .collect();
+    // collate intentionally shuffles by qname hash; assert the set.
+    names.sort();
     assert_eq!(names, ["a", "b"]);
-    assert!(text.contains("@HD\tVN:1.6\tSO:coordinate\n"));
+    // Upstream merge preserves input[0]'s @HD verbatim (no forced
+    // SO:coordinate) — verified vs the merge/* fixtures.
+    assert!(text.starts_with("@HD\tVN:1.6\n"));
 }
 
 #[test]
@@ -467,11 +527,13 @@ fn merge_reads_inputs_from_file_list() {
     assert_eq!(exit_to_u8(merge::main(&argv)), 0);
 
     let text = std::fs::read_to_string(out).unwrap();
-    let names: Vec<_> = text
+    let mut names: Vec<_> = text
         .lines()
         .filter(|line| !line.starts_with('@'))
         .map(|line| line.split('\t').next().unwrap().to_string())
         .collect();
+    // collate intentionally shuffles by qname hash; assert the set.
+    names.sort();
     assert_eq!(names, ["a", "b"]);
 }
 
@@ -606,7 +668,10 @@ fn merge_unions_compatible_sq_metadata_fields() {
     assert_eq!(exit_to_u8(merge::main(&argv)), 0);
 
     let text = std::fs::read_to_string(out).unwrap();
-    assert!(text.contains("@SQ\tSN:chr1\tLN:8\tM5:0123456789abcdef0123456789abcdef\n"));
+    // Upstream keeps the *first* @SQ definition for an SN verbatim (it
+    // does not graft M5/etc from later inputs).
+    assert!(text.contains("@SQ\tSN:chr1\tLN:8\n"));
+    assert_eq!(text.matches("@SQ\tSN:chr1").count(), 1);
 }
 
 #[test]
@@ -702,7 +767,7 @@ fn merge_unions_read_group_headers() {
 }
 
 #[test]
-fn merge_rejects_conflicting_read_group_headers() {
+fn merge_reconciles_conflicting_read_group_headers() {
     let tmp = tmp_dir("merge-conflicting-rg");
     let sam_a = tmp.join("a.sam");
     let sam_b = tmp.join("b.sam");
@@ -741,8 +806,18 @@ fn merge_rejects_conflicting_read_group_headers() {
     .iter()
     .map(OsString::from)
     .collect();
-    assert_eq!(exit_to_u8(merge::main(&argv)), 1);
-    assert!(!out.exists());
+    // Upstream `samtools merge` does NOT reject a conflicting @RG ID — it
+    // reconciles by suffixing the colliding one (gen_unique_id PRNG).
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("@RG\tID:rg1\tSM:s1"));
+    let suffixed = text
+        .lines()
+        .any(|l| l.starts_with("@RG\tID:rg1-") && l.contains("SM:s2"));
+    assert!(suffixed, "conflicting @RG should be suffixed:\n{text}");
+    // Record `b` (from input b) has its RG:Z: remapped to the suffixed id.
+    let b = text.lines().find(|l| l.starts_with("b\t")).unwrap();
+    assert!(b.contains("RG:Z:rg1-"), "record RG not remapped: {b}");
 }
 
 #[test]
@@ -834,9 +909,10 @@ fn merge_preserves_later_header_metadata_when_first_input_lacks_hd() {
 
     let text = std::fs::read_to_string(out).unwrap();
     let hd = text.lines().find(|line| line.starts_with("@HD")).unwrap();
+    // input[0] has no @HD → the first @HD found (input b) is used
+    // verbatim; merge does not graft SO.
     assert!(hd.contains("VN:1.5"));
     assert!(hd.contains("GO:query"));
-    assert!(hd.contains("SO:coordinate"));
 }
 
 #[test]
@@ -882,9 +958,9 @@ fn merge_unions_compatible_header_metadata_fields() {
 
     let text = std::fs::read_to_string(out).unwrap();
     let hd = text.lines().find(|line| line.starts_with("@HD")).unwrap();
-    assert!(hd.contains("VN:1.6"));
-    assert!(hd.contains("GO:query"));
-    assert!(hd.contains("SO:coordinate"));
+    // Upstream uses input[0]'s @HD verbatim; it does not union later
+    // inputs' @HD metadata (no grafted GO:query) nor graft SO.
+    assert_eq!(hd, "@HD\tVN:1.6");
 }
 
 #[test]
@@ -979,7 +1055,7 @@ fn merge_unions_program_headers() {
 }
 
 #[test]
-fn merge_rejects_conflicting_program_headers() {
+fn merge_reconciles_conflicting_program_headers() {
     let tmp = tmp_dir("merge-conflicting-pg");
     let sam_a = tmp.join("a.sam");
     let sam_b = tmp.join("b.sam");
@@ -1019,8 +1095,15 @@ fn merge_rejects_conflicting_program_headers() {
     .iter()
     .map(OsString::from)
     .collect();
-    assert_eq!(exit_to_u8(merge::main(&argv)), 1);
-    assert!(!out.exists());
+    // Upstream reconciles conflicting @PG IDs (suffix) rather than erroring.
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("@PG\tID:pg1\tPN:tool1"));
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("@PG\tID:pg1-") && l.contains("PN:tool2")),
+        "conflicting @PG should be suffixed:\n{text}"
+    );
 }
 
 #[test]
@@ -1057,7 +1140,8 @@ fn merge_short_output_format_consumes_value() {
     assert_eq!(exit_to_u8(merge::main(&argv)), 0);
 
     let text = std::fs::read_to_string(out).unwrap();
-    assert!(text.starts_with("@HD\tVN:1.6\tSO:coordinate\n"));
+    // Upstream merge preserves input[0]'s @HD verbatim (no forced SO).
+    assert!(text.starts_with("@HD\tVN:1.6\n"));
     assert!(text.contains("\na\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n"));
 }
 
@@ -1228,11 +1312,13 @@ fn collate_positional_prefix_writes_format_extension() {
 
     let text = std::fs::read_to_string(out).unwrap();
     assert!(text.starts_with("@HD\tVN:1.6\tSO:unsorted\tGO:query\n"));
-    let names: Vec<_> = text
+    let mut names: Vec<_> = text
         .lines()
         .filter(|line| !line.starts_with('@'))
         .map(|line| line.split('\t').next().unwrap().to_string())
         .collect();
+    // collate intentionally shuffles by qname hash; assert the set.
+    names.sort();
     assert_eq!(names, ["a", "b"]);
 }
 
@@ -1250,6 +1336,56 @@ fn collate_rejects_output_file_with_stdout() {
     .collect();
 
     assert_eq!(exit_to_u8(collate::main(&argv)), 1);
+}
+
+#[test]
+fn collate_matches_upstream_test_collate_fixtures() {
+    // Byte-exact (modulo the harness-stripped @PG) vs the entire
+    // upstream test_collate harness: -o (==collate.expected), positional
+    // prefix, fast `-f`, and fast `-f -r 4` (ring-eviction deferral).
+    let d = fixtures_dir();
+    let tmp = tmp_dir("collate-fixtures");
+    let np = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.starts_with("@PG\t"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    let din = d.join("dat/test_input_1_d.sam");
+    let fin = d.join("collate/fast_collate.sam");
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["--output-fmt=sam", "-o", "@OUT@", "@DIN@"],
+            "collate/collate.expected.sam",
+        ),
+        (
+            &["--output-fmt=sam", "-f", "@FIN@", "-o", "@OUT@"],
+            "collate/1_fast_collate.sam.expected",
+        ),
+        (
+            &["--output-fmt=sam", "-f", "-r", "4", "@FIN@", "-o", "@OUT@"],
+            "collate/2_fast_collate_with_tmp_used.sam.expected",
+        ),
+    ];
+    for (i, (args, expected)) in cases.iter().enumerate() {
+        let out = tmp.join(format!("c{i}.sam"));
+        let v: Vec<OsString> = std::iter::once(OsString::from("collate"))
+            .chain(args.iter().map(|a| {
+                OsString::from(match *a {
+                    "@OUT@" => out.to_str().unwrap().to_string(),
+                    "@DIN@" => din.to_str().unwrap().to_string(),
+                    "@FIN@" => fin.to_str().unwrap().to_string(),
+                    other => other.to_string(),
+                })
+            }))
+            .collect();
+        assert_eq!(exit_to_u8(collate::main(&v)), 0, "{expected}");
+        assert_eq!(
+            np(&std::fs::read_to_string(&out).unwrap()),
+            np(&std::fs::read_to_string(d.join(expected)).unwrap()),
+            "collate {expected}"
+        );
+    }
 }
 
 #[test]
@@ -1331,11 +1467,13 @@ fn collate_accepts_temporary_file_count_option() {
     assert_eq!(exit_to_u8(collate::main(&argv)), 0);
 
     let text = std::fs::read_to_string(out).unwrap();
-    let names: Vec<_> = text
+    let mut names: Vec<_> = text
         .lines()
         .filter(|line| !line.starts_with('@'))
         .map(|line| line.split('\t').next().unwrap().to_string())
         .collect();
+    // collate intentionally shuffles by qname hash; assert the set.
+    names.sort();
     assert_eq!(names, ["a", "b"]);
 }
 
@@ -1383,7 +1521,16 @@ fn collate_cram_input_uses_top_level_reference() {
         .map(|line| line.split('\t').next().unwrap())
         .collect();
     assert!(!names.is_empty());
-    assert!(names.windows(2).all(|w| w[0] <= w[1]));
+    // collate groups records by qname (hash-bucketed shuffle, not
+    // sorted); assert each qname's records are contiguous.
+    let mut seen = std::collections::HashSet::new();
+    let mut prev = "";
+    for n in &names {
+        if *n != prev {
+            assert!(seen.insert(*n), "qname {n} not contiguous after shuffle");
+            prev = n;
+        }
+    }
 }
 
 #[test]
@@ -1678,4 +1825,252 @@ fn merge_l_bed_restricts_to_indexed_records_and_deduplicates_overlaps() {
 
     let unique: std::collections::HashSet<_> = bed_records.iter().copied().collect();
     assert_eq!(unique.len(), bed_records.len());
+}
+
+#[test]
+fn sort_matches_upstream_test_sort_fixtures() {
+    // TODO.md §13: basic test_sort group byte-exact (modulo @PG, which
+    // the harness strips via ignore_pg_header). Covers coordinate, `-n`
+    // natural name, `-t TAG`, and `-n -t TAG` orders + raw @HD SO/SS.
+    let d = fixtures_dir();
+    let tmp = tmp_dir("sort-fixtures");
+    let np = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.starts_with("@PG\t"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    let cases: &[(&[&str], &str, &str)] = &[
+        (
+            &["-m", "10M"],
+            "dat/test_input_1_a.bam",
+            "sort/pos.sort.expected.sam",
+        ),
+        (
+            &["-n", "-m", "10M"],
+            "dat/test_input_1_a.bam",
+            "sort/name.sort.expected.sam",
+        ),
+        (
+            &["-n", "-m", "10M"],
+            "dat/sort_name_input_1.sam",
+            "sort/name3.sort.expected.sam",
+        ),
+        (
+            &["-t", "RG", "-m", "10M"],
+            "dat/test_input_1_a.bam",
+            "sort/tag.rg.sort.expected.sam",
+        ),
+        (
+            &["-n", "-t", "RG", "-m", "10M"],
+            "dat/test_input_1_a.bam",
+            "sort/tag.rg.n.sort.expected.sam",
+        ),
+        // Exercises SAM `AS:I:` (uint32) aux integer-synonym tolerance.
+        (
+            &["-t", "AS", "-m", "10M"],
+            "dat/test_input_1_d.sam",
+            "sort/tag.as.sort.expected.sam",
+        ),
+        (
+            &["-t", "FI", "-m", "10M"],
+            "dat/test_input_1_d.sam",
+            "sort/tag.fi.sort.expected.sam",
+        ),
+        // `-N`: lexicographical (byte strcmp) name sort →
+        // @HD SS:queryname:lexicographical.
+        (
+            &["-N", "-m", "10M"],
+            "dat/test_input_1_b.bam",
+            "sort/name2.sort.expected.sam",
+        ),
+        // `--template-coordinate`: RG→library lookup, MC-derived mate
+        // unclipped coords, MI, is_upper_of_pair; @HD GO:query.
+        (
+            &["--template-coordinate", "-m", "10M"],
+            "sort/template-coordinate.sort.sam",
+            "sort/template-coordinate.sort.expected.sam",
+        ),
+    ];
+    for (args, input, expected) in cases {
+        let out = tmp.join(expected.replace('/', "_"));
+        let mut v: Vec<String> = vec!["sort".into()];
+        v.extend(args.iter().map(|s| s.to_string()));
+        v.push("-O".into());
+        v.push("SAM".into());
+        v.push("-o".into());
+        v.push(out.to_str().unwrap().into());
+        v.push(d.join(input).to_str().unwrap().into());
+        let refs: Vec<&OsString> = Vec::new();
+        let _ = refs;
+        let argv: Vec<OsString> = v.iter().map(OsString::from).collect();
+        assert_eq!(exit_to_u8(sort::main(&argv)), 0, "{expected}");
+        assert_eq!(
+            np(&std::fs::read_to_string(&out).unwrap()),
+            np(&std::fs::read_to_string(d.join(expected)).unwrap()),
+            "sort {expected} args={args:?}"
+        );
+    }
+}
+
+#[test]
+fn merge_reconciles_rg_pg_byte_exact_vs_upstream() {
+    // completed library batch merge: `merge -s 1` @RG/@PG PRNG reconciliation +
+    // raw-header preservation, byte-exact vs upstream test_merge
+    // fixtures (modulo @PG, which the harness strips).
+    let d = fixtures_dir();
+    let tmp = tmp_dir("merge-fixtures");
+    let np = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.starts_with("@PG\t"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    // (extra_flags, inputs, expected). merge/5 exercises `-r`
+    // (filename-derived @RG attached to every record); merge/6 `-cp`
+    // (combine identical @RG and @PG IDs instead of suffixing).
+    let cases: &[(&[&str], &[&str], &str)] = &[
+        (
+            &[],
+            &[
+                "dat/test_input_1_a.sam",
+                "dat/test_input_1_b.sam",
+                "dat/test_input_1_c.sam",
+            ],
+            "merge/2.merge.expected.sam",
+        ),
+        (
+            &[],
+            &["dat/test_input_1_b.bam"],
+            "merge/4.merge.expected.sam",
+        ),
+        (
+            &["-r"],
+            &[
+                "dat/test_input_1_a.sam",
+                "dat/test_input_1_b.sam",
+                "dat/test_input_1_c.sam",
+            ],
+            "merge/5.merge.expected.sam",
+        ),
+        (
+            &["-cp"],
+            &["dat/test_input_1_a.sam", "dat/test_input_1_b.sam"],
+            "merge/6.merge.expected.sam",
+        ),
+        (
+            &[],
+            &[
+                "dat/test_input_1_a_regex.sam",
+                "dat/test_input_1_b_regex.sam",
+            ],
+            "merge/7.merge.expected.sam",
+        ),
+    ];
+    for (flags, ins, expected) in cases {
+        let out = tmp.join(expected.replace('/', "_"));
+        let mut v: Vec<String> = vec!["merge".into()];
+        for f in *flags {
+            v.push((*f).into());
+        }
+        v.extend([
+            "-s".into(),
+            "1".into(),
+            "-O".into(),
+            "sam".into(),
+            "-o".into(),
+            out.to_str().unwrap().into(),
+        ]);
+        for i in *ins {
+            v.push(d.join(i).to_str().unwrap().into());
+        }
+        let argv: Vec<OsString> = v.iter().map(OsString::from).collect();
+        assert_eq!(exit_to_u8(merge::main(&argv)), 0, "{expected}");
+        assert_eq!(
+            np(&std::fs::read_to_string(&out).unwrap()),
+            np(&std::fs::read_to_string(d.join(expected)).unwrap()),
+            "merge {expected}"
+        );
+    }
+}
+
+/// All three upstream `test_sort` minimiser cases:
+/// `samtools reset --dupflag dat/auto_indexed.tmp.bam | samtools sort
+/// -m 10M {-M | -M -I ref | -MH -I ref} -K10 -O SAM` →
+/// `sort/minimiser-{basic,indexed,indexed-poly}.sam`. The minimiser
+/// sort reorders the unmapped reads by their 62-bit minhash key (non-
+/// indexed, or against the `-I` reference k-mer index) and reverse-
+/// complements records whose reverse-strand minimiser wins; `reset`
+/// rebuilds the fresh `@HD VN:1.6` + `@RG` (no `@SQ`) header. Output is
+/// byte-identical to each upstream fixture under the harness'
+/// `ignore_pg_header` (`@PG` stripped) — header **and** all 569 records.
+#[test]
+fn sort_minimiser_all_variants_match_upstream() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("sort-minimiser-basic");
+    let dir = fixtures_dir();
+    let src = dir.join("dat").join("mpileup.1.sam");
+    let ai = tmp.join("auto_indexed.tmp.bam");
+    let reset_bam = tmp.join("reset.bam");
+    let got = tmp.join("got.sam");
+
+    let run = |args: &[&str]| {
+        let argv: Vec<OsString> = std::iter::once(OsString::from("samtools"))
+            .chain(args.iter().map(OsString::from))
+            .collect();
+        assert_eq!(exit_to_u8(samtools_run(argv)), 0, "args={args:?}");
+    };
+    run(&[
+        "view",
+        "--write-index",
+        "-o",
+        ai.to_str().unwrap(),
+        src.to_str().unwrap(),
+    ]);
+    run(&[
+        "reset",
+        "--dupflag",
+        "-o",
+        reset_bam.to_str().unwrap(),
+        ai.to_str().unwrap(),
+    ]);
+    let reference = dir.join("dat").join("mpileup.ref.fa");
+    // The upstream harness compares with `ignore_pg_header => 1`
+    // (strip @PG runs); everything else — @HD/@RG header and all 569
+    // records — must be byte-identical.
+    let strip_pg = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.starts_with("@PG"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    // (extra sort args, expected fixture). All three upstream
+    // test_sort minimiser cases: non-indexed, indexed reference, and
+    // indexed + homopolymer squash (`-MH`).
+    let cases: [(&[&str], &str); 3] = [
+        (&["-M", "-K10"], "minimiser-basic.sam"),
+        (
+            &["-M", "-K10", "-I", reference.to_str().unwrap()],
+            "minimiser-indexed.sam",
+        ),
+        (
+            &["-MH", "-K10", "-I", reference.to_str().unwrap()],
+            "minimiser-indexed-poly.sam",
+        ),
+    ];
+    for (extra, expected) in cases {
+        let mut sort_args: Vec<&str> = vec!["sort", "-m", "10M"];
+        sort_args.extend_from_slice(extra);
+        sort_args.extend_from_slice(&["-O", "SAM", "-o", got.to_str().unwrap()]);
+        sort_args.push(reset_bam.to_str().unwrap());
+        run(&sort_args);
+
+        let got_text = std::fs::read_to_string(&got).unwrap();
+        let exp_text = std::fs::read_to_string(dir.join("sort").join(expected)).unwrap();
+        assert_eq!(
+            strip_pg(&got_text),
+            strip_pg(&exp_text),
+            "{expected} must be byte-identical to upstream (modulo @PG)"
+        );
+    }
 }

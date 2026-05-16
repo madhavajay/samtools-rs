@@ -12,8 +12,14 @@
 //!  - `-E`: extended BAQ (`recalculate_extended_baq_from_sam_path`).
 //!  - `-d`: drop existing `BQ` tags from the SAM-text output.
 //!
-//! **Pending:** `-A` (always-apply), `-C cap`, BAM/CRAM output, and
-//! BAM/CRAM BAQ helper paths.
+//!  - `-A` (with `-r`): apply the recalculated BAQ to the quality
+//!    string (`recalculate_and_apply_baq_from_sam_path`).
+//!  - `-b`/`-u`: BAM output (compressed / uncompressed), so
+//!    `calmd -uAr in.sam ref.fa` emits a BGZF stream like upstream.
+//!  - glued short-option clusters (`-uAr`) are split like `getopt`.
+//!
+//! **Pending:** `-C cap`, `-n max_nm`, CRAM output, and BAM/CRAM BAQ
+//! helper paths (BAQ recalculation still requires SAM input).
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -27,17 +33,57 @@ use htslib_rs::format::Exact;
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
 
+/// Splits glued short-option clusters (`-uAr` → `-u -A -r`) the way
+/// `getopt` does. Value-taking options (`-C`, `-n`, `-@`) consume the
+/// rest of the cluster as their argument (or the next token), so
+/// `-rC20` becomes `-r -C 20`. `--long`, a lone `-`, and non-option
+/// operands pass through unchanged.
+fn expand_short_clusters(args: &[OsString]) -> Vec<OsString> {
+    const TAKES_VALUE: &[char] = &['C', 'n', '@'];
+    let mut out: Vec<OsString> = Vec::with_capacity(args.len());
+    for arg in args {
+        let s = arg.to_str().unwrap_or("");
+        let is_cluster = s.len() > 2
+            && s.starts_with('-')
+            && !s.starts_with("--")
+            && s[1..].chars().all(|c| c.is_ascii_alphanumeric());
+        if !is_cluster {
+            out.push(arg.clone());
+            continue;
+        }
+        let chars: Vec<char> = s[1..].chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            out.push(OsString::from(format!("-{c}")));
+            if TAKES_VALUE.contains(&c) {
+                let rest: String = chars[i + 1..].iter().collect();
+                if !rest.is_empty() {
+                    out.push(OsString::from(rest));
+                }
+                break;
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Entry point for `samtools calmd` / `samtools fillmd`.
 pub fn main(args: &[OsString]) -> ExitCode {
     let mut realn = false;
     let mut extended = false;
     let mut apply_existing = false;
+    let mut always_apply = false;
+    let mut bam_out = false;
+    let mut uncompressed = false;
     let mut drop_baq = false;
     let mut reference: Option<PathBuf> = None;
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut no_pg = false;
 
+    let args = expand_short_clusters(args);
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
         let s = arg.to_str().unwrap_or("");
@@ -49,7 +95,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-d" => {
                 drop_baq = true;
             }
-            "-A" | "-C" | "-n" | "-S" | "-b" | "-u" | "-N" | "-h" | "-q" | "-Q" => {
+            "-A" => always_apply = true,
+            "-b" => bam_out = true,
+            "-u" => {
+                bam_out = true;
+                uncompressed = true;
+            }
+            "-C" | "-n" | "-S" | "-N" | "-h" | "-q" | "-Q" => {
                 if matches!(s, "-C" | "-n") {
                     let _ = iter.next();
                 }
@@ -116,7 +168,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         };
         if extended {
             htslib_rs::alignment_compat::recalculate_extended_baq_from_sam_path(&input, reference)
-        } else if apply_existing {
+        } else if apply_existing || always_apply {
             htslib_rs::alignment_compat::recalculate_and_apply_baq_from_sam_path(&input, reference)
         } else {
             htslib_rs::alignment_compat::recalculate_baq_from_sam_path(&input, reference)
@@ -155,7 +207,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let text = if no_pg {
         text
     } else {
-        match inject_pg_into_sam_text(&text, args) {
+        match inject_pg_into_sam_text(&text, &args) {
             Ok(modified) => modified,
             Err(e) => {
                 print_error_errno("calmd", "inject @PG line", &e);
@@ -171,6 +223,37 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    if bam_out {
+        use htslib_rs::bgzf::io::writer::CompressionLevel;
+        let level = if uncompressed {
+            CompressionLevel::try_from(0).unwrap_or_default()
+        } else {
+            CompressionLevel::default()
+        };
+        let mut reader = htslib_rs::sam::io::Reader::new(io::Cursor::new(text.into_bytes()));
+        let result = htslib_rs::alignment_compat::write_bam_from_sam_reader_with_compression_level(
+            &mut reader,
+            &mut out,
+            level,
+        );
+        match result {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {}
+            Err(e) => {
+                print_error_errno("calmd", "write BAM output", &e);
+                return ExitCode::from(1);
+            }
+        }
+        if let Err(e) = out.flush()
+            && e.kind() != io::ErrorKind::BrokenPipe
+        {
+            print_error_errno("calmd", "flush BAM output", &e);
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+
     if let Err(e) = sam_io::write_all_and_close(&mut out, text.as_bytes())
         && e.kind() != io::ErrorKind::BrokenPipe
     {

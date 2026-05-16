@@ -2157,3 +2157,362 @@ fn view_u_unselected_routes_into_bam_output_for_sam_input() {
     assert!(unsel_text.contains("\nr2\t"));
     assert!(!unsel_text.contains("\nr1\t"));
 }
+
+/// `view -b in.sam` must embed the samtools `@PG` in the **binary**
+/// BAM header (completed library batch #4 / TODO.md). Round-trip via `view -h`:
+/// without `--no-PG` the BAM carries a `PN:samtools` `@PG`; with
+/// `--no-PG` it does not. Records are unaffected.
+#[test]
+fn view_b_embeds_pg_in_binary_bam_header() {
+    let tmp = tmp_dir("view-b-pg");
+    let sam = tmp.join("in.sam");
+    std::fs::write(
+        &sam,
+        "@HD\tVN:1.6\n@SQ\tSN:c1\tLN:10\nr1\t0\tc1\t1\t60\t4M\t*\t0\t0\tACGT\tIIII\n",
+    )
+    .unwrap();
+
+    // -b without --no-PG: BAM header gains a samtools @PG.
+    let bam = tmp.join("out.bam");
+    assert_eq!(
+        run(&["-b", sam.to_str().unwrap(), "-o", bam.to_str().unwrap()]),
+        0
+    );
+    let hdr = tmp.join("hdr.sam");
+    assert_eq!(
+        run(&[
+            "-H",
+            "--no-PG",
+            bam.to_str().unwrap(),
+            "-o",
+            hdr.to_str().unwrap(),
+        ]),
+        0
+    );
+    let hdr_text = std::fs::read_to_string(&hdr).unwrap();
+    assert!(
+        hdr_text
+            .lines()
+            .any(|l| l.starts_with("@PG") && l.contains("PN:samtools")),
+        "binary BAM header must carry the samtools @PG, got:\n{hdr_text}"
+    );
+
+    // -b --no-PG: no @PG in the BAM header.
+    let bam2 = tmp.join("out.nopg.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            "--no-PG",
+            sam.to_str().unwrap(),
+            "-o",
+            bam2.to_str().unwrap(),
+        ]),
+        0
+    );
+    let hdr2 = tmp.join("hdr2.sam");
+    assert_eq!(
+        run(&[
+            "-H",
+            "--no-PG",
+            bam2.to_str().unwrap(),
+            "-o",
+            hdr2.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(
+        !std::fs::read_to_string(&hdr2).unwrap().contains("@PG"),
+        "view -b --no-PG must not add a @PG"
+    );
+
+    // Records survive the SAM->BAM @PG-injection round-trip.
+    let recs = tmp.join("recs.sam");
+    assert_eq!(
+        run(&[
+            "--no-PG",
+            bam.to_str().unwrap(),
+            "-o",
+            recs.to_str().unwrap(),
+        ]),
+        0
+    );
+    let rt = std::fs::read_to_string(&recs).unwrap();
+    assert!(
+        rt.lines()
+            .any(|l| l.starts_with("r1\t") && l.contains("ACGT"))
+    );
+
+    // BAM-input -> BAM-output also injects the @PG into the binary
+    // header (records streamed unchanged), suppressed by --no-PG.
+    let nopg_bam = tmp.join("base.nopg.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            "--no-PG",
+            sam.to_str().unwrap(),
+            "-o",
+            nopg_bam.to_str().unwrap(),
+        ]),
+        0
+    );
+    let bb = tmp.join("bam2bam.bam");
+    assert_eq!(
+        run(&["-b", nopg_bam.to_str().unwrap(), "-o", bb.to_str().unwrap()]),
+        0
+    );
+    let bbh = tmp.join("bb.sam");
+    assert_eq!(
+        run(&[
+            "-H",
+            "--no-PG",
+            bb.to_str().unwrap(),
+            "-o",
+            bbh.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(
+        std::fs::read_to_string(&bbh)
+            .unwrap()
+            .lines()
+            .any(|l| l.starts_with("@PG") && l.contains("PN:samtools")),
+        "BAM->BAM must inject the samtools @PG into the binary header"
+    );
+    let bbrecs = tmp.join("bb.recs.sam");
+    assert_eq!(
+        run(&[
+            "--no-PG",
+            bb.to_str().unwrap(),
+            "-o",
+            bbrecs.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(
+        std::fs::read_to_string(&bbrecs)
+            .unwrap()
+            .lines()
+            .any(|l| l.starts_with("r1\t") && l.contains("ACGT")),
+        "BAM->BAM @PG injection must preserve records"
+    );
+}
+
+/// The SAM-text-intermediate binary paths (here: `view -b -z`
+/// sanitizer on BAM input) also inject the samtools `@PG` into the
+/// binary BAM header (completed library batch #4).
+#[test]
+fn view_b_sanitizer_bam_path_embeds_pg() {
+    let tmp = tmp_dir("view-b-sanitize-pg");
+    let sam = tmp.join("in.sam");
+    std::fs::write(
+        &sam,
+        "@HD\tVN:1.6\n@SQ\tSN:c1\tLN:10\nr1\t0\tc1\t1\t60\t4M\t*\t0\t0\tACGT\tIIII\n",
+    )
+    .unwrap();
+    let bam = tmp.join("in.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            "--no-PG",
+            sam.to_str().unwrap(),
+            "-o",
+            bam.to_str().unwrap(),
+        ]),
+        0
+    );
+    // BAM input + sanitizer -> BAM output (SAM-text intermediate path).
+    let out = tmp.join("out.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            "-z",
+            "all",
+            bam.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ]),
+        0
+    );
+    let hdr = tmp.join("h.sam");
+    assert_eq!(
+        run(&[
+            "-H",
+            "--no-PG",
+            out.to_str().unwrap(),
+            "-o",
+            hdr.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(
+        std::fs::read_to_string(&hdr)
+            .unwrap()
+            .lines()
+            .any(|l| l.starts_with("@PG") && l.contains("PN:samtools")),
+        "sanitizer BAM->BAM path must inject the samtools @PG"
+    );
+}
+
+/// BAM-input filter and region binary copies inject the samtools
+/// `@PG` (routed via the SAM-text path when `@PG` is wanted),
+/// suppressed by `--no-PG` which keeps the fast binary copy
+/// (completed library batch #4).
+#[test]
+fn view_b_bam_filter_and_region_paths_embed_pg() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("view-b-filter-region-pg");
+    let sam = tmp.join("in.sam");
+    std::fs::write(
+        &sam,
+        "@HD\tVN:1.6\n@SQ\tSN:c1\tLN:20\n\
+         r1\t0\tc1\t1\t60\t4M\t*\t0\t0\tACGT\tIIII\n\
+         r2\t0\tc1\t5\t10\t4M\t*\t0\t0\tACGT\tIIII\n",
+    )
+    .unwrap();
+    let bam = tmp.join("in.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            "--no-PG",
+            sam.to_str().unwrap(),
+            "-o",
+            bam.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &["index", bam.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let has_pg = |p: &std::path::Path| -> bool {
+        let h = tmp.join("h.sam");
+        assert_eq!(
+            run(&[
+                "-H",
+                "--no-PG",
+                p.to_str().unwrap(),
+                "-o",
+                h.to_str().unwrap()
+            ]),
+            0
+        );
+        std::fs::read_to_string(&h)
+            .unwrap()
+            .lines()
+            .any(|l| l.starts_with("@PG") && l.contains("PN:samtools"))
+    };
+
+    // BAM filter -> BAM
+    let f = tmp.join("f.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            "-e",
+            "mapq>=20",
+            bam.to_str().unwrap(),
+            "-o",
+            f.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(has_pg(&f), "BAM filter -> BAM must inject @PG");
+
+    // BAM region -> BAM
+    let r = tmp.join("r.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            bam.to_str().unwrap(),
+            "c1:1-3",
+            "-o",
+            r.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(has_pg(&r), "BAM region -> BAM must inject @PG");
+
+    // --no-PG keeps it absent.
+    let fn_ = tmp.join("fn.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            "--no-PG",
+            "-e",
+            "mapq>=20",
+            bam.to_str().unwrap(),
+            "-o",
+            fn_.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(!has_pg(&fn_), "view -b --no-PG must not add a @PG");
+}
+
+/// `view -C` (SAM->CRAM) likewise embeds the samtools `@PG` in the
+/// CRAM header unless `--no-PG` (completed library batch #4).
+#[test]
+fn view_c_embeds_pg_in_binary_cram_header() {
+    // Uses the same known-good fixtures as the other SAM->CRAM tests.
+    let sam = fixtures_dir().join("view.001.sam");
+    let reference = fixtures_dir().join("view.001.fa");
+    let r = reference.to_str().unwrap();
+    let tmp = tmp_dir("view-c-pg");
+
+    // Read the CRAM header back via the htslib-rs helper (the same
+    // approach the other SAM->CRAM tests use), so the assertion is on
+    // the bytes actually stored in the binary CRAM header.
+    let cram_header = |p: &std::path::Path| -> String {
+        let text =
+            htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+                p,
+                &reference,
+                Some(0),
+            )
+            .unwrap();
+        text.lines()
+            .take_while(|l| l.starts_with('@'))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+
+    let cram = tmp.join("out.cram");
+    assert_eq!(
+        run(&[
+            "-C",
+            "-T",
+            r,
+            sam.to_str().unwrap(),
+            "-o",
+            cram.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(
+        cram_header(&cram)
+            .lines()
+            .any(|l| l.starts_with("@PG") && l.contains("PN:samtools")),
+        "binary CRAM header must carry the samtools @PG"
+    );
+
+    let cram2 = tmp.join("out.nopg.cram");
+    assert_eq!(
+        run(&[
+            "-C",
+            "--no-PG",
+            "-T",
+            r,
+            sam.to_str().unwrap(),
+            "-o",
+            cram2.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(
+        !cram_header(&cram2).contains("PN:samtools"),
+        "view -C --no-PG must not add a samtools @PG"
+    );
+}

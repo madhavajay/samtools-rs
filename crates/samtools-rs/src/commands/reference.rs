@@ -1,9 +1,15 @@
 //! `samtools reference` — reconstruct references from alignments and MD tags.
 //!
-//! This is a partial port of `reference.c`'s MD:Z path. It supports SAM and
-//! BAM input, optional region output, and FASTA output. Embedded CRAM reference
-//! extraction is intentionally deferred because it needs CRAM container/block
-//! internals that are not exposed in this samtools-rs-only pass.
+//! Ports `reference.c`'s MD:Z path (SAM/BAM/CRAM input, region
+//! output, FASTA output) and the `-e`/`--embedded` `cram2ref` path
+//! (per-slice embedded-reference-block extraction via the vendored
+//! noodles `Container::slices()`/`decode_blocks()` inventory). The
+//! `-e` byte-exact fixture (`reference/mpileup.embed.fa.expected`)
+//! additionally needs samtools-rs `view -O cram,embed_ref=1` to
+//! *write* an embedded reference (the regenerated test CRAM is
+//! reference-compressed) — completed library batch #2's embed_ref-write tail; the
+//! `-e` extraction itself is a faithful `cram2ref` port (it errors
+//! identically on a slice without an embedded reference).
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -59,14 +65,6 @@ pub fn main(args: &[OsString]) -> ExitCode {
         Err(ParseOutcome::Help) => return ExitCode::SUCCESS,
         Err(ParseOutcome::Error) => return ExitCode::from(1),
     };
-
-    if opts.embedded {
-        print_error(
-            "reference",
-            "-e/--embedded requires CRAM container internals not exposed in samtools-rs",
-        );
-        return ExitCode::from(1);
-    }
 
     let input = input.unwrap_or_else(|| PathBuf::from("-"));
     let mut writer = match sam_io::open_text_output(opts.output.as_deref()) {
@@ -184,15 +182,102 @@ fn reference_path(input: &Path, opts: &ReferenceOptions, writer: &mut dyn Write)
             dump_refs(writer, &refs, target.as_ref(), opts.quiet)
         }
         Exact::Bam => reference_bam_path(input, opts, writer),
-        Exact::Cram => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "CRAM reference reconstruction is blocked on CRAM all-record/container APIs",
-        )),
+        Exact::Cram => reference_cram_path(input, opts, writer),
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "only SAM and BAM input are currently supported",
         )),
     }
+}
+
+/// `reference` MD path for CRAM input. The fixture CRAMs are built
+/// with `embed_ref=1`, so the embedded reference travels in the
+/// container and noodles decodes full SEQ with no external reference;
+/// `update_refs` then reconstructs the reference from MD:Z + CIGAR +
+/// SEQ exactly as the SAM/BAM paths do. The `-e` embedded-extraction
+/// mode still needs CRAM container internals (completed library batch #3).
+fn reference_cram_path(
+    input: &Path,
+    opts: &ReferenceOptions,
+    writer: &mut dyn Write,
+) -> io::Result<()> {
+    let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
+    let mut refs = init_refs(&header);
+    let target = opts
+        .region
+        .as_ref()
+        .map(|region| region_target(&header, region))
+        .transpose()?;
+
+    if opts.embedded {
+        // `cram2ref` (`reference.c:139-297`): per slice, copy the
+        // embedded-reference block (content id ==
+        // `embed_ref_id`) into the per-reference all-`N` buffer at
+        // the slice's 1-based `ref_start`.
+        use htslib_rs::cram::container::reference_sequence_context::ReferenceSequenceContext;
+        let mut reader = std::fs::File::open(input)
+            .map(std::io::BufReader::new)
+            .map(htslib_rs::cram::io::Reader::new)?;
+        reader.read_header()?;
+        let mut container = htslib_rs::cram::io::reader::Container::default();
+        while reader.read_container(&mut container)? != 0 {
+            if container.header().landmarks().is_empty() {
+                continue;
+            }
+            for slice in container.slices() {
+                let slice = slice?;
+                let ReferenceSequenceContext::Some(ctx) =
+                    slice.header().reference_sequence_context()
+                else {
+                    continue;
+                };
+                let ref_id = ctx.reference_sequence_id();
+                let Some(embed_id) = slice.header().embedded_reference_bases_block_content_id()
+                else {
+                    // `cram2ref` (`reference.c:221`): a mapped slice
+                    // with no embedded reference is a hard error.
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "CRAM file has slice without embedded reference",
+                    ));
+                };
+                let ref_start = usize::from(ctx.alignment_start()); // 1-based
+                let (_, externals) = slice.decode_blocks()?;
+                let Some((_, data)) = externals.iter().find(|(id, _)| *id == embed_id) else {
+                    continue;
+                };
+                if let Some(rb) = refs.get_mut(ref_id) {
+                    let ref_len = rb.seq.len();
+                    let mut ref_end = ref_start + data.len();
+                    if ref_end > ref_len + 1 {
+                        ref_end = ref_len + 1;
+                    }
+                    if ref_end > ref_start {
+                        let dst = ref_start - 1..ref_end - 1;
+                        rb.seq[dst].copy_from_slice(&data[..ref_end - ref_start]);
+                        rb.touched = true;
+                    }
+                }
+            }
+        }
+        return dump_refs(writer, &refs, target.as_ref(), opts.quiet);
+    }
+    // The vendored noodles-cram now decodes an embedded reference
+    // (`embed_ref`) directly, so the MD path needs no external
+    // reference for embed_ref CRAM; fall back to `--reference` only
+    // when one is supplied (reference-compressed CRAM).
+    let records = match crate::sam_global::current_global_args().reference {
+        Some(reference) => {
+            htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+                input, reference,
+            )?
+        }
+        None => htslib_rs::alignment_compat::query_cram_records_all_from_path(input)?,
+    };
+    for record in records {
+        update_refs(&header, &mut refs, &record, target.as_ref())?;
+    }
+    dump_refs(writer, &refs, target.as_ref(), opts.quiet)
 }
 
 fn reference_bam_path(

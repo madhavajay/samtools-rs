@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -52,7 +52,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
             _ => {
                 if input.is_none() {
                     input = Some(PathBuf::from(arg));
-                } else if output.is_none() {
+                } else if output.is_none() && s != "-" {
+                    // A `-` output operand means stdout (output stays None).
                     output = Some(PathBuf::from(arg));
                 }
             }
@@ -133,7 +134,7 @@ fn run_sam_rmdup(
     pg_argv: Option<&[OsString]>,
     single_end: bool,
 ) -> io::Result<()> {
-    let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
+    let mut reader = crate::sam_compat::open_sam_reader_tolerant(input)?;
     let mut header = reader.read_header()?;
     if let Some(argv) = pg_argv {
         header = crate::pg::add_samtools_pg_to_header(&header, argv)?;

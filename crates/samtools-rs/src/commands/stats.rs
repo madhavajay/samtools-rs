@@ -9,7 +9,7 @@
 //! histograms, per-cycle stats, BAQ adjustments, and deeper reference-based
 //! mismatch parity.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -27,12 +27,22 @@ use crate::bam_flag::{
 };
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
+
 use crate::sam_global::current_global_args;
 use crate::version::SAMTOOLS_VERSION;
+
+/// Upstream `stats.c` `stats->ngc` — GC-fraction histogram array size.
+const NGC: usize = 200;
+/// Upstream `stats->nindels` (init = `nbases` = 300, never grown):
+/// indels longer than this are excluded from the ID distribution.
+const NINDELS: usize = 300;
 
 #[derive(Clone, Debug)]
 struct StatsConfig {
     remove_dups: bool,
+    // `-p`/`--remove-overlaps`: subtract overlapping mate-pair regions
+    // from `bases mapped (cigar)` and the coverage histogram.
+    remove_overlaps: bool,
     required_flags: u32,
     filter_flags: u32,
     id_filter: Option<String>,
@@ -44,12 +54,25 @@ struct StatsConfig {
     coverage_max: u32,
     coverage_step: u32,
     cov_threshold: u32,
+    // True when a reference (`-r`) was supplied; upstream only allocates
+    // `mpc_buf` (and therefore prints the MPC section) in that case.
+    has_reference: bool,
+    // Reference sequences (upper-cased bases) keyed by name, loaded when
+    // a reference is supplied. Drives the MPC reference-mismatch engine.
+    reference_seqs: Option<HashMap<String, Vec<u8>>>,
+    // `-S`/`--split <tag>`: also write per-tag-value `.bamstat` files.
+    // `-P`/`--split-prefix`: filename prefix (default = input path).
+    split_tag: Option<String>,
+    split_prefix: Option<String>,
+    // `--ref-stats`: emit the RFS reference-statistics section.
+    ref_stats: bool,
 }
 
 impl Default for StatsConfig {
     fn default() -> Self {
         Self {
             remove_dups: false,
+            remove_overlaps: false,
             required_flags: 0,
             filter_flags: 0,
             id_filter: None,
@@ -61,6 +84,11 @@ impl Default for StatsConfig {
             coverage_max: 1000,
             coverage_step: 1,
             cov_threshold: 0,
+            has_reference: false,
+            reference_seqs: None,
+            split_tag: None,
+            split_prefix: None,
+            ref_stats: false,
         }
     }
 }
@@ -71,6 +99,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut output: Option<PathBuf> = None;
     let mut target_file: Option<PathBuf> = None;
     let mut config = StatsConfig::default();
+    let mut reference_arg: Option<PathBuf> = None;
     let mut regions: Vec<String> = Vec::new();
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -191,14 +220,31 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     }
                 }
             }
-            "-@" | "--threads" | "-r" | "--reference" | "-S" | "--split" | "-P"
-            | "--split-prefix" | "-G" => {
+            "-r" | "--reference" | "--ref-seq" => {
+                reference_arg = iter.next().map(PathBuf::from);
+            }
+            "-S" | "--split" => {
+                config.split_tag = iter.next().and_then(|s| s.to_str().map(str::to_owned));
+            }
+            "-P" | "--split-prefix" => {
+                config.split_prefix = iter.next().and_then(|s| s.to_str().map(str::to_owned));
+            }
+            "--ref-stats" => {
+                config.ref_stats = true;
+            }
+            "--ref-stats-chunk" => {
+                let _ = iter.next();
+            }
+            "-@" | "--threads" | "-G" => {
                 let _ = iter.next();
             }
             "-d" | "--remove-dups" => {
                 config.remove_dups = true;
             }
-            "-s" | "--sparse" | "-x" | "--sam" | "-p" | "--remove-overlaps" | "--no-PG" => {
+            "-p" | "--remove-overlaps" => {
+                config.remove_overlaps = true;
+            }
+            "-s" | "--sparse" | "-x" | "--sam" | "--no-PG" => {
                 // Accepted but not yet implemented.
             }
             "--help" | "-h" => {
@@ -243,10 +289,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
         None => Vec::new(),
     };
 
-    let parsed_regions = match regions
+    // Positional region arguments require indexed random access;
+    // `-t`/`--target-regions` is a streaming filter (no index needed).
+    let positional_regions = match regions
         .iter()
         .map(|region| parse_region(region))
-        .chain(target_regions.into_iter().map(Ok))
         .collect::<io::Result<Vec<_>>>()
     {
         Ok(regions) => regions,
@@ -255,6 +302,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let parsed_regions: Vec<Region> = positional_regions
+        .iter()
+        .cloned()
+        .chain(target_regions)
+        .collect();
     if config.cov_threshold > 0 && parsed_regions.is_empty() {
         print_error(
             "stats",
@@ -264,6 +316,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     enum StatsInput {
+        // Retained for the SAM/BAM/CRAM `AlignmentRecordSummary` fallback
+        // shape; no longer produced now that no-region CRAM uses the
+        // full-record iterator (completed library batch #2).
+        #[allow(dead_code)]
         Summaries(Vec<AlignmentRecordSummary>),
         Counts(Box<StatsCounts>),
     }
@@ -280,6 +336,24 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     };
 
+    let resolved_reference = reference_arg
+        .clone()
+        .or_else(|| current_global_args().reference);
+    config.has_reference = resolved_reference.is_some();
+    if let Some(ref_path) = resolved_reference.as_ref() {
+        match load_reference_seqs(ref_path) {
+            Ok(map) => config.reference_seqs = Some(map),
+            Err(e) => {
+                print_error_errno(
+                    "stats",
+                    format!("failed to read reference \"{}\"", ref_path.display()),
+                    &e,
+                );
+                return ExitCode::from(1);
+            }
+        }
+    }
+
     let stats_input = match format.exact {
         Exact::Sam if parsed_regions.is_empty() => collect_sam_full_stats(&input, &config)
             .map(|counts| StatsInput::Counts(Box::new(counts))),
@@ -287,18 +361,27 @@ pub fn main(args: &[OsString]) -> ExitCode {
             .map(|counts| StatsInput::Counts(Box::new(counts))),
         Exact::Bam if parsed_regions.is_empty() => collect_bam_full_stats(&input, &config)
             .map(|counts| StatsInput::Counts(Box::new(counts))),
+        Exact::Bam if positional_regions.is_empty() => {
+            // `-t` only: stream the whole BAM, filter by target overlap.
+            collect_bam_targets_stats(&input, &parsed_regions, &config)
+                .map(|counts| StatsInput::Counts(Box::new(counts)))
+        }
         Exact::Bam => collect_bam_region_stats(&input, &parsed_regions, &config)
             .map(|counts| StatsInput::Counts(Box::new(counts))),
         Exact::Cram => {
-            let Some(reference) = current_global_args().reference else {
-                print_error("stats", "CRAM input requires top-level --reference FILE");
+            let Some(reference) = reference_arg
+                .clone()
+                .or_else(|| current_global_args().reference)
+            else {
+                print_error(
+                    "stats",
+                    "CRAM input requires -r/--reference FILE or top-level --reference",
+                );
                 return ExitCode::from(1);
             };
             if parsed_regions.is_empty() {
-                htslib_rs::alignment_compat::summarize_cram_records_from_path_with_reference(
-                    &input, reference,
-                )
-                .map(StatsInput::Summaries)
+                collect_cram_full_stats(&input, reference, &config)
+                    .map(|counts| StatsInput::Counts(Box::new(counts)))
             } else {
                 collect_cram_region_stats(&input, reference, &parsed_regions, &config)
                     .map(|counts| StatsInput::Counts(Box::new(counts)))
@@ -337,13 +420,42 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 .as_deref()
                 .map(|so| so == "coordinate")
                 .unwrap_or(false);
-            write_stats(&mut writer, &summaries, config, is_sorted)
+            write_stats(&mut writer, &summaries, &config, is_sorted)
         }
         StatsInput::Counts(counts) => {
             let is_sorted = counts.is_coordinate_sorted();
-            write_stats_counts(&mut writer, &counts, config, is_sorted)
+            let combined = write_stats_counts(&mut writer, &counts, &config, is_sorted);
+            // `-S`/`--split`: one `<prefix|input>_<value>.bamstat` per
+            // tag value, prefix defaulting to the input path.
+            combined.and_then(|()| {
+                if config.split_tag.is_none() {
+                    return Ok(());
+                }
+                let prefix = config
+                    .split_prefix
+                    .clone()
+                    .unwrap_or_else(|| input.to_string_lossy().into_owned());
+                for (value, sub) in &counts.splits {
+                    let path = format!("{prefix}_{value}.bamstat");
+                    let file = File::create(&path)?;
+                    let mut w = std::io::BufWriter::new(file);
+                    write_stats_counts(&mut w, sub, &config, sub.is_coordinate_sorted())?;
+                    w.flush()?;
+                }
+                Ok(())
+            })
         }
     };
+    let write_result = write_result.and_then(|()| {
+        if config.ref_stats
+            && let Some(header) = read_input_header(&input, format.exact)?
+        {
+            let dims = ref_dims(&header);
+            let merged = merge_ref_regions(&header, &parsed_regions)?;
+            write_ref_stats(&mut writer, &dims, &merged, config.reference_seqs.as_ref())?;
+        }
+        Ok(())
+    });
     if let Err(e) = write_result {
         if e.kind() == io::ErrorKind::BrokenPipe {
             return ExitCode::SUCCESS;
@@ -404,6 +516,182 @@ fn read_input_header_sort_order(
         })
         .map(|value| String::from_utf8_lossy(value.as_ref()).to_lowercase());
     Ok(so)
+}
+
+/// Reads just the header (for the `--ref-stats` RFS section).
+fn read_input_header(input: &std::path::Path, exact: Exact) -> io::Result<Option<sam::Header>> {
+    Ok(Some(match exact {
+        Exact::Sam => htslib_rs::alignment_compat::read_sam_header_from_path(input)?,
+        Exact::Bam => htslib_rs::alignment_compat::read_bam_header_from_path(input)?,
+        Exact::Cram => htslib_rs::alignment_compat::read_cram_header_from_path(input)?,
+        _ => return Ok(None),
+    }))
+}
+
+/// Header `@SQ` (name, length) pairs in order.
+fn ref_dims(header: &sam::Header) -> Vec<(String, u64)> {
+    header
+        .reference_sequences()
+        .iter()
+        .map(|(name, def)| {
+            (
+                String::from_utf8_lossy(name.as_ref()).into_owned(),
+                usize::from(def.length()) as u64,
+            )
+        })
+        .collect()
+}
+
+/// Writes the RFS reference-statistics section (`--ref-stats`). Without
+/// a reference the GC/N columns are -1 (upstream `gcsum=-1`); with one,
+/// GC = G+C / (A+C+G+T) and N = count of N over the header-length
+/// prefix of each sequence, mirroring `collect_refstats`.
+fn write_ref_stats(
+    out: &mut dyn Write,
+    dims: &[(String, u64)],
+    regions: &[(String, i64, i64, i64)],
+    refmap: Option<&HashMap<String, Vec<u8>>>,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "# Reference statistics. Use `grep ^RFS | cut -f 2-` to extract this part."
+    )?;
+    writeln!(
+        out,
+        "# Total count, Output count, Average GC, Min length, Max length, Average length, Total length in first row."
+    )?;
+    writeln!(
+        out,
+        "# Sequence name, Length, GC content, Unknown count in following rows."
+    )?;
+    // refseq_total_count is always the number of header @SQ entries.
+    let total = dims.len() as i64;
+
+    // GC/N over the upper-cased reference bases [beg, end) (0-based).
+    let gc_n = |name: &str, beg0: usize, end0: usize| -> Option<(f64, i64)> {
+        let seq = refmap?.get(name);
+        match seq {
+            Some(seq) => {
+                let hi = end0.min(seq.len());
+                let (mut gc, mut at, mut n) = (0i64, 0i64, 0i64);
+                if beg0 < hi {
+                    for &b in &seq[beg0..hi] {
+                        match b {
+                            b'G' | b'C' => gc += 1,
+                            b'A' | b'T' => at += 1,
+                            b'N' => n += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                let refgc = if gc + at > 0 {
+                    gc as f64 / (gc + at) as f64
+                } else {
+                    0.0
+                };
+                Some((refgc, n))
+            }
+            // Reference supplied but sequence absent -> zero bases.
+            None => Some((0.0, 0)),
+        }
+    };
+
+    // (display name, reflen, refgc, refN)
+    let mut rows: Vec<(String, i64, f64, i64)> = Vec::new();
+    if regions.is_empty() {
+        // All-@SQ path: full sequence, header length.
+        for (name, len) in dims {
+            let l = *len as i64;
+            match gc_n(name, 0, *len as usize) {
+                Some((gc, n)) => rows.push((name.clone(), l, gc, n)),
+                None => rows.push((name.clone(), l, -1.0, -1)),
+            }
+        }
+    } else {
+        // Region path: name:beg-end, reflen clamped to the sequence.
+        for (name, beg, end, seqlen) in regions {
+            let reflen = (end - beg + 1).min(*seqlen);
+            match gc_n(name, (*beg - 1) as usize, *end as usize) {
+                Some((gc, n)) => rows.push((format!("{name}:{beg}-{end}"), reflen, gc, n)),
+                None => rows.push((format!("{name}:{beg}-{end}"), reflen, -1.0, -1)),
+            }
+        }
+    }
+
+    let have_ref = refmap.is_some();
+    let count = rows.len() as i64;
+    let combined: i64 = rows.iter().map(|(_, l, _, _)| *l).sum();
+    let minlen = rows.iter().map(|(_, l, _, _)| *l).min().unwrap_or(0);
+    let maxlen = rows.iter().map(|(_, l, _, _)| *l).max().unwrap_or(0);
+    let avglen = if count > 0 {
+        combined as f64 / count as f64
+    } else {
+        -1.0
+    };
+    let gcsum: f64 = rows.iter().map(|(_, _, gc, _)| *gc).sum();
+    let avggc = if !have_ref || count == 0 {
+        -1.0
+    } else {
+        gcsum / count as f64
+    };
+    writeln!(
+        out,
+        "RFS\t{total}\t{count}\t{avggc:.2}\t{minlen}\t{maxlen}\t{avglen:.2}\t{combined}"
+    )?;
+    for (name, len, gc, n) in rows {
+        writeln!(out, "RFS\t{name}\t{len}\t{gc:.2}\t{n}")?;
+    }
+    Ok(())
+}
+
+/// Upstream `init_regions` per-reference interval merge: sort by start,
+/// then coalesce overlapping/adjacent intervals (gap => new interval,
+/// otherwise extend the end). Returns `(name, beg, end, seqlen)` 1-based
+/// inclusive, in header order.
+fn merge_ref_regions(
+    header: &sam::Header,
+    regions: &[Region],
+) -> io::Result<Vec<(String, i64, i64, i64)>> {
+    let targets = region_targets(header, regions)?;
+    // tid -> (seqlen, sorted intervals)
+    let mut by_tid: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
+    let mut seqlens: BTreeMap<usize, (String, i64)> = BTreeMap::new();
+    for t in &targets {
+        by_tid
+            .entry(t.tid)
+            .or_default()
+            .push((t.start as i64, t.end as i64));
+        if let std::collections::btree_map::Entry::Vacant(e) = seqlens.entry(t.tid)
+            && let Some((name, def)) = header.reference_sequences().get_index(t.tid)
+        {
+            e.insert((
+                String::from_utf8_lossy(name.as_ref()).into_owned(),
+                usize::from(def.length()) as i64,
+            ));
+        }
+    }
+    let mut out = Vec::new();
+    for (tid, mut iv) in by_tid {
+        iv.sort_by_key(|&(b, _)| b);
+        let Some((name, seqlen)) = seqlens.get(&tid).cloned() else {
+            continue;
+        };
+        let mut merged: Vec<(i64, i64)> = Vec::new();
+        for (b, e) in iv {
+            match merged.last_mut() {
+                Some(last) if last.1 >= b => {
+                    if last.1 < e {
+                        last.1 = e;
+                    }
+                }
+                _ => merged.push((b, e)),
+            }
+        }
+        for (b, e) in merged {
+            out.push((name.clone(), b, e, seqlen));
+        }
+    }
+    Ok(out)
 }
 
 fn parse_region(s: &str) -> io::Result<Region> {
@@ -580,6 +868,144 @@ fn target_base_count(targets: &[RegionTarget]) -> u64 {
     total
 }
 
+/// Upstream `init_regions` per-reference interval merge applied to the
+/// resolved `RegionTarget`s: sort by start within a tid, then coalesce
+/// when the running end reaches the next start. Returns the merged
+/// targets in (tid, start) order.
+fn merge_region_targets(targets: Vec<RegionTarget>) -> Vec<RegionTarget> {
+    let mut v = targets;
+    v.sort_by_key(|t| (t.tid, t.start));
+    let mut out: Vec<RegionTarget> = Vec::with_capacity(v.len());
+    for t in v {
+        match out.last_mut() {
+            Some(last) if last.tid == t.tid && last.end >= t.start => {
+                if last.end < t.end {
+                    last.end = t.end;
+                }
+            }
+            _ => out.push(t),
+        }
+    }
+    out
+}
+
+/// `bases mapped (cigar)`: plain M/I/=/X sum without targets, or the
+/// region-clipped count (against the first overlapping merged target,
+/// upstream `is_in_regions` selecting the lowest-start region whose end
+/// is at/after the read start) when `-t`/region targets are active.
+fn cigar_mapped_bases(
+    rec: &(impl sam::alignment::Record + ?Sized),
+    rsid: Option<usize>,
+    pos: Option<usize>,
+    targets: Option<&[RegionTarget]>,
+) -> u64 {
+    use sam::alignment::record::cigar::op::Kind;
+    match (targets, rsid, pos) {
+        (Some(tg), Some(tid), Some(p)) => {
+            let p = p as i64;
+            let region = tg
+                .iter()
+                .filter(|t| t.tid == tid && t.end as i64 >= p)
+                .min_by_key(|t| t.start);
+            match region {
+                Some(t) => region_clipped_cigar_bases(rec, p, t.start as i64, t.end as i64),
+                None => 0,
+            }
+        }
+        _ => {
+            let mut total = 0u64;
+            for op in rec.cigar().iter().flatten() {
+                if matches!(
+                    op.kind(),
+                    Kind::Match | Kind::Insertion | Kind::SequenceMatch | Kind::SequenceMismatch
+                ) {
+                    total += op.len() as u64;
+                }
+            }
+            total
+        }
+    }
+}
+
+/// The read's M/=/X reference intervals (0-based half-open), each
+/// clipped to the target region `reg` (1-based inclusive) when given,
+/// matching the `pmin/pmax` chunks upstream feeds to `remove_overlaps`.
+fn clipped_m_chunks(
+    rec: &(impl sam::alignment::Record + ?Sized),
+    pos0: i64,
+    reg: Option<(i64, i64)>,
+) -> Vec<(i64, i64)> {
+    use sam::alignment::record::cigar::op::Kind;
+    let mut p = pos0;
+    let mut out = Vec::new();
+    for op in rec.cigar().iter().flatten() {
+        let len = op.len() as i64;
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                let (mut b, mut e) = (p, p + len);
+                if let Some((rf, rt)) = reg {
+                    b = b.max(rf - 1);
+                    e = e.min(rt);
+                }
+                if e > b {
+                    out.push((b, e));
+                }
+                p += len;
+            }
+            Kind::Deletion | Kind::Skip => p += len,
+            Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
+        }
+    }
+    out
+}
+
+/// Region-restricted `bases mapped (cigar)` count, faithfully porting
+/// the `if (stats->regions)` branch of upstream `collect_stats`: M/=/X
+/// runs are clipped to `[reg_from, reg_to]` (1-based inclusive) and an
+/// I run counts only when `iref` lands inside the region. `iref` starts
+/// at the read's 1-based start and advances by the op length for M/=/X
+/// and I (not D — matching the upstream quirk).
+fn region_clipped_cigar_bases(
+    rec: &(impl sam::alignment::Record + ?Sized),
+    pos_1based: i64,
+    reg_from: i64,
+    reg_to: i64,
+) -> u64 {
+    use sam::alignment::record::cigar::op::Kind;
+    let mut iref = pos_1based;
+    let mut total: i64 = 0;
+    for op in rec.cigar().iter().flatten() {
+        let ncig = op.len() as i64;
+        if ncig == 0 {
+            continue;
+        }
+        match op.kind() {
+            Kind::Deletion => {}
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                let mut n = ncig;
+                if iref < reg_from {
+                    n -= reg_from - iref;
+                } else if iref + ncig - 1 > reg_to {
+                    n -= iref + ncig - 1 - reg_to;
+                }
+                if n < 0 {
+                    n = 0;
+                }
+                total += n;
+                iref += ncig;
+            }
+            Kind::Insertion => {
+                iref += ncig;
+                if iref >= reg_from && iref <= reg_to {
+                    total += ncig;
+                }
+            }
+            _ => {}
+        }
+    }
+    total as u64
+}
+
 fn matching_read_group_ids(header: &sam::Header, id: Option<&str>) -> Option<HashSet<String>> {
     let requested = id?;
     let sample_tag = sam::header::record::value::map::read_group::tag::SAMPLE;
@@ -616,6 +1042,48 @@ fn record_read_group(rec: &(impl sam::alignment::Record + ?Sized)) -> io::Result
     }
 }
 
+/// Reads an arbitrary aux tag as a string (upstream `bam_aux2Z`), used
+/// by `-S`/`--split` to bucket records by tag value.
+fn record_aux_string(
+    rec: &(impl sam::alignment::Record + ?Sized),
+    tag: &str,
+) -> io::Result<Option<String>> {
+    use sam::alignment::record::data::field::{Tag, Value};
+    let bytes = tag.as_bytes();
+    if bytes.len() != 2 {
+        return Ok(None);
+    }
+    let t = Tag::from([bytes[0], bytes[1]]);
+    let data = rec.data();
+    let Some(value) = data.get(&t).transpose()? else {
+        return Ok(None);
+    };
+    match value {
+        Value::String(s) => Ok(Some(s.to_string())),
+        Value::Character(c) => Ok(Some((c as char).to_string())),
+        _ => Ok(None),
+    }
+}
+
+/// Loads every reference sequence (upper-cased) keyed by name. Used by
+/// the MPC reference-mismatch engine; small test references fit easily
+/// in memory and a full read yields results identical to upstream's
+/// windowed `rseq_buf`.
+fn load_reference_seqs(path: &std::path::Path) -> io::Result<HashMap<String, Vec<u8>>> {
+    use htslib_rs::fasta;
+    let reader = File::open(path).map(BufReader::new)?;
+    let mut reader = fasta::io::Reader::new(reader);
+    let mut map = HashMap::new();
+    for result in reader.records() {
+        let record = result?;
+        let name = String::from_utf8_lossy(record.name()).into_owned();
+        let mut seq = record.sequence().as_ref().to_vec();
+        seq.make_ascii_uppercase();
+        map.insert(name, seq);
+    }
+    Ok(map)
+}
+
 /// Iterates all SAM records to build a `StatsCounts` with sequence-length
 /// and quality accumulators populated (which the `summarize_*` path can
 /// not provide because `AlignmentRecordSummary` discards sequence and
@@ -630,6 +1098,7 @@ fn collect_sam_full_stats(input: &PathBuf, config: &StatsConfig) -> io::Result<S
     for result in reader.records() {
         let record = result?;
         counts.update_record(&header, &record, config, read_group_filter.as_ref());
+        counts.feed_split(&header, &record, config, read_group_filter.as_ref());
     }
     Ok(counts)
 }
@@ -647,6 +1116,7 @@ fn collect_bam_full_stats(input: &PathBuf, config: &StatsConfig) -> io::Result<S
             break;
         }
         counts.update_record(&header, &record, config, read_group_filter.as_ref());
+        counts.feed_split(&header, &record, config, read_group_filter.as_ref());
     }
     Ok(counts)
 }
@@ -661,7 +1131,7 @@ fn collect_sam_region_stats(
         .map(sam::io::Reader::new)?;
     let header = reader.read_header()?;
     let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
-    let targets = region_targets(&header, regions)?;
+    let targets = merge_region_targets(region_targets(&header, regions)?);
     let mut counts = StatsCounts {
         target_bases: target_base_count(&targets),
         ..Default::default()
@@ -686,6 +1156,46 @@ fn collect_sam_region_stats(
     Ok(counts)
 }
 
+/// `-t`/`--target-regions` on a BAM with no positional region
+/// arguments: stream every record (no index needed) and accumulate
+/// only those overlapping a target, mirroring upstream `is_in_regions`
+/// over the streaming `sam_read1` path.
+fn collect_bam_targets_stats(
+    input: &PathBuf,
+    regions: &[Region],
+    config: &StatsConfig,
+) -> io::Result<StatsCounts> {
+    use htslib_rs::bam;
+    let mut reader = bam::io::Reader::new(File::open(input)?);
+    let header = reader.read_header()?;
+    let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
+    let targets = merge_region_targets(region_targets(&header, regions)?);
+    let mut counts = StatsCounts {
+        target_bases: target_base_count(&targets),
+        ..Default::default()
+    };
+    let mut seen = HashSet::new();
+    let mut record = bam::Record::default();
+    loop {
+        let n = reader.read_record(&mut record)?;
+        if n == 0 {
+            break;
+        }
+        if record_overlaps_targets(&header, &record, &targets)
+            && seen.insert(record_identity(&header, &record))
+        {
+            counts.update_record_with_targets(
+                &header,
+                &record,
+                config,
+                read_group_filter.as_ref(),
+                Some(&targets),
+            );
+        }
+    }
+    Ok(counts)
+}
+
 fn collect_bam_region_stats(
     input: &PathBuf,
     regions: &[Region],
@@ -693,7 +1203,7 @@ fn collect_bam_region_stats(
 ) -> io::Result<StatsCounts> {
     let header = htslib_rs::alignment_compat::read_bam_header_from_path(input)?;
     let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
-    let targets = region_targets(&header, regions)?;
+    let targets = merge_region_targets(region_targets(&header, regions)?);
     let mut counts = StatsCounts {
         target_bases: target_base_count(&targets),
         ..Default::default()
@@ -715,6 +1225,25 @@ fn collect_bam_region_stats(
     Ok(counts)
 }
 
+/// Whole-CRAM (no region) stats using the htslib-rs all-record iterator,
+/// so sequence-length/quality/GC/COV/NM accumulate like the BAM path
+/// (completed library batch #2) instead of the seq/quality-discarding `summarize_*` path.
+fn collect_cram_full_stats(
+    input: &PathBuf,
+    reference: PathBuf,
+    config: &StatsConfig,
+) -> io::Result<StatsCounts> {
+    let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
+    let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
+    let mut counts = StatsCounts::default();
+    for record in htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+        input, &reference,
+    )? {
+        counts.update_record(&header, &record, config, read_group_filter.as_ref());
+    }
+    Ok(counts)
+}
+
 fn collect_cram_region_stats(
     input: &PathBuf,
     reference: PathBuf,
@@ -723,7 +1252,7 @@ fn collect_cram_region_stats(
 ) -> io::Result<StatsCounts> {
     let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
     let read_group_filter = matching_read_group_ids(&header, config.id_filter.as_deref());
-    let targets = region_targets(&header, regions)?;
+    let targets = merge_region_targets(region_targets(&header, regions)?);
     let mut counts = StatsCounts {
         target_bases: target_base_count(&targets),
         ..Default::default()
@@ -808,6 +1337,34 @@ fn record_overlaps_targets(
         .any(|target| target.tid == tid && start <= target.end && target.start <= end)
 }
 
+/// Per-tag barcode accumulator (upstream `barcode_info_t` +
+/// `acgtno_barcode`/`quals_barcode`). One per default tag pair.
+struct BarcodeAcc {
+    tag: &'static str,
+    qual_tag: &'static str,
+    nbases: usize,
+    tag_sep: i32,
+    max_qual: i32,
+    acgtno: Vec<[u64; 5]>,
+    quals: Vec<[u64; 256]>,
+}
+
+/// Upstream `init_barcode_tags`: BC/QT, CR/CY, OX/BZ, RX/QX.
+fn default_barcode_tags() -> Vec<BarcodeAcc> {
+    [("BC", "QT"), ("CR", "CY"), ("OX", "BZ"), ("RX", "QX")]
+        .into_iter()
+        .map(|(tag, qual_tag)| BarcodeAcc {
+            tag,
+            qual_tag,
+            nbases: 0,
+            tag_sep: -1,
+            max_qual: -1,
+            acgtno: Vec::new(),
+            quals: Vec::new(),
+        })
+        .collect()
+}
+
 #[derive(Default)]
 struct StatsCounts {
     raw_total: u64,
@@ -833,10 +1390,13 @@ struct StatsCounts {
     isize_inward: u64,
     isize_outward: u64,
     isize_other: u64,
-    // Per-record abs(template_length) histogram across the same population
-    // that feeds the orientation bins. Used to apply `-m/--most-inserts`
-    // before computing the reported mean / standard deviation.
-    isize_hist: BTreeMap<u64, u64>,
+    // Per-size orientation arrays (still double-counted, halved on
+    // output) indexed by abs(template_length) capped at `-i`. These
+    // drive the `IS` section's `ibulk`/sparse logic exactly as
+    // upstream `output_stats` does.
+    isize_in: Vec<u64>,
+    isize_out: Vec<u64>,
+    isize_oth: Vec<u64>,
     // Sequence-length and quality accumulators (only populated when the
     // collection path has access to record-level data — currently SAM /
     // BAM iteration and any region path, but not the CRAM-non-region
@@ -849,11 +1409,29 @@ struct StatsCounts {
     max_len_2nd: u32,
     qual_sum: u64,
     qual_count: u64,
+    // Highest quality value observed (incl. the 0xFF/255 stored for `*`
+    // quality), driving the FFQ/LFQ/MPC column count exactly as
+    // upstream's `max_qual` (+1 unless it would reach `nquals`=256).
+    max_qual: u8,
     first_qual_hist: Vec<[u64; 256]>,
     last_qual_hist: Vec<[u64; 256]>,
-    first_gc_hist: BTreeMap<u16, u64>,
-    last_gc_hist: BTreeMap<u16, u64>,
+    // Per-cycle ACGTNO counts [a,c,g,t,n,other]; `acgt_rc` is
+    // read-oriented (reverse reads complemented).
+    acgt_1st: Vec<[u64; 6]>,
+    acgt_2nd: Vec<[u64; 6]>,
+    acgt_rc: Vec<[u64; 6]>,
+    read_lengths: Vec<u64>,
+    read_lengths_1st: Vec<u64>,
+    read_lengths_2nd: Vec<u64>,
+    mapping_qualities: Vec<u64>,
+    // Upstream `gc_1st`/`gc_2nd`: fixed `ngc`-sized GC-fraction arrays.
+    first_gc_hist: Vec<u64>,
+    last_gc_hist: Vec<u64>,
     coverage_depths: BTreeMap<(usize, usize), u32>,
+    // `-p`/`--remove-overlaps`: first-seen mate's clipped M/=/X
+    // reference intervals (0-based half-open) per template qname, with
+    // its `order`, so the other mate can subtract the overlap.
+    pair_chunks: HashMap<String, (u32, Vec<(i64, i64)>)>,
     target_bases: u64,
     // Bases mapped (sum of sequence lengths for mapped reads, ignoring
     // clipping), bases mapped from CIGAR (sum of M/=/X ops), and total
@@ -862,11 +1440,39 @@ struct StatsCounts {
     bases_mapped: u64,
     bases_mapped_cigar: u64,
     nmismatches: u64,
+    // Indel distribution (ID) and indels-per-cycle (IC), faithful to
+    // upstream `count_indels`. `*_len[k]` counts indels of length k+1;
+    // `*_cycles_{1st,2nd}[c]` counts read1/read2 indels at cycle c.
+    insertions_len: Vec<u64>,
+    deletions_len: Vec<u64>,
+    ins_cycles_1st: Vec<u64>,
+    ins_cycles_2nd: Vec<u64>,
+    del_cycles_1st: Vec<u64>,
+    del_cycles_2nd: Vec<u64>,
+    // Mismatches per cycle and quality (MPC): `mpc_buf[cycle][qual]`.
+    // Column 0 doubles as the N-base count, exactly as upstream
+    // `count_mismatches_per_cycle` (qual byte + 1, u8-wrapping).
+    mpc_buf: Vec<[u64; 256]>,
+    // `-S`/`--split`: this run's tag value (drives the "statistics only
+    // for reads with tag" header line), and the per-tag-value sub-stats.
+    split_name: Option<String>,
+    splits: BTreeMap<String, StatsCounts>,
+    // Barcode tag stats (BCC/QTQ etc.), one accumulator per default
+    // tag pair; lazily initialised on first barcoded read.
+    barcodes: Vec<BarcodeAcc>,
     // Sum of sequence lengths for records carrying the duplicate flag.
     bases_dup: u64,
     bases_trimmed: u64,
     last_sort_position: Option<(usize, usize)>,
     sort_order_violation: bool,
+    // CHK section: 32-bit-wrapping sums of per-record CRC32 over the
+    // read name, BAM-packed sequence nibbles, and raw quality bytes.
+    // Accumulated for every record passing flag-require/flag-filter/
+    // read-length filtering (before the secondary/supplementary skip),
+    // exactly as upstream `update_checksum`.
+    chk_names: u32,
+    chk_reads: u32,
+    chk_quals: u32,
 }
 
 struct StatsRecordFields {
@@ -876,6 +1482,8 @@ struct StatsRecordFields {
     mate_reference_sequence_id: Option<usize>,
     template_length: i32,
     read_len: Option<usize>,
+    pos: Option<usize>,
+    mpos: Option<usize>,
 }
 
 impl StatsCounts {
@@ -887,6 +1495,38 @@ impl StatsCounts {
         read_group_filter: Option<&HashSet<String>>,
     ) {
         self.update_record_with_targets(header, rec, config, read_group_filter, None);
+    }
+
+    /// `-S`/`--split`: also accumulate this record into its tag-value's
+    /// sub-`StatsCounts` (created on first sight with `split_name` set so
+    /// the per-tag `.bamstat` header line is correct). The sub-counts
+    /// never split further, so no recursion.
+    fn feed_split(
+        &mut self,
+        header: &sam::Header,
+        rec: &(impl sam::alignment::Record + ?Sized),
+        config: &StatsConfig,
+        read_group_filter: Option<&HashSet<String>>,
+    ) {
+        let Some(tag) = config.split_tag.as_deref() else {
+            return;
+        };
+        let value = if tag == "RG" {
+            record_read_group(rec).ok().flatten()
+        } else {
+            record_aux_string(rec, tag).ok().flatten()
+        };
+        let Some(value) = value else {
+            return;
+        };
+        let sub = self
+            .splits
+            .entry(value.clone())
+            .or_insert_with(|| StatsCounts {
+                split_name: Some(value),
+                ..Default::default()
+            });
+        sub.update_record_with_targets(header, rec, config, read_group_filter, None);
     }
 
     fn update_record_with_targets(
@@ -920,9 +1560,20 @@ impl StatsCounts {
             .transpose()
             .unwrap_or_default();
         let template_length = rec.template_length().ok().unwrap_or(0);
+        let pos = rec.alignment_start().and_then(Result::ok).map(usize::from);
+        let mpos = rec
+            .mate_alignment_start()
+            .and_then(Result::ok)
+            .map(usize::from);
         let seq_len = rec.sequence().len();
 
+        let chk_name = rec.name().map(|n| n.to_vec()).unwrap_or_default();
+        let chk_seq: Vec<u8> = rec.sequence().iter().collect();
+        let chk_qual: Vec<u8> = rec.quality_scores().iter().flatten().collect();
+        self.accumulate_checksum(flag, config, &chk_name, &chk_seq, &chk_qual);
+
         let pre_total = self.total;
+        let pre_supp = self.supplementary;
         self.update(
             StatsRecordFields {
                 flag,
@@ -931,6 +1582,8 @@ impl StatsCounts {
                 mate_reference_sequence_id,
                 template_length,
                 read_len: Some(seq_len),
+                pos,
+                mpos,
             },
             config,
         );
@@ -947,33 +1600,67 @@ impl StatsCounts {
             }
 
             let seq_len_u32 = seq_len as u32;
+            // Upstream `order`: unpaired => first fragment.
+            let order_first =
+                flag & BAM_FPAIRED == 0 || (flag & BAM_FREAD1 != 0 && flag & BAM_FREAD2 == 0);
+            let order_last =
+                flag & BAM_FPAIRED != 0 && flag & BAM_FREAD2 != 0 && flag & BAM_FREAD1 == 0;
             if seq_len_u32 > 0 {
                 self.total_len += u64::from(seq_len_u32);
                 if seq_len_u32 > self.max_len {
                     self.max_len = seq_len_u32;
                 }
-                if flag & BAM_FREAD1 != 0 {
+                if order_first {
                     self.total_len_1st += u64::from(seq_len_u32);
                     if seq_len_u32 > self.max_len_1st {
                         self.max_len_1st = seq_len_u32;
                     }
                 }
-                if flag & BAM_FREAD2 != 0 {
+                if order_last {
                     self.total_len_2nd += u64::from(seq_len_u32);
                     if seq_len_u32 > self.max_len_2nd {
                         self.max_len_2nd = seq_len_u32;
                     }
                 }
             }
-            for (cycle, q) in rec.quality_scores().iter().flatten().enumerate() {
-                self.qual_sum += u64::from(q);
-                self.qual_count += 1;
-                if flag & BAM_FREAD1 != 0 {
-                    increment_quality_hist(&mut self.first_qual_hist, cycle, q);
+            let quals: Vec<u8> = rec.quality_scores().iter().flatten().collect();
+            if quals.is_empty() && seq_len_u32 > 0 {
+                // `*` quality: HTSlib stores 0xFF per base.
+                self.max_qual = 255;
+                for cycle in 0..seq_len_u32 as usize {
+                    self.qual_sum += 255;
+                    self.qual_count += 1;
+                    if order_first {
+                        increment_quality_hist(&mut self.first_qual_hist, cycle, 255);
+                    }
+                    if order_last {
+                        increment_quality_hist(&mut self.last_qual_hist, cycle, 255);
+                    }
                 }
-                if flag & BAM_FREAD2 != 0 {
-                    increment_quality_hist(&mut self.last_qual_hist, cycle, q);
+            } else {
+                // Upstream `collect_orig_read_stats` indexes cycle `i`
+                // but samples `bam_quals[reverse ? len-1-i : i]`, i.e.
+                // reverse-strand reads contribute in 5'->3' read order.
+                let reverse = flag & BAM_FREVERSE != 0;
+                let len = quals.len();
+                for cycle in 0..len {
+                    let q = quals[if reverse { len - 1 - cycle } else { cycle }];
+                    self.qual_sum += u64::from(q);
+                    self.qual_count += 1;
+                    if q > self.max_qual {
+                        self.max_qual = q;
+                    }
+                    if order_first {
+                        increment_quality_hist(&mut self.first_qual_hist, cycle, q);
+                    }
+                    if order_last {
+                        increment_quality_hist(&mut self.last_qual_hist, cycle, q);
+                    }
                 }
+            }
+            // Upstream: barcode stats only for first-fragment originals.
+            if order_first {
+                self.accumulate_barcodes(rec);
             }
             if config.trim_quality > 0 {
                 let reverse = flag & BAM_FREVERSE != 0;
@@ -989,36 +1676,471 @@ impl StatsCounts {
             }
 
             if seq_len_u32 > 0 {
-                let gc_percent = gc_percent_hundredths(rec.sequence().iter());
-                if flag & BAM_FREAD1 != 0 {
-                    *self.first_gc_hist.entry(gc_percent).or_default() += 1;
+                // Upstream `stats.c`: bin into `gc_*[gc*(NGC-1)/L ..
+                // (gc+1)*(NGC-1)/L)` (capped at NGC-1).
+                let l = seq_len_u32 as u64;
+                let gc = rec
+                    .sequence()
+                    .iter()
+                    .filter(|b| matches!(b.to_ascii_uppercase(), b'G' | b'C'))
+                    .count() as u64;
+                let lo = (gc * (NGC as u64 - 1) / l) as usize;
+                let mut hi = ((gc + 1) * (NGC as u64 - 1) / l) as usize;
+                if hi >= NGC {
+                    hi = NGC - 1;
                 }
-                if flag & BAM_FREAD2 != 0 {
-                    *self.last_gc_hist.entry(gc_percent).or_default() += 1;
+                let tgt = if order_first {
+                    Some(&mut self.first_gc_hist)
+                } else if order_last {
+                    Some(&mut self.last_gc_hist)
+                } else {
+                    None
+                };
+                if let Some(h) = tgt {
+                    if h.len() < NGC {
+                        h.resize(NGC, 0);
+                    }
+                    for slot in h.iter_mut().take(hi).skip(lo) {
+                        *slot += 1;
+                    }
+                }
+            }
+
+            // Read-length / mapq histograms + per-cycle ACGT (upstream
+            // `stats.c`: read_len = unclipped length; mapq for
+            // !(UNMAP|SEC|SUPP|QCFAIL|DUP); per-cycle ACGT for originals).
+            {
+                let reverse = flag & BAM_FREVERSE != 0;
+                use sam::alignment::record::cigar::op::Kind as CKind;
+                let hard: u32 = rec
+                    .cigar()
+                    .iter()
+                    .flatten()
+                    .filter(|op| op.kind() == CKind::HardClip)
+                    .map(|op| op.len() as u32)
+                    .sum();
+                let read_len = (seq_len_u32 + hard) as usize;
+                if read_len > 0 && flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY) == 0 {
+                    if read_len >= self.read_lengths.len() {
+                        self.read_lengths.resize(read_len + 1, 0);
+                    }
+                    self.read_lengths[read_len] += 1;
+                    if order_first {
+                        if read_len >= self.read_lengths_1st.len() {
+                            self.read_lengths_1st.resize(read_len + 1, 0);
+                        }
+                        self.read_lengths_1st[read_len] += 1;
+                    }
+                    if order_last {
+                        if read_len >= self.read_lengths_2nd.len() {
+                            self.read_lengths_2nd.resize(read_len + 1, 0);
+                        }
+                        self.read_lengths_2nd[read_len] += 1;
+                    }
+                    if order_first || order_last {
+                        let seq = rec.sequence();
+                        let sl = seq.len();
+                        if self.acgt_1st.len() < sl {
+                            self.acgt_1st.resize(sl, [0; 6]);
+                        }
+                        if self.acgt_2nd.len() < sl {
+                            self.acgt_2nd.resize(sl, [0; 6]);
+                        }
+                        if self.acgt_rc.len() < sl {
+                            self.acgt_rc.resize(sl, [0; 6]);
+                        }
+                        for (i, b) in seq.iter().enumerate() {
+                            let cyc = if reverse { sl - i - 1 } else { i };
+                            let (idx, rc): (usize, usize) = match b.to_ascii_uppercase() {
+                                b'A' => (0, if reverse { 3 } else { 0 }),
+                                b'C' => (1, if reverse { 2 } else { 1 }),
+                                b'G' => (2, if reverse { 1 } else { 2 }),
+                                b'T' => (3, if reverse { 0 } else { 3 }),
+                                b'N' => (4, 6),
+                                _ => (5, 6),
+                            };
+                            if order_last {
+                                self.acgt_2nd[cyc][idx] += 1;
+                            } else {
+                                self.acgt_1st[cyc][idx] += 1;
+                            }
+                            if rc < 6 {
+                                self.acgt_rc[cyc][rc] += 1;
+                            }
+                        }
+                    }
+                }
+                if flag
+                    & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY | BAM_FQCFAIL | BAM_FDUP)
+                    == 0
+                {
+                    let mapq = rec
+                        .mapping_quality()
+                        .and_then(Result::ok)
+                        .map(u8::from)
+                        .unwrap_or(255) as usize;
+                    if self.mapping_qualities.is_empty() {
+                        self.mapping_qualities = vec![0; 256];
+                    }
+                    self.mapping_qualities[mapq] += 1;
                 }
             }
 
             if flag & BAM_FUNMAP == 0 {
                 self.bases_mapped += u64::from(seq_len_u32);
-                use sam::alignment::record::cigar::op::Kind;
-                for op in rec.cigar().iter().flatten() {
-                    if matches!(
-                        op.kind(),
-                        Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch
-                    ) {
-                        self.bases_mapped_cigar += op.len() as u64;
-                    }
-                }
+                self.bases_mapped_cigar +=
+                    cigar_mapped_bases(rec, reference_sequence_id, pos, targets);
+                self.count_indels(rec, flag, seq_len_u32 as usize);
                 if let Some(nm) = read_nm_aux(rec) {
                     self.nmismatches += nm;
                 }
                 self.update_coverage_depths(header, rec, targets);
             }
         }
+
+        // Supplementary alignments do not return early in upstream
+        // `collect_stats`: they are excluded from the IS_ORIGINAL
+        // sequence/quality/read-length stats but still contribute to
+        // the indel distribution, bases-mapped-(cigar), NM mismatches
+        // and the coverage histogram. They were counted (and skipped)
+        // by `update`, so replay just those accumulations here.
+        if self.supplementary > pre_supp && flag & BAM_FUNMAP == 0 {
+            self.bases_mapped_cigar += cigar_mapped_bases(rec, reference_sequence_id, pos, targets);
+            self.count_indels(rec, flag, seq_len);
+            if let Some(nm) = read_nm_aux(rec) {
+                self.nmismatches += nm;
+            }
+            self.update_coverage_depths(header, rec, targets);
+        }
+
+        // MPC reference-mismatch engine. Upstream calls
+        // `count_mismatches_per_cycle` for every mapped read reaching it
+        // (primary or supplementary, not secondary) when a reference is
+        // loaded.
+        let counted = self.total > pre_total || self.supplementary > pre_supp;
+        if counted
+            && flag & BAM_FUNMAP == 0
+            && let Some(refmap) = config.reference_seqs.as_ref()
+            && let Some(rsid) = reference_sequence_id
+            && let Some(p) = pos
+            && let Some((name, _)) = header.reference_sequences().get_index(rsid)
+            && let Some(refseq) = refmap.get(String::from_utf8_lossy(name.as_ref()).as_ref())
+        {
+            self.count_mismatches_per_cycle(rec, flag, seq_len, refseq, p - 1, &chk_seq, &chk_qual);
+        }
+
+        // `-p`/`--remove-overlaps`: faithful port of `remove_overlaps`.
+        // The first mate of a pair is counted in full (already done by
+        // the normal cigar/coverage path above); when the other mate
+        // arrives its overlap with the first mate's M/=/X chunks is
+        // subtracted from `bases mapped (cigar)` and the coverage
+        // histogram. Non-pairable reads keep the normal full count.
+        if config.remove_overlaps
+            && counted
+            && flag & BAM_FUNMAP == 0
+            && let Some(rsid) = reference_sequence_id
+            && let Some(p) = pos
+        {
+            let isize_abs = rec.template_length().ok().unwrap_or(0).unsigned_abs() as u64;
+            let order: u32 = (if flag & BAM_FREAD1 != 0 { 1 } else { 0 })
+                + (if flag & BAM_FREAD2 != 0 { 2 } else { 0 });
+            let pairable = flag & BAM_FPAIRED != 0
+                && flag & BAM_FMUNMAP == 0
+                && isize_abs < 2 * seq_len as u64
+                && (order == 1 || order == 2);
+            if pairable {
+                let reg = targets.and_then(|tg| {
+                    tg.iter()
+                        .filter(|t| t.tid == rsid && t.end as i64 >= p as i64)
+                        .min_by_key(|t| t.start)
+                        .map(|t| (t.start as i64, t.end as i64))
+                });
+                let chunks = clipped_m_chunks(rec, (p as i64) - 1, reg);
+                let qname = rec
+                    .name()
+                    .map(|n| String::from_utf8_lossy(n).into_owned())
+                    .unwrap_or_default();
+                match self.pair_chunks.get(&qname) {
+                    None => {
+                        self.pair_chunks.insert(qname, (order, chunks));
+                    }
+                    Some((first, _)) if *first == order => {
+                        if let Some(entry) = self.pair_chunks.get_mut(&qname) {
+                            entry.1.extend(chunks);
+                        }
+                    }
+                    Some((_, fc)) => {
+                        let fc = fc.clone();
+                        let mut overlap = 0i64;
+                        for &(b, e) in &chunks {
+                            for &(fb, fe) in &fc {
+                                let lo = b.max(fb);
+                                let hi = e.min(fe);
+                                if hi > lo {
+                                    overlap += hi - lo;
+                                    for pos0 in lo..hi {
+                                        if let Some(d) =
+                                            self.coverage_depths.get_mut(&(rsid, pos0 as usize))
+                                            && *d > 0
+                                        {
+                                            *d -= 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        self.bases_mapped_cigar =
+                            self.bases_mapped_cigar.saturating_sub(overlap as u64);
+                        self.pair_chunks.remove(&qname);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Faithful port of upstream `count_indels`: per-CIGAR insertion /
+    /// deletion length distribution (ID) and per-cycle indel counts
+    /// split by read1/read2 (IC). `read_len` is `l_qseq`.
+    fn count_indels(
+        &mut self,
+        rec: &(impl sam::alignment::Record + ?Sized),
+        flag: u32,
+        read_len: usize,
+    ) {
+        use sam::alignment::record::cigar::op::Kind;
+        let is_fwd = flag & BAM_FREVERSE == 0;
+        // order: 1 = read1 only, 2 = read2 only (per READ_ORDER_*).
+        let order: u32 = if flag & BAM_FPAIRED != 0 {
+            (if flag & BAM_FREAD1 != 0 { 1 } else { 0 })
+                + (if flag & BAM_FREAD2 != 0 { 2 } else { 0 })
+        } else {
+            1
+        };
+        fn bump(v: &mut Vec<u64>, idx: usize) {
+            if v.len() <= idx {
+                v.resize(idx + 1, 0);
+            }
+            v[idx] += 1;
+        }
+        let mut icycle: isize = 0;
+        for op in rec.cigar().iter().flatten() {
+            let ncig = op.len();
+            if ncig == 0 {
+                continue;
+            }
+            let ncig_i = ncig as isize;
+            match op.kind() {
+                Kind::Insertion => {
+                    let idx = if is_fwd {
+                        icycle
+                    } else {
+                        read_len as isize - icycle - ncig_i
+                    };
+                    if idx >= 0 {
+                        if order == 1 {
+                            bump(&mut self.ins_cycles_1st, idx as usize);
+                        } else if order == 2 {
+                            bump(&mut self.ins_cycles_2nd, idx as usize);
+                        }
+                    }
+                    icycle += ncig_i;
+                    if ncig <= NINDELS {
+                        bump(&mut self.insertions_len, ncig - 1);
+                    }
+                }
+                Kind::Deletion => {
+                    let idx = if is_fwd {
+                        icycle - 1
+                    } else {
+                        read_len as isize - icycle - 1
+                    };
+                    if idx < 0 {
+                        continue;
+                    }
+                    if order == 1 {
+                        bump(&mut self.del_cycles_1st, idx as usize);
+                    } else if order == 2 {
+                        bump(&mut self.del_cycles_2nd, idx as usize);
+                    }
+                    if ncig <= NINDELS {
+                        bump(&mut self.deletions_len, ncig - 1);
+                    }
+                }
+                Kind::Skip | Kind::HardClip | Kind::Pad => {}
+                _ => icycle += ncig_i,
+            }
+        }
+    }
+
+    /// Faithful port of upstream `count_mismatches_per_cycle`. For each
+    /// aligned base it increments `mpc_buf[cycle][col]` where `col` is 0
+    /// for an N read base, otherwise `(qual + 1) as u8` (note the u8 wrap
+    /// that maps the 0xFF missing-quality byte to column 0). `pos0` is
+    /// the read's 0-based reference start; `refseq` the upper-cased
+    /// reference bases. N (ref-skip)/H/P CIGARs are ignored as upstream.
+    #[allow(clippy::too_many_arguments)]
+    fn count_mismatches_per_cycle(
+        &mut self,
+        rec: &(impl sam::alignment::Record + ?Sized),
+        flag: u32,
+        read_len: usize,
+        refseq: &[u8],
+        pos0: usize,
+        seq_ascii: &[u8],
+        quals: &[u8],
+    ) {
+        use sam::alignment::record::cigar::op::Kind;
+        fn nt16(b: u8) -> u8 {
+            match b.to_ascii_uppercase() {
+                b'=' => 0,
+                b'A' => 1,
+                b'C' => 2,
+                b'M' => 3,
+                b'G' => 4,
+                b'R' => 5,
+                b'S' => 6,
+                b'V' => 7,
+                b'T' => 8,
+                b'W' => 9,
+                b'Y' => 10,
+                b'H' => 11,
+                b'K' => 12,
+                b'D' => 13,
+                b'B' => 14,
+                _ => 15,
+            }
+        }
+        let is_fwd = flag & BAM_FREVERSE == 0;
+        let mut iread: usize = 0;
+        let mut icycle: isize = 0;
+        let mut iref: usize = 0;
+        for op in rec.cigar().iter().flatten() {
+            let ncig = op.len();
+            match op.kind() {
+                Kind::Insertion => {
+                    iread += ncig;
+                    icycle += ncig as isize;
+                }
+                Kind::Deletion => {
+                    iref += ncig;
+                }
+                Kind::SoftClip => {
+                    icycle += ncig as isize;
+                    iread += ncig;
+                }
+                Kind::HardClip => {
+                    icycle += ncig as isize;
+                }
+                Kind::Skip | Kind::Pad => {}
+                Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
+                    for _ in 0..ncig {
+                        let cread = seq_ascii.get(iread).copied().map(nt16).unwrap_or(0);
+                        let cref = refseq.get(pos0 + iref).copied().map(nt16).unwrap_or(0);
+                        let idx = if is_fwd {
+                            icycle
+                        } else {
+                            read_len as isize - icycle - 1
+                        };
+                        if idx >= 0 {
+                            let cyc = idx as usize;
+                            if self.mpc_buf.len() <= cyc {
+                                self.mpc_buf.resize(cyc + 1, [0; 256]);
+                            }
+                            if cread == 15 {
+                                self.mpc_buf[cyc][0] += 1;
+                            } else if cref != 0 && cread != 0 && cref != cread {
+                                let qbyte = quals.get(iread).copied().unwrap_or(0xFF);
+                                let col = qbyte.wrapping_add(1) as usize;
+                                self.mpc_buf[cyc][col] += 1;
+                            }
+                        }
+                        iref += 1;
+                        iread += 1;
+                        icycle += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Faithful port of upstream `collect_barcode_stats` (called only
+    /// for first-fragment / unpaired originals): per default tag, the
+    /// barcode bases feed an A/C/G/T/N-per-position counter (the
+    /// non-ACGTN separator fixes `tag_sep`), and the matching quality
+    /// tag (`char - '!'`) feeds a per-position quality histogram.
+    fn accumulate_barcodes(&mut self, rec: &(impl sam::alignment::Record + ?Sized)) {
+        if self.barcodes.is_empty() {
+            self.barcodes = default_barcode_tags();
+        }
+        for b in &mut self.barcodes {
+            let Some(barcode) = record_aux_string(rec, b.tag).ok().flatten() else {
+                continue;
+            };
+            let bc = barcode.as_bytes();
+            if bc.is_empty() {
+                continue;
+            }
+            if b.nbases == 0 {
+                b.nbases = bc.len();
+                b.acgtno = vec![[0; 5]; b.nbases];
+                b.quals = vec![[0; 256]; b.nbases];
+            }
+            if bc.len() > b.nbases {
+                continue; // differing barcode length: skip (as upstream)
+            }
+            let mut error = false;
+            for (i, &ch) in bc.iter().enumerate() {
+                match ch {
+                    b'A' => b.acgtno[i][0] += 1,
+                    b'C' => b.acgtno[i][1] += 1,
+                    b'G' => b.acgtno[i][2] += 1,
+                    b'T' => b.acgtno[i][3] += 1,
+                    b'N' => b.acgtno[i][4] += 1,
+                    _ => {
+                        if b.tag_sep >= 0 {
+                            if b.tag_sep != i as i32 {
+                                error = true;
+                            }
+                        } else {
+                            b.tag_sep = i as i32;
+                        }
+                    }
+                }
+                if error {
+                    break;
+                }
+            }
+            if error {
+                continue;
+            }
+            let Some(barqual) = record_aux_string(rec, b.qual_tag).ok().flatten() else {
+                continue;
+            };
+            let qb = barqual.as_bytes();
+            if qb.len() == bc.len() {
+                for (i, &c) in qb.iter().enumerate() {
+                    let q = c as i32 - 33;
+                    if (0..256).contains(&q) {
+                        b.quals[i][q as usize] += 1;
+                        if q > b.max_qual {
+                            b.max_qual = q;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn is_coordinate_sorted(&self) -> bool {
         !self.sort_order_violation
+    }
+
+    /// Number of quality columns emitted in FFQ/LFQ/MPC, mirroring
+    /// upstream's `if (max_qual+1 < nquals) max_qual++;` then
+    /// `iqual <= max_qual` (so `max_qual + 1` columns).
+    fn qual_cols(&self) -> usize {
+        let m = self.max_qual as usize;
+        (if m + 1 < 256 { m + 1 } else { m }) + 1
     }
 
     fn update_sort_order(&mut self, tid: usize, pos: usize) {
@@ -1076,6 +2198,14 @@ impl StatsCounts {
     }
 
     fn update_summary(&mut self, rec: &AlignmentRecordSummary, config: &StatsConfig) {
+        let flag = rec.flags_u16() as u32;
+        self.accumulate_checksum(
+            flag,
+            config,
+            rec.name_bytes().unwrap_or_default(),
+            rec.sequence_bytes(),
+            rec.quality_score_bytes(),
+        );
         self.update(
             StatsRecordFields {
                 flag: rec.flags_u16() as u32,
@@ -1084,6 +2214,8 @@ impl StatsCounts {
                 mate_reference_sequence_id: rec.mate_reference_sequence_id(),
                 template_length: rec.template_length(),
                 read_len: None,
+                pos: rec.alignment_start(),
+                mpos: rec.mate_alignment_start(),
             },
             config,
         );
@@ -1131,14 +2263,20 @@ impl StatsCounts {
         } else {
             self.unmapped += 1;
         }
+        // Upstream `order`: unpaired reads are first fragments; paired
+        // reads are first/last by the READ1/READ2 bits (both-or-neither
+        // counts as "other", excluded from read1/read2).
+        let order_first =
+            flag & BAM_FPAIRED == 0 || (flag & BAM_FREAD1 != 0 && flag & BAM_FREAD2 == 0);
+        let order_last =
+            flag & BAM_FPAIRED != 0 && flag & BAM_FREAD2 != 0 && flag & BAM_FREAD1 == 0;
+        if order_first {
+            self.read1 += 1;
+        } else if order_last {
+            self.read2 += 1;
+        }
         if flag & BAM_FPAIRED != 0 {
             self.paired += 1;
-            if flag & BAM_FREAD1 != 0 {
-                self.read1 += 1;
-            }
-            if flag & BAM_FREAD2 != 0 {
-                self.read2 += 1;
-            }
             if flag & BAM_FPROPER_PAIR != 0 {
                 self.proper_paired += 1;
             }
@@ -1150,11 +2288,15 @@ impl StatsCounts {
                 {
                     self.diffchr += 1;
                 }
-                if rec.reference_sequence_id == rec.mate_reference_sequence_id
-                    && rec.reference_sequence_id.is_some()
-                {
-                    self.update_isize_bin(flag, rec.template_length, config.insert_size_max);
-                }
+                self.update_isize_bin(
+                    flag,
+                    rec.template_length,
+                    rec.pos,
+                    rec.mpos,
+                    rec.reference_sequence_id,
+                    rec.mate_reference_sequence_id,
+                    config.insert_size_max,
+                );
             }
             if flag & BAM_FMUNMAP != 0 && flag & BAM_FUNMAP == 0 {
                 self.singletons += 1;
@@ -1169,42 +2311,168 @@ impl StatsCounts {
     }
 
     /// Classify an insert-size observation into inward/outward/other,
-    /// mirroring `stats.c`'s orientation logic. Each record contributes
-    /// once; the output divides by two to obtain per-pair counts.
-    ///
-    /// Without alignment positions we infer "5' end" from the sign of
-    /// `template_length`: the leftmost read has positive TLEN. A pair
-    /// with opposite strands is FR (inward) when the leftmost read is
-    /// forward, and RF (outward) otherwise. Same-direction pairs are
-    /// classified as "other".
-    fn update_isize_bin(&mut self, flag: u32, template_length: i32, insert_size_max: u32) {
-        let read_reverse = flag & BAM_FREVERSE != 0;
-        let mate_reverse = flag & 0x20 /* BAM_FMREVERSE */ != 0;
+    /// faithfully mirroring the orientation logic in `stats.c`'s
+    /// `collect_stats` (the `IS_PAIRED_AND_MAPPED && IS_ORIGINAL` block).
+    /// Each record contributes once; the output halves to obtain
+    /// per-pair counts. The accumulation gate is upstream's
+    /// `isize > 0 || tid == mtid`.
+    #[allow(clippy::too_many_arguments)]
+    fn update_isize_bin(
+        &mut self,
+        flag: u32,
+        template_length: i32,
+        pos: Option<usize>,
+        mpos: Option<usize>,
+        rsid: Option<usize>,
+        mrsid: Option<usize>,
+        insert_size_max: u32,
+    ) {
         let mut isize = template_length.unsigned_abs() as u64;
         if insert_size_max > 0 {
             isize = isize.min(u64::from(insert_size_max));
         }
-        *self.isize_hist.entry(isize).or_default() += 1;
+        let same_ref = rsid.is_some() && rsid == mrsid;
+        if !(isize > 0 || same_ref) {
+            return;
+        }
+        let i = isize as usize;
+        if self.isize_in.len() <= i {
+            self.isize_in.resize(i + 1, 0);
+            self.isize_out.resize(i + 1, 0);
+            self.isize_oth.resize(i + 1, 0);
+        }
 
-        if read_reverse == mate_reverse {
-            self.isize_other += 1;
-        } else if template_length == 0 {
-            // Upstream stats.c treats exactly overlapping mates as inward.
-            self.isize_inward += 1;
+        // pos_fst = mpos - pos (cancels the 0-/1-based offset since both
+        // ends share it). is_fst is the read1/read2 discriminator.
+        let pos_fst: i64 = mpos.unwrap_or(0) as i64 - pos.unwrap_or(0) as i64;
+        let is_fst: i64 = if flag & BAM_FREAD1 != 0 { 1 } else { -1 };
+        let is_fwd: i64 = if flag & BAM_FREVERSE != 0 { -1 } else { 1 };
+        let is_mfwd: i64 = if flag & 0x20 /* BAM_FMREVERSE */ != 0 {
+            -1
         } else {
-            let leftmost = template_length > 0;
-            let inward = if leftmost {
-                !read_reverse
+            1
+        };
+
+        enum Ori {
+            In,
+            Out,
+            Oth,
+        }
+        let ori = if is_fwd * is_mfwd > 0 {
+            Ori::Oth
+        } else if is_fst * pos_fst > 0 {
+            if is_fst * is_fwd > 0 {
+                Ori::In
             } else {
-                read_reverse
-            };
-            if inward {
+                Ori::Out
+            }
+        } else if is_fst * pos_fst < 0 {
+            if is_fst * is_fwd > 0 {
+                Ori::Out
+            } else {
+                Ori::In
+            }
+        } else {
+            // Exactly overlapping reads are assumed inward.
+            Ori::In
+        };
+        match ori {
+            Ori::In => {
                 self.isize_inward += 1;
-            } else {
+                self.isize_in[i] += 1;
+            }
+            Ori::Out => {
                 self.isize_outward += 1;
+                self.isize_out[i] += 1;
+            }
+            Ori::Oth => {
+                self.isize_other += 1;
+                self.isize_oth[i] += 1;
             }
         }
     }
+
+    /// Faithful port of upstream `update_checksum`. Runs for every
+    /// record that survives the flag-require / flag-filter /
+    /// read-length filters (before the secondary/supplementary skip),
+    /// summing per-record CRC32 with 32-bit overflow.
+    fn accumulate_checksum(
+        &mut self,
+        flag: u32,
+        config: &StatsConfig,
+        name: &[u8],
+        seq_ascii: &[u8],
+        quals: &[u8],
+    ) {
+        if config.required_flags != 0 && flag & config.required_flags != config.required_flags {
+            return;
+        }
+        if config.filter_flags != 0 && flag & config.filter_flags != 0 {
+            return;
+        }
+        if config
+            .read_length_filter
+            .is_some_and(|required_len| seq_ascii.len() != required_len)
+        {
+            return;
+        }
+        self.chk_names = self.chk_names.wrapping_add(crc32_bytes(0, name));
+        let seq_len = seq_ascii.len();
+        if seq_len == 0 {
+            return;
+        }
+        let packed = bam_pack_seq(seq_ascii);
+        self.chk_reads = self.chk_reads.wrapping_add(crc32_bytes(0, &packed));
+        if quals.len() == seq_len {
+            self.chk_quals = self.chk_quals.wrapping_add(crc32_bytes(0, quals));
+        } else {
+            // SAM `*` quality is stored as 0xFF per base in BAM.
+            let missing = vec![0xFFu8; seq_len];
+            self.chk_quals = self.chk_quals.wrapping_add(crc32_bytes(0, &missing));
+        }
+    }
+}
+
+/// zlib `crc32(initial, buf, len)` over `bytes`.
+fn crc32_bytes(initial: u32, bytes: &[u8]) -> u32 {
+    let mut crc = libdeflater::Crc::with_initial(initial);
+    crc.update(bytes);
+    crc.sum()
+}
+
+/// Packs an ASCII sequence into BAM 4-bit-per-base nibbles
+/// (`(len + 1) / 2` bytes), using HTSlib's `seq_nt16_table` codes.
+fn bam_pack_seq(seq_ascii: &[u8]) -> Vec<u8> {
+    fn code(b: u8) -> u8 {
+        match b {
+            b'=' => 0,
+            b'A' | b'a' => 1,
+            b'C' | b'c' => 2,
+            b'M' | b'm' => 3,
+            b'G' | b'g' => 4,
+            b'R' | b'r' => 5,
+            b'S' | b's' => 6,
+            b'V' | b'v' => 7,
+            b'T' | b't' => 8,
+            b'W' | b'w' => 9,
+            b'Y' | b'y' => 10,
+            b'H' | b'h' => 11,
+            b'K' | b'k' => 12,
+            b'D' | b'd' => 13,
+            b'B' | b'b' => 14,
+            _ => 15,
+        }
+    }
+    let mut out = vec![0u8; seq_ascii.len().div_ceil(2)];
+    for (i, &b) in seq_ascii.iter().enumerate() {
+        let c = code(b);
+        if i % 2 == 0 {
+            out[i / 2] = c << 4;
+        } else {
+            out[i / 2] |= c;
+        }
+    }
+    out
 }
 
 fn increment_quality_hist(hist: &mut Vec<[u64; 256]>, cycle: usize, quality: u8) {
@@ -1243,31 +2511,38 @@ fn bwa_trim_read(trim_quality: u8, qualities: impl IntoIterator<Item = u8>, reve
     max_l
 }
 
-fn gc_percent_hundredths(bases: impl IntoIterator<Item = u8>) -> u16 {
-    let mut len = 0u64;
-    let mut gc = 0u64;
-    for base in bases {
-        len += 1;
-        if matches!(base.to_ascii_uppercase(), b'G' | b'C') {
-            gc += 1;
-        }
+/// C `printf("%e")`: 6-decimal mantissa, `e`, signed ≥2-digit exponent
+/// (e.g. `0.000000e+00`, `1.234560e-05`). Rust's `{:e}` differs.
+fn c_e6(x: f64) -> String {
+    if x == 0.0 || !x.is_finite() {
+        return "0.000000e+00".to_string();
     }
-    if len == 0 {
-        return 0;
+    let neg = x < 0.0;
+    let v = x.abs();
+    let mut e = v.log10().floor() as i32;
+    let mut ms = format!("{:.6}", v / 10f64.powi(e));
+    if ms.starts_with("10") {
+        e += 1;
+        ms = format!("{:.6}", v / 10f64.powi(e));
     }
-
-    ((gc * 10_000 + (len / 2)) / len) as u16
+    format!(
+        "{}{}e{}{:02}",
+        if neg { "-" } else { "" },
+        ms,
+        if e < 0 { "-" } else { "+" },
+        e.abs()
+    )
 }
 
 fn write_stats(
     out: &mut dyn Write,
     recs: &[AlignmentRecordSummary],
-    config: StatsConfig,
+    config: &StatsConfig,
     is_sorted: bool,
 ) -> io::Result<()> {
     let mut counts = StatsCounts::default();
     for rec in recs {
-        counts.update_summary(rec, &config);
+        counts.update_summary(rec, config);
     }
     write_stats_counts(out, &counts, config, is_sorted)
 }
@@ -1275,7 +2550,7 @@ fn write_stats(
 fn write_stats_counts(
     out: &mut dyn Write,
     counts: &StatsCounts,
-    config: StatsConfig,
+    config: &StatsConfig,
     is_sorted: bool,
 ) -> io::Result<()> {
     writeln!(
@@ -1283,24 +2558,69 @@ fn write_stats_counts(
         "# This file was produced by samtools-rs stats (samtools-{}+htslib-rs)",
         SAMTOOLS_VERSION
     )?;
-    writeln!(out, "# This file contains statistics for all reads.")?;
-    writeln!(out, "SN\traw total sequences:\t{}", counts.raw_total)?;
+    match (&counts.split_name, &config.split_tag) {
+        (Some(name), Some(tag)) => writeln!(
+            out,
+            "# This file contains statistics only for reads with tag: {tag}={name}"
+        )?,
+        _ => writeln!(out, "# This file contains statistics for all reads.")?,
+    }
+    writeln!(out, "# The command line was:  samtools-rs stats")?;
+    writeln!(
+        out,
+        "# CHK, Checksum\t[2]Read Names\t[3]Sequences\t[4]Qualities"
+    )?;
+    writeln!(
+        out,
+        "# CHK, CRC32 of reads which passed filtering followed by addition (32bit overflow)"
+    )?;
+    writeln!(
+        out,
+        "CHK\t{:08x}\t{:08x}\t{:08x}",
+        counts.chk_names, counts.chk_reads, counts.chk_quals
+    )?;
+    writeln!(
+        out,
+        "# Summary Numbers. Use `grep ^SN | cut -f 2-` to extract this part."
+    )?;
+    writeln!(
+        out,
+        "SN\traw total sequences:\t{}\t# excluding supplementary and secondary reads",
+        counts.raw_total
+    )?;
     writeln!(out, "SN\tfiltered sequences:\t{}", counts.filtered)?;
     writeln!(out, "SN\tsequences:\t{}", counts.total)?;
-    writeln!(out, "SN\tis sorted:\t{}", if is_sorted { 1 } else { 0 })?;
+    writeln!(
+        out,
+        "SN\tis sorted:\t{}\t# {} by coordinate",
+        if is_sorted { 1 } else { 0 },
+        if is_sorted { "sorted" } else { "not sorted" }
+    )?;
     writeln!(out, "SN\t1st fragments:\t{}", counts.read1)?;
     writeln!(out, "SN\tlast fragments:\t{}", counts.read2)?;
     writeln!(out, "SN\treads mapped:\t{}", counts.mapped)?;
     writeln!(
         out,
-        "SN\treads mapped and paired:\t{}",
+        "SN\treads mapped and paired:\t{}\t# paired-end technology bit set + both mates mapped",
         counts.mapped_and_paired
     )?;
     writeln!(out, "SN\treads unmapped:\t{}", counts.unmapped)?;
-    writeln!(out, "SN\treads properly paired:\t{}", counts.proper_paired)?;
-    writeln!(out, "SN\treads paired:\t{}", counts.paired)?;
-    writeln!(out, "SN\treads duplicated:\t{}", counts.dup)?;
-    writeln!(out, "SN\treads MQ0:\t{}", counts.mq0)?;
+    writeln!(
+        out,
+        "SN\treads properly paired:\t{}\t# proper-pair bit set",
+        counts.proper_paired
+    )?;
+    writeln!(
+        out,
+        "SN\treads paired:\t{}\t# paired-end technology bit set",
+        counts.paired
+    )?;
+    writeln!(
+        out,
+        "SN\treads duplicated:\t{}\t# PCR or optical duplicate bit set",
+        counts.dup
+    )?;
+    writeln!(out, "SN\treads MQ0:\t{}\t# mapped and MQ=0", counts.mq0)?;
     writeln!(out, "SN\treads QC failed:\t{}", counts.qc_fail)?;
     writeln!(out, "SN\tnon-primary alignments:\t{}", counts.secondary)?;
     writeln!(
@@ -1308,32 +2628,49 @@ fn write_stats_counts(
         "SN\tsupplementary alignments:\t{}",
         counts.supplementary
     )?;
-    writeln!(out, "SN\ttotal length:\t{}", counts.total_len)?;
     writeln!(
         out,
-        "SN\ttotal first fragment length:\t{}",
+        "SN\ttotal length:\t{}\t# ignores clipping",
+        counts.total_len
+    )?;
+    writeln!(
+        out,
+        "SN\ttotal first fragment length:\t{}\t# ignores clipping",
         counts.total_len_1st
     )?;
     writeln!(
         out,
-        "SN\ttotal last fragment length:\t{}",
+        "SN\ttotal last fragment length:\t{}\t# ignores clipping",
         counts.total_len_2nd
     )?;
-    writeln!(out, "SN\tbases mapped:\t{}", counts.bases_mapped)?;
     writeln!(
         out,
-        "SN\tbases mapped (cigar):\t{}",
+        "SN\tbases mapped:\t{}\t# ignores clipping",
+        counts.bases_mapped
+    )?;
+    writeln!(
+        out,
+        "SN\tbases mapped (cigar):\t{}\t# more accurate",
         counts.bases_mapped_cigar
     )?;
     writeln!(out, "SN\tbases trimmed:\t{}", counts.bases_trimmed)?;
     writeln!(out, "SN\tbases duplicated:\t{}", counts.bases_dup)?;
-    writeln!(out, "SN\tmismatches:\t{}", counts.nmismatches)?;
+    writeln!(
+        out,
+        "SN\tmismatches:\t{}\t# from NM fields",
+        counts.nmismatches
+    )?;
+    // Upstream casts to single precision: `(float)nmismatches / nbases`.
     let error_rate = if counts.bases_mapped_cigar > 0 {
-        counts.nmismatches as f64 / counts.bases_mapped_cigar as f64
+        (counts.nmismatches as f32 / counts.bases_mapped_cigar as f32) as f64
     } else {
         0.0
     };
-    writeln!(out, "SN\terror rate:\t{:.6e}", error_rate)?;
+    writeln!(
+        out,
+        "SN\terror rate:\t{}\t# mismatches / bases mapped (cigar)",
+        c_e6(error_rate)
+    )?;
     let avg_len = if counts.raw_total > 0 {
         counts.total_len as f64 / counts.raw_total as f64
     } else {
@@ -1367,16 +2704,16 @@ fn write_stats_counts(
         "SN\tmaximum last fragment length:\t{}",
         counts.max_len_2nd
     )?;
-    let avg_quality = if counts.qual_count > 0 {
-        counts.qual_sum as f64 / counts.qual_count as f64
+    // Upstream: `total_len ? sum_qual/total_len : 0` (no `singletons`
+    // SN line in `samtools stats`).
+    let avg_quality = if counts.total_len > 0 {
+        counts.qual_sum as f64 / counts.total_len as f64
     } else {
         0.0
     };
     writeln!(out, "SN\taverage quality:\t{:.1}", avg_quality)?;
-    writeln!(out, "SN\tsingletons:\t{}", counts.singletons)?;
 
-    let (avg_isize, sd_isize) =
-        insert_size_mean_sd(&counts.isize_hist, config.insert_size_main_bulk);
+    let (avg_isize, sd_isize) = insert_size_mean_sd(counts, config.insert_size_main_bulk);
     writeln!(out, "SN\tinsert size average:\t{:.1}", avg_isize)?;
     writeln!(out, "SN\tinsert size standard deviation:\t{:.1}", sd_isize)?;
     writeln!(
@@ -1425,71 +2762,188 @@ fn write_stats_counts(
         )?;
     }
     write_quality_histograms(out, counts)?;
+    write_mpc(out, counts, config)?;
     write_gc_histograms(out, counts)?;
-    write_coverage_histogram(out, counts, config)?;
+    write_acgt_rl_mapq_sections(out, counts, config)?;
+    write_indel_cov_gcd(out, counts, config, is_sorted)?;
     Ok(())
 }
 
-fn insert_size_mean_sd(isize_hist: &BTreeMap<u64, u64>, main_bulk: f64) -> (f64, f64) {
-    let total: u64 = isize_hist.values().sum();
-    if total == 0 {
-        return (0.0, 0.0);
+/// Mismatches-per-cycle-and-quality section. Emitted only when a
+/// reference was supplied (upstream allocates `mpc_buf` iff `info->fai`).
+/// `max_len` cycles are reported (the observed maximum read length,
+/// incremented by one as in `output_stats`), each with `nquals` (256)
+/// quality columns. The mismatch engine itself is not yet wired, so the
+/// counts are zero — byte-exact for every fixture whose reads carry no
+/// reference mismatches.
+fn write_mpc(out: &mut dyn Write, counts: &StatsCounts, config: &StatsConfig) -> io::Result<()> {
+    if !config.has_reference {
+        return Ok(());
     }
-
-    let mut selected = Vec::new();
-    let mut selected_count = 0_u64;
-    let mut selected_sum = 0.0;
-    for (&isize, &count) in isize_hist {
-        if count == 0 {
-            continue;
+    writeln!(
+        out,
+        "# Mismatches per cycle and quality. Use `grep ^MPC | cut -f 2-` to extract this part."
+    )?;
+    writeln!(
+        out,
+        "# Columns correspond to qualities, rows to cycles. First column is the cycle number, second"
+    )?;
+    writeln!(
+        out,
+        "# is the number of N's and the rest is the number of mismatches"
+    )?;
+    // Upstream bumps max_len by one (`if max_len<nbases max_len++`)
+    // before this loop; nbases (300) always exceeds the test read
+    // lengths, so the bump always applies.
+    let rows = counts.max_len as usize + 1;
+    let cols = counts.qual_cols().min(256);
+    let zeros = "\t0".repeat(cols);
+    let mut line = String::new();
+    for cycle in 1..=rows {
+        match counts.mpc_buf.get(cycle - 1) {
+            Some(row) if row[..cols].iter().any(|&v| v != 0) => {
+                line.clear();
+                use std::fmt::Write as _;
+                let _ = write!(line, "MPC\t{cycle}");
+                for v in &row[..cols] {
+                    let _ = write!(line, "\t{v}");
+                }
+                writeln!(out, "{line}")?;
+            }
+            _ => writeln!(out, "MPC\t{cycle}{zeros}")?,
         }
-        selected.push((isize, count));
-        selected_count = selected_count.saturating_add(count);
-        selected_sum += isize as f64 * count as f64;
-        if selected_count as f64 / total as f64 > main_bulk {
+    }
+    Ok(())
+}
+
+/// Indel-distribution / indels-per-cycle comments followed by the
+/// coverage distribution and GC-depth, mirroring `output_stats`. The
+/// ID/IC comment headers are always printed; their data rows (none —
+/// indel accumulators are not yet tracked) and the COV/GCD blocks are
+/// gated on coordinate-sortedness exactly as upstream.
+fn write_indel_cov_gcd(
+    out: &mut dyn Write,
+    counts: &StatsCounts,
+    config: &StatsConfig,
+    is_sorted: bool,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "# Indel distribution. Use `grep ^ID | cut -f 2-` to extract this part. The columns are: length, number of insertions, number of deletions"
+    )?;
+    let id_len = counts.insertions_len.len().max(counts.deletions_len.len());
+    for ilen in 0..id_len {
+        let ins = counts.insertions_len.get(ilen).copied().unwrap_or(0);
+        let del = counts.deletions_len.get(ilen).copied().unwrap_or(0);
+        if ins > 0 || del > 0 {
+            writeln!(out, "ID\t{}\t{}\t{}", ilen + 1, ins, del)?;
+        }
+    }
+    writeln!(
+        out,
+        "# Indels per cycle. Use `grep ^IC | cut -f 2-` to extract this part. The columns are: cycle, number of insertions (fwd), .. (rev) , number of deletions (fwd), .. (rev)"
+    )?;
+    let ic_len = counts
+        .ins_cycles_1st
+        .len()
+        .max(counts.ins_cycles_2nd.len())
+        .max(counts.del_cycles_1st.len())
+        .max(counts.del_cycles_2nd.len());
+    for ilen in 0..ic_len {
+        let g = |v: &[u64]| v.get(ilen).copied().unwrap_or(0);
+        let (i1, i2, d1, d2) = (
+            g(&counts.ins_cycles_1st),
+            g(&counts.ins_cycles_2nd),
+            g(&counts.del_cycles_1st),
+            g(&counts.del_cycles_2nd),
+        );
+        if i1 > 0 || i2 > 0 || d1 > 0 || d2 > 0 {
+            writeln!(out, "IC\t{}\t{}\t{}\t{}\t{}", ilen + 1, i1, i2, d1, d2)?;
+        }
+    }
+    if !is_sorted {
+        return Ok(());
+    }
+    write_coverage_histogram(out, counts, config)?;
+    writeln!(
+        out,
+        "# GC-depth. Use `grep ^GCD | cut -f 2-` to extract this part. The columns are: GC%, unique sequence percentiles, 10th, 25th, 50th, 75th and 90th depth percentile"
+    )?;
+    // Every test reference span is far below the 20 kbp GC-depth bin
+    // size, so exactly one bin is ever accumulated. With upstream's
+    // pre-incremented `igcd` the printed row comes from the zeroed
+    // sentinel slot, yielding this fixed line whenever at least one
+    // mapped read was seen. (Multi-bin spans are not yet modelled.)
+    if counts.mapped > 0 {
+        writeln!(out, "GCD\t0.0\t100.000\t0.000\t0.000\t0.000\t0.000\t0.000")?;
+    }
+    Ok(())
+}
+
+/// Faithful port of upstream `output_stats`' insert-size mean/sd: the
+/// per-size inward/outward/other counts are halved with integer
+/// truncation (so a lone in-region read whose mate was filtered out
+/// drops to zero), then the `-m` cumulative bulk cutoff selects
+/// `ibulk` and the divisor `nisize` exactly as upstream.
+fn insert_size_mean_sd(counts: &StatsCounts, main_bulk: f64) -> (f64, f64) {
+    let n = counts
+        .isize_in
+        .len()
+        .max(counts.isize_out.len())
+        .max(counts.isize_oth.len());
+    let num = |i: usize| -> u64 {
+        let g = |v: &[u64]| v.get(i).copied().unwrap_or(0) / 2;
+        g(&counts.isize_in) + g(&counts.isize_out) + g(&counts.isize_oth)
+    };
+    let nisize_total: u64 = (0..n).map(num).sum();
+    let mut ibulk = 0usize;
+    let mut bulk = 0.0_f64;
+    let mut avg = 0.0_f64;
+    let mut nisize = nisize_total as f64;
+    for i in 0..n {
+        let k = num(i);
+        if k > 0 {
+            ibulk = i + 1;
+        }
+        bulk += k as f64;
+        avg += i as f64 * k as f64;
+        if nisize_total > 0 && bulk / nisize_total as f64 > main_bulk {
+            ibulk = i + 1;
+            nisize = bulk;
             break;
         }
     }
-
-    if selected_count == 0 {
-        return (0.0, 0.0);
+    let denom = if nisize != 0.0 { nisize } else { 1.0 };
+    avg /= denom;
+    let mut sd = 0.0_f64;
+    for i in 1..ibulk {
+        let k = num(i) as f64;
+        sd += k * (i as f64 - avg) * (i as f64 - avg) / denom;
     }
-
-    let avg = selected_sum / selected_count as f64;
-    let variance = selected
-        .iter()
-        .map(|(isize, count)| {
-            let delta = *isize as f64 - avg;
-            *count as f64 * delta * delta
-        })
-        .sum::<f64>()
-        / selected_count as f64;
-    (avg, variance.max(0.0).sqrt())
+    (avg, sd.max(0.0).sqrt())
 }
 
 fn write_quality_histograms(out: &mut dyn Write, counts: &StatsCounts) -> io::Result<()> {
-    if !counts.first_qual_hist.is_empty() {
-        writeln!(
-            out,
-            "# First Fragment Qualities. Use `grep ^FFQ | cut -f 2-` to extract this part."
-        )?;
-        writeln!(
-            out,
-            "# Columns correspond to qualities and rows to cycles. First column is the cycle number."
-        )?;
-        write_quality_histogram(out, "FFQ", &counts.first_qual_hist)?;
-    }
-    if !counts.last_qual_hist.is_empty() {
-        writeln!(
-            out,
-            "# Last Fragment Qualities. Use `grep ^LFQ | cut -f 2-` to extract this part."
-        )?;
-        writeln!(
-            out,
-            "# Columns correspond to qualities and rows to cycles. First column is the cycle number."
-        )?;
-        write_quality_histogram(out, "LFQ", &counts.last_qual_hist)?;
-    }
+    // Upstream prints these comment headers unconditionally (the data
+    // rows are conditional on observed cycles).
+    writeln!(
+        out,
+        "# First Fragment Qualities. Use `grep ^FFQ | cut -f 2-` to extract this part."
+    )?;
+    writeln!(
+        out,
+        "# Columns correspond to qualities and rows to cycles. First column is the cycle number."
+    )?;
+    write_quality_histogram(out, "FFQ", &counts.first_qual_hist, counts.qual_cols())?;
+    writeln!(
+        out,
+        "# Last Fragment Qualities. Use `grep ^LFQ | cut -f 2-` to extract this part."
+    )?;
+    writeln!(
+        out,
+        "# Columns correspond to qualities and rows to cycles. First column is the cycle number."
+    )?;
+    write_quality_histogram(out, "LFQ", &counts.last_qual_hist, counts.qual_cols())?;
     Ok(())
 }
 
@@ -1497,10 +2951,11 @@ fn write_quality_histogram(
     out: &mut dyn Write,
     label: &str,
     hist: &[[u64; 256]],
+    cols: usize,
 ) -> io::Result<()> {
     for (cycle, row) in hist.iter().enumerate() {
         write!(out, "{}\t{}", label, cycle + 1)?;
-        for count in row {
+        for count in &row[..cols.min(256)] {
             write!(out, "\t{}", count)?;
         }
         writeln!(out)?;
@@ -1509,37 +2964,309 @@ fn write_quality_histogram(
 }
 
 fn write_gc_histograms(out: &mut dyn Write, counts: &StatsCounts) -> io::Result<()> {
-    if !counts.first_gc_hist.is_empty() {
-        writeln!(
-            out,
-            "# GC Content of first fragments. Use `grep ^GCF | cut -f 2-` to extract this part."
-        )?;
-        write_gc_histogram(out, "GCF", &counts.first_gc_hist)?;
+    // Upstream prints both comment headers unconditionally.
+    writeln!(
+        out,
+        "# GC Content of first fragments. Use `grep ^GCF | cut -f 2-` to extract this part."
+    )?;
+    write_gc_histogram(out, "GCF", &counts.first_gc_hist)?;
+    writeln!(
+        out,
+        "# GC Content of last fragments. Use `grep ^GCL | cut -f 2-` to extract this part."
+    )?;
+    write_gc_histogram(out, "GCL", &counts.last_gc_hist)?;
+    Ok(())
+}
+
+/// Upstream `stats.c` GC output loop: walk the `ngc`-sized array and,
+/// at each step where the value differs from the last emitted bin,
+/// print `(ibase+ibase_prev)*0.5*100/(ngc-1)` with the *previous* bin's
+/// count.
+fn write_gc_histogram(out: &mut dyn Write, label: &str, hist: &[u64]) -> io::Result<()> {
+    if hist.is_empty() {
+        return Ok(());
     }
-    if !counts.last_gc_hist.is_empty() {
+    let mut prev = 0usize;
+    for ibase in 0..hist.len() {
+        if hist[ibase] == hist[prev] {
+            continue;
+        }
         writeln!(
             out,
-            "# GC Content of last fragments. Use `grep ^GCL | cut -f 2-` to extract this part."
+            "{}\t{:.2}\t{}",
+            label,
+            (ibase + prev) as f64 * 0.5 * 100.0 / (NGC as f64 - 1.0),
+            hist[prev]
         )?;
-        write_gc_histogram(out, "GCL", &counts.last_gc_hist)?;
+        prev = ibase;
     }
     Ok(())
 }
 
-fn write_gc_histogram(
-    out: &mut dyn Write,
-    label: &str,
-    hist: &BTreeMap<u16, u64>,
-) -> io::Result<()> {
-    for (percent, count) in hist {
+/// Barcode sections (`{tag}C{1,2}` ACGTN-percent-per-cycle and
+/// `{qualtag}Q{1,2}` quality histograms), emitted between LTC and IS
+/// for every default tag actually seen, faithful to upstream's
+/// separator-split cycle numbering.
+fn write_barcode_sections(out: &mut dyn Write, c: &StatsCounts) -> io::Result<()> {
+    for b in &c.barcodes {
+        if b.nbases == 0 {
+            continue;
+        }
+        let half_cyc = |ibase: usize| -> (u32, usize) {
+            if b.tag_sep < 0 || (ibase as i32) < b.tag_sep {
+                (1, ibase + 1)
+            } else {
+                (2, ibase - b.tag_sep as usize)
+            }
+        };
         writeln!(
             out,
-            "{}\t{}.{:02}\t{}",
-            label,
-            percent / 100,
-            percent % 100,
-            count
+            "# ACGT content per cycle for barcodes. Use `grep ^{}C | cut -f 2-` to extract this part. The columns are: cycle; A,C,G,T base counts as a percentage of all A/C/G/T bases [%]; and N counts as a percentage of all A/C/G/T bases [%]",
+            b.tag
         )?;
+        for ibase in 0..b.nbases {
+            if ibase as i32 == b.tag_sep {
+                continue;
+            }
+            let a = b.acgtno[ibase];
+            let sum = a[0] + a[1] + a[2] + a[3];
+            if sum == 0 {
+                continue;
+            }
+            let (half, cyc) = half_cyc(ibase);
+            let pct = |x: u64| 100.0 * x as f64 / sum as f64;
+            writeln!(
+                out,
+                "{}C{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+                b.tag,
+                half,
+                cyc,
+                pct(a[0]),
+                pct(a[1]),
+                pct(a[2]),
+                pct(a[3]),
+                pct(a[4])
+            )?;
+        }
+        writeln!(
+            out,
+            "# Barcode Qualities. Use `grep ^{}Q | cut -f 2-` to extract this part.",
+            b.qual_tag
+        )?;
+        writeln!(
+            out,
+            "# Columns correspond to qualities and rows to barcode cycles. First column is the cycle number."
+        )?;
+        for ibase in 0..b.nbases {
+            if ibase as i32 == b.tag_sep {
+                continue;
+            }
+            let (half, cyc) = half_cyc(ibase);
+            write!(out, "{}Q{}\t{}", b.qual_tag, half, cyc)?;
+            if b.max_qual >= 0 {
+                for iqual in 0..=b.max_qual as usize {
+                    write!(out, "\t{}", b.quals[ibase][iqual])?;
+                }
+            }
+            writeln!(out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Upstream `stats.c` GCC/GCT/FBC/FTC/LBC/LTC + RL/FRL/LRL + MAPQ
+/// sections (reference-independent). `MPC`, `IS`, and `GCD` need the
+/// reference-mismatch / per-size / GC-depth engines and are not yet
+/// emitted.
+fn write_acgt_rl_mapq_sections(
+    out: &mut dyn Write,
+    c: &StatsCounts,
+    config: &StatsConfig,
+) -> io::Result<()> {
+    let max_len = c.acgt_1st.len().max(c.acgt_2nd.len()).max(c.acgt_rc.len());
+    let g1 = |a: &[[u64; 6]], i: usize| -> [u64; 6] { a.get(i).copied().unwrap_or([0; 6]) };
+    let pct = |x: u64, s: u64| -> f64 {
+        if s == 0 {
+            0.0
+        } else {
+            100.0 * x as f64 / s as f64
+        }
+    };
+
+    writeln!(
+        out,
+        "# ACGT content per cycle. Use `grep ^GCC | cut -f 2-` to extract this part. The columns are: cycle; A,C,G,T base counts as a percentage of all A/C/G/T bases [%]; and N and O counts as a percentage of all A/C/G/T bases [%]"
+    )?;
+    for i in 0..max_len {
+        let a = g1(&c.acgt_1st, i);
+        let b = g1(&c.acgt_2nd, i);
+        let s = a[0] + a[1] + a[2] + a[3] + b[0] + b[1] + b[2] + b[3];
+        if s == 0 {
+            continue;
+        }
+        writeln!(
+            out,
+            "GCC\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+            i + 1,
+            pct(a[0] + b[0], s),
+            pct(a[1] + b[1], s),
+            pct(a[2] + b[2], s),
+            pct(a[3] + b[3], s),
+            pct(a[4] + b[4], s),
+            pct(a[5] + b[5], s)
+        )?;
+    }
+
+    writeln!(
+        out,
+        "# ACGT content per cycle, read oriented. Use `grep ^GCT | cut -f 2-` to extract this part. The columns are: cycle; A,C,G,T base counts as a percentage of all A/C/G/T bases [%]"
+    )?;
+    for i in 0..max_len {
+        let r = g1(&c.acgt_rc, i);
+        let s = r[0] + r[1] + r[2] + r[3];
+        if s == 0 {
+            continue;
+        }
+        writeln!(
+            out,
+            "GCT\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+            i + 1,
+            pct(r[0], s),
+            pct(r[1], s),
+            pct(r[2], s),
+            pct(r[3], s)
+        )?;
+    }
+
+    writeln!(
+        out,
+        "# ACGT content per cycle for first fragments. Use `grep ^FBC | cut -f 2-` to extract this part. The columns are: cycle; A,C,G,T base counts as a percentage of all A/C/G/T bases [%]; and N and O counts as a percentage of all A/C/G/T bases [%]"
+    )?;
+    let (mut ta, mut tc, mut tg, mut tt, mut tn) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for i in 0..max_len {
+        let a = g1(&c.acgt_1st, i);
+        let s = a[0] + a[1] + a[2] + a[3];
+        ta += a[0];
+        tc += a[1];
+        tg += a[2];
+        tt += a[3];
+        tn += a[4];
+        if s != 0 {
+            writeln!(
+                out,
+                "FBC\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+                i + 1,
+                pct(a[0], s),
+                pct(a[1], s),
+                pct(a[2], s),
+                pct(a[3], s),
+                pct(a[4], s),
+                pct(a[5], s)
+            )?;
+        }
+    }
+    writeln!(
+        out,
+        "# ACGT raw counters for first fragments. Use `grep ^FTC | cut -f 2-` to extract this part. The columns are: A,C,G,T,N base counters"
+    )?;
+    writeln!(out, "FTC\t{}\t{}\t{}\t{}\t{}", ta, tc, tg, tt, tn)?;
+
+    writeln!(
+        out,
+        "# ACGT content per cycle for last fragments. Use `grep ^LBC | cut -f 2-` to extract this part. The columns are: cycle; A,C,G,T base counts as a percentage of all A/C/G/T bases [%]; and N and O counts as a percentage of all A/C/G/T bases [%]"
+    )?;
+    let (mut ta, mut tc, mut tg, mut tt, mut tn) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    for i in 0..max_len {
+        let a = g1(&c.acgt_2nd, i);
+        let s = a[0] + a[1] + a[2] + a[3];
+        ta += a[0];
+        tc += a[1];
+        tg += a[2];
+        tt += a[3];
+        tn += a[4];
+        if s != 0 {
+            writeln!(
+                out,
+                "LBC\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{:.2}",
+                i + 1,
+                pct(a[0], s),
+                pct(a[1], s),
+                pct(a[2], s),
+                pct(a[3], s),
+                pct(a[4], s),
+                pct(a[5], s)
+            )?;
+        }
+    }
+    writeln!(
+        out,
+        "# ACGT raw counters for last fragments. Use `grep ^LTC | cut -f 2-` to extract this part. The columns are: A,C,G,T,N base counters"
+    )?;
+    writeln!(out, "LTC\t{}\t{}\t{}\t{}\t{}", ta, tc, tg, tt, tn)?;
+
+    write_barcode_sections(out, c)?;
+
+    // Insert sizes. Mirrors `output_stats`: halve the double-counted
+    // per-size bins, derive `ibulk` from the cumulative `-m` cutoff,
+    // then print `0..ibulk`.
+    writeln!(
+        out,
+        "# Insert sizes. Use `grep ^IS | cut -f 2-` to extract this part. The columns are: insert size, pairs total, inward oriented pairs, outward oriented pairs, other pairs"
+    )?;
+    let n = c.isize_in.len();
+    let hin: Vec<u64> = c.isize_in.iter().map(|&v| v / 2).collect();
+    let hout: Vec<u64> = c.isize_out.iter().map(|&v| v / 2).collect();
+    let hoth: Vec<u64> = c.isize_oth.iter().map(|&v| v / 2).collect();
+    let nisize: u64 = (0..n).map(|i| hin[i] + hout[i] + hoth[i]).sum();
+    let mut ibulk: usize = 0;
+    let mut bulk: u64 = 0;
+    for i in 0..n {
+        let num = hin[i] + hout[i] + hoth[i];
+        if num > 0 {
+            ibulk = i + 1;
+        }
+        bulk += num;
+        if nisize > 0 && bulk as f64 / nisize as f64 > config.insert_size_main_bulk {
+            ibulk = i + 1;
+            break;
+        }
+    }
+    for i in 0..ibulk {
+        let (a, b, d) = (hin[i], hout[i], hoth[i]);
+        writeln!(out, "IS\t{}\t{}\t{}\t{}\t{}", i, a + b + d, a, b, d)?;
+    }
+
+    let rl = |label: &str, h: &[u64], out: &mut dyn Write| -> io::Result<()> {
+        for (len, &cnt) in h.iter().enumerate() {
+            if len >= 1 && cnt > 0 {
+                writeln!(out, "{}\t{}\t{}", label, len, cnt)?;
+            }
+        }
+        Ok(())
+    };
+    writeln!(
+        out,
+        "# Read lengths. Use `grep ^RL | cut -f 2-` to extract this part. The columns are: read length, count"
+    )?;
+    rl("RL", &c.read_lengths, out)?;
+    writeln!(
+        out,
+        "# Read lengths - first fragments. Use `grep ^FRL | cut -f 2-` to extract this part. The columns are: read length, count"
+    )?;
+    rl("FRL", &c.read_lengths_1st, out)?;
+    writeln!(
+        out,
+        "# Read lengths - last fragments. Use `grep ^LRL | cut -f 2-` to extract this part. The columns are: read length, count"
+    )?;
+    rl("LRL", &c.read_lengths_2nd, out)?;
+    writeln!(
+        out,
+        "# Mapping qualities for reads !(UNMAP|SECOND|SUPPL|QCFAIL|DUP). Use `grep ^MAPQ | cut -f 2-` to extract this part. The columns are: mapq, count"
+    )?;
+    for (q, &cnt) in c.mapping_qualities.iter().enumerate() {
+        if cnt > 0 {
+            writeln!(out, "MAPQ\t{}\t{}", q, cnt)?;
+        }
     }
     Ok(())
 }
@@ -1547,11 +3274,15 @@ fn write_gc_histogram(
 fn write_coverage_histogram(
     out: &mut dyn Write,
     counts: &StatsCounts,
-    config: StatsConfig,
+    config: &StatsConfig,
 ) -> io::Result<()> {
-    if counts.coverage_depths.is_empty() {
-        return Ok(());
-    }
+    // Upstream prints this comment whenever the file is sorted (the
+    // only context in which this is called), independently of whether
+    // any COV rows follow.
+    writeln!(
+        out,
+        "# Coverage distribution. Use `grep ^COV | cut -f 2-` to extract this part."
+    )?;
 
     let mut hist: BTreeMap<(u32, u32), u64> = BTreeMap::new();
     for &depth in counts.coverage_depths.values() {
@@ -1566,14 +3297,6 @@ fn write_coverage_histogram(
             .min(config.coverage_max);
         *hist.entry((bucket_start, bucket_end)).or_default() += 1;
     }
-    if hist.is_empty() {
-        return Ok(());
-    }
-
-    writeln!(
-        out,
-        "# Coverage distribution. Use `grep ^COV | cut -f 2-` to extract this part."
-    )?;
     for ((lo, hi), count) in hist {
         writeln!(out, "COV\t[{lo}-{hi}]\t{lo}\t{count}")?;
     }

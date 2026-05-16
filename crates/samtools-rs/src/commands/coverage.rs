@@ -434,10 +434,14 @@ fn merge_coverage_refs(merged: &mut [RefStats], next: Vec<RefStats>) -> io::Resu
         for (left_depth, right_depth) in left.depths.iter_mut().zip(right.depths) {
             *left_depth = left_depth.saturating_add(right_depth);
         }
+        for (l, r) in left.baseq_pos.iter_mut().zip(right.baseq_pos) {
+            *l = l.saturating_add(r);
+        }
+        for (l, r) in left.baseqn_pos.iter_mut().zip(right.baseqn_pos) {
+            *l = l.saturating_add(r);
+        }
         left.num_reads = left.num_reads.saturating_add(right.num_reads);
         left.aligned_bases = left.aligned_bases.saturating_add(right.aligned_bases);
-        left.baseq_sum = left.baseq_sum.saturating_add(right.baseq_sum);
-        left.baseq_count = left.baseq_count.saturating_add(right.baseq_count);
         left.mapq_sum = left.mapq_sum.saturating_add(right.mapq_sum);
     }
 
@@ -461,30 +465,79 @@ fn ref_region(target: &RefStats) -> io::Result<Region> {
     })
 }
 
+/// C `printf("%.*g")` with `prec` significant digits (default-style, no
+/// `#`): pick `%f` when the decimal exponent X satisfies `-4 <= X < prec`,
+/// else `%e`; strip trailing zeros and a trailing point. Matches glibc's
+/// round-half-to-even (as Rust's float formatting also does).
+fn c_printf_g(value: f64, prec: usize) -> String {
+    let p = prec.max(1);
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    if !value.is_finite() {
+        return format!("{value}");
+    }
+
+    // Round to `p` significant digits via %e to get the true exponent.
+    let sci = format!("{:.*e}", p - 1, value);
+    let (mantissa, exp) = sci.split_once('e').unwrap();
+    let x: i32 = exp.parse().unwrap();
+
+    let trim = |s: &str| -> String {
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s.to_string()
+        }
+    };
+
+    if x >= -4 && x < p as i32 {
+        let decimals = (p as i32 - 1 - x).max(0) as usize;
+        trim(&format!("{value:.decimals$}"))
+    } else {
+        let m = trim(mantissa);
+        format!("{}e{}{:02}", m, if x < 0 { "-" } else { "+" }, x.abs())
+    }
+}
+
 fn emit_coverage(
     out: &mut dyn Write,
     refs: &[RefStats],
     min_depth: u32,
     max_depth: Option<u32>,
 ) -> io::Result<()> {
-    for rs in refs {
-        let covbases = rs
-            .depths
-            .iter()
-            .map(|&d| cap_depth(d, max_depth))
-            .filter(|&d| d >= min_depth)
-            .count();
+    // coverage.c prints references as their pileup columns are reached,
+    // flushing any reference with no selected reads at the very end (still
+    // in tid order). Reproduce: references with reads first, then the
+    // empty ones, each group stable in tid order.
+    let ordered = refs
+        .iter()
+        .filter(|rs| rs.num_reads > 0)
+        .chain(refs.iter().filter(|rs| rs.num_reads == 0));
+    for rs in ordered {
+        // Single pass mirroring coverage.c: a position contributes to
+        // covbases / summed_coverage / summed_baseQ only when its (capped)
+        // depth clears `min_depth`.
+        let mut covbases = 0u64;
+        let mut summed_coverage = 0u64;
+        let mut summed_baseq = 0u64;
+        let mut quality_bases = 0u64;
+        for (i, &raw) in rs.depths.iter().enumerate() {
+            let d = cap_depth(raw, max_depth);
+            if d >= min_depth {
+                covbases += 1;
+                summed_coverage += d as u64;
+                summed_baseq += rs.baseq_pos[i];
+                quality_bases += rs.baseqn_pos[i] as u64;
+            }
+        }
         let coverage_pct = if rs.length > 0 {
             covbases as f64 / rs.length as f64 * 100.0
         } else {
             0.0
         };
         let meandepth = if rs.length > 0 {
-            rs.depths
-                .iter()
-                .map(|&d| cap_depth(d, max_depth) as u64)
-                .sum::<u64>() as f64
-                / rs.length as f64
+            summed_coverage as f64 / rs.length as f64
         } else {
             0.0
         };
@@ -493,23 +546,24 @@ fn emit_coverage(
         } else {
             0.0
         };
-        let meanbaseq = if rs.baseq_count > 0 {
-            rs.baseq_sum as f64 / rs.baseq_count as f64
+        let meanbaseq = if quality_bases > 0 {
+            summed_baseq as f64 / quality_bases as f64
         } else {
             0.0
         };
+        // Upstream coverage.c:211 — `\t...\t%g\t%g\t%.3g\t%.3g`.
         writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             rs.name,
             rs.output_start,
             rs.output_end,
             rs.num_reads,
             covbases,
-            coverage_pct,
-            meandepth,
-            meanbaseq,
-            meanmapq,
+            c_printf_g(coverage_pct, 6),
+            c_printf_g(meandepth, 6),
+            c_printf_g(meanbaseq, 3),
+            c_printf_g(meanmapq, 3),
         )?;
     }
     Ok(())
@@ -611,8 +665,12 @@ struct RefStats {
     depths: Vec<u32>,
     num_reads: u64,
     aligned_bases: u64,
-    baseq_sum: u64,
-    baseq_count: u64,
+    /// Per-position summed base quality / count of quality bases, so the
+    /// `meandepth`/`meanbaseq` accumulators can be gated by `min_depth`
+    /// exactly like upstream `coverage.c` (only positions whose depth
+    /// clears `min_depth` contribute).
+    baseq_pos: Vec<u64>,
+    baseqn_pos: Vec<u32>,
     mapq_sum: u64,
 }
 
@@ -663,8 +721,8 @@ fn coverage_targets(
                 depths: vec![0u32; length],
                 num_reads: 0,
                 aligned_bases: 0u64,
-                baseq_sum: 0u64,
-                baseq_count: 0u64,
+                baseq_pos: vec![0u64; length],
+                baseqn_pos: vec![0u32; length],
                 mapq_sum: 0u64,
             }])
         }
@@ -685,8 +743,8 @@ fn coverage_targets(
                     depths: vec![0u32; length],
                     num_reads: 0,
                     aligned_bases: 0u64,
-                    baseq_sum: 0u64,
-                    baseq_count: 0u64,
+                    baseq_pos: vec![0u64; length],
+                    baseqn_pos: vec![0u32; length],
                     mapq_sum: 0u64,
                 }
             })
@@ -842,8 +900,8 @@ fn update_target_after_filter(
                             let query_offset = query_pos + (p - ref_pos);
                             match qualities.get(query_offset) {
                                 Some(&quality) if quality >= min_baseq => {
-                                    rs.baseq_sum += quality as u64;
-                                    rs.baseq_count += 1;
+                                    rs.baseq_pos[offset] += quality as u64;
+                                    rs.baseqn_pos[offset] += 1;
                                     true
                                 }
                                 Some(_) => false,

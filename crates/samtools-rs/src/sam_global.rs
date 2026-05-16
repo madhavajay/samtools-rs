@@ -4,9 +4,9 @@
 //! The parser is intentionally limited to top-level options that appear before
 //! the subcommand so command-local parsers still own their own option surface.
 
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
 
 /// Parsed values for upstream's standard `sam_global_args` option family.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -21,25 +21,18 @@ pub struct SamGlobalArgs {
     pub verbosity: Option<i32>,
 }
 
-static CURRENT_GLOBAL_ARGS: OnceLock<Mutex<SamGlobalArgs>> = OnceLock::new();
+thread_local! {
+    static CURRENT_GLOBAL_ARGS: RefCell<SamGlobalArgs> = RefCell::new(SamGlobalArgs::default());
+}
 
 /// Stores globals parsed by the top-level dispatcher for command I/O paths.
 pub fn set_current_global_args(globals: SamGlobalArgs) {
-    *global_args_cell()
-        .lock()
-        .expect("global args mutex poisoned") = globals;
+    CURRENT_GLOBAL_ARGS.with(|cell| *cell.borrow_mut() = globals);
 }
 
 /// Returns the globals parsed by the top-level dispatcher.
 pub fn current_global_args() -> SamGlobalArgs {
-    global_args_cell()
-        .lock()
-        .expect("global args mutex poisoned")
-        .clone()
-}
-
-fn global_args_cell() -> &'static Mutex<SamGlobalArgs> {
-    CURRENT_GLOBAL_ARGS.get_or_init(|| Mutex::new(SamGlobalArgs::default()))
+    CURRENT_GLOBAL_ARGS.with(|cell| cell.borrow().clone())
 }
 
 /// Applies top-level samtools global options and returns argv without them.

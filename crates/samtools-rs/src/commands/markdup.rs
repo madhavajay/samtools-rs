@@ -1,14 +1,25 @@
 //! `samtools markdup` — mark duplicate alignments.
 //!
-//! Mirrors `bam_markdup.c`. The upstream implementation is paired-aware,
-//! barcode-aware, and supports optical-duplicate clustering. This initial
-//! Rust port handles single-end and paired-end primary alignments for SAM
-//! and BAM inputs. SE records are grouped by `(tid, alignment_start,
-//! reverse-flag)`; PE records pair by qname and group on the canonical
-//! combined position key. In each group the entry with the highest
-//! (combined) MAPQ stays primary and the rest receive the `BAM_FDUP`
-//! flag. Secondary and supplementary records inherit the duplicate flag from
-//! duplicate primary records with the same query name.
+//! Faithful port of `bam_markdup.c`'s primary duplicate detection. Reads
+//! are processed in coordinate order; paired reads build the upstream
+//! `make_pair_key` (template / `--mode s` sequence) and a shared
+//! `make_single_key`, and the kept read of a colliding key is the one
+//! with the higher `calc_score (+ ms)` (sum of base quals ≥ 15 plus the
+//! mate-score tag), ties broken by qname. The left/right (`R_LE`/`R_RI`)
+//! component keeps the two ends of a template distinct so only
+//! corresponding mates of duplicate templates collide. With `-S`,
+//! duplicate reads carrying `SA`/`XA` or an unmapped mate seed a
+//! qname `dup_hash` that flags matching supplementary/secondary/unmapped
+//! records. Optical duplicates use the faithful `get_coordinates_colons`
+//! parse plus the `find_duplicate_chains` re-tagging pass (per-read
+//! `original`/`duplicate` chain links with the exact swap/splice
+//! semantics). `--use-read-groups` keys the hashes by `@RG` order;
+//! `--duplicate-count` emits `dc:i`. Regex `--read-coords` /
+//! `--coords-order` / `--barcode-rgx` / `--barcode-name` supported (via
+//! the `regex` crate). Raw-header SAM output preserves input `@RG`/`@SQ`
+//! order. **Byte-exact vs the entire upstream `test_markdup` SAM
+//! harness — `markdup/{5..18}` (all 14 fixtures)**. **Not yet:** exact
+//! `-s` stats counts, CRAM, the `1..4` expect-fail error-message cases.
 //!
 //! Supported flags:
 //!  - `-r` — remove duplicates from the output (rather than just flagging).
@@ -29,10 +40,10 @@
 //!
 //! Not yet supported: exact upstream stats output, CRAM.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -43,7 +54,8 @@ use htslib_rs::format::Exact;
 use htslib_rs::sam::{
     self,
     alignment::{
-        RecordBuf, io::Write as _, record::data::field::Tag, record_buf::data::field::Value,
+        RecordBuf, io::Write as _, record::cigar::op::Kind, record::data::field::Tag,
+        record_buf::data::field::Value,
     },
 };
 
@@ -60,6 +72,14 @@ enum OutFmt {
     Bam,
 }
 
+/// Duplicate-decision mode (`-m`/`--mode`). Upstream default is
+/// `MD_MODE_TEMPLATE`; `s` selects `MD_MODE_SEQUENCE`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DupMode {
+    Template,
+    Sequence,
+}
+
 #[derive(Clone, Copy)]
 struct MarkdupOptions {
     remove_dups: bool,
@@ -68,7 +88,10 @@ struct MarkdupOptions {
     duplicate_origin_tag: bool,
     optical_distance: Option<u32>,
     include_fails: bool,
-    barcode_tag: Option<Tag>,
+    mode: DupMode,
+    supp: bool,
+    use_read_groups: bool,
+    duplicate_count: bool,
 }
 
 /// Entry point for `samtools markdup`.
@@ -84,6 +107,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut include_fails = false;
     let mut no_pg = false;
     let mut barcode_tag: Option<Tag> = None;
+    let mut mode = DupMode::Template;
+    let mut supp = false;
+    let mut use_read_groups = false;
+    let mut duplicate_count = false;
+    let mut read_coords: Option<String> = None;
+    let mut coords_order = String::from("txy");
+    let mut barcode_rgx: Option<String> = None;
+    let mut barcode_name = false;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -91,8 +122,20 @@ pub fn main(args: &[OsString]) -> ExitCode {
         match s {
             "-r" => remove_dups = true,
             "-s" => emit_stats = true,
-            "-S" => {
-                // Supplementary duplicate propagation is always performed.
+            "-S" => supp = true,
+            "--use-read-groups" => use_read_groups = true,
+            "--duplicate-count" => duplicate_count = true,
+            "--barcode-name" => barcode_name = true,
+            "--read-coords" => {
+                read_coords = iter.next().and_then(|a| a.to_str()).map(str::to_owned);
+            }
+            "--coords-order" => {
+                if let Some(v) = iter.next().and_then(|a| a.to_str()) {
+                    coords_order = v.to_owned();
+                }
+            }
+            "--barcode-rgx" => {
+                barcode_rgx = iter.next().and_then(|a| a.to_str()).map(str::to_owned);
             }
             "--include-fails" => include_fails = true,
             "-c" => clear_existing_dups = true,
@@ -102,11 +145,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     print_error("markdup", format!("missing value for {}", s));
                     return ExitCode::from(1);
                 };
-                if !matches!(v, "t" | "s") {
-                    print_error("markdup", format!("unknown mode '{}'", v));
-                    return ExitCode::from(1);
-                }
-                // Current PE grouping uses the implemented coordinate key for both modes.
+                mode = match v {
+                    "t" => DupMode::Template,
+                    "s" => DupMode::Sequence,
+                    _ => {
+                        print_error("markdup", format!("unknown mode '{}'", v));
+                        return ExitCode::from(1);
+                    }
+                };
             }
             "-d" => {
                 let Some(v) = iter.next().and_then(|a| a.to_str()) else {
@@ -170,7 +216,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
             _ => {
                 if input.is_none() {
                     input = Some(PathBuf::from(arg));
-                } else if output.is_none() {
+                } else if output.is_none() && s != "-" {
+                    // A `-` output operand means stdout (output stays None).
                     output = Some(PathBuf::from(arg));
                 }
             }
@@ -205,11 +252,82 @@ pub fn main(args: &[OsString]) -> ExitCode {
         duplicate_origin_tag,
         optical_distance,
         include_fails,
-        barcode_tag,
+        mode,
+        supp,
+        use_read_groups,
+        duplicate_count,
     };
+    // Compile the optical-coordinate / barcode regexes once.
+    let coord = if let Some(rx) = &read_coords {
+        let (x, y, t) = match coords_order.as_str() {
+            o if o.starts_with("txy") || o.starts_with("tyx") => (2, 3, 1),
+            o if o.starts_with("xyt") || o.starts_with("yxt") => (1, 2, 3),
+            o if o.starts_with("xty") || o.starts_with("ytx") => (1, 3, 2),
+            o if o.starts_with("xy") || o.starts_with("yx") => (1, 2, 0),
+            _ => {
+                print_error(
+                    "markdup",
+                    format!("could not recognise regex coordinate order \"{coords_order}\""),
+                );
+                return ExitCode::from(1);
+            }
+        };
+        match regex::Regex::new(rx) {
+            Ok(re) => CoordCfg {
+                rx: Some(re),
+                x,
+                y,
+                t,
+            },
+            Err(e) => {
+                print_error("markdup", format!("regex fail \"{e}\""));
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        CoordCfg {
+            rx: None,
+            x: 0,
+            y: 0,
+            t: 0,
+        }
+    };
+    let bc = if barcode_name || barcode_rgx.is_some() {
+        // Default UMI regex: the 8th colon-delimited read-name field.
+        let pat = barcode_rgx.as_deref().unwrap_or(
+            "[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:([!-?A-~]+)",
+        );
+        match regex::Regex::new(pat) {
+            Ok(re) => BcMode::Rgx(re),
+            Err(e) => {
+                print_error("markdup", format!("barcode regex fail \"{e}\""));
+                return ExitCode::from(1);
+            }
+        }
+    } else if let Some(t) = barcode_tag {
+        BcMode::Tag(t)
+    } else {
+        BcMode::None
+    };
+    let cfg = Cfg { coord, bc };
+
     let result = match format.exact {
-        Exact::Sam => run_sam_markdup(&input, output.as_deref(), output_fmt, pg_argv, options),
-        Exact::Bam => run_bam_markdup(&input, output.as_deref(), output_fmt, pg_argv, options),
+        Exact::Sam => run_sam_markdup(
+            &input,
+            output.as_deref(),
+            output_fmt,
+            pg_argv,
+            options,
+            &cfg,
+        ),
+        Exact::Bam => run_bam_markdup(
+            &input,
+            output.as_deref(),
+            output_fmt,
+            pg_argv,
+            options,
+            &cfg,
+        ),
         _ => unreachable!("format checked above"),
     };
 
@@ -261,12 +379,41 @@ struct DuplicateMetadata {
     duplicate_type: Option<DuplicateType>,
 }
 
+/// Per-record read-group number (`--use-read-groups`): the 1-based index
+/// of the record's `RG` in the header's `@RG` order, else 0.
+fn compute_rg_of(header: &sam::Header, records: &[RecordBuf], enabled: bool) -> Vec<i32> {
+    if !enabled {
+        return vec![0; records.len()];
+    }
+    let mut rg_num: HashMap<Vec<u8>, i32> = HashMap::new();
+    for (i, id) in header.read_groups().keys().enumerate() {
+        let bytes: &[u8] = id.as_ref();
+        rg_num.insert(bytes.to_vec(), i as i32 + 1);
+    }
+    records
+        .iter()
+        .map(|r| {
+            r.data()
+                .get(&Tag::from([b'R', b'G']))
+                .and_then(|v| match v {
+                    Value::String(s) => {
+                        let b: &[u8] = s.as_ref();
+                        rg_num.get(b).copied()
+                    }
+                    _ => None,
+                })
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
 fn run_bam_markdup(
     input: &Path,
     output: Option<&Path>,
     fmt: OutFmt,
     pg_argv: Option<&[OsString]>,
     options: MarkdupOptions,
+    cfg: &Cfg,
 ) -> io::Result<()> {
     let mut reader = bam::io::Reader::new(File::open(input)?);
     let mut header = reader.read_header()?;
@@ -284,14 +431,38 @@ fn run_bam_markdup(
     if options.clear_existing_dups {
         clear_duplicate_marks(&mut records);
     }
-    let mut stats = mark_duplicates(&mut records, options);
+    let rg_of = compute_rg_of(&header, &records, options.use_read_groups);
+    let mut stats = mark_duplicates(&mut records, options, &rg_of, cfg);
     stats.written = output_record_count(&records, options.remove_dups);
-    let mut sink = open_output(output, fmt, &header)?;
-    for rec in &records {
-        if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
-            continue;
+    if matches!(fmt, OutFmt::Sam) {
+        // Byte-faithful: emit the raw input header (preserving @RG/@SQ
+        // order) + the samtools @PG, then records via the float-correct
+        // renderer (mirrors merge/sort/ampliconclip).
+        let mut header_text = crate::header_text::read_raw_header_text(input)?;
+        if let Some(argv) = pg_argv {
+            header_text =
+                crate::pg::add_samtools_pg(&header_text, argv).map_err(io::Error::other)?;
         }
-        sink.write_record(&header, rec)?;
+        let mut out: Box<dyn Write> = match output {
+            Some(p) => Box::new(io::BufWriter::new(File::create(p)?)),
+            None => Box::new(io::BufWriter::new(io::stdout().lock())),
+        };
+        out.write_all(header_text.as_bytes())?;
+        for rec in &records {
+            if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
+                continue;
+            }
+            crate::sam_render::write_record(&mut out, &header, rec)?;
+        }
+        out.flush()?;
+    } else {
+        let mut sink = open_output(output, fmt, &header)?;
+        for rec in &records {
+            if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
+                continue;
+            }
+            sink.write_record(&header, rec)?;
+        }
     }
     if options.emit_stats {
         write_markdup_stats(&mut io::stderr().lock(), &stats)?;
@@ -305,8 +476,9 @@ fn run_sam_markdup(
     fmt: OutFmt,
     pg_argv: Option<&[OsString]>,
     options: MarkdupOptions,
+    cfg: &Cfg,
 ) -> io::Result<()> {
-    let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
+    let mut reader = crate::sam_compat::open_sam_reader_tolerant(input)?;
     let mut header = reader.read_header()?;
     if let Some(argv) = pg_argv {
         header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
@@ -322,14 +494,38 @@ fn run_sam_markdup(
     if options.clear_existing_dups {
         clear_duplicate_marks(&mut records);
     }
-    let mut stats = mark_duplicates(&mut records, options);
+    let rg_of = compute_rg_of(&header, &records, options.use_read_groups);
+    let mut stats = mark_duplicates(&mut records, options, &rg_of, cfg);
     stats.written = output_record_count(&records, options.remove_dups);
-    let mut sink = open_output(output, fmt, &header)?;
-    for rec in &records {
-        if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
-            continue;
+    if matches!(fmt, OutFmt::Sam) {
+        // Byte-faithful: emit the raw input header (preserving @RG/@SQ
+        // order) + the samtools @PG, then records via the float-correct
+        // renderer (mirrors merge/sort/ampliconclip).
+        let mut header_text = crate::header_text::read_raw_header_text(input)?;
+        if let Some(argv) = pg_argv {
+            header_text =
+                crate::pg::add_samtools_pg(&header_text, argv).map_err(io::Error::other)?;
         }
-        sink.write_record(&header, rec)?;
+        let mut out: Box<dyn Write> = match output {
+            Some(p) => Box::new(io::BufWriter::new(File::create(p)?)),
+            None => Box::new(io::BufWriter::new(io::stdout().lock())),
+        };
+        out.write_all(header_text.as_bytes())?;
+        for rec in &records {
+            if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
+                continue;
+            }
+            crate::sam_render::write_record(&mut out, &header, rec)?;
+        }
+        out.flush()?;
+    } else {
+        let mut sink = open_output(output, fmt, &header)?;
+        for rec in &records {
+            if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
+                continue;
+            }
+            sink.write_record(&header, rec)?;
+        }
     }
     if options.emit_stats {
         write_markdup_stats(&mut io::stderr().lock(), &stats)?;
@@ -337,34 +533,449 @@ fn run_sam_markdup(
     Ok(())
 }
 
-/// Marks duplicates across single-end and paired-end primary alignments.
+// ---- Upstream-faithful duplicate detection (bam_markdup.c port) ----
+
+const MD_MIN_QUALITY: u8 = 15;
+const O_FF: i8 = 2;
+const O_RR: i8 = 3;
+const O_FR: i8 = 5;
+const O_RF: i8 = 7;
+const R_LE: i8 = 11;
+const R_RI: i8 = 13;
+const BAM_FREAD1: u32 = 0x40;
+const BAM_FMREVERSE: u32 = 0x20;
+
+/// Mirror of upstream `key_data_t`. For single keys the `other_*`/`leftmost`
+/// fields are forced to 0 so derived `Eq`/`Hash` ignore them, matching
+/// `key_equal`'s `!a.single` guard.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct KeyData {
+    single: bool,
+    this_ref: i32,
+    this_coord: i64,
+    other_ref: i32,
+    other_coord: i64,
+    leftmost: i8,
+    orientation: i8,
+    barcode: Vec<u8>,
+    read_group: i32,
+}
+
+fn rec_flags(r: &RecordBuf) -> u32 {
+    r.flags().bits() as u32
+}
+fn is_rev(r: &RecordBuf) -> bool {
+    rec_flags(r) & BAM_FREVERSE != 0
+}
+fn is_mrev(r: &RecordBuf) -> bool {
+    rec_flags(r) & BAM_FMREVERSE != 0
+}
+fn is_read1(r: &RecordBuf) -> bool {
+    rec_flags(r) & BAM_FREAD1 != 0
+}
+fn rec_tid(r: &RecordBuf) -> i32 {
+    r.reference_sequence_id().map(|t| t as i32).unwrap_or(-1)
+}
+fn rec_mtid(r: &RecordBuf) -> i32 {
+    r.mate_reference_sequence_id()
+        .map(|t| t as i32)
+        .unwrap_or(-1)
+}
+/// 1-based alignment start (upstream `core.pos + 1`); 0 if unmapped.
+fn pos1(r: &RecordBuf) -> i64 {
+    r.alignment_start().map(|p| p.get() as i64).unwrap_or(0)
+}
+/// 0-based mate position (upstream `core.mpos`); -1 if absent.
+fn mpos0(r: &RecordBuf) -> i64 {
+    r.mate_alignment_start()
+        .map(|p| p.get() as i64 - 1)
+        .unwrap_or(-1)
+}
+fn rec_name(r: &RecordBuf) -> Vec<u8> {
+    r.name().map(|n| n.to_vec()).unwrap_or_default()
+}
+
+fn clip_lead(cigar: &sam::alignment::record_buf::Cigar) -> i64 {
+    let mut n = 0i64;
+    for op in cigar.as_ref() {
+        match op.kind() {
+            Kind::SoftClip | Kind::HardClip => n += op.len() as i64,
+            _ => break,
+        }
+    }
+    n
+}
+fn clip_trail(cigar: &sam::alignment::record_buf::Cigar) -> i64 {
+    let mut n = 0i64;
+    for op in cigar.as_ref().iter().rev() {
+        match op.kind() {
+            Kind::SoftClip | Kind::HardClip => n += op.len() as i64,
+            _ => break,
+        }
+    }
+    n
+}
+fn ref_len(cigar: &sam::alignment::record_buf::Cigar) -> i64 {
+    let mut n = 0i64;
+    for op in cigar.as_ref() {
+        match op.kind() {
+            Kind::Match
+            | Kind::Deletion
+            | Kind::Skip
+            | Kind::SequenceMatch
+            | Kind::SequenceMismatch => n += op.len() as i64,
+            _ => {}
+        }
+    }
+    n
+}
+
+/// `unclipped_start`: `core.pos - leading_clip + 1`.
+fn unclipped_start(r: &RecordBuf) -> i64 {
+    pos1(r) - clip_lead(r.cigar())
+}
+/// `unclipped_end`: `bam_endpos + trailing_clip`, where
+/// `bam_endpos = core.pos + ref_len`.
+fn unclipped_end(r: &RecordBuf) -> i64 {
+    pos1(r) - 1 + ref_len(r.cigar()) + clip_trail(r.cigar())
+}
+
+/// Iterate `<num><op>` tokens of an MC-style CIGAR string. A non-digit run
+/// yields `num = 1` (mirrors upstream `strtol` fallback).
+fn mc_tokens(mc: &str) -> Vec<(i64, u8)> {
+    let bytes = mc.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] != b'*' {
+        let mut num: i64 = 0;
+        if bytes[i].is_ascii_digit() {
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                num = num * 10 + (bytes[i] - b'0') as i64;
+                i += 1;
+            }
+        } else {
+            num = 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let op = bytes[i];
+        out.push((num, op));
+        i += 1;
+    }
+    out
+}
+/// `unclipped_other_start(op, cigar)` = `op - leading_clip + 1`.
+fn unclipped_other_start(op: i64, mc: &str) -> i64 {
+    let mut clipped = 0i64;
+    for (num, c) in mc_tokens(mc) {
+        if c == b'S' || c == b'H' {
+            clipped += num;
+        } else {
+            break;
+        }
+    }
+    op - clipped + 1
+}
+/// `unclipped_other_end(op, cigar)` = `op + ref_consumed` where reference
+/// consumption counts M/D/N/=/X and post-leading-clip S/H.
+fn unclipped_other_end(op: i64, mc: &str) -> i64 {
+    let mut refpos = 0i64;
+    let mut skip = true;
+    for (num, c) in mc_tokens(mc) {
+        match c {
+            b'M' | b'D' | b'N' | b'=' | b'X' => {
+                refpos += num;
+                skip = false;
+            }
+            b'S' | b'H' if !skip => refpos += num,
+            _ => {}
+        }
+    }
+    op + refpos
+}
+
+/// Sum of base qualities `>= MD_MIN_QUALITY` (upstream `calc_score`).
+fn calc_score(r: &RecordBuf) -> i64 {
+    r.quality_scores()
+        .as_ref()
+        .iter()
+        .filter(|&&q| q >= MD_MIN_QUALITY)
+        .map(|&q| q as i64)
+        .sum()
+}
+/// Mate score from the `ms` aux tag (set by `fixmate -m`).
+fn mate_score(r: &RecordBuf) -> i64 {
+    r.data()
+        .get(&Tag::from([b'm', b's']))
+        .and_then(|v| v.as_int())
+        .unwrap_or(0)
+}
+
+/// Optical-coordinate config: a compiled `--read-coords` regex (else the
+/// `get_coordinates_colons` fallback) plus the 1-based capture-group
+/// indices for x / y / tile (`t == 0` ⇒ no tile, empty prefix).
+struct CoordCfg {
+    rx: Option<regex::Regex>,
+    x: usize,
+    y: usize,
+    t: usize,
+}
+
+/// Barcode key source.
+enum BcMode {
+    None,
+    Tag(Tag),
+    Rgx(regex::Regex),
+}
+
+struct Cfg {
+    coord: CoordCfg,
+    bc: BcMode,
+}
+
+/// Port of `get_coordinates`: regex path when `--read-coords` was given,
+/// else the colon-separator heuristic.
+fn get_coords(name: &[u8], cfg: &CoordCfg) -> Option<(usize, usize, i64, i64)> {
+    let Some(rx) = &cfg.rx else {
+        return get_coordinates_colons(name);
+    };
+    let s = std::str::from_utf8(name).ok()?;
+    let caps = rx.captures(s)?;
+    let xm = caps.get(cfg.x)?;
+    let ym = caps.get(cfg.y)?;
+    // Upstream copies the exact captured substring before `strtol`, so
+    // parsing must stop at the group end (groups may be adjacent digits).
+    let x = parse_strtol_span(name, xm.start(), xm.end())?;
+    let y = parse_strtol_span(name, ym.start(), ym.end())?;
+    let (tb, te) = if cfg.t > 0 {
+        let tm = caps.get(cfg.t)?;
+        (tm.start(), tm.end())
+    } else {
+        (0, 0)
+    };
+    Some((tb, te, x, y))
+}
+
+fn barcode_bytes(r: &RecordBuf, bc: &BcMode) -> Vec<u8> {
+    match bc {
+        BcMode::None => Vec::new(),
+        BcMode::Tag(t) => barcode_value(r, Some(*t)).unwrap_or_default(),
+        BcMode::Rgx(rx) => {
+            let n = rec_name(r);
+            if let Ok(s) = std::str::from_utf8(&n)
+                && let Some(c) = rx.captures(s)
+                && let Some(m) = c.get(1)
+            {
+                return n[m.start()..m.end()].to_vec();
+            }
+            Vec::new()
+        }
+    }
+}
+
+fn mc_string(r: &RecordBuf) -> Option<String> {
+    match r.data().get(&Tag::from([b'M', b'C']))? {
+        Value::String(s) => Some(String::from_utf8_lossy(s).into_owned()),
+        _ => None,
+    }
+}
+
+/// has_mate: paired, mate mapped, and mate coordinates present.
+fn has_mate(r: &RecordBuf) -> bool {
+    let f = rec_flags(r);
+    f & BAM_FPAIRED != 0 && f & BAM_FMUNMAP == 0 && !(rec_mtid(r) == -1 && mpos0(r) == -1)
+}
+
+#[allow(clippy::collapsible_else_if)]
+fn make_pair_key(r: &RecordBuf, mode: DupMode, bc: &BcMode, rg: i32) -> KeyData {
+    let this_ref = rec_tid(r) + 1;
+    let other_ref = rec_mtid(r) + 1;
+    let mut this_coord = unclipped_start(r);
+    let this_end = unclipped_end(r);
+    let mc = mc_string(r).unwrap_or_default();
+    let mp = mpos0(r);
+    let mut other_coord = unclipped_other_start(mp, &mc);
+    let other_end = unclipped_other_end(mp, &mc);
+    let rev = is_rev(r);
+    let mrev = is_mrev(r);
+    let read1 = is_read1(r);
+    let orientation: i8;
+    let leftmost: bool;
+
+    if mode == DupMode::Template {
+        let lm = if this_ref != other_ref {
+            this_ref < other_ref
+        } else if rev == mrev {
+            if !rev {
+                this_coord <= other_coord
+            } else {
+                this_end <= other_end
+            }
+        } else if rev {
+            this_end <= other_coord
+        } else {
+            this_coord <= other_end
+        };
+        leftmost = lm;
+
+        if lm {
+            if rev == mrev {
+                other_coord = other_end;
+                orientation = if !rev {
+                    if read1 { O_FF } else { O_RR }
+                } else {
+                    if read1 { O_RR } else { O_FF }
+                };
+            } else if !rev {
+                orientation = O_FR;
+                other_coord = other_end;
+            } else {
+                orientation = O_RF;
+                this_coord = this_end;
+            }
+        } else {
+            if rev == mrev {
+                this_coord = this_end;
+                orientation = if !rev {
+                    if read1 { O_RR } else { O_FF }
+                } else {
+                    if read1 { O_FF } else { O_RR }
+                };
+            } else if !rev {
+                orientation = O_RF;
+                other_coord = other_end;
+            } else {
+                orientation = O_FR;
+                this_coord = this_end;
+            }
+        }
+    } else {
+        // MD_MODE_SEQUENCE
+        let diff: i64 = if this_ref != other_ref {
+            (this_ref - other_ref) as i64
+        } else if rev == mrev {
+            if !rev {
+                this_coord - other_coord
+            } else {
+                this_end - other_end
+            }
+        } else if rev {
+            this_end - other_coord
+        } else {
+            this_coord - other_end
+        };
+        let pos0 = pos1(r) - 1;
+        leftmost = if diff < 0 {
+            true
+        } else if diff > 0 {
+            false
+        } else if pos0 == mp {
+            read1
+        } else {
+            pos0 < mp
+        };
+
+        orientation = if leftmost {
+            if rev == mrev {
+                if !rev { O_FF } else { O_RR }
+            } else if !rev {
+                O_FR
+            } else {
+                O_RF
+            }
+        } else if rev == mrev {
+            if !rev { O_RR } else { O_FF }
+        } else if !rev {
+            O_RF
+        } else {
+            O_FR
+        };
+
+        this_coord = if !rev {
+            unclipped_start(r)
+        } else {
+            unclipped_end(r)
+        };
+        other_coord = if !mrev {
+            unclipped_other_start(mp, &mc)
+        } else {
+            unclipped_other_end(mp, &mc)
+        };
+    }
+
+    let left_read = if !leftmost { R_RI } else { R_LE };
+
+    KeyData {
+        single: false,
+        this_ref,
+        this_coord,
+        other_ref,
+        other_coord,
+        leftmost: left_read,
+        orientation,
+        barcode: barcode_bytes(r, bc),
+        read_group: rg,
+    }
+}
+
+fn make_single_key(r: &RecordBuf, bc: &BcMode, rg: i32) -> KeyData {
+    let this_ref = rec_tid(r) + 1;
+    let (this_coord, orientation) = if is_rev(r) {
+        (unclipped_end(r), O_RR)
+    } else {
+        (unclipped_start(r), O_FF)
+    };
+    KeyData {
+        single: true,
+        this_ref,
+        this_coord,
+        other_ref: 0,
+        other_coord: 0,
+        leftmost: 0,
+        orientation,
+        barcode: barcode_bytes(r, bc),
+        read_group: rg,
+    }
+}
+
+/// Paired score = `calc_score + ms`, with QCFAIL-asymmetry override.
+fn pair_scores(stored: &RecordBuf, incoming: &RecordBuf) -> (i64, i64) {
+    let qf_s = rec_flags(stored) & BAM_FQCFAIL != 0;
+    let qf_i = rec_flags(incoming) & BAM_FQCFAIL != 0;
+    if qf_s != qf_i {
+        if qf_s { (0, 1) } else { (1, 0) }
+    } else {
+        (
+            calc_score(stored) + mate_score(stored),
+            calc_score(incoming) + mate_score(incoming),
+        )
+    }
+}
+
+/// Faithful port of `bam_markdup.c`'s primary duplicate decision.
 ///
-/// SE records (unpaired, or paired with the mate unmapped) are grouped by
-/// `(tid, alignment_start, reverse_flag)` and the record with the highest
-/// MAPQ in each group is kept as the primary.
-///
-/// PE records (paired + both mates mapped) are grouped into pairs by
-/// qname. Each pair gets a canonical key combining both reads' `(tid,
-/// pos, strand)` triples (sorted so the order does not matter), and the
-/// pair with the highest summed MAPQ within a key group is kept; all
-/// other records of duplicate pairs are flagged `BAM_FDUP`.
-///
-/// Secondary and supplementary alignments are not assessed for duplicates
-/// themselves but inherit the dup flag from their primary if it gets one.
-/// (Upstream's full algorithm matches this with extra qname-based linkage;
-/// here we approximate by carrying the dup flag forward across records
-/// with the same qname when at least one primary in that qname is dup.)
-fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> MarkdupStats {
-    type BarcodeKey = Option<Vec<u8>>;
-    type PosKey = (i32, i64, bool);
-    type SeKey = (PosKey, BarcodeKey);
-    type PairBarcodeKey = (BarcodeKey, BarcodeKey);
-    type PairKey = (PosKey, PosKey, PairBarcodeKey);
-    type PairIdx = (usize, usize);
-    let mut se_best: HashMap<SeKey, usize> = HashMap::new();
-    let mut pair_pending: HashMap<Vec<u8>, usize> = HashMap::new();
-    let mut pair_best: HashMap<PairKey, PairIdx> = HashMap::new();
+/// Reads are processed in input (coordinate) order. Paired reads build an
+/// upstream `make_pair_key` (template/sequence mode) plus a `make_single_key`
+/// kept in a shared single hash so a true singleton always loses to a pair.
+/// The kept read of a colliding key is the one with the higher
+/// `calc_score (+ mate ms)`, breaking ties by qname (`strcmp`). Each
+/// mate's key encodes left/right (`R_LE`/`R_RI`) so the two ends of one
+/// template get distinct keys and only corresponding mates of duplicate
+/// templates collide. Secondary/supplementary records inherit the flag
+/// from their duplicate primary by qname.
+fn mark_duplicates(
+    records: &mut [RecordBuf],
+    options: MarkdupOptions,
+    rg_of: &[i32],
+    cfg: &Cfg,
+) -> MarkdupStats {
+    let mut single_hash: HashMap<KeyData, usize> = HashMap::new();
+    let mut pair_hash: HashMap<KeyData, usize> = HashMap::new();
     let mut duplicate_primary_metadata: HashMap<Vec<u8>, DuplicateMetadata> = HashMap::new();
+    // Upstream `dup_hash`: qnames of marked-duplicate reads that carry an
+    // `SA`/`XA` tag or have an unmapped mate; only built with `-S`.
+    let mut supp_dups: HashMap<Vec<u8>, DuplicateMetadata> = HashMap::new();
     let mut stats = MarkdupStats {
         read: records.len() as u64,
         written: records.len() as u64,
@@ -380,8 +991,53 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
         duplicate_non_primary_optical: 0,
     };
 
+    let opt = options.optical_distance;
+    let do_tag = options.duplicate_origin_tag;
+    // Upstream `check_chain` is on when `-t`(tag) or `-d`(opt_dist).
+    let check_chain = do_tag || opt.is_some();
+    let n_rec = records.len();
+    // `dup_next[x]` == upstream `x->duplicate`; `orig_link[x]` == `x->original`.
+    let mut dup_next: Vec<Option<usize>> = vec![None; n_rec];
+    let mut orig_link: Vec<Option<usize>> = vec![None; n_rec];
+    // `--duplicate-count`: per-read collapsed-duplicate count (incl self).
+    let mut dc: Vec<i64> = vec![1; n_rec];
+
+    let supp = options.supp;
+    // Marks `dup_idx` as a duplicate of `orig_idx`, recording origin/type.
+    // Mirrors `mark_duplicates`: with `-S`, a dup read carrying `SA`/`XA`
+    // or an unmapped mate seeds `dup_hash` (first qname wins).
+    let mark = |records: &mut [RecordBuf],
+                duplicate_primary_metadata: &mut HashMap<Vec<u8>, DuplicateMetadata>,
+                supp_dups: &mut HashMap<Vec<u8>, DuplicateMetadata>,
+                dup_idx: usize,
+                orig_idx: usize|
+     -> Option<DuplicateType> {
+        let origin = rec_name(&records[orig_idx]);
+        let dtype = duplicate_type(&records[dup_idx], &records[orig_idx], opt, &cfg.coord);
+        mark_duplicate(&mut records[dup_idx], Some(&origin), do_tag, dtype);
+        remember_duplicate_metadata(
+            duplicate_primary_metadata,
+            &records[dup_idx],
+            &origin,
+            dtype,
+        );
+        if supp {
+            let dup = &records[dup_idx];
+            let mate_unmapped = rec_flags(dup) & BAM_FMUNMAP != 0;
+            let has_sa = dup.data().get(&Tag::from([b'S', b'A'])).is_some();
+            let has_xa = dup.data().get(&Tag::from([b'X', b'A'])).is_some();
+            if mate_unmapped || has_sa || has_xa {
+                supp_dups.entry(rec_name(dup)).or_insert(DuplicateMetadata {
+                    origin: origin.clone(),
+                    duplicate_type: dtype,
+                });
+            }
+        }
+        dtype
+    };
+
     for i in 0..records.len() {
-        let flag = records[i].flags().bits() as u32;
+        let flag = rec_flags(&records[i]);
         if flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY) != 0 {
             continue;
         }
@@ -390,245 +1046,388 @@ fn mark_duplicates(records: &mut [RecordBuf], options: MarkdupOptions) -> Markdu
             continue;
         }
         stats.examined += 1;
-        let tid = records[i]
-            .reference_sequence_id()
-            .map(|t| t as i32)
-            .unwrap_or(-1);
-        let pos = records[i].alignment_start().map(usize::from).unwrap_or(0) as i64;
-        let rev = flag & BAM_FREVERSE != 0;
-        let mapq = records[i].mapping_quality().map(u8::from).unwrap_or(0);
-        let me = (tid, pos, rev);
 
-        let paired_both_mapped = flag & BAM_FPAIRED != 0 && flag & BAM_FMUNMAP == 0;
-        if paired_both_mapped {
+        if has_mate(&records[i]) {
+            let pair_key = make_pair_key(&records[i], options.mode, &cfg.bc, rg_of[i]);
+            let single_key = make_single_key(&records[i], &cfg.bc, rg_of[i]);
             stats.paired += 1;
-            // Look for the partner record by qname; pair them when both
-            // ends have been seen. The first read of the pair sits in
-            // `pair_pending`; the second read computes the pair key and
-            // resolves dedup against any prior pair sharing the same key.
-            let name = records[i].name().map(|n| n.to_vec()).unwrap_or_default();
-            match pair_pending.remove(&name) {
+
+            // Single hash: a true singleton already stored loses to this pair.
+            match single_hash.get(&single_key).copied() {
                 None => {
-                    pair_pending.insert(name, i);
+                    single_hash.insert(single_key.clone(), i);
                 }
-                Some(first_idx) => {
-                    let first_flag = records[first_idx].flags().bits() as u32;
-                    let first_tid = records[first_idx]
-                        .reference_sequence_id()
-                        .map(|t| t as i32)
-                        .unwrap_or(-1);
-                    let first_pos = records[first_idx]
-                        .alignment_start()
-                        .map(usize::from)
-                        .unwrap_or(0) as i64;
-                    let first_rev = first_flag & BAM_FREVERSE != 0;
-                    let first_mapq = records[first_idx]
-                        .mapping_quality()
-                        .map(u8::from)
-                        .unwrap_or(0);
-                    let first_barcode = barcode_value(&records[first_idx], options.barcode_tag);
-                    let barcode = barcode_value(&records[i], options.barcode_tag);
+                Some(j) => {
+                    if !has_mate(&records[j]) {
+                        let dtype = mark(
+                            records,
+                            &mut duplicate_primary_metadata,
+                            &mut supp_dups,
+                            j,
+                            i,
+                        );
+                        stats.duplicate_single += 1;
+                        if dtype.is_some_and(DuplicateType::is_optical) {
+                            stats.duplicate_single_optical += 1;
+                        }
+                        if check_chain {
+                            chain_new_wins(&mut dup_next, &mut orig_link, i, j);
+                        }
+                        dc[i] += 1;
+                        single_hash.insert(single_key.clone(), i);
+                    }
+                }
+            }
 
-                    let first = (first_tid, first_pos, first_rev);
-                    let key = if first <= me {
-                        (first, me, (first_barcode, barcode))
+            // Pair hash: corresponding mates of duplicate templates collide.
+            match pair_hash.get(&pair_key).copied() {
+                None => {
+                    pair_hash.insert(pair_key, i);
+                }
+                Some(j) => {
+                    let (old_s, new_s) = pair_scores(&records[j], &records[i]);
+                    let tie = if new_s == old_s {
+                        if rec_name(&records[i]) < rec_name(&records[j]) {
+                            1
+                        } else {
+                            -1
+                        }
                     } else {
-                        (me, first, (barcode, first_barcode))
+                        0
                     };
-                    let score = first_mapq as u32 + mapq as u32;
-
-                    match pair_best.get(&key).copied() {
-                        Some((prev_first, prev_second)) => {
-                            let prev_score = records[prev_first]
-                                .mapping_quality()
-                                .map(u8::from)
-                                .unwrap_or(0) as u32
-                                + records[prev_second]
-                                    .mapping_quality()
-                                    .map(u8::from)
-                                    .unwrap_or(0) as u32;
-                            if score > prev_score {
-                                let origin = records[first_idx]
-                                    .name()
-                                    .map(|name| name.to_vec())
-                                    .unwrap_or_default();
-                                let prev_duplicate_type = duplicate_type(
-                                    &records[prev_first],
-                                    &records[first_idx],
-                                    options.optical_distance,
-                                );
-                                mark_duplicate(
-                                    &mut records[prev_first],
-                                    Some(&origin),
-                                    options.duplicate_origin_tag,
-                                    prev_duplicate_type,
-                                );
-                                mark_duplicate(
-                                    &mut records[prev_second],
-                                    Some(&origin),
-                                    options.duplicate_origin_tag,
-                                    prev_duplicate_type,
-                                );
-                                remember_duplicate_metadata(
-                                    &mut duplicate_primary_metadata,
-                                    &records[prev_first],
-                                    &origin,
-                                    prev_duplicate_type,
-                                );
-                                remember_duplicate_metadata(
-                                    &mut duplicate_primary_metadata,
-                                    &records[prev_second],
-                                    &origin,
-                                    prev_duplicate_type,
-                                );
-                                if prev_duplicate_type.is_some_and(DuplicateType::is_optical) {
-                                    stats.duplicate_pair_optical += 2;
-                                }
-                                pair_best.insert(key, (first_idx, i));
+                    let (dup_idx, orig_idx, swap) = if new_s + tie > old_s {
+                        (j, i, true)
+                    } else {
+                        (i, j, false)
+                    };
+                    let dtype = mark(
+                        records,
+                        &mut duplicate_primary_metadata,
+                        &mut supp_dups,
+                        dup_idx,
+                        orig_idx,
+                    );
+                    if check_chain {
+                        if swap {
+                            chain_new_wins(&mut dup_next, &mut orig_link, i, j);
+                        } else {
+                            chain_keep_wins(&mut dup_next, &mut orig_link, j, i);
+                        }
+                    }
+                    if swap {
+                        dc[i] += dc[j];
+                        pair_hash.insert(pair_key, i);
+                    } else {
+                        dc[j] += 1;
+                    }
+                    stats.duplicate_pair += 1;
+                    if dtype.is_some_and(DuplicateType::is_optical) {
+                        stats.duplicate_pair_optical += 1;
+                    }
+                }
+            }
+        } else {
+            // Single (or effectively single) reads.
+            let single_key = make_single_key(&records[i], &cfg.bc, rg_of[i]);
+            stats.single += 1;
+            match single_hash.get(&single_key).copied() {
+                None => {
+                    single_hash.insert(single_key, i);
+                }
+                Some(j) => {
+                    if has_mate(&records[j]) {
+                        let dtype = mark(
+                            records,
+                            &mut duplicate_primary_metadata,
+                            &mut supp_dups,
+                            i,
+                            j,
+                        );
+                        stats.duplicate_single += 1;
+                        if dtype.is_some_and(DuplicateType::is_optical) {
+                            stats.duplicate_single_optical += 1;
+                        }
+                        if check_chain {
+                            chain_keep_wins(&mut dup_next, &mut orig_link, j, i);
+                        }
+                        dc[j] += 1;
+                    } else {
+                        let old_s = calc_score(&records[j]);
+                        let new_s = calc_score(&records[i]);
+                        let (dup_idx, orig_idx, swap) = if new_s > old_s {
+                            (j, i, true)
+                        } else {
+                            (i, j, false)
+                        };
+                        let dtype = mark(
+                            records,
+                            &mut duplicate_primary_metadata,
+                            &mut supp_dups,
+                            dup_idx,
+                            orig_idx,
+                        );
+                        if check_chain {
+                            if swap {
+                                chain_new_wins(&mut dup_next, &mut orig_link, i, j);
                             } else {
-                                let origin = records[prev_first]
-                                    .name()
-                                    .map(|name| name.to_vec())
-                                    .unwrap_or_default();
-                                let current_duplicate_type = duplicate_type(
-                                    &records[first_idx],
-                                    &records[prev_first],
-                                    options.optical_distance,
-                                );
-                                mark_duplicate(
-                                    &mut records[first_idx],
-                                    Some(&origin),
-                                    options.duplicate_origin_tag,
-                                    current_duplicate_type,
-                                );
-                                mark_duplicate(
-                                    &mut records[i],
-                                    Some(&origin),
-                                    options.duplicate_origin_tag,
-                                    current_duplicate_type,
-                                );
-                                remember_duplicate_metadata(
-                                    &mut duplicate_primary_metadata,
-                                    &records[first_idx],
-                                    &origin,
-                                    current_duplicate_type,
-                                );
-                                remember_duplicate_metadata(
-                                    &mut duplicate_primary_metadata,
-                                    &records[i],
-                                    &origin,
-                                    current_duplicate_type,
-                                );
-                                if current_duplicate_type.is_some_and(DuplicateType::is_optical) {
-                                    stats.duplicate_pair_optical += 2;
-                                }
+                                chain_keep_wins(&mut dup_next, &mut orig_link, j, i);
                             }
-                            stats.duplicate_pair += 2;
                         }
-                        None => {
-                            pair_best.insert(key, (first_idx, i));
+                        if swap {
+                            dc[i] += dc[j];
+                            single_hash.insert(single_key, i);
+                        } else {
+                            dc[j] += 1;
+                        }
+                        stats.duplicate_single += 1;
+                        if dtype.is_some_and(DuplicateType::is_optical) {
+                            stats.duplicate_single_optical += 1;
                         }
                     }
                 }
-            }
-            continue;
-        }
-
-        // SE path: mate not mapped (singleton) or unpaired primary.
-        stats.single += 1;
-        let se_key = (me, barcode_value(&records[i], options.barcode_tag));
-        match se_best.get(&se_key).copied() {
-            Some(idx) => {
-                let prev_mapq = records[idx].mapping_quality().map(u8::from).unwrap_or(0);
-                if mapq > prev_mapq {
-                    let origin = records[i]
-                        .name()
-                        .map(|name| name.to_vec())
-                        .unwrap_or_default();
-                    let prev_duplicate_type =
-                        duplicate_type(&records[idx], &records[i], options.optical_distance);
-                    mark_duplicate(
-                        &mut records[idx],
-                        Some(&origin),
-                        options.duplicate_origin_tag,
-                        prev_duplicate_type,
-                    );
-                    remember_duplicate_metadata(
-                        &mut duplicate_primary_metadata,
-                        &records[idx],
-                        &origin,
-                        prev_duplicate_type,
-                    );
-                    if prev_duplicate_type.is_some_and(DuplicateType::is_optical) {
-                        stats.duplicate_single_optical += 1;
-                    }
-                    se_best.insert(se_key, i);
-                } else {
-                    let origin = records[idx]
-                        .name()
-                        .map(|name| name.to_vec())
-                        .unwrap_or_default();
-                    let current_duplicate_type =
-                        duplicate_type(&records[i], &records[idx], options.optical_distance);
-                    mark_duplicate(
-                        &mut records[i],
-                        Some(&origin),
-                        options.duplicate_origin_tag,
-                        current_duplicate_type,
-                    );
-                    remember_duplicate_metadata(
-                        &mut duplicate_primary_metadata,
-                        &records[i],
-                        &origin,
-                        current_duplicate_type,
-                    );
-                    if current_duplicate_type.is_some_and(DuplicateType::is_optical) {
-                        stats.duplicate_single_optical += 1;
-                    }
-                }
-                stats.duplicate_single += 1;
-            }
-            None => {
-                se_best.insert(se_key, i);
             }
         }
     }
 
-    let duplicate_primary_names: HashSet<Vec<u8>> = records
-        .iter()
-        .filter_map(|record| {
-            let flag = record.flags().bits() as u32;
-            (flag & BAM_FDUP != 0
-                && flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY) == 0
-                && flag & BAM_FUNMAP == 0)
-                .then(|| record.name().map(|name| name.to_vec()))
-                .flatten()
-        })
-        .collect();
-
-    for record in records {
-        let flag = record.flags().bits() as u32;
-        if flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY) == 0 {
-            continue;
+    // Optical-duplicate chain pass (`find_duplicate_chains`): for each
+    // chain root (no `->original`, has a `->duplicate`), rewrite each
+    // dup's `do` tag to the root name and re-tag `dt:Z:SQ` where the
+    // chain shows the read is an optical duplicate of the root or of a
+    // close-by sibling.
+    if check_chain {
+        struct Chk {
+            idx: usize,
+            x: i64,
+            y: i64,
+            opt: bool,
+            beg: usize,
+            len: usize,
+            score: i64,
+            mate_score: i64,
+            paired: bool,
+            qcfail: bool,
         }
-        let Some(name) = record.name() else {
-            continue;
-        };
-        if duplicate_primary_names.contains(name) {
-            let metadata = duplicate_primary_metadata.get(name);
-            if mark_duplicate(
-                record,
-                metadata.map(|metadata| metadata.origin.as_slice()),
-                options.duplicate_origin_tag,
-                metadata.and_then(|metadata| metadata.duplicate_type),
-            ) {
+        let dt_tag = Tag::from([b'd', b't']);
+        let do_tag_t = Tag::from([b'd', b'o']);
+        for root in 0..n_rec {
+            if orig_link[root].is_some() || dup_next[root].is_none() {
+                continue;
+            }
+            let ori_name = rec_name(&records[root]);
+            let root_coord = get_coords(&ori_name, &cfg.coord);
+            let mut list: Vec<Chk> = Vec::new();
+            let mut cur = dup_next[root];
+            while let Some(c) = cur {
+                if do_tag {
+                    let cur_do = match records[c].data().get(&do_tag_t) {
+                        Some(Value::String(s)) => Some(s.to_vec()),
+                        _ => None,
+                    };
+                    if cur_do.is_some_and(|v| v != ori_name) {
+                        records[c]
+                            .data_mut()
+                            .insert(do_tag_t, Value::String(BString::from(ori_name.clone())));
+                    }
+                }
+                let mut chk = Chk {
+                    idx: c,
+                    x: -1,
+                    y: -1,
+                    opt: false,
+                    beg: 0,
+                    len: 0,
+                    score: 0,
+                    mate_score: 0,
+                    paired: has_mate(&records[c]),
+                    qcfail: rec_flags(&records[c]) & BAM_FQCFAIL != 0,
+                };
+                if let Some(dist) = opt
+                    && let Some((ob, oe, ox, oy)) = root_coord
+                {
+                    let already_sq = matches!(
+                        records[c].data().get(&dt_tag),
+                        Some(Value::String(s)) if String::from_utf8_lossy(s) == "SQ"
+                    );
+                    chk.opt = already_sq;
+                    let cn = rec_name(&records[c]);
+                    if let Some((db, de, dx, dy)) = get_coords(&cn, &cfg.coord) {
+                        chk.x = dx;
+                        chk.y = dy;
+                        chk.beg = db;
+                        chk.len = de - db;
+                        let o_len = oe - ob;
+                        let is_opt = o_len == (de - db)
+                            && ori_name[ob..oe] == cn[db..de]
+                            && ox.abs_diff(dx) <= dist as u64
+                            && oy.abs_diff(dy) <= dist as u64;
+                        if !chk.opt && is_opt {
+                            optical_retag(
+                                &mut records[c],
+                                chk.paired,
+                                supp,
+                                &mut supp_dups,
+                                &mut stats,
+                            );
+                            chk.opt = true;
+                        }
+                    }
+                    chk.score = calc_score(&records[c]);
+                    if chk.paired {
+                        chk.mate_score = mate_score(&records[c]);
+                    }
+                }
+                list.push(chk);
+                cur = dup_next[c];
+            }
+
+            if root_coord.is_none() || opt.is_none() {
+                continue;
+            }
+            // check_duplicate_chain: sort by (len, prefix bytes, x).
+            list.sort_by(|a, b| {
+                a.len
+                    .cmp(&b.len)
+                    .then_with(|| {
+                        let an = rec_name(&records[a.idx]);
+                        let bn = rec_name(&records[b.idx]);
+                        an[a.beg..a.beg + a.len].cmp(&bn[b.beg..b.beg + b.len])
+                    })
+                    .then_with(|| a.x.cmp(&b.x))
+            });
+            let dist = opt.unwrap() as i64;
+            let llen = list.len();
+            if llen == 0 {
+                continue;
+            }
+            let mut curr = 0usize;
+            while curr + 1 < llen {
+                let base_name = rec_name(&records[list[curr].idx]);
+                let base_beg = list[curr].beg;
+                let base_len = list[curr].len;
+                let mut end_name_match = curr;
+                loop {
+                    end_name_match += 1;
+                    if end_name_match >= llen {
+                        break;
+                    }
+                    let cn = rec_name(&records[list[end_name_match].idx]);
+                    let cb = list[end_name_match].beg;
+                    if base_len == list[end_name_match].len
+                        && base_name[base_beg..base_beg + base_len] != cn[cb..cb + base_len]
+                    {
+                        break;
+                    }
+                }
+                while curr < end_name_match {
+                    let mut count = curr;
+                    loop {
+                        count += 1;
+                        if count >= end_name_match || list[count].x - list[curr].x > dist {
+                            break;
+                        }
+                        if list[curr].opt && list[count].opt {
+                            continue;
+                        }
+                        let ydiff = (list[curr].y - list[count].y).abs();
+                        if ydiff > dist {
+                            continue;
+                        }
+                        let cur_p = list[curr].paired;
+                        let chk_p = list[count].paired;
+                        let chk_dup = if cur_p != chk_p {
+                            !chk_p
+                        } else {
+                            let (cs, mut ks) = if list[curr].qcfail != list[count].qcfail {
+                                if list[curr].qcfail {
+                                    (0i64, 1i64)
+                                } else {
+                                    (1, 0)
+                                }
+                            } else {
+                                let mut a = list[curr].score;
+                                let mut b = list[count].score;
+                                if cur_p {
+                                    a += list[curr].mate_score;
+                                    b += list[count].mate_score;
+                                }
+                                (a, b)
+                            };
+                            if cs == ks {
+                                let cn = rec_name(&records[list[curr].idx]);
+                                let kn = rec_name(&records[list[count].idx]);
+                                if kn < cn {
+                                    ks += 1;
+                                } else {
+                                    ks -= 1;
+                                }
+                            }
+                            cs > ks
+                        };
+                        if chk_dup {
+                            if !list[count].opt {
+                                optical_retag(
+                                    &mut records[list[count].idx],
+                                    chk_p,
+                                    supp,
+                                    &mut supp_dups,
+                                    &mut stats,
+                                );
+                                list[count].opt = true;
+                            }
+                        } else if !list[curr].opt {
+                            optical_retag(
+                                &mut records[list[curr].idx],
+                                cur_p,
+                                supp,
+                                &mut supp_dups,
+                                &mut stats,
+                            );
+                            list[curr].opt = true;
+                        }
+                    }
+                    curr += 1;
+                }
+            }
+        }
+    }
+
+    // Upstream supplementary pass (`-S` only): supplementary, secondary, and
+    // unmapped records whose qname seeded `dup_hash` inherit the flag.
+    if options.supp {
+        for record in records.iter_mut() {
+            let flag = record.flags().bits() as u32;
+            if flag & (BAM_FSECONDARY | BAM_FSUPPLEMENTARY | BAM_FUNMAP) == 0 {
+                continue;
+            }
+            let Some(name) = record.name() else {
+                continue;
+            };
+            if let Some(metadata) = supp_dups.get(name)
+                && mark_duplicate(
+                    record,
+                    Some(metadata.origin.as_slice()),
+                    options.duplicate_origin_tag,
+                    metadata.duplicate_type,
+                )
+            {
                 stats.duplicate_non_primary += 1;
                 if metadata
-                    .and_then(|metadata| metadata.duplicate_type)
+                    .duplicate_type
                     .is_some_and(DuplicateType::is_optical)
                 {
                     stats.duplicate_non_primary_optical += 1;
                 }
+            }
+        }
+    }
+
+    // `--duplicate-count`: emit `dc:i` on every final non-duplicate read
+    // (after all marking, incl. the supplementary pass).
+    if options.duplicate_count {
+        for (idx, rec) in records.iter_mut().enumerate() {
+            if rec.flags().bits() as u32 & BAM_FDUP == 0 {
+                rec.data_mut()
+                    .insert(Tag::from([b'd', b'c']), Value::Int32(dc[idx] as i32));
             }
         }
     }
@@ -672,6 +1471,78 @@ fn remember_duplicate_metadata(
     }
 }
 
+/// `i` wins, `j` becomes its duplicate: append `j` to the tail of `i`'s
+/// `->duplicate` chain (mirrors `bam_markdup.c` swap branch).
+fn chain_new_wins(
+    dup_next: &mut [Option<usize>],
+    orig_link: &mut [Option<usize>],
+    i: usize,
+    j: usize,
+) {
+    if dup_next[i].is_some() {
+        let mut t = dup_next[i].unwrap();
+        while let Some(nx) = dup_next[t] {
+            t = nx;
+        }
+        dup_next[t] = Some(j);
+    } else {
+        dup_next[i] = Some(j);
+    }
+    orig_link[j] = Some(i);
+}
+
+/// `j` stays, `i` becomes its duplicate, splicing any existing `i` chain
+/// onto `j`'s (mirrors the non-swap branch).
+fn chain_keep_wins(
+    dup_next: &mut [Option<usize>],
+    orig_link: &mut [Option<usize>],
+    j: usize,
+    i: usize,
+) {
+    if let Some(jh) = dup_next[j] {
+        if let Some(ih) = dup_next[i] {
+            let mut t = jh;
+            while let Some(nx) = dup_next[t] {
+                t = nx;
+            }
+            dup_next[t] = Some(ih);
+        }
+        dup_next[i] = Some(jh);
+    }
+    dup_next[j] = Some(i);
+    orig_link[i] = Some(j);
+}
+
+/// `optical_retag`: flip a duplicate's `dt` tag to `SQ`, bump the optical
+/// stat, and (with `-S`) upgrade its `dup_hash` entry to optical.
+fn optical_retag(
+    record: &mut RecordBuf,
+    paired: bool,
+    supp: bool,
+    supp_dups: &mut HashMap<Vec<u8>, DuplicateMetadata>,
+    stats: &mut MarkdupStats,
+) {
+    record.data_mut().insert(
+        Tag::from([b'd', b't']),
+        Value::String(BString::from(&b"SQ"[..])),
+    );
+    if paired {
+        stats.duplicate_pair_optical += 1;
+    } else {
+        stats.duplicate_single_optical += 1;
+    }
+    if supp {
+        let mate_unmapped = rec_flags(record) & BAM_FMUNMAP != 0;
+        let has_sa = record.data().get(&Tag::from([b'S', b'A'])).is_some();
+        let has_xa = record.data().get(&Tag::from([b'X', b'A'])).is_some();
+        if (mate_unmapped || has_sa || has_xa)
+            && let Some(m) = supp_dups.get_mut(&rec_name(record))
+        {
+            m.duplicate_type = Some(DuplicateType::Optical);
+        }
+    }
+}
+
 fn mark_duplicate(
     record: &mut RecordBuf,
     origin: Option<&[u8]>,
@@ -698,56 +1569,116 @@ fn duplicate_type(
     duplicate: &RecordBuf,
     original: &RecordBuf,
     optical_distance: Option<u32>,
+    coord: &CoordCfg,
 ) -> Option<DuplicateType> {
     let distance = optical_distance?;
-    Some(if is_optical_duplicate(duplicate, original, distance) {
-        DuplicateType::Optical
-    } else {
-        DuplicateType::Library
-    })
+    Some(
+        if is_optical_duplicate(duplicate, original, distance, coord) {
+            DuplicateType::Optical
+        } else {
+            DuplicateType::Library
+        },
+    )
 }
 
-fn is_optical_duplicate(duplicate: &RecordBuf, original: &RecordBuf, distance: u32) -> bool {
-    let Some(duplicate_location) = duplicate
-        .name()
-        .and_then(|name| optical_location(name.as_ref()))
-    else {
+fn is_optical_duplicate(
+    duplicate: &RecordBuf,
+    original: &RecordBuf,
+    distance: u32,
+    coord: &CoordCfg,
+) -> bool {
+    let (Some(dn), Some(on)) = (duplicate.name(), original.name()) else {
         return false;
     };
-    let Some(original_location) = original
-        .name()
-        .and_then(|name| optical_location(name.as_ref()))
-    else {
+    let dn = dn.as_ref();
+    let on = on.as_ref();
+    let Some((d_beg, d_end, dx, dy)) = get_coords(dn, coord) else {
         return false;
     };
-    duplicate_location.is_within_distance(original_location, distance)
+    let Some((o_beg, o_end, ox, oy)) = get_coords(on, coord) else {
+        return false;
+    };
+    let o_len = o_end - o_beg;
+    let d_len = d_end - d_beg;
+    o_len == d_len
+        && on[o_beg..o_end] == dn[d_beg..d_end]
+        && ox.abs_diff(dx) <= distance as u64
+        && oy.abs_diff(dy) <= distance as u64
 }
 
-#[derive(Clone, Copy)]
-struct OpticalLocation {
-    tile: i64,
-    x: i64,
-    y: i64,
-}
-
-impl OpticalLocation {
-    fn is_within_distance(self, other: Self, distance: u32) -> bool {
-        self.tile == other.tile
-            && self.x.abs_diff(other.x) <= distance as u64
-            && self.y.abs_diff(other.y) <= distance as u64
+/// Port of `get_coordinates_colons`: from an Illumina-style read name,
+/// pick x/y by colon-separator count and return
+/// `(tile_beg, tile_end, x, y)` where `name[tile_beg..tile_end]` is the
+/// prefix compared for string equality. `None` if undecipherable.
+fn get_coordinates_colons(qname: &[u8]) -> Option<(usize, usize, i64, i64)> {
+    let mut sep = 0;
+    let mut xpos = 0usize;
+    let mut ypos = 0usize;
+    for (pos, &c) in qname.iter().enumerate() {
+        if c == b':' {
+            sep += 1;
+            match sep {
+                2 => xpos = pos + 1,
+                3 => ypos = pos + 1,
+                4 => {
+                    xpos = ypos;
+                    ypos = pos + 1;
+                }
+                5 => xpos = pos + 1,
+                6 => ypos = pos + 1,
+                _ => {}
+            }
+        }
     }
+    if !(sep == 3 || sep == 4 || sep == 6 || sep == 7) {
+        return None;
+    }
+    let x = parse_strtol(qname, xpos)?;
+    let y = parse_strtol(qname, ypos)?;
+    Some((0, xpos, x, y))
 }
 
-fn optical_location(name: &[u8]) -> Option<OpticalLocation> {
-    let mut fields = name.rsplit(|&b| b == b':');
-    let y = parse_i64_ascii(fields.next()?)?;
-    let x = parse_i64_ascii(fields.next()?)?;
-    let tile = parse_i64_ascii(fields.next()?)?;
-    Some(OpticalLocation { tile, x, y })
+/// `strtol`-style: parse a base-10 integer at `start`; `None` if no
+/// digits are consumed (mirrors `(qname+pos) == end`).
+fn parse_strtol(bytes: &[u8], start: usize) -> Option<i64> {
+    let mut i = start;
+    let mut neg = false;
+    if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
+        neg = bytes[i] == b'-';
+        i += 1;
+    }
+    let digit_start = i;
+    let mut v: i64 = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        v = v * 10 + (bytes[i] - b'0') as i64;
+        i += 1;
+    }
+    if i == digit_start {
+        return None;
+    }
+    Some(if neg { -v } else { v })
 }
 
-fn parse_i64_ascii(bytes: &[u8]) -> Option<i64> {
-    std::str::from_utf8(bytes).ok()?.parse().ok()
+/// `strtol` of `bytes[start..end]` (bounded; stops at the span end or
+/// first non-digit). `None` if no digits.
+fn parse_strtol_span(bytes: &[u8], start: usize, end: usize) -> Option<i64> {
+    let end = end.min(bytes.len());
+    let mut i = start;
+    let mut neg = false;
+    if i < end && (bytes[i] == b'-' || bytes[i] == b'+') {
+        neg = bytes[i] == b'-';
+        i += 1;
+    }
+    let digit_start = i;
+    let mut v: i64 = 0;
+    while i < end && bytes[i].is_ascii_digit() {
+        v = v * 10 + (bytes[i] - b'0') as i64;
+        i += 1;
+    }
+    if i == digit_start {
+        return None;
+    }
+    Some(if neg { -v } else { v })
 }
 
 fn set_dup(record: &mut RecordBuf) -> bool {

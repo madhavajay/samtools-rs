@@ -95,13 +95,21 @@ pub fn main(args: &[OsString]) -> ExitCode {
         Exact::Sam => htslib_rs::alignment_compat::summarize_sam_records_from_path(&input),
         Exact::Bam => htslib_rs::alignment_compat::summarize_bam_records_from_path(&input),
         Exact::Cram => {
-            let Some(reference) = current_global_args().reference else {
-                print_error("flagstat", "CRAM input requires top-level --reference FILE");
-                return ExitCode::from(1);
-            };
-            htslib_rs::alignment_compat::summarize_cram_records_from_path_with_reference(
-                &input, reference,
-            )
+            // flagstat only inspects flags (reference-independent in
+            // CRAM), so a reference is optional — fall back to the
+            // synthesizing path, matching `samtools flagstat foo.cram`.
+            match current_global_args().reference {
+                Some(reference) => {
+                    htslib_rs::alignment_compat::summarize_cram_records_from_path_with_reference(
+                        &input, reference,
+                    )
+                }
+                None => {
+                    htslib_rs::alignment_compat::summarize_cram_records_from_path_synthesizing_reference(
+                        &input,
+                    )
+                }
+            }
         }
         _ => {
             print_error(

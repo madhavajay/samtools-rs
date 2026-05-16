@@ -78,6 +78,28 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 let _ = print_usage();
                 return ExitCode::SUCCESS;
             }
+            // Attached short-option values (`-g512`, `-G2048`, `-Q20`,
+            // `-d5`) as upstream / option-grouping callers pass them.
+            _ if s.starts_with("-g") && s.len() > 2 => {
+                let v = OsString::from(&s[2..]);
+                match parse_flag_value(Some(&v), "-g") {
+                    Ok(flags) => exclude_flags &= !flags,
+                    Err(()) => return ExitCode::from(1),
+                }
+            }
+            _ if s.starts_with("-G") && s.len() > 2 => {
+                let v = OsString::from(&s[2..]);
+                match parse_flag_value(Some(&v), "-G") {
+                    Ok(flags) => exclude_flags |= flags,
+                    Err(()) => return ExitCode::from(1),
+                }
+            }
+            _ if s.starts_with("-Q") && s.len() > 2 => {
+                min_mapq = s[2..].parse().unwrap_or(0);
+            }
+            _ if s.starts_with("-d") && s.len() > 2 => {
+                min_depth = Some(s[2..].parse().unwrap_or(0));
+            }
             _ if s.starts_with('-') && s != "-" => {
                 print_error("bedcov", format!("unknown option {}", s));
                 return ExitCode::from(1);

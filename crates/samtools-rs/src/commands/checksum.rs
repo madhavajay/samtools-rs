@@ -1,8 +1,9 @@
 //! `samtools checksum` — order-agnostic sequence-content checksums.
 //!
 //! This is a partial port of `bam_checksum.c`. It supports SAM/BAM input for
-//! the default checksum columns and common filters. CRAM input needs an
-//! all-record CRAM iterator, so that piece remains deferred.
+//! the default checksum columns and common filters, plus CRAM input via the
+//! htslib-rs whole-CRAM all-record iterator (completed library batch #2; needs the global
+//! `--reference`).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -372,10 +373,35 @@ fn checksum_path(input: &Path, opts: &ChecksumOptions, writer: &mut dyn Write) -
                 }
             }
             Exact::Cram => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "CRAM checksum requires a CRAM all-record iterator in htslib-rs",
-                ));
+                // completed library batch #2: whole-CRAM via the htslib-rs all-record
+                // iterator, decoded against the global --reference.
+                let Some(reference) = crate::sam_global::current_global_args().reference else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "CRAM checksum requires top-level --reference FILE",
+                    ));
+                };
+                let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
+                let mut seen = 0u64;
+                for mut record in
+                    htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+                        input, &reference,
+                    )?
+                {
+                    if update_record_buf(
+                        &header,
+                        &mut record,
+                        opts,
+                        &mut all,
+                        &mut no_rg,
+                        &mut groups,
+                    )? {
+                        seen += 1;
+                        if opts.nrec != 0 && seen == opts.nrec {
+                            break;
+                        }
+                    }
+                }
             }
             _ => {
                 return Err(io::Error::new(

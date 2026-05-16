@@ -67,7 +67,7 @@ samtools-rs status legend:
 - **htslib-rs coverage:** ⚠️
   - `read_associated_bam_index` returns `Box<dyn csi::BinningIndex>` — ✅
   - Per-reference mapped/unmapped counts from index meta — needs accessor — ❌ (must extend `htslib-rs::index_compat`)
-- **samtools-rs status:** 🟡 — BAM index counts exist, with streaming slow-path counts for SAM, reference-backed CRAM, and unindexed BAM; index-derived CRAM counting without an explicit reference and full harness parity remain.
+- **samtools-rs status:** 🟡 — BAM index counts exist, with streaming slow-path counts for SAM, BAM, and CRAM. CRAM works **with or without** an explicit reference (no-reference path uses the synthesizing-reference summary, since idxstats only needs the reference-independent reference id + flags); `samtools idxstats dat/test_input_1_a.cram` is byte-exact vs `idxstats/test_input_1_a.bam.expected` (test `idxstats_cram_without_reference_succeeds`). Full harness parity (index-meta fast path) remains.
 
 ### faidx / fqidx
 
@@ -88,7 +88,7 @@ samtools-rs status legend:
 - **C source:** `bam_stat.c`
 - **HTSlib APIs used:** `sam_open_format`, `sam_hdr_read`, `sam_read1`, `hts_set_threads`, `hts_set_opt` (CRAM_OPT_REQUIRED_FIELDS)
 - **htslib-rs coverage:** ✅ — `AlignmentRecordSummary` exposes flag/reference/mate/mapq accessors, with SAM/BAM/reference-backed CRAM summary helpers.
-- **samtools-rs status:** 🟡 — SAM, BAM, and reference-backed CRAM input are implemented with default text, `-O json`, and `-O tsv` output; CRAM input without an explicit reference remains unsupported.
+- **samtools-rs status:** 🟡 — SAM, BAM, and CRAM input are implemented with default text, `-O json`, and `-O tsv` output. CRAM works **with or without** an explicit reference (no-reference path uses the synthesizing-reference summary, since flagstat only needs reference-independent flags); CRAM `flagstat` output equals the BAM equivalent. Test `flagstat_cram_without_reference_succeeds`.
 
 ## Wave B — File Operations
 
@@ -100,7 +100,7 @@ samtools-rs status legend:
   - Streaming write — ✅
   - Custom per-record sort key extraction — ✅ partial for coordinate, query-name, and aux-tag keys
   - Multi-way merge — ❌
-- **samtools-rs status:** 🟡 — in-memory coordinate, query-name, and aux-tag sort works for BAM, SAM, and reference-backed CRAM inputs; external merge, template/minimiser sorts, write-index, thread/memory caps, and CRAM output remain.
+- **samtools-rs status:** 🟡 — in-memory coordinate, query-name (`-n` natural / `-N` lexicographical), aux-tag (`-t`), **minimiser (`-M`/`-K`/`-H`/`-R`/`-I`)**, and **`--template-coordinate`** sort work for BAM, SAM, and reference-backed CRAM inputs. **Every upstream `test_sort` fixture is byte-exact** (pos/name/name2/name3/tag.rg/tag.rg.n/tag.as/tag.fi/minimiser-{basic,indexed,indexed-poly}/template-coordinate; tests `sort_matches_upstream_test_sort_fixtures` + `sort_minimiser_all_variants_match_upstream`). Remaining: external/temp-file merge for very large inputs (perf), thread/memory caps, and CRAM output.
 
 ### merge
 
@@ -180,7 +180,7 @@ samtools-rs status legend:
 - **C source:** `bam_md.c`
 - **HTSlib APIs used:** record iteration, BAQ via `probaln_glocal`, MD/NM recomputation
 - **htslib-rs coverage:** ✅ partial via `htslib_rs::probaln` and `htslib_rs::alignment_compat::recalculate_baq_*`
-- **samtools-rs status:** 🟡 — SAM, BAM, and reference-backed CRAM input can emit SAM text with recomputed MD/NM tags against FASTA references; SAM input can also run BAQ paths, and `-d` drops existing `BQ` tags, with default `@PG`/`--no-PG`. BAM/CRAM output, BAM/CRAM BAQ paths, remaining flags, and full upstream MD/BAQ parity remain.
+- **samtools-rs status:** 🟡 — SAM, BAM, and reference-backed CRAM input can emit SAM text with recomputed MD/NM tags against FASTA references; SAM input can also run BAQ paths (`-r`/`-E`/`-A`/`-e`), `-d` drops existing `BQ` tags, `-b`/`-u` emit BGZF BAM output, and getopt-style glued short clusters (`-uAr`) are split, with default `@PG`/`--no-PG`. The upstream `test_calmd` invocation (`calmd -uAr mpileup.1.sam mpileup.ref.fa` → BGZF) passes (integration test `calmd_dash_u_a_r_emits_bgzf_bam_like_upstream`). Remaining: `-C cap`, `-n max_nm`, CRAM output, BAQ over BAM/CRAM input, full upstream MD/BAQ byte parity.
 
 ### targetcut
 
@@ -191,7 +191,7 @@ samtools-rs status legend:
 
 - **C source:** `reset.c`
 - **HTSlib APIs used:** record iteration, aux-tag stripping, flag/CIGAR/pos resets
-- **samtools-rs status:** 🟡 — BAM and SAM reset paths clear alignment fields, default aux tags, and alignment-dependent flags; reverse-strand sequence/quality re-reversal, `-x`/`--keep-tag`, `--no-RG`, `--reject-PG`, `--dupflag`, default `@PG`, and `--no-PG` are supported. CRAM remains.
+- **samtools-rs status:** 🟡 — BAM and SAM reset paths clear alignment fields, default aux tags, and alignment-dependent flags; reverse-strand sequence/quality re-reversal, `-x`/`--keep-tag`, `--no-RG`, `--reject-PG`, `--dupflag`, default `@PG`, and `--no-PG` are supported. The output header is rebuilt faithfully per `reset.c:307-324` — a fresh `@HD VN:1.6` + verbatim `@RG`/`@PG` (no `@SQ`/`@CO`), for SAM **and** BAM output. CRAM remains.
 
 ### ampliconclip
 
@@ -238,7 +238,11 @@ samtools-rs status legend:
 ### consensus
 
 - **C source:** `bam_consensus.c` (~126k LOC) + `consensus_pileup.c`
-- **samtools-rs status:** ⬜
+- **samtools-rs status:** ✅ — byte-exact vs all 77 upstream
+  `test/consensus/consensus.reg` cases: simple + bayesian/recall
+  (Gap5) modes, fasta/fastq/pileup, `-a`/`-aa`, `-r`, `-T`/`--ref-qual`,
+  `--min-MQ`/`--min-BQ`, show-del/ins, glued short options. Locked by
+  `consensus_matches_upstream_consensus_reg`.
 
 ### phase
 
@@ -259,8 +263,8 @@ samtools-rs status legend:
 
 - **C source:** `cram_size.c`
 - **HTSlib APIs used:** CRAM internal block/container/codec inspection
-- **htslib-rs coverage:** ❌ — explicitly out-of-scope in `htslib-rs`. May need to drop this subcommand or expose minimal CRAM internals.
-- **samtools-rs status:** ⬜
+- **htslib-rs coverage:** ✅ — the vendored noodles fork exposes `Container::blocks()` (raw per-block content_id/type/method/sizes) + the public `CompressionHeader` encodings/preservation-map inventory.
+- **samtools-rs status:** ✅ — default, `-v` (verbose), **and `-e` (encodings)** are all **byte-exact** vs the entire upstream `test/cram_size/cram_size.reg` (`normal.out`/`verbose.out`/`encodings.out`): faithful `cram_expand_method`/`comp_method2expanded` method decoder, block walk, `cram_cid2ds` map, aggregation, summary, and `cram_describe_encodings`/`cram_codec_describe` with htslib's exact DS + `tag_encoding_map` ordering. Test `cram_size_matches_upstream_cram_size_reg` (all 3).
 
 ### checksum
 
@@ -279,7 +283,7 @@ samtools-rs status legend:
 ### reference
 
 - **C source:** `reference.c`
-- **samtools-rs status:** 🟡 — SAM/BAM MD-tag reconstruction to FASTA works with `-o`, `-q`, basic `-r` region output, and indexed BAM region iteration when an associated BAI/CSI is present; CRAM input, embedded-reference extraction (`-e`), and full upstream parity remain.
+- **samtools-rs status:** ✅ — **entire upstream `test_reference` byte-exact**. SAM/BAM/CRAM MD-tag reconstruction (`-o`, `-q`, `-r`, indexed BAM iteration); embed_ref CRAM **read + write** in the vendored noodles fork; `view -O cram,embed_ref=1`; `-e`/`--embedded` faithful `cram2ref`. All four upstream invocations (`reference` MD no-`-T`, `-e`, and both `-r 17:1000-1500` variants) match `reference/mpileup.{MD,embed}.fa{,.reg}.expected` (tests `reference_embed_ref_full_test_reference_byte_exact`, `reference_cram_md_path_with_reference_matches_upstream`).
 
 ### flags
 

@@ -19,9 +19,17 @@
 //!  - `-@`/`--threads`, `-m`/`--max-mem`, `-T`/`--temp` — accepted but ignored.
 //!  - `--no-PG` — accepted, silently ignored.
 //!  - `--write-index` — write a BAI next to coordinate-sorted BAM output.
+//!  - `-M` — minimiser sort: faithful `bam_sort.c` `worker_minhash` + `bam1_cmp_by_minhash` + `build_minhash_index` + `minhash_with_idx[_squash]` port, with `-K` kmer (default 20, clamped 1..=31), `-H` homopolymer squash, `-R` (no reverse-strand minimiser), and `-I FILE` indexed reference. Byte-identical to all three upstream `sort/minimiser-{basic,indexed,indexed-poly}.sam` fixtures.
+//!
+//!  - `-N` — name sort with lexicographical (byte `strcmp`) collation.
+//!  - `--template-coordinate` — faithful `bam_sort.c`
+//!    `template_coordinate_key` + `bam1_cmp_template_coordinate` port
+//!    (RG→library lookup, MC-derived mate unclipped coords, MI
+//!    molecular id, `is_upper_of_pair`); `@HD` gets `GO:query`.
+//!    Byte-identical to `sort/template-coordinate.sort.expected.sam`.
 //!
 //! Not yet supported: external merge (large inputs spill to disk),
-//! template-coordinate sort (`-M`), minimiser sort (`-N`), CRAM output.
+//! CRAM output.
 
 use std::cmp::Ordering;
 use std::ffi::OsString;
@@ -42,12 +50,22 @@ use crate::sam_global::current_global_args;
 /// Entry point for `samtools sort`.
 pub fn main(args: &[OsString]) -> ExitCode {
     let mut name_sort = false;
+    let mut natural_sort = true;
+    let mut template_coordinate = false;
     let mut output: Option<PathBuf> = None;
     let mut output_fmt = OutFmt::Bam;
     let mut input: Option<PathBuf> = None;
     let mut local_write_index = false;
     let mut no_pg = false;
     let mut tag_sort: Option<[u8; 2]> = None;
+    // Minimiser (`-M`) sort state. `-K` kmer (default 20, clamped
+    // 1..=31), `-H` enables homopolymer squash (default off / no_squash),
+    // `-R` disables the reverse-strand minimiser, `-I` indexed reference.
+    let mut minhash_mode = false;
+    let mut minhash_kmer: i32 = 20;
+    let mut minhash_try_rev = true;
+    let mut minhash_no_squash = true;
+    let mut minhash_indexed: Option<PathBuf> = None;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -56,8 +74,21 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-n" | "--name" => {
                 name_sort = true;
             }
+            // `bam_sort.c` `-N`: name sort with lexicographical
+            // (byte `strcmp`) collation instead of natural order.
+            "-N" => {
+                name_sort = true;
+                natural_sort = false;
+            }
+            "--template-coordinate" => {
+                template_coordinate = true;
+            }
             "-o" | "--output" => {
-                output = iter.next().map(PathBuf::from);
+                output = match iter.next().and_then(|a| a.to_str()) {
+                    // `-o -` means stdout (output stays None).
+                    Some("-") | None => None,
+                    Some(p) => Some(PathBuf::from(p)),
+                };
             }
             "-t" => {
                 let Some(v) = iter.next().and_then(|a| a.to_str()) else {
@@ -92,9 +123,44 @@ pub fn main(args: &[OsString]) -> ExitCode {
             | "-T"
             | "--temp"
             | "-l"
-            | "--compression-level"
-            | "-K" => {
+            | "--compression-level" => {
                 let _ = iter.next();
+            }
+            "-M" => minhash_mode = true,
+            "-H" => minhash_no_squash = false,
+            "-R" => minhash_try_rev = false,
+            "-K" => {
+                minhash_kmer = iter
+                    .next()
+                    .and_then(|a| a.to_str())
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(minhash_kmer);
+            }
+            "-I" => {
+                minhash_indexed = iter.next().map(PathBuf::from);
+            }
+            // Glued minimiser clusters: `-MH`, `-MR`, `-MHR` (getopt
+            // string `…MI:K:uRw:H`; only H/R follow M without a value).
+            _ if s.starts_with("-M")
+                && s.len() > 2
+                && !s.starts_with("--")
+                && s[2..].chars().all(|c| c == 'H' || c == 'R') =>
+            {
+                minhash_mode = true;
+                for c in s[2..].chars() {
+                    match c {
+                        'H' => minhash_no_squash = false,
+                        'R' => minhash_try_rev = false,
+                        _ => {}
+                    }
+                }
+            }
+            // Attached `-K10` / `-Iref.fa`.
+            _ if s.starts_with("-K") && s.len() > 2 && !s.starts_with("--") => {
+                minhash_kmer = s[2..].parse().unwrap_or(minhash_kmer);
+            }
+            _ if s.starts_with("-I") && s.len() > 2 && !s.starts_with("--") => {
+                minhash_indexed = Some(PathBuf::from(&s[2..]));
             }
             "--write-index" => {
                 local_write_index = true;
@@ -108,6 +174,25 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "--help" => {
                 let _ = print_usage();
                 return ExitCode::SUCCESS;
+            }
+            // Attached-value forms of the accepted-but-ignored options
+            // (`-@4`, `-m768M`, `-l6`, `-Kprefix`, `-Tprefix`, `--threads=4`).
+            _ if (s.starts_with("-@")
+                || s.starts_with("-m")
+                || s.starts_with("-l")
+                || s.starts_with("-K")
+                || s.starts_with("-T"))
+                && s.len() > 2
+                && !s.starts_with("--") =>
+            {
+                // value is in the same token; nothing to consume.
+            }
+            _ if s.starts_with("--threads=")
+                || s.starts_with("--max-mem=")
+                || s.starts_with("--compression-level=")
+                || s.starts_with("--temp=") =>
+            {
+                // value embedded; ignored.
             }
             _ if s.starts_with('-') && s != "-" => {
                 print_error(
@@ -160,6 +245,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     }
 
+    let minhash = if minhash_mode {
+        Some(MinhashOpts {
+            kmer: minhash_kmer.clamp(1, 31),
+            try_rev: minhash_try_rev,
+            no_squash: minhash_no_squash,
+            indexed: minhash_indexed,
+        })
+    } else {
+        None
+    };
+
     match run_sort(
         &input,
         output.as_deref(),
@@ -168,6 +264,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
         output_fmt,
         write_index,
         if no_pg { None } else { Some(args) },
+        minhash,
+        natural_sort,
+        template_coordinate,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -200,6 +299,17 @@ pub(crate) enum OutFmt {
     Bam,
 }
 
+/// `samtools sort -M` minimiser parameters.
+#[derive(Clone)]
+pub(crate) struct MinhashOpts {
+    pub kmer: i32,
+    pub try_rev: bool,
+    pub no_squash: bool,
+    /// `-I FILE` indexed reference (built into a kmer→refpos map).
+    pub indexed: Option<PathBuf>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_sort(
     input: &Path,
     output: Option<&Path>,
@@ -208,6 +318,9 @@ pub(crate) fn run_sort(
     fmt: OutFmt,
     write_index: bool,
     pg_argv: Option<&[OsString]>,
+    minhash: Option<MinhashOpts>,
+    natural_sort: bool,
+    template_coordinate: bool,
 ) -> io::Result<()> {
     let format = sam_io::sam_open_format(input)?;
     let (mut header, mut records) = match format.exact {
@@ -222,14 +335,45 @@ pub(crate) fn run_sort(
         }
     };
 
-    if let Some(tag) = tag_sort {
-        records.sort_by(|a, b| compare_by_tag(a, b, tag, name_sort));
+    let mut minhash_mapped = false;
+    if template_coordinate {
+        // `bam_sort.c` `template_coordinate_key` + comparator: build a
+        // per-record key (RG→library lookup, MC-derived mate unclipped
+        // coords, MI molecular id) then sort by it.
+        let lib_lookup = library_lookup(&header);
+        let mut keyed: Vec<(TemplateCoordinateKey, RecordBuf)> = Vec::with_capacity(records.len());
+        for r in records.drain(..) {
+            let key = template_coordinate_key(&r, &lib_lookup).map_err(io::Error::other)?;
+            keyed.push((key, r));
+        }
+        keyed.sort_by(|a, b| template_coordinate_cmp(&a.0, &b.0));
+        records = keyed.into_iter().map(|(_, r)| r).collect();
+    } else if let Some(opts) = minhash.as_ref() {
+        // Faithful port of `bam_sort.c` `worker_minhash` +
+        // `bam1_cmp_by_minhash`. Per unmapped record compute the
+        // minimiser hash over its sequence (against the `-I` index when
+        // given), reverse-complement it when the reverse-strand
+        // minimiser wins, then sort unmapped records by that 62-bit key
+        // (mapped records keep coordinate order).
+        minhash_mapped = records.iter().any(|r| r.reference_sequence_id().is_some());
+        let kmer_h = match opts.indexed.as_deref() {
+            // `-w` defaults to 100 in `bam_sort.c`.
+            Some(p) => Some(build_minhash_index(p, opts.kmer, 100, opts.no_squash)?),
+            None => None,
+        };
+        let mut keyed: Vec<(MinhashKey, RecordBuf)> = records
+            .drain(..)
+            .map(|mut r| {
+                let key = minhash_prepare(&mut r, opts, kmer_h.as_ref());
+                (key, r)
+            })
+            .collect();
+        keyed.sort_by(|a, b| minhash_cmp(&a.0, &b.0));
+        records = keyed.into_iter().map(|(_, r)| r).collect();
+    } else if let Some(tag) = tag_sort {
+        records.sort_by(|a, b| compare_by_tag(a, b, tag, name_sort, natural_sort));
     } else if name_sort {
-        records.sort_by(|a, b| {
-            let an = name_key(a);
-            let bn = name_key(b);
-            an.cmp(&bn)
-        });
+        records.sort_by(|a, b| name_cmp(a, b, natural_sort));
     } else {
         // Coordinate sort: by (reference_sequence_id, alignment_start).
         records.sort_by(|a, b| {
@@ -238,37 +382,79 @@ pub(crate) fn run_sort(
         });
     }
 
-    // Update @HD SO to reflect new sort order so downstream consumers can
-    // tell. (Header is otherwise preserved verbatim.)
-    if let Some(tag) = tag_sort {
-        set_sort_order(
-            &mut header,
-            "unsorted",
-            Some(&format!(
+    // Sort-order tags for @HD (SO, optional GO, optional SS).
+    let (so, go, ss): (String, Option<&str>, Option<String>) = if template_coordinate {
+        (
+            "unsorted".to_string(),
+            Some("query"),
+            Some("unsorted:template-coordinate".to_string()),
+        )
+    } else if minhash.is_some() {
+        if minhash_mapped {
+            (
+                "coordinate".to_string(),
+                None,
+                Some("coordinate:minhash".to_string()),
+            )
+        } else {
+            (
+                "unsorted".to_string(),
+                None,
+                Some("unsorted:minhash".to_string()),
+            )
+        }
+    } else if let Some(tag) = tag_sort {
+        (
+            "unsorted".to_string(),
+            None,
+            Some(format!(
                 "unsorted:{}{}:{}",
                 tag[0] as char,
                 tag[1] as char,
                 if name_sort {
-                    "queryname:lexicographical"
+                    if natural_sort {
+                        "queryname:natural"
+                    } else {
+                        "queryname:lexicographical"
+                    }
                 } else {
                     "coordinate"
                 }
             )),
-        );
-    } else {
-        set_sort_order(
-            &mut header,
-            if name_sort { "queryname" } else { "coordinate" },
+        )
+    } else if name_sort {
+        (
+            "queryname".to_string(),
             None,
-        );
-    }
+            Some(
+                if natural_sort {
+                    "queryname:natural"
+                } else {
+                    "queryname:lexicographical"
+                }
+                .to_string(),
+            ),
+        )
+    } else {
+        ("coordinate".to_string(), None, None)
+    };
+    set_sort_order(&mut header, &so, go, ss.as_deref());
 
+    // Emit the *raw* input header (preserving @SQ/@RG field order, @CO,
+    // etc. — noodles' canonical writer reorders @RG fields) with the @HD
+    // SO/GO/SS applied and the samtools @PG appended.
+    let mut header_text = apply_hd_sort_order(
+        &crate::header_text::read_raw_header_text_with_format(input, format.exact)?,
+        &so,
+        go,
+        ss.as_deref(),
+    );
     if let Some(argv) = pg_argv {
-        header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
+        header_text = crate::pg::add_samtools_pg(&header_text, argv).map_err(io::Error::other)?;
     }
 
     {
-        let mut writer = open_output(output, fmt, &header)?;
+        let mut writer = open_output(output, fmt, &header, &header_text)?;
         for rec in &records {
             writer.write_record(&header, rec)?;
         }
@@ -301,8 +487,7 @@ fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
 }
 
 fn read_sam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
-    let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
-    read_sam_records_from_reader(&mut reader)
+    crate::sam_compat::read_sam_records_tolerant(input)
 }
 
 fn read_cram_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
@@ -351,17 +536,870 @@ fn name_key(r: &RecordBuf) -> Vec<u8> {
     r.name().map(|s| s.to_vec()).unwrap_or_default()
 }
 
-fn compare_by_tag(a: &RecordBuf, b: &RecordBuf, tag: [u8; 2], name_sort: bool) -> Ordering {
+/// Port of `bam_sort.c`'s `strnum_cmp` natural-order comparison: runs of
+/// digits compare numerically (leading zeros skipped, then by length,
+/// then by first differing digit); everything else byte-wise.
+fn strnum_cmp(a: &[u8], b: &[u8]) -> Ordering {
+    let (mut ia, mut ib) = (0usize, 0usize);
+    let is_digit = |c: u8| c.is_ascii_digit();
+    while ia < a.len() && ib < b.len() {
+        let (ca, cb) = (a[ia], b[ib]);
+        if !is_digit(ca) || !is_digit(cb) {
+            if ca != cb {
+                return ca.cmp(&cb);
+            }
+            ia += 1;
+            ib += 1;
+        } else {
+            while ia < a.len() && a[ia] == b'0' {
+                ia += 1;
+            }
+            while ib < b.len() && b[ib] == b'0' {
+                ib += 1;
+            }
+            while ia < a.len() && ib < b.len() && is_digit(a[ia]) && a.get(ia) == b.get(ib) {
+                ia += 1;
+                ib += 1;
+            }
+            let diff =
+                a.get(ia).copied().unwrap_or(0) as i32 - b.get(ib).copied().unwrap_or(0) as i32;
+            while ia < a.len() && ib < b.len() && is_digit(a[ia]) && is_digit(b[ib]) {
+                ia += 1;
+                ib += 1;
+            }
+            if ia < a.len() && is_digit(a[ia]) {
+                return Ordering::Greater;
+            } else if ib < b.len() && is_digit(b[ib]) {
+                return Ordering::Less;
+            } else if diff != 0 {
+                return diff.cmp(&0);
+            }
+        }
+    }
+    let ra = ia < a.len();
+    let rb = ib < b.len();
+    if ra {
+        Ordering::Greater
+    } else if rb {
+        Ordering::Less
+    } else {
+        Ordering::Equal
+    }
+}
+
+/// `bam_sort.c` QueryName secondary key:
+/// `((f&0xc0)<<8)|((f&0x100)<<3)|((f&0x800)>>3)` — READ1, READ2,
+/// (primary), SUPPLEMENTARY, SECONDARY.
+fn qname_flag_key(r: &RecordBuf) -> u32 {
+    let f = u32::from(u16::from(r.flags()));
+    ((f & 0xc0) << 8) | ((f & 0x100) << 3) | ((f & 0x800) >> 3)
+}
+
+// ----- `samtools sort -M` minimiser sort (non-indexed path) -----
+
+/// `bam_sort.c` `#define XOR 0xdead7878beef7878`.
+const MINHASH_XOR: u64 = 0xdead_7878_beef_7878;
+
+/// Per-record sort key. For mapped records the coordinate triple is
+/// used (`bam1_cmp_by_minhash` falls back to `bam1_cmp_core` whenever
+/// either side is mapped); for unmapped records the 62-bit minimiser
+/// key `m`, the `isize` tie-break, and the post-RC strand bit are used.
+struct MinhashKey {
+    mapped: bool,
+    tid: u64,
+    pos: u64,
+    rev: u8,
+    m: u64,
+    isize_tb: i64,
+}
+
+/// 16-entry `bam_seqi` → 0..3 forward base table (`L` in `minhash`).
+const MINHASH_L: [u64; 16] = [0, 0, 1, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0];
+/// 16-entry reverse-complement base table (`R`, pre-shift).
+const MINHASH_R: [u64; 16] = [0, 3, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+/// ASCII base → 4-bit `bam_seqi` code (`=ACMGRSVTWYHKDBN`).
+fn base_to_4bit(c: u8) -> usize {
+    match c.to_ascii_uppercase() {
+        b'=' => 0,
+        b'A' => 1,
+        b'C' => 2,
+        b'M' => 3,
+        b'G' => 4,
+        b'R' => 5,
+        b'S' => 6,
+        b'V' => 7,
+        b'T' => 8,
+        b'W' => 9,
+        b'Y' => 10,
+        b'H' => 11,
+        b'K' => 12,
+        b'D' => 13,
+        b'B' => 14,
+        _ => 15,
+    }
+}
+
+/// Faithful port of `bam_sort.c` `minhash` (the windowed scan).
+/// `i_start` is the C `*curr_pos` in-value; returns
+/// `(minhashf, curr_pos, is_rev, end)` where
+/// `curr_pos = minhashpf - (kmer-1)` and `end = (i_end == len)`.
+#[allow(clippy::too_many_arguments)]
+fn minhash(
+    seq: &[u8],
+    kmer: i32,
+    window: i32,
+    i_start: i32,
+    try_fwd: bool,
+    try_rev: bool,
+    no_squash: bool,
+) -> (u64, i32, bool, bool) {
+    let kmer = kmer as usize;
+    let len = seq.len() as i32;
+    let mask: u64 = if 2 * kmer >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * kmer)) - 1
+    };
+    let xor = MINHASH_XOR & mask;
+    let shift = 2 * (kmer as u32 - 1);
+
+    let i_start = i_start.max(0);
+    let i_end = i_start + window.min(len - i_start);
+
+    // Forward strand.
+    let mut hashf: u64 = 0;
+    let mut minhashf: u64 = u64::MAX;
+    let mut minhashpf: i32 = i_start;
+    if try_fwd {
+        let mut last_base: i32 = -1;
+        let mut i = i_start;
+        let mut j = 0usize;
+        while j < kmer - 1 && i < i_end {
+            let base = base_to_4bit(seq[i as usize]);
+            if no_squash || last_base != base as i32 {
+                last_base = base as i32;
+                hashf = (hashf << 2) | MINHASH_L[base];
+                j += 1;
+            }
+            i += 1;
+        }
+        if no_squash {
+            while i < i_end {
+                let base = base_to_4bit(seq[i as usize]);
+                hashf = (hashf << 2) | MINHASH_L[base];
+                let hashfx = (hashf ^ MINHASH_XOR) & mask;
+                if minhashf > hashfx {
+                    minhashf = hashfx;
+                    minhashpf = i;
+                }
+                i += 1;
+            }
+        } else {
+            while i < i_end {
+                let base = base_to_4bit(seq[i as usize]);
+                if last_base != base as i32 {
+                    last_base = base as i32;
+                    hashf = (hashf << 2) | MINHASH_L[base];
+                    let hashfx = (hashf ^ MINHASH_XOR) & mask;
+                    if minhashf > hashfx {
+                        minhashf = hashfx;
+                        minhashpf = i;
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+
+    let mut is_rev = false;
+    if try_rev {
+        let mut hashr: u64 = 0;
+        let mut minhashr: u64 = u64::MAX;
+        let mut minhashpr: i32 = i_start;
+        let mut last_base: i32 = -1;
+        let mut i = i_start;
+        let mut j = 0usize;
+        while j < kmer - 1 && i < len {
+            let base = base_to_4bit(seq[i as usize]);
+            if no_squash || last_base != base as i32 {
+                last_base = base as i32;
+                hashr = (hashr >> 2) | (MINHASH_R[base] << shift);
+                j += 1;
+            }
+            i += 1;
+        }
+        if no_squash {
+            while i < i_end {
+                let base = base_to_4bit(seq[i as usize]);
+                hashr = (hashr >> 2) | (MINHASH_R[base] << shift);
+                if minhashr > (hashr ^ xor) {
+                    minhashr = hashr ^ xor;
+                    minhashpr = len - i + kmer as i32 - 2;
+                }
+                i += 1;
+            }
+        } else {
+            while i < i_end {
+                let base = base_to_4bit(seq[i as usize]);
+                if last_base != base as i32 {
+                    last_base = base as i32;
+                    hashr = (hashr >> 2) | (MINHASH_R[base] << shift);
+                    if minhashr > (hashr ^ xor) {
+                        minhashr = hashr ^ xor;
+                        minhashpr = len - i + kmer as i32 - 2;
+                    }
+                }
+                i += 1;
+            }
+        }
+        if minhashr < minhashf {
+            minhashf = minhashr;
+            minhashpf = minhashpr;
+            is_rev = true;
+        }
+    }
+
+    (
+        minhashf,
+        minhashpf - (kmer as i32 - 1),
+        is_rev,
+        i_end == len,
+    )
+}
+
+/// `bam_sort.c` `build_minhash_index` (forward strand only): read each
+/// reference sequence from `ref_path` (FASTA), slide a `window`-wide
+/// minhash and record `hash -> tpos+pos` with the high `UNIQ_BIT` set
+/// once a hash recurs (so unique vs duplicate placements are known).
+fn build_minhash_index(
+    ref_path: &Path,
+    kmer: i32,
+    window: i32,
+    no_squash: bool,
+) -> io::Result<std::collections::HashMap<u64, u64>> {
+    use htslib_rs::fasta;
+    const UNIQ_BIT: u64 = 1 << 60;
+    let reader = File::open(ref_path).map(BufReader::new)?;
+    let mut reader = fasta::io::Reader::new(reader);
+    let mut map: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    let mut tpos: u64 = 0;
+    for result in reader.records() {
+        let record = result?;
+        let mut seq = record.sequence().as_ref().to_vec();
+        seq.make_ascii_uppercase();
+        let len = seq.len() as i32;
+        if len < window {
+            continue;
+        }
+        let mut pos: i32 = 0;
+        loop {
+            let last_pos = pos;
+            let (hashf, out_pos, _rev, end) =
+                minhash(&seq, kmer, window, pos, true, false, no_squash);
+            let key_pos = tpos.wrapping_add(out_pos as i64 as u64);
+            map.entry(hashf)
+                .and_modify(|v| *v = key_pos | UNIQ_BIT)
+                .or_insert(key_pos);
+            pos = (last_pos + kmer).max(out_pos + 1);
+            if end {
+                break;
+            }
+        }
+        tpos += seq.len() as u64;
+    }
+    Ok(map)
+}
+
+/// `bam_sort.c` `minhash_with_idx[_squash]` merged via the `squash`
+/// flag: scan the whole read, preferring hashes that are uniquely (then
+/// non-uniquely) placed in `kmer_h` over absent ones; on a hit the key
+/// becomes the reference position. Returns `(minhashf, pos, dir)`.
+fn minhash_with_idx(
+    seq: &[u8],
+    kmer: i32,
+    kmer_h: &std::collections::HashMap<u64, u64>,
+    try_rev: bool,
+    squash: bool,
+) -> (u64, i32, bool) {
+    const UNIQ_BIT: u64 = 1 << 60;
+    const UNIQ_MASK: u64 = UNIQ_BIT - 1;
+    let uniq_test = |x: u64| (x & UNIQ_BIT) == 0;
+    let kmer = kmer as usize;
+    let len = seq.len() as i32;
+    let mask: u64 = if 2 * kmer >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * kmer)) - 1
+    };
+    let xor = MINHASH_XOR & mask;
+    let shift = 2 * (kmer as u32 - 1);
+
+    // Forward.
+    let mut hashf: u64 = 0;
+    let mut minhashf = u64::MAX;
+    let mut minhashfi = u64::MAX;
+    let mut minhashfd = u64::MAX;
+    let (mut minhashpf, mut minhashpfi, mut minhashpfd) = (0i32, 0i32, 0i32);
+    let mut last_base: i32 = -1;
+    let mut i = 0i32;
+    let mut j = 0usize;
+    while j < kmer - 1 && i < len {
+        let base = base_to_4bit(seq[i as usize]);
+        if squash && base as i32 == last_base {
+            i += 1;
+            continue;
+        }
+        last_base = base as i32;
+        j += 1;
+        hashf = (hashf << 2) | MINHASH_L[base];
+        i += 1;
+    }
+    let mut found_f = 0i32;
+    while i < len {
+        let base = base_to_4bit(seq[i as usize]);
+        if squash && base as i32 == last_base {
+            i += 1;
+            continue;
+        }
+        last_base = base as i32;
+        hashf = ((hashf << 2) | MINHASH_L[base]) & mask;
+        let hashfx = hashf ^ xor;
+        let mut index = 0;
+        if (minhashfi > hashfx || (found_f < 2 && minhashfd > hashfx))
+            && let Some(&v) = kmer_h.get(&hashfx)
+        {
+            index = if uniq_test(v) { 2 } else { 1 };
+        }
+        found_f |= index;
+        match index {
+            2 => {
+                minhashfi = hashfx;
+                minhashpfi = i;
+            }
+            1 => {
+                minhashfd = hashfx;
+                minhashpfd = i;
+            }
+            _ => {
+                if minhashf > hashfx {
+                    minhashf = hashfx;
+                    minhashpf = i;
+                }
+            }
+        }
+        i += 1;
+    }
+    if minhashfi != u64::MAX {
+        minhashf = minhashfi;
+        minhashpf = minhashpfi;
+    } else if minhashfd != u64::MAX {
+        minhashf = minhashfd;
+        minhashpf = minhashpfd;
+    }
+
+    let mut dir = false;
+    if try_rev {
+        let mut hashr: u64 = 0;
+        let mut minhashr = u64::MAX;
+        let mut minhashri = u64::MAX;
+        let mut minhashrd = u64::MAX;
+        let (mut minhashpr, mut minhashpri, mut minhashprd) = (0i32, 0i32, 0i32);
+        let mut last_base: i32 = -1;
+        let mut i = 0i32;
+        let mut j = 0usize;
+        while j < kmer - 1 && i < len {
+            let base = base_to_4bit(seq[i as usize]);
+            if squash && base as i32 == last_base {
+                i += 1;
+                continue;
+            }
+            last_base = base as i32;
+            j += 1;
+            hashr = (hashr >> 2) | (MINHASH_R[base] << shift);
+            i += 1;
+        }
+        let mut found_r = 0i32;
+        while i < len {
+            let base = base_to_4bit(seq[i as usize]);
+            if squash && base as i32 == last_base {
+                i += 1;
+                continue;
+            }
+            last_base = base as i32;
+            hashr = (hashr >> 2) | (MINHASH_R[base] << shift);
+            let hashrx = hashr ^ xor;
+            let mut index = 0;
+            if (minhashri > hashrx || (found_r < 2 && minhashrd > hashrx))
+                && let Some(&v) = kmer_h.get(&hashrx)
+            {
+                index = if uniq_test(v) { 2 } else { 1 };
+            }
+            found_r |= index;
+            match index {
+                2 => {
+                    minhashri = hashrx;
+                    minhashpri = i;
+                }
+                1 => {
+                    minhashrd = hashrx;
+                    minhashprd = i;
+                }
+                _ => {
+                    if minhashr > hashrx {
+                        minhashr = hashrx;
+                        minhashpr = i;
+                    }
+                }
+            }
+            i += 1;
+        }
+        if minhashri != u64::MAX {
+            minhashr = minhashri;
+            minhashpr = minhashpri;
+        } else if minhashrd != u64::MAX {
+            minhashr = minhashrd;
+            minhashpr = minhashprd;
+        }
+        if ((minhashf > minhashr) || (found_f == 0 && found_r != 0))
+            && (found_f == 0 || found_r != 0)
+        {
+            minhashf = minhashr;
+            minhashpf = len - minhashpr + kmer as i32 - 2;
+            dir = true;
+        }
+    }
+
+    // Indexed kmer → its reference position (mask off the uniq bit).
+    if let Some(&v) = kmer_h.get(&minhashf) {
+        minhashf = v & UNIQ_MASK;
+    }
+    let out = if minhashf != u64::MAX { minhashf } else { 0 };
+    (out, minhashpf, dir)
+}
+
+/// `bam_sort.c` `reverse_complement`: reverse-complement the sequence,
+/// reverse the quality scores, and toggle the REVERSE flag bit.
+fn minhash_reverse_complement(r: &mut RecordBuf) {
+    let seq = r.sequence_mut().as_mut();
+    seq.reverse();
+    for b in seq.iter_mut() {
+        *b = minhash_complement(*b);
+    }
+    r.quality_scores_mut().as_mut().reverse();
+    let f = r.flags_mut();
+    *f ^= htslib_rs::sam::alignment::record::Flags::REVERSE_COMPLEMENTED;
+}
+
+fn minhash_complement(b: u8) -> u8 {
+    match b {
+        b'A' => b'T',
+        b'C' => b'G',
+        b'G' => b'C',
+        b'T' => b'A',
+        b'M' => b'K',
+        b'R' => b'Y',
+        b'W' => b'W',
+        b'S' => b'S',
+        b'Y' => b'R',
+        b'K' => b'M',
+        b'V' => b'B',
+        b'H' => b'D',
+        b'D' => b'H',
+        b'B' => b'V',
+        b'a' => b't',
+        b'c' => b'g',
+        b'g' => b'c',
+        b't' => b'a',
+        b'm' => b'k',
+        b'r' => b'y',
+        b'w' => b'w',
+        b's' => b's',
+        b'y' => b'r',
+        b'k' => b'm',
+        b'v' => b'b',
+        b'h' => b'd',
+        b'd' => b'h',
+        b'b' => b'v',
+        b'N' | b'n' => b,
+        _ => b'N',
+    }
+}
+
+/// `worker_minhash` for one record + key extraction. With `kmer_h` the
+/// indexed path (`minhash_with_idx[_squash]`, `mh -= pos`) is taken;
+/// otherwise the non-indexed path (`mh += 1<<30`, `isize = 65535-pos`).
+fn minhash_prepare(
+    r: &mut RecordBuf,
+    opts: &MinhashOpts,
+    kmer_h: Option<&std::collections::HashMap<u64, u64>>,
+) -> MinhashKey {
+    if let Some(tid) = r.reference_sequence_id() {
+        // Mapped: keep coordinate order (bam1_cmp_core path).
+        let pos = r.alignment_start().map(usize::from).unwrap_or(0) as u64; // core.pos+1
+        let rev = u8::from(r.flags().is_reverse_complemented());
+        return MinhashKey {
+            mapped: true,
+            tid: tid as u64,
+            pos,
+            rev,
+            m: 0,
+            isize_tb: 0,
+        };
+    }
+
+    let seq: Vec<u8> = r.sequence().as_ref().to_vec();
+    let len = seq.len() as i32;
+    let (mh, isize_tb, is_rev) = if let Some(kmer_h) = kmer_h {
+        let (minhashf, pos, dir) =
+            minhash_with_idx(&seq, opts.kmer, kmer_h, opts.try_rev, !opts.no_squash);
+        if dir {
+            minhash_reverse_complement(r);
+        }
+        // worker_minhash indexed branch: `mh -= pos; pos = 0;`.
+        (minhashf.wrapping_sub(pos as i64 as u64), 0i64, dir)
+    } else {
+        let (minhashf, curr, is_rev, _end) =
+            minhash(&seq, opts.kmer, len, 0, true, opts.try_rev, opts.no_squash);
+        if is_rev {
+            minhash_reverse_complement(r);
+        }
+        let mh = minhashf.wrapping_add(1 << 30);
+        let isize_tb = if 65535 - curr >= 0 { 65535 - curr } else { 0 } as i64;
+        (mh, isize_tb, is_rev)
+    };
+    let m = (((mh >> 31) & 0x7fff_ffff) << 31) | (mh & 0x7fff_ffff);
+    MinhashKey {
+        mapped: false,
+        tid: u64::MAX, // core.tid == -1 cast to uint64
+        pos: 0,
+        rev: u8::from(is_rev),
+        m,
+        isize_tb,
+    }
+}
+
+/// `bam1_cmp_by_minhash` → `Ordering` (stable sort preserves input
+/// order on `Equal`, mirroring `ks_mergesort`).
+fn minhash_cmp(a: &MinhashKey, b: &MinhashKey) -> Ordering {
+    if a.mapped || b.mapped {
+        // bam1_cmp_core, MinHash (non-QueryName) branch: tid, then
+        // pos+1, then reverse bit.
+        return a
+            .tid
+            .cmp(&b.tid)
+            .then_with(|| a.pos.cmp(&b.pos))
+            .then_with(|| a.rev.cmp(&b.rev));
+    }
+    a.m.cmp(&b.m)
+        // bigger isize sorts first (A.isize > B.isize → A before B).
+        .then_with(|| b.isize_tb.cmp(&a.isize_tb))
+        // bam1_cmp_core tail: m equal ⇒ pos equal ⇒ reverse bit asc.
+        .then_with(|| a.rev.cmp(&b.rev))
+}
+
+/// Full `bam_sort.c` QueryName comparator. `bam_sort.c`'s `strnum_cmp`
+/// is natural-order unless `-N` (`!natural_sort`), where it is a plain
+/// byte `strcmp`.
+fn name_cmp(a: &RecordBuf, b: &RecordBuf, natural_sort: bool) -> Ordering {
+    let (ka, kb) = (name_key(a), name_key(b));
+    let primary = if natural_sort {
+        strnum_cmp(&ka, &kb)
+    } else {
+        ka.cmp(&kb)
+    };
+    primary.then_with(|| qname_flag_key(a).cmp(&qname_flag_key(b)))
+}
+
+fn compare_by_tag(
+    a: &RecordBuf,
+    b: &RecordBuf,
+    tag: [u8; 2],
+    name_sort: bool,
+    natural_sort: bool,
+) -> Ordering {
     tag_sort_value(a, tag)
         .cmp(&tag_sort_value(b, tag))
         .then_with(|| {
             if name_sort {
-                name_key(a).cmp(&name_key(b))
+                name_cmp(a, b, natural_sort)
             } else {
                 coordinate_key(a).cmp(&coordinate_key(b))
             }
         })
         .then_with(|| name_key(a).cmp(&name_key(b)))
+}
+
+// ----- `samtools sort --template-coordinate` -----
+
+/// `bam_sort.c` `lookup_libraries`: `@RG ID` → `LB` (only RGs with an
+/// `LB` tag are recorded).
+fn library_lookup(header: &sam::Header) -> std::collections::HashMap<Vec<u8>, Vec<u8>> {
+    let mut m = std::collections::HashMap::new();
+    for (id, rg) in header.read_groups() {
+        const LB: [u8; 2] = [b'L', b'B'];
+        if let Some(lb) = rg.other_fields().get(&LB) {
+            let id_bytes: Vec<u8> = id.to_string().into_bytes();
+            let lb_bytes: Vec<u8> = lb.to_string().into_bytes();
+            m.insert(id_bytes, lb_bytes);
+        }
+    }
+    m
+}
+
+fn rb_aux_text(r: &RecordBuf, tag: [u8; 2]) -> Option<Vec<u8>> {
+    use sam::alignment::record_buf::data::field::Value;
+    match r.data().get(&tag) {
+        Some(Value::String(s)) | Some(Value::Hex(s)) => Some(s.to_vec()),
+        _ => None,
+    }
+}
+
+fn cigar_ops(r: &RecordBuf) -> Vec<(char, i64)> {
+    use sam::alignment::record::cigar::op::Kind;
+    r.cigar()
+        .as_ref()
+        .iter()
+        .map(|op| {
+            let c = match op.kind() {
+                Kind::Match => 'M',
+                Kind::Insertion => 'I',
+                Kind::Deletion => 'D',
+                Kind::Skip => 'N',
+                Kind::SoftClip => 'S',
+                Kind::HardClip => 'H',
+                Kind::Pad => 'P',
+                Kind::SequenceMatch => '=',
+                Kind::SequenceMismatch => 'X',
+            };
+            (c, op.len() as i64)
+        })
+        .collect()
+}
+
+/// `bam.c` `unclipped_start`: `pos0 - leading S/H + 1`.
+fn unclipped_start(pos0: i64, cig: &[(char, i64)]) -> i64 {
+    let mut clipped = 0;
+    for &(c, n) in cig {
+        if c == 'S' || c == 'H' {
+            clipped += n;
+        } else {
+            break;
+        }
+    }
+    pos0 - clipped + 1
+}
+
+/// `bam.c` `unclipped_end`: `bam_endpos + trailing S/H`.
+fn unclipped_end(pos0: i64, cig: &[(char, i64)]) -> i64 {
+    let mut rlen = 0;
+    for &(c, n) in cig {
+        if matches!(c, 'M' | 'D' | 'N' | '=' | 'X') {
+            rlen += n;
+        }
+    }
+    let mut clipped = 0;
+    for &(c, n) in cig.iter().rev() {
+        if c == 'S' || c == 'H' {
+            clipped += n;
+        } else {
+            break;
+        }
+    }
+    pos0 + rlen + clipped
+}
+
+/// Parse the leading run of a SAM CIGAR string into `(op, len)` pairs.
+fn parse_cigar_str(cigar: &[u8]) -> Vec<(char, i64)> {
+    let mut out = Vec::new();
+    let mut num: i64 = 0;
+    let mut seen = false;
+    for &b in cigar {
+        if b == b'*' {
+            break;
+        }
+        if b.is_ascii_digit() {
+            num = num * 10 + i64::from(b - b'0');
+            seen = true;
+        } else {
+            out.push((b as char, if seen { num } else { 1 }));
+            num = 0;
+            seen = false;
+        }
+    }
+    out
+}
+
+/// `bam.c` `unclipped_other_start`: `mpos0 - leading S/H + 1`.
+fn unclipped_other_start(op0: i64, mc: &[u8]) -> i64 {
+    let mut clipped = 0;
+    for &(c, n) in parse_cigar_str(mc).iter() {
+        if c == 'S' || c == 'H' {
+            clipped += n;
+        } else {
+            break;
+        }
+    }
+    op0 - clipped + 1
+}
+
+/// `bam.c` `unclipped_other_end`: `mpos0 + refpos`, where `refpos` sums
+/// `M/D/N/=/X` and post-initial-clip `S/H`.
+fn unclipped_other_end(op0: i64, mc: &[u8]) -> i64 {
+    let mut refpos = 0;
+    let mut skip = true;
+    for (c, n) in parse_cigar_str(mc) {
+        match c {
+            'M' | 'D' | 'N' | '=' | 'X' => {
+                refpos += n;
+                skip = false;
+            }
+            'S' | 'H' if !skip => {
+                refpos += n;
+            }
+            _ => {}
+        }
+    }
+    op0 + refpos
+}
+
+struct TemplateCoordinateKey {
+    tid1: i32,
+    tid2: i32,
+    pos1: i64,
+    pos2: i64,
+    neg1: bool,
+    neg2: bool,
+    library: Vec<u8>,
+    mid: Vec<u8>,
+    name: Vec<u8>,
+    is_upper_of_pair: bool,
+}
+
+fn template_coordinate_key(
+    r: &RecordBuf,
+    lib_lookup: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
+) -> Result<TemplateCoordinateKey, String> {
+    let flags = r.flags();
+    let mut tid1 = i32::MAX;
+    let mut tid2 = i32::MAX;
+    let mut pos1 = i64::MAX;
+    let mut pos2 = i64::MAX;
+    let mut neg1 = false;
+    let mut neg2 = false;
+
+    let library = match rb_aux_text(r, [b'R', b'G']) {
+        Some(rg) => lib_lookup.get(&rg).cloned().unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let name = r.name().map(|n| n.to_vec()).unwrap_or_default();
+
+    let cig = cigar_ops(r);
+    if !flags.is_unmapped() {
+        tid1 = r.reference_sequence_id().map(|t| t as i32).unwrap_or(-1);
+        neg1 = flags.is_reverse_complemented();
+        let pos0 = r.alignment_start().map(usize::from).unwrap_or(1) as i64 - 1;
+        pos1 = if neg1 {
+            unclipped_end(pos0, &cig)
+        } else {
+            unclipped_start(pos0, &cig)
+        };
+    }
+    if flags.is_segmented() && !flags.is_mate_unmapped() {
+        let mc = rb_aux_text(r, [b'M', b'C'])
+            .ok_or_else(|| "no MC tag. Please run samtools fixmate on file first.".to_string())?;
+        tid2 = r
+            .mate_reference_sequence_id()
+            .map(|t| t as i32)
+            .unwrap_or(-1);
+        neg2 = flags.is_mate_reverse_complemented();
+        let mpos0 = r.mate_alignment_start().map(usize::from).unwrap_or(1) as i64 - 1;
+        pos2 = if neg2 {
+            unclipped_other_end(mpos0, &mc)
+        } else {
+            unclipped_other_start(mpos0, &mc)
+        };
+    }
+    let mid = rb_aux_text(r, [b'M', b'I']).unwrap_or_default();
+
+    // is_upper_of_pair + canonicalising swap.
+    let is_upper_of_pair = if tid1 < tid2
+        || (tid1 == tid2 && pos1 < pos2)
+        || (tid1 == tid2 && pos1 == pos2 && !neg1)
+    {
+        false
+    } else {
+        std::mem::swap(&mut tid1, &mut tid2);
+        std::mem::swap(&mut pos1, &mut pos2);
+        std::mem::swap(&mut neg1, &mut neg2);
+        true
+    };
+
+    Ok(TemplateCoordinateKey {
+        tid1,
+        tid2,
+        pos1,
+        pos2,
+        neg1,
+        neg2,
+        library,
+        mid,
+        name,
+        is_upper_of_pair,
+    })
+}
+
+/// `bam_sort.c` `template_coordinate_key_compare_mid`: ignore a trailing
+/// `/<single char>`, then compare; the shorter prefix sorts first.
+fn compare_mid(m1: &[u8], m2: &[u8]) -> Ordering {
+    let trim = |m: &[u8]| -> usize {
+        let l = m.len();
+        if l >= 2 && m[l - 2] == b'/' { l - 2 } else { l }
+    };
+    let (len1, len2) = (trim(m1), trim(m2));
+    let shortest = len1.min(len2);
+    let mut i = 0;
+    while i < shortest && m1[i] == m2[i] {
+        i += 1;
+    }
+    if i == len1 && i < len2 {
+        Ordering::Less
+    } else if i == len2 && i < len1 {
+        Ordering::Greater
+    } else if i == len1 && i == len2 {
+        Ordering::Equal
+    } else {
+        m1[i].cmp(&m2[i])
+    }
+}
+
+/// `bam_sort.c` `bam1_cmp_template_coordinate`.
+fn template_coordinate_cmp(a: &TemplateCoordinateKey, b: &TemplateCoordinateKey) -> Ordering {
+    a.tid1
+        .cmp(&b.tid1)
+        .then_with(|| a.tid2.cmp(&b.tid2))
+        .then_with(|| a.pos1.cmp(&b.pos1))
+        .then_with(|| a.pos2.cmp(&b.pos2))
+        // neg == true sorts first.
+        .then_with(|| match (a.neg1, b.neg1) {
+            (x, y) if x == y => Ordering::Equal,
+            (true, _) => Ordering::Less,
+            _ => Ordering::Greater,
+        })
+        .then_with(|| match (a.neg2, b.neg2) {
+            (x, y) if x == y => Ordering::Equal,
+            (true, _) => Ordering::Less,
+            _ => Ordering::Greater,
+        })
+        .then_with(|| a.library.cmp(&b.library))
+        .then_with(|| compare_mid(&a.mid, &b.mid))
+        .then_with(|| a.name.cmp(&b.name))
+        // is_upper_of_pair: a upper & b not → greater.
+        .then_with(|| match (a.is_upper_of_pair, b.is_upper_of_pair) {
+            (x, y) if x == y => Ordering::Equal,
+            (true, _) => Ordering::Greater,
+            _ => Ordering::Less,
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -439,12 +1477,21 @@ fn tag_sort_value(record: &RecordBuf, tag: [u8; 2]) -> TagSortValue {
     }
 }
 
-fn set_sort_order(header: &mut sam::Header, so: &str, ss: Option<&str>) {
+fn set_sort_order(header: &mut sam::Header, so: &str, go: Option<&str>, ss: Option<&str>) {
     use bstr::BString;
+    use sam::header::record::value::map::header::tag::GROUP_ORDER;
     use sam::header::record::value::map::{self, Map};
     if let Some(hd) = header.header_mut() {
         hd.other_fields_mut()
             .insert(map::header::tag::SORT_ORDER, BString::from(so));
+        match go {
+            Some(go) => {
+                hd.other_fields_mut().insert(GROUP_ORDER, BString::from(go));
+            }
+            None => {
+                hd.other_fields_mut().shift_remove(&GROUP_ORDER);
+            }
+        }
         match ss {
             Some(ss) => {
                 hd.other_fields_mut()
@@ -459,6 +1506,9 @@ fn set_sort_order(header: &mut sam::Header, so: &str, ss: Option<&str>) {
         let mut hd: Map<map::Header> = Map::default();
         hd.other_fields_mut()
             .insert(map::header::tag::SORT_ORDER, BString::from(so));
+        if let Some(go) = go {
+            hd.other_fields_mut().insert(GROUP_ORDER, BString::from(go));
+        }
         if let Some(ss) = ss {
             hd.other_fields_mut()
                 .insert(map::header::tag::SUBSORT_ORDER, BString::from(ss));
@@ -500,15 +1550,59 @@ impl SortSink for SamStdout {
     }
 }
 
+/// Replaces/sets the `@HD` line's `SO:`/`SS:` fields in raw header text,
+/// preserving every other line and field verbatim (so `@RG`/`@SQ`/`@CO`
+/// keep their original byte form). Inserts an `@HD` if absent.
+fn apply_hd_sort_order(raw: &str, so: &str, go: Option<&str>, ss: Option<&str>) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut had_hd = false;
+    for line in raw.lines() {
+        if line.starts_with("@HD") {
+            had_hd = true;
+            let mut fields: Vec<&str> = line
+                .split('\t')
+                .filter(|f| !f.starts_with("SO:") && !f.starts_with("GO:") && !f.starts_with("SS:"))
+                .collect();
+            let mut nl = fields.join("\t");
+            if fields.is_empty() {
+                nl.push_str("@HD");
+            }
+            nl.push_str(&format!("\tSO:{so}"));
+            if let Some(go) = go {
+                nl.push_str(&format!("\tGO:{go}"));
+            }
+            if let Some(ss) = ss {
+                nl.push_str(&format!("\tSS:{ss}"));
+            }
+            lines.push(nl);
+            let _ = &mut fields;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !had_hd {
+        let go = go.map(|g| format!("\tGO:{g}")).unwrap_or_default();
+        let hd = match ss {
+            Some(ss) => format!("@HD\tVN:1.6\tSO:{so}{go}\tSS:{ss}"),
+            None => format!("@HD\tVN:1.6\tSO:{so}{go}"),
+        };
+        lines.insert(0, hd);
+    }
+    let mut s = lines.join("\n");
+    s.push('\n');
+    s
+}
+
 fn open_output(
     out: Option<&Path>,
     fmt: OutFmt,
     header: &sam::Header,
+    header_text: &str,
 ) -> io::Result<Box<dyn SortSink>> {
     match (out, fmt) {
         (Some(p), OutFmt::Sam) => {
             let mut file = File::create(p)?;
-            crate::sam_render::write_header(&mut file, header)?;
+            file.write_all(header_text.as_bytes())?;
             Ok(Box::new(SamFile(file)))
         }
         (Some(p), OutFmt::Bam) => {
@@ -519,7 +1613,7 @@ fn open_output(
         }
         (None, OutFmt::Sam) => {
             let mut stdout = io::stdout();
-            crate::sam_render::write_header(&mut stdout, header)?;
+            stdout.write_all(header_text.as_bytes())?;
             Ok(Box::new(SamStdout(stdout)))
         }
         (None, OutFmt::Bam) => {

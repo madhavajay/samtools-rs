@@ -3,15 +3,16 @@
 
 use std::ffi::OsString;
 use std::io::{BufReader, Cursor};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Mutex;
 
 use htslib_rs::bam;
 use htslib_rs::sam;
 use samtools_rs::commands::{
-    addreplacerg, bedcov, calmd, cat, checksum, depad, faidx, fastq, fixmate, flagstat, fqidx,
-    idxstats, import, index, reference, reheader, reset, rmdup, samples, split, view,
+    addreplacerg, bedcov, calmd, cat, checksum, consensus, cram_size, depad, faidx, fastq, fixmate,
+    flagstat, fqidx, idxstats, import, index, mpileup, reference, reheader, reset, rmdup, samples,
+    sort, split, view,
 };
 use samtools_rs::header_text;
 use samtools_rs::run as samtools_run;
@@ -54,6 +55,60 @@ fn tmp_dir(name: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!("samtools-rs-misc-{}-{}", name, std::process::id()));
     std::fs::create_dir_all(&p).unwrap();
     p
+}
+
+fn fasta_region(path: &Path, name: &str, start: usize, end: usize) -> String {
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut current_name = None;
+    let mut seq = String::new();
+
+    for line in text.lines() {
+        if let Some(header) = line.strip_prefix('>') {
+            current_name = Some(header.split_whitespace().next().unwrap_or(""));
+            continue;
+        }
+
+        if current_name == Some(name) {
+            seq.push_str(line);
+        }
+    }
+
+    let slice = &seq[start - 1..end];
+    let mut out = format!(">{name}:{start}-{end} length: {}\n", end - start + 1);
+    for chunk in slice.as_bytes().chunks(60) {
+        out.push_str(std::str::from_utf8(chunk).unwrap());
+        out.push('\n');
+    }
+    out
+}
+
+fn build_reference_embed_ref_cram(tmp: &Path) -> PathBuf {
+    let d = fixtures_dir();
+    let sam = d.join("dat/mpileup.1.sam");
+    let refa = d.join("dat/mpileup.ref.fa");
+    let cram = tmp.join("mpileup.1.tmp.cram");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "view",
+                "--no-PG",
+                "-e",
+                "pos<1000||pos>1200",
+                "-O",
+                "cram,embed_ref=1",
+                "-T",
+                refa.to_str().unwrap(),
+                "-o",
+                cram.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+
+    cram
 }
 
 fn argv(name: &str, rest: &[&str]) -> Vec<OsString> {
@@ -880,6 +935,54 @@ fn reference_region_uses_indexed_bam_query_path() {
     );
 }
 
+/// `samtools reference` MD path on CRAM input. Builds the upstream
+/// `test_reference` embed_ref CRAM in a temp dir, then checks the
+/// external-reference MD2ref output byte-exactly against the committed
+/// upstream `mpileup.MD.fa` fixture (whole-file + region).
+#[test]
+fn reference_cram_md_path_with_reference_matches_upstream() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let d = fixtures_dir();
+    let refa = d.join("dat/mpileup.ref.fa");
+    let tmp = tmp_dir("reference-cram-md");
+    let cram = build_reference_embed_ref_cram(&tmp);
+    let expected_full = d.join("reference/mpileup.MD.fa.expected");
+
+    let cases: Vec<(&[&str], String)> = vec![
+        (&[], std::fs::read_to_string(&expected_full).unwrap()),
+        (
+            &["-r", "17:1000-1500"],
+            fasta_region(&expected_full, "17", 1000, 1500),
+        ),
+    ];
+    for (i, (extra, expected)) in cases.into_iter().enumerate() {
+        let out = tmp.join(format!("reference_md_{i}.fa"));
+        let mut a: Vec<String> = vec![
+            "samtools".into(),
+            "--reference".into(),
+            refa.to_str().unwrap().into(),
+            "reference".into(),
+            "-q".into(),
+        ];
+        a.extend(extra.iter().map(|s| s.to_string()));
+        a.push(cram.to_str().unwrap().into());
+        a.push("-o".into());
+        a.push(out.to_str().unwrap().into());
+        assert_eq!(
+            exit_to_u8(samtools_run(
+                a.iter().map(std::ffi::OsString::from).collect()
+            )),
+            0,
+            "args={a:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            expected,
+            "reference MD case {i} must be byte-exact"
+        );
+    }
+}
+
 #[test]
 fn flagstat_cram_uses_top_level_reference() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
@@ -902,11 +1005,14 @@ fn flagstat_cram_uses_top_level_reference() {
 }
 
 #[test]
-fn flagstat_cram_without_reference_fails_cleanly() {
+fn flagstat_cram_without_reference_succeeds() {
+    // flagstat only inspects flags (reference-independent in CRAM), so
+    // it now works without `--reference` via the synthesizing path,
+    // matching `samtools flagstat foo.cram`.
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let cram = htslib_fixtures_dir().join("range.cram");
 
-    assert_ne!(
+    assert_eq!(
         exit_to_u8(samtools_run(argv(
             "samtools",
             &["flagstat", cram.to_str().unwrap()],
@@ -987,11 +1093,16 @@ fn idxstats_cram_uses_top_level_reference() {
 }
 
 #[test]
-fn idxstats_cram_without_reference_fails_cleanly() {
+fn idxstats_cram_without_reference_succeeds() {
+    // idxstats needs only per-record reference id + flags
+    // (reference-independent in CRAM), so it now works without
+    // `--reference` via the synthesizing path. (Byte-exact counts vs
+    // the BAM equivalent are proven by the htslib-rs unit test
+    // `cram_summaries_without_reference_match_bam_flags_and_tids`.)
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let cram = htslib_fixtures_dir().join("range.cram");
 
-    assert_ne!(
+    assert_eq!(
         exit_to_u8(samtools_run(argv(
             "samtools",
             &["idxstats", cram.to_str().unwrap()],
@@ -4519,7 +4630,7 @@ fn reset_no_pg_skips_adding_reset_program_entry() {
 }
 
 #[test]
-fn reset_reject_pg_removes_program_chain_from_id() {
+fn reset_reject_pg_removes_named_pg_and_all_subsequent() {
     let tmp = tmp_dir("reset-reject-pg");
     let sam = tmp.join("in.sam");
     let out = tmp.join("reset.sam");
@@ -4552,10 +4663,138 @@ fn reset_reject_pg_removes_program_chain_from_id() {
         0
     );
 
+    // Upstream `reset.c:223`: `--reject-PG ID` keeps @PG lines until the
+    // first matching ID, then drops it and *every subsequent @PG*
+    // ("from this PG onwards"). bwa_index is the first @PG, so all
+    // three input @PG are dropped; only the added samtools @PG remains.
     let text = std::fs::read_to_string(out).unwrap();
     assert!(!text.contains("@PG\tID:bwa_index"));
     assert!(!text.contains("@PG\tID:bwa_aln"));
-    assert!(text.contains("@PG\tID:qc"));
+    assert!(!text.contains("@PG\tID:qc"));
+    assert!(text.contains("@PG\tID:samtools"));
+}
+
+#[test]
+fn reset_matches_upstream_test_reset_fixtures() {
+    use samtools_rs::commands::reset;
+    // Byte-exact vs upstream test_reset (harness `hskip=1` drops the
+    // first output line, `ignore_pg_header` strips @PG): -o SAM from a
+    // SAM input, -o SAM from a BAM input, and --no-RG; plus the
+    // reject.1 / reject.2 @PG-count assertions.
+    let d = fixtures_dir();
+    let tmp = tmp_dir("reset-fixtures");
+    // hskip=1 + strip @PG
+    let norm = |s: &str| -> String {
+        s.lines()
+            .skip(1)
+            .filter(|l| !l.starts_with("@PG\t"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    let exp_norm = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.starts_with("@PG\t"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    let cases: &[(&[&str], &str, &str)] = &[
+        (
+            &["--dupflag", "-o", "@OUT@", "dat/mpileup.1.sam"],
+            "@OUT@",
+            "reset/basic.output.mp.1.expected",
+        ),
+        (
+            &["--dupflag", "-o", "@OUT@", "dat/test_input_1_a.bam"],
+            "@OUT@",
+            "reset/basic.bam.input.expected",
+        ),
+        (
+            &[
+                "--dupflag",
+                "--reject-PG",
+                "bwa_index",
+                "dat/mpileup.1.sam",
+                "--no-RG",
+                "-o",
+                "@OUT@",
+            ],
+            "@OUT@",
+            "reset/output.nRG.1.expected",
+        ),
+    ];
+    for (i, (args, _, expected)) in cases.iter().enumerate() {
+        let out = tmp.join(format!("r{i}.sam"));
+        let v: Vec<OsString> = std::iter::once(OsString::from("reset"))
+            .chain(args.iter().map(|a| {
+                OsString::from(if *a == "@OUT@" {
+                    out.to_str().unwrap().to_string()
+                } else if a.starts_with("dat/") || a.starts_with("reset/") {
+                    d.join(a).to_str().unwrap().to_string()
+                } else {
+                    a.to_string()
+                })
+            }))
+            .collect();
+        assert_eq!(exit_to_u8(reset::main(&v)), 0, "{expected}");
+        assert_eq!(
+            norm(&std::fs::read_to_string(&out).unwrap()),
+            exp_norm(&std::fs::read_to_string(d.join(expected)).unwrap()),
+            "reset {expected}"
+        );
+    }
+
+    // reject.1: count of the added samtools @PG line.
+    let o = tmp.join("rej1.sam");
+    assert_eq!(
+        exit_to_u8(reset::main(&argv(
+            "reset",
+            &[
+                "--dupflag",
+                "--reject-PG",
+                "bwa_index",
+                d.join("dat/mpileup.1.sam").to_str().unwrap(),
+                "-o",
+                o.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let txt = std::fs::read_to_string(&o).unwrap();
+    let n = txt
+        .lines()
+        .filter(|l| l.starts_with("@PG\tID:samtools\tPN:samtools"))
+        .count();
+    assert_eq!(
+        n.to_string(),
+        std::fs::read_to_string(d.join("reset/reject.1.expected"))
+            .unwrap()
+            .trim()
+    );
+
+    // reject.2: total @PG count after positional "onwards" removal.
+    let o = tmp.join("rej2.sam");
+    assert_eq!(
+        exit_to_u8(reset::main(&argv(
+            "reset",
+            &[
+                "--dupflag",
+                "--reject-PG",
+                "sam_to_fixed_bam",
+                d.join("dat/mpileup.1.sam").to_str().unwrap(),
+                "-o",
+                o.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let txt = std::fs::read_to_string(&o).unwrap();
+    let n = txt.lines().filter(|l| l.starts_with("@PG\tID:")).count();
+    assert_eq!(
+        n.to_string(),
+        std::fs::read_to_string(d.join("reset/reject.2.expected"))
+            .unwrap()
+            .trim()
+    );
 }
 
 #[test]
@@ -5596,19 +5835,78 @@ fn calmd_drop_baq_removes_bq_tags() {
     assert!(record.contains("\tNM:i:0"));
 }
 
+/// Mirrors upstream `test_calmd`: `calmd -uAr mpileup.1.sam
+/// mpileup.ref.fa` must emit a BGZF (BAM) stream. We additionally
+/// assert the BAM round-trips with the input record count via `view`,
+/// and that the glued `-uAr` cluster is split like `getopt`.
 #[test]
-fn markdup_sam_input_flags_duplicates_keeping_highest_mapq() {
+fn calmd_dash_u_a_r_emits_bgzf_bam_like_upstream() {
+    use samtools_rs::commands::view;
+    let dat = fixtures_dir().join("dat");
+    let sam = dat.join("mpileup.1.sam");
+    let reference = dat.join("mpileup.ref.fa");
+    let tmp = tmp_dir("calmd-uAr");
+    let out = tmp.join("out.bam");
+
+    assert_eq!(
+        exit_to_u8(calmd::main(&argv(
+            "calmd",
+            &[
+                "--no-PG",
+                "-uAr",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+                reference.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    // BGZF magic (gzip \x1f\x8b + BAM's FEXTRA), the exact upstream
+    // `test_calmd` acceptance check.
+    let bytes = std::fs::read(&out).unwrap();
+    assert!(
+        bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b,
+        "calmd -uAr output is not BGZF-compressed"
+    );
+
+    // Record count is preserved through the SAM->BAQ->BAM path.
+    let in_records = std::fs::read_to_string(&sam)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('@'))
+        .count();
+    let counted = tmp.join("count.txt");
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &["-c", "-o", counted.to_str().unwrap(), out.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(&counted).unwrap().trim(),
+        in_records.to_string()
+    );
+}
+
+#[test]
+fn markdup_sam_input_flags_duplicates_keeping_highest_score() {
     use samtools_rs::commands::markdup;
     let tmp = tmp_dir("markdup-sam");
     let sam = tmp.join("in.sam");
     let out = tmp.join("out.sam");
+    // Upstream keeps the read with the higher `calc_score` (sum of base
+    // quals >= 15), not the higher MAPQ. `low` quals are all phred 0;
+    // `high` quals are all phred 40, so `high` wins regardless of MAPQ.
     std::fs::write(
         &sam,
         concat!(
             "@HD\tVN:1.6\tSO:coordinate\n",
             "@SQ\tSN:chr1\tLN:100\n",
             "low\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
-            "high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\tIIII\n",
             "reverse\t16\tchr1\t1\t30\t4M\t*\t0\t0\tCCCC\t$$$$\n",
             "unique\t0\tchr1\t2\t30\t4M\t*\t0\t0\tGGGG\t....\n",
         ),
@@ -5640,9 +5938,9 @@ fn markdup_sam_input_flags_duplicates_keeping_highest_mapq() {
     assert_eq!(
         flag_of(high) & 0x400,
         0,
-        "highest MAPQ in group keeps primary"
+        "highest calc_score in group keeps primary"
     );
-    assert_eq!(flag_of(low) & 0x400, 0x400, "low MAPQ duplicate flagged");
+    assert_eq!(flag_of(low) & 0x400, 0x400, "low-score duplicate flagged");
     assert_eq!(
         flag_of(reverse) & 0x400,
         0,
@@ -5667,7 +5965,7 @@ fn markdup_barcode_tag_separates_duplicate_groups() {
             "@HD\tVN:1.6\tSO:coordinate\n",
             "@SQ\tSN:chr1\tLN:100\n",
             "aa_low\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\tBC:Z:AA\n",
-            "aa_high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\tBC:Z:AA\n",
+            "aa_high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\tIIII\tBC:Z:AA\n",
             "bb\t0\tchr1\t1\t20\t4M\t*\t0\t0\tCCCC\t$$$$\tBC:Z:BB\n",
         ),
     )
@@ -6053,18 +6351,22 @@ fn markdup_propagates_duplicate_flag_to_supplementary_records() {
         concat!(
             "@HD\tVN:1.6\tSO:coordinate\n",
             "@SQ\tSN:chr1\tLN:1000\n",
-            "keep\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
-            "dup\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "keep\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\tIIII\n",
+            "dup\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\tSA:Z:chr1,20,+,4M,10,0;\n",
             "dup\t2048\tchr1\t20\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
-            "keep\t2048\tchr1\t30\t10\t4M\t*\t0\t0\tTGCA\t####\n",
+            "keep\t2048\tchr1\t30\t10\t4M\t*\t0\t0\tTGCA\tIIII\n",
         ),
     )
     .unwrap();
 
+    // Upstream only propagates to supplementary/secondary records with
+    // `-S`, and only when the marked-duplicate read carries `SA`/`XA` or
+    // an unmapped mate (here `dup` has an `SA` tag).
     assert_eq!(
         exit_to_u8(markdup::main(&argv(
             "markdup",
             &[
+                "-S",
                 "-O",
                 "sam",
                 "-o",
@@ -6095,6 +6397,7 @@ fn markdup_propagates_duplicate_flag_to_supplementary_records() {
         exit_to_u8(markdup::main(&argv(
             "markdup",
             &[
+                "-S",
                 "-r",
                 "-O",
                 "sam",
@@ -6117,6 +6420,781 @@ fn markdup_propagates_duplicate_flag_to_supplementary_records() {
             .lines()
             .any(|line| line.starts_with("keep\t2048\t"))
     );
+}
+
+#[test]
+fn ampliconstats_matches_upstream_test_ampliconstats_fixtures() {
+    use samtools_rs::commands::ampliconstats;
+    // Byte-exact (modulo the harness-stripped version/command-line lines)
+    // vs the entire upstream test_ampliconstats harness: single-ref
+    // multi-file (-S -t 50 -d 1,20,100), and the multi-ref/partial
+    // single-file -c 0 cases.
+    let astats = fixtures_dir().join("ampliconstats");
+    let aclip = fixtures_dir().join("ampliconclip");
+    let tmp = tmp_dir("ampliconstats-fixtures");
+    let strip = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.contains("Samtools version") && !l.contains("Command line"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    let p = |b: &std::path::Path| b.to_str().unwrap().to_string();
+    let cases: Vec<(Vec<String>, &str)> = vec![
+        (
+            vec![
+                "-S".into(),
+                "-t".into(),
+                "50".into(),
+                "-d".into(),
+                "1,20,100".into(),
+                p(&aclip.join("ac_test.bed")),
+                p(&aclip.join("1_hard_clipped.expected.sam")),
+                p(&aclip.join("1_soft_clipped.expected.sam")),
+                p(&aclip.join("1_soft_clipped_strand.expected.sam")),
+                p(&aclip.join("2_both_clipped.expected.sam")),
+            ],
+            "stats.expected.txt",
+        ),
+        (
+            vec![
+                "-c".into(),
+                "0".into(),
+                p(&aclip.join("multi_ref.bed")),
+                p(&astats.join("mixed_clipped.sam")),
+            ],
+            "stats_mixed.expected.txt",
+        ),
+        (
+            vec![
+                "-c".into(),
+                "0".into(),
+                p(&aclip.join("ac_test.bed")),
+                p(&astats.join("mixed_clipped.sam")),
+            ],
+            "stats_partial.expected.txt",
+        ),
+    ];
+    for (rest, expected) in cases {
+        let out = tmp.join(expected);
+        let mut v: Vec<String> = vec!["-o".into(), p(&out)];
+        v.extend(rest);
+        assert_eq!(
+            exit_to_u8(ampliconstats::main(&argv(
+                "ampliconstats",
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
+            ))),
+            0,
+            "ampliconstats {expected}"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            strip(&std::fs::read_to_string(astats.join(expected)).unwrap()),
+            "ampliconstats {expected} byte-exact",
+        );
+    }
+}
+
+#[test]
+fn stats_matches_upstream_stat_fixtures() {
+    use samtools_rs::commands::stats;
+    // Byte-exact end to end vs samtools' own `test/stat/*` expected
+    // output (modulo the three harness-stripped header lines, i.e.
+    // `| tail -n+4`): CHK, all SN lines, FFQ/LFQ, MPC, GCF/GCL,
+    // GCC/GCT/FBC/FTC/LBC/LTC, IS, RL/FRL/LRL, MAPQ, the ID/IC indel
+    // distribution + per-cycle rows, COV, and the GC-depth row. Covers
+    // the plain map, equal/full-seq, insertion (ID/IC + bases-cigar),
+    // `-i 0`, and secondary-read fixtures.
+    let stat = fixtures_dir().join("stat");
+    let tmp = tmp_dir("stats-fixtures");
+    let reference = stat.join("test.fa");
+    let p = |b: &std::path::Path| b.to_str().unwrap().to_string();
+    // `tail -n+4`: drop the produced-by / contains / command-line lines.
+    let strip = |s: &str| -> String { s.lines().skip(3).map(|l| format!("{l}\n")).collect() };
+    // (sam, extra args, expected). Covers plain map, equal/full-seq,
+    // X-cigar (MPC reference mismatch), insertion (ID/IC + bases-cigar),
+    // `-i 0`, supplementary (MPC + supp aux), and secondary fixtures.
+    let cases: [(&str, &[&str], &str); 8] = [
+        ("1_map_cigar.sam", &[], "1.stats.expected"),
+        ("2_equal_cigar_full_seq.sam", &[], "2.stats.expected"),
+        ("3_map_cigar_equal_seq.sam", &[], "3.stats.expected"),
+        ("4_X_cigar_full_seq.sam", &[], "4.stats.expected"),
+        ("5_insert_cigar.sam", &[], "5.stats.expected"),
+        ("5_insert_cigar.sam", &["-i", "0"], "6.stats.expected"),
+        ("7_supp.sam", &[], "7.stats.expected"),
+        ("8_secondary.sam", &[], "8.stats.expected"),
+    ];
+    for (sam, extra, expected) in cases {
+        let out = tmp.join(expected);
+        let mut v: Vec<String> = vec!["-r".into(), p(&reference), "-o".into(), p(&out)];
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v.push(p(&stat.join(sam)));
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
+            ))),
+            0,
+            "stats {expected}"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            std::fs::read_to_string(stat.join(expected)).unwrap(),
+            "stats {expected} byte-exact",
+        );
+    }
+
+    // stat/15: unpaired read with a 60000D deletion against the
+    // mpileup `ce.fa` reference — exercises the upstream `order`
+    // (unpaired => first fragment) and the `nindels` (>300) ID cap.
+    {
+        let ce_fa = fixtures_dir().join("mpileup").join("ce.fa");
+        let out = tmp.join("15.stats.expected");
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &[
+                    "-r",
+                    &p(&ce_fa),
+                    "-o",
+                    &p(&out),
+                    &p(&stat.join("15.big_del.sam")),
+                ]
+            ))),
+            0,
+            "stats 15"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            std::fs::read_to_string(stat.join("15.stats.expected")).unwrap(),
+            "stats 15 byte-exact",
+        );
+    }
+
+    // stat/13: barcode BCC/QTQ (and OXC/BZQ) sections, no reference.
+    for (sam, expected) in [
+        ("13_barcodes_ok.sam", "13.barcodes.bc.ok.expected"),
+        ("13_barcodes_ok_ox_bz.sam", "13.barcodes.ox.ok.expected"),
+    ] {
+        let out = tmp.join(expected);
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &["-o", &p(&out), &p(&stat.join(sam))]
+            ))),
+            0,
+            "stats {sam}"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            std::fs::read_to_string(stat.join(expected)).unwrap(),
+            "stats {sam} byte-exact",
+        );
+    }
+
+    // stat/12: overlapping-pairs BAM with `-t` BED. The overlap
+    // variants exercise the integer-halved insert-size avg/sd; the
+    // `-p`/--remove-overlaps variants the paired-overlap chunk
+    // subtraction (bases-mapped-cigar + coverage) and the f32
+    // error-rate cast.
+    let cases12: [(&[&str], &str); 4] = [
+        (&["12_3reads.bed"], "12.3reads.overlap.expected"),
+        (&["-p", "12_3reads.bed"], "12.3reads.nooverlap.expected"),
+        (&["12_2reads.bed"], "12.2reads.overlap.expected"),
+        (&["-p", "12_2reads.bed"], "12.2reads.nooverlap.expected"),
+    ];
+    for (rest, expected) in cases12 {
+        let (opt, bed) = if rest.len() == 2 {
+            (Some("-p"), rest[1])
+        } else {
+            (None, rest[0])
+        };
+        let out = tmp.join(expected);
+        let mut v: Vec<String> = vec!["-o".into(), p(&out)];
+        if let Some(o) = opt {
+            v.push(o.into());
+        }
+        v.push("-t".into());
+        v.push(p(&stat.join(bed)));
+        v.push(p(&stat.join("12_overlaps.bam")));
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
+            ))),
+            0,
+            "stats {expected}"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            std::fs::read_to_string(stat.join(expected)).unwrap(),
+            "stats {expected} byte-exact",
+        );
+    }
+
+    // `--ref-stats` RFS section (upstream compares only `grep ^RFS`):
+    // stat/16 no reference (GC/N = -1), stat/17 reference-backed GC/N
+    // (plain and `--ref-stats-chunk -1` no-op), stat/18 positional
+    // region, stat/19 `-t` target file (overlapping intervals merged).
+    let test1_fa = p(&stat.join("test1.fa"));
+    let sam = p(&stat.join("11_target.sam"));
+    let bam = p(&stat.join("11_target.bam"));
+    let targets = p(&stat.join("11.stats.targets"));
+    let rfs_cases: [(Vec<String>, &str); 5] = [
+        (vec![sam.clone()], "16.stats.expected"),
+        (
+            vec!["-r".into(), test1_fa.clone(), sam.clone()],
+            "17.stats.expected",
+        ),
+        (
+            vec![
+                "--ref-stats-chunk".into(),
+                "-1".into(),
+                "-r".into(),
+                test1_fa.clone(),
+                sam.clone(),
+            ],
+            "17.stats.expected",
+        ),
+        (
+            vec![
+                "-r".into(),
+                test1_fa.clone(),
+                bam.clone(),
+                "alpha:10-20".into(),
+            ],
+            "18.stats.expected",
+        ),
+        (
+            vec![
+                "-r".into(),
+                test1_fa.clone(),
+                "-t".into(),
+                targets.clone(),
+                sam.clone(),
+            ],
+            "19.stats.expected",
+        ),
+    ];
+    for (rest, expected) in rfs_cases {
+        let out = tmp.join(expected);
+        let mut v: Vec<String> = vec!["--ref-stats".into(), "-o".into(), p(&out)];
+        v.extend(rest);
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
+            ))),
+            0,
+            "stats --ref-stats {expected}"
+        );
+        let rfs: String = std::fs::read_to_string(&out)
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("RFS\t"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(
+            rfs,
+            std::fs::read_to_string(stat.join(expected)).unwrap(),
+            "stats --ref-stats {expected} RFS byte-exact",
+        );
+    }
+
+    // stat/11: `-t` target file on a SAM (streaming + region-clipped
+    // bases-mapped-cigar with the init_regions overlap-merge), the same
+    // expected via positional regions on the indexed BAM, and `-g 4`.
+    let targets11 = p(&stat.join("11.stats.targets"));
+    let sam11 = p(&stat.join("11_target.sam"));
+    let bam11 = p(&stat.join("11_target.bam"));
+    let region11_cases: [(Vec<String>, &str); 3] = [
+        (
+            vec!["-t".into(), targets11.clone(), sam11.clone()],
+            "11.stats.expected",
+        ),
+        (
+            vec![
+                bam11.clone(),
+                "ref1:10-24".into(),
+                "ref1:30-46".into(),
+                "ref1:39-56".into(),
+            ],
+            "11.stats.expected",
+        ),
+        (
+            vec![
+                "-g".into(),
+                "4".into(),
+                "-t".into(),
+                targets11.clone(),
+                sam11.clone(),
+            ],
+            "11.stats.g4.expected",
+        ),
+    ];
+    for (rest, expected) in region11_cases {
+        let out = tmp.join(expected);
+        let mut v: Vec<String> = vec!["-o".into(), p(&out)];
+        v.extend(rest);
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
+            ))),
+            0,
+            "stats region {expected}"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            std::fs::read_to_string(stat.join(expected)).unwrap(),
+            "stats region {expected} byte-exact",
+        );
+    }
+
+    // `-S RG` split cases: stdout matches `<n>.stats.expected` and each
+    // per-RG `<input>_<rg>.bamstat` matches its `.expected.bamstat`
+    // (both modulo the three stripped header lines). The input is copied
+    // into the temp dir so the side files land there.
+    let split_cases: [(&str, &str, &[&str]); 2] = [
+        ("1_map_cigar.sam", "9.stats.expected", &["s1_a_1"]),
+        (
+            "10_map_cigar.sam",
+            "10.stats.expected",
+            &["s1_a_1", "s1_b_1"],
+        ),
+    ];
+    for (sam, expected, rgs) in split_cases {
+        let local_sam = tmp.join(sam);
+        std::fs::copy(stat.join(sam), &local_sam).unwrap();
+        let out = tmp.join(expected);
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &[
+                    "-S",
+                    "RG",
+                    "-r",
+                    &p(&reference),
+                    "-o",
+                    &p(&out),
+                    &p(&local_sam),
+                ]
+            ))),
+            0,
+            "stats -S RG {expected}"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            std::fs::read_to_string(stat.join(expected)).unwrap(),
+            "stats -S RG {expected} stdout byte-exact",
+        );
+        for rg in rgs {
+            let bamstat = tmp.join(format!("{sam}_{rg}.bamstat"));
+            let exp = stat.join(format!("{sam}_{rg}.expected.bamstat"));
+            assert_eq!(
+                strip(&std::fs::read_to_string(&bamstat).unwrap()),
+                std::fs::read_to_string(&exp).unwrap(),
+                "stats -S RG {sam}_{rg}.bamstat byte-exact",
+            );
+        }
+    }
+
+    // `-I <rg>` read-group filter on an indexed BAM (stat/14), incl.
+    // grp3 which matches no reads (empty FFQ/LFQ/GCF/GCL but their
+    // comment headers are still emitted, as upstream).
+    let bam = stat.join("11_target.bam");
+    for rg in ["s1", "grp2", "grp3"] {
+        let out = tmp.join(format!("14.rg.{rg}"));
+        assert_eq!(
+            exit_to_u8(stats::main(&argv(
+                "stats",
+                &["-I", rg, "-o", &p(&out), &p(&bam)]
+            ))),
+            0,
+            "stats -I {rg}"
+        );
+        assert_eq!(
+            strip(&std::fs::read_to_string(&out).unwrap()),
+            std::fs::read_to_string(stat.join(format!("14.rg.{rg}.expected"))).unwrap(),
+            "stats -I {rg} byte-exact",
+        );
+    }
+}
+
+#[test]
+fn ampliconclip_matches_upstream_test_ampliconclip_fixtures() {
+    use samtools_rs::commands::ampliconclip;
+    // Byte-exact vs the entire upstream `test/ampliconclip` harness:
+    // soft/hard clip, NM/MD deletion, OA tag, strand, filter-len,
+    // fail-len, both-ends, multi-ref, total-hard-clip + unmap, and the
+    // three primer-counts TSVs.
+    let d = fixtures_dir().join("ampliconclip");
+    let tmp = tmp_dir("ampliconclip-fixtures");
+    let acb = d.join("ac_test.bed");
+    let acb = acb.to_str().unwrap();
+    let td = d.join("1_test_data.sam");
+    let td = td.to_str().unwrap();
+    let sam_cases: &[(&[&str], &str)] = &[
+        (
+            &["--no-PG", "--keep-tag", "--output-fmt=sam", "-b", acb, td],
+            "1_soft_clipped",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--output-fmt=sam",
+                "--hard-clip",
+                "-b",
+                acb,
+                td,
+            ],
+            "1_hard_clipped",
+        ),
+        (
+            &["--no-PG", "--output-fmt=sam", "-b", acb, td],
+            "1_delete_tag",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--output-fmt=sam",
+                "--original",
+                "-b",
+                acb,
+                td,
+            ],
+            "1_original_tag",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--output-fmt=sam",
+                "--strand",
+                "-b",
+                acb,
+                td,
+            ],
+            "1_soft_clipped_strand",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--output-fmt=sam",
+                "--strand",
+                "--filter-len",
+                "185",
+                "-b",
+                acb,
+                td,
+            ],
+            "1_filter",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--output-fmt=sam",
+                "--strand",
+                "--fail-len",
+                "185",
+                "-b",
+                acb,
+                td,
+            ],
+            "1_fail",
+        ),
+    ];
+    for (rest, expected) in sam_cases {
+        let out = tmp.join(format!("{expected}.sam"));
+        let mut v: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
+        v.extend(["-o".into(), out.to_str().unwrap().into()]);
+        assert_eq!(
+            exit_to_u8(ampliconclip::main(&argv(
+                "ampliconclip",
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
+            ))),
+            0,
+            "ampliconclip {expected}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(d.join(format!("{expected}.expected.sam"))).unwrap(),
+            "ampliconclip {expected} byte-exact",
+        );
+    }
+
+    // --both-ends, multi-ref, total-hard-clip.
+    let extra: &[(&[&str], &str)] = &[
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--output-fmt=sam",
+                "--strand",
+                "--both-ends",
+                "-b",
+                "ac_test.bed",
+                "2_both_test_data.sam",
+            ],
+            "2_both_clipped",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--output-fmt=sam",
+                "--keep-tag",
+                "-b",
+                "multi_ref.bed",
+                "3_multi_ref_data.sam",
+            ],
+            "3_multi_ref_clip",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--output-fmt=sam",
+                "--hard-clip",
+                "-b",
+                "ac_test2.bed",
+                "4_total_hc_data.sam",
+            ],
+            "4_total_hc_data",
+        ),
+    ];
+    for (rest, expected) in extra {
+        let out = tmp.join(format!("{expected}.sam"));
+        let mut v: Vec<String> = Vec::new();
+        for tok in *rest {
+            if tok.ends_with(".bed") || tok.ends_with(".sam") {
+                v.push(d.join(tok).to_str().unwrap().to_string());
+            } else {
+                v.push((*tok).to_string());
+            }
+        }
+        v.extend(["-o".into(), out.to_str().unwrap().into()]);
+        assert_eq!(
+            exit_to_u8(ampliconclip::main(&argv(
+                "ampliconclip",
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
+            ))),
+            0,
+            "ampliconclip {expected}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(d.join(format!("{expected}.expected.sam"))).unwrap(),
+            "ampliconclip {expected} byte-exact",
+        );
+    }
+
+    // primer-counts TSV outputs.
+    let pc = tmp.join("pc.tsv");
+    let pcs = pc.to_str().unwrap();
+    let pc_cases: &[(&[&str], &str)] = &[
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--primer-counts",
+                pcs,
+                "--output-fmt=sam",
+                "-b",
+                acb,
+                td,
+            ],
+            "1_soft_clipped_primer_counts",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--output-fmt=sam",
+                "--strand",
+                "--primer-counts",
+                pcs,
+                "-b",
+                acb,
+                td,
+            ],
+            "1_soft_clipped_strand_primer_counts",
+        ),
+    ];
+    for (rest, expected) in pc_cases {
+        let out = tmp.join("oc.sam");
+        let mut v: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
+        v.extend(["-o".into(), out.to_str().unwrap().into()]);
+        assert_eq!(
+            exit_to_u8(ampliconclip::main(&argv(
+                "ampliconclip",
+                &v.iter().map(String::as_str).collect::<Vec<_>>()
+            ))),
+            0,
+            "ampliconclip {expected}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pc).unwrap(),
+            std::fs::read_to_string(d.join(format!("{expected}.expected.tsv"))).unwrap(),
+            "ampliconclip {expected} byte-exact",
+        );
+    }
+}
+
+#[test]
+fn markdup_matches_upstream_test_markdup_fixtures() {
+    use samtools_rs::commands::markdup;
+    // Byte-exact vs upstream `samtools/test/markdup` expected SAMs
+    // (modulo @PG, suppressed by --no-PG): default template mode,
+    // `-r` removal, `-S` supplementary propagation, and `--mode s`
+    // sequence mode with optical-distance + barcode-tag keying.
+    let d = fixtures_dir();
+    let tmp = tmp_dir("markdup-fixtures");
+    let cases: &[(&[&str], &str, &str)] = &[
+        (&[], "5_markdup", "5_markdup.expected.sam"),
+        (&["-r"], "6_remove_dups", "6_remove_dups.expected.sam"),
+        (&["-S"], "7_mark_supp_dup", "7_mark_supp_dup.expected.sam"),
+        (
+            &[
+                "-S",
+                "-d",
+                "100",
+                "--mode",
+                "s",
+                "-t",
+                "--barcode-tag",
+                "BX",
+            ],
+            "13_optical_barcode_tag",
+            "13_optical_barcode_tag.expected.sam",
+        ),
+        (
+            &["-S", "-d", "100", "--mode", "s", "-t"],
+            "8_optical_dup",
+            "8_optical_dup.expected.sam",
+        ),
+        (
+            &["-S", "-d", "2500", "--mode", "s", "-t", "--include-fails"],
+            "9_optical_dup_qcfail",
+            "9_optical_dup_qcfail.expected.sam",
+        ),
+        (
+            &["-S", "-d", "2500", "--mode", "s", "-t", "-S"],
+            "10_optical_chain",
+            "10_optical_chain.expected.sam",
+        ),
+        (
+            &[
+                "--mode",
+                "t",
+                "-t",
+                "--duplicate-count",
+                "--barcode-tag",
+                "BC",
+                "-S",
+            ],
+            "18_primary_duplicate_count",
+            "18_primary_duplicate_count.expected.sam",
+        ),
+        (
+            &["-d", "100", "--mode", "s", "-t", "--use-read-groups"],
+            "17_read_group",
+            "17_read_group.expected.sam",
+        ),
+        (
+            &[
+                "-S",
+                "-d",
+                "2500",
+                "--mode",
+                "s",
+                "-t",
+                "--read-coords",
+                "([[:digit:]]+):([[:digit:]]+)$",
+                "--coords-order",
+                "xy",
+            ],
+            "12_optical_chain_regex",
+            "12_optical_chain_regex.expected.sam",
+        ),
+        (
+            &["-S", "-d", "100", "--mode", "s", "-t", "--barcode-name"],
+            "14_optical_barcode_name",
+            "14_optical_barcode_name.expected.sam",
+        ),
+        (
+            &[
+                "-S",
+                "-d",
+                "100",
+                "--mode",
+                "s",
+                "-t",
+                "--barcode-rgx",
+                "^([!-9;-?A-~]+):[0-9]+:",
+                "--read-coords",
+                "^[!-9;-?A-~]+:([0-9]+):([0-9]+)",
+                "--coords-order",
+                "xy",
+            ],
+            "15_optical_barcode_rgx_name",
+            "15_optical_barcode_rgx_name.expected.sam",
+        ),
+        (
+            &[
+                "-S",
+                "-d",
+                "100",
+                "--mode",
+                "s",
+                "-t",
+                "--read-coords",
+                "^([0-9]+):([0-9]+):([[:print:]]+)",
+                "--coords-order",
+                "xyt",
+            ],
+            "11_optical_dup_regex",
+            "11_optical_dup_regex.expected.sam",
+        ),
+        (
+            &[
+                "-S",
+                "-d",
+                "100",
+                "--mode",
+                "s",
+                "-t",
+                "--barcode-rgx",
+                "^([!-9;-?A-~]+):[0-9]+:",
+                "--read-coords",
+                "^[!-9;-?A-~]+:([0-9]{4})([0-9]{4})",
+                "--coords-order",
+                "xy",
+            ],
+            "16_optical_barcode_rgx_name_test_2",
+            "16_optical_barcode_rgx_name_test_2.expected.sam",
+        ),
+    ];
+    for (flags, stem, expected) in cases {
+        let inp = d.join("markdup").join(format!("{stem}.sam"));
+        let out = tmp.join(format!("{stem}.out.sam"));
+        let mut rest: Vec<&str> = flags.to_vec();
+        rest.extend(["-O", "sam", "--no-PG"]);
+        let inp_s = inp.to_str().unwrap();
+        let out_s = out.to_str().unwrap();
+        rest.extend(["-o", out_s, inp_s]);
+        assert_eq!(
+            exit_to_u8(markdup::main(&argv("markdup", &rest))),
+            0,
+            "markdup {stem}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(d.join("markdup").join(expected)).unwrap(),
+            "markdup {stem} byte-exact vs upstream"
+        );
+    }
 }
 
 #[test]
@@ -6180,4 +7258,883 @@ fn markdup_paired_end_groups_pairs_and_flags_duplicates() {
     // pair_c: NOT a duplicate (different coordinates)
     assert_eq!(flag_of("pair_c\t", 99) & 0x400, 0);
     assert_eq!(flag_of("pair_c\t", 147) & 0x400, 0);
+}
+
+#[test]
+fn mpileup_minus_b_ff_matches_upstream_out3() {
+    let tmp = tmp_dir("mpileup-out3");
+    let output = tmp.join("out.3");
+    let input = fixtures_dir().join("dat").join("mpileup.1.sam");
+    let reference = fixtures_dir().join("dat").join("mpileup.ref.fa");
+    let expected = fixtures_dir().join("dat").join("mpileup.out.3");
+
+    assert_eq!(
+        exit_to_u8(mpileup::main(&argv(
+            "mpileup",
+            &[
+                "-B",
+                "--ff",
+                "0x14",
+                "-f",
+                reference.to_str().unwrap(),
+                "-r17:1050-1060",
+                "-o",
+                output.to_str().unwrap(),
+                input.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(output).unwrap(),
+        std::fs::read_to_string(expected).unwrap()
+    );
+}
+
+#[test]
+fn mpileup_overlap_removal_matches_upstream_out5() {
+    let tmp = tmp_dir("mpileup-out5");
+    let output = tmp.join("out.5");
+    let input = fixtures_dir().join("mpileup").join("overlap.bam");
+    let expected = fixtures_dir().join("dat").join("mpileup.out.5");
+
+    assert_eq!(
+        exit_to_u8(mpileup::main(&argv(
+            "mpileup",
+            &[input.to_str().unwrap(), "-o", output.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let line = std::fs::read_to_string(output)
+        .unwrap()
+        .lines()
+        .find(|l| l.contains("128814202"))
+        .unwrap()
+        .to_string();
+    assert_eq!(line + "\n", std::fs::read_to_string(expected).unwrap());
+}
+
+#[test]
+fn index_bam_without_so_coordinate_header() {
+    // Upstream `samtools index` indexes coordinate-ordered BAMs whose
+    // header omits `@HD SO:coordinate` (completed library batch #6).
+    let tmp = tmp_dir("index-no-so");
+    let bam = tmp.join("test_input_1_a.bam");
+    std::fs::copy(fixtures_dir().join("dat").join("test_input_1_a.bam"), &bam).unwrap();
+
+    assert_eq!(
+        exit_to_u8(index::main(&argv("index", &[bam.to_str().unwrap()]))),
+        0
+    );
+    assert!(bam.with_extension("bam.bai").exists());
+}
+
+#[test]
+fn view_dot_region_means_whole_file() {
+    // HTSlib region grammar: `.` == everything (completed library batch #10).
+    let bam = fixtures_dir().join("dat").join("test_input_1_a.bam");
+    let tmp = tmp_dir("view-dot");
+    let with_dot = tmp.join("dot.txt");
+    let no_region = tmp.join("all.txt");
+
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &["-c", bam.to_str().unwrap(), "."]
+        ))),
+        0
+    );
+    // -c writes the count to stdout; compare via -o.
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &[
+                "-c",
+                "-o",
+                with_dot.to_str().unwrap(),
+                bam.to_str().unwrap(),
+                "."
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &[
+                "-c",
+                "-o",
+                no_region.to_str().unwrap(),
+                bam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(with_dot).unwrap(),
+        std::fs::read_to_string(no_region).unwrap()
+    );
+}
+
+#[test]
+fn view_large_chrom_csi_region_matches_upstream() {
+    // completed library batch #12: ref2 is 541556283 bp (> 2^29). With a header-aware
+    // CSI, `view large_chrom.bam ref2` and `ref2:1-541556283` must both
+    // produce dat/large_chrom.out without panicking.
+    let tmp = tmp_dir("large-chrom");
+    let bam = tmp.join("large_chrom.bam");
+    let sam = fixtures_dir().join("dat").join("large_chrom.sam");
+    let expected =
+        std::fs::read_to_string(fixtures_dir().join("dat").join("large_chrom.out")).unwrap();
+
+    // SAM -> BAM
+    let bam_out = tmp.join("lc.tmp");
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &["-b", "-o", bam.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+    // CSI index
+    assert_eq!(
+        exit_to_u8(index::main(&argv("index", &["-c", bam.to_str().unwrap()]))),
+        0
+    );
+
+    for region in ["ref2", "ref2:1-541556283"] {
+        assert_eq!(
+            exit_to_u8(view::main(&argv(
+                "view",
+                &[
+                    "-o",
+                    bam_out.to_str().unwrap(),
+                    bam.to_str().unwrap(),
+                    region,
+                ]
+            ))),
+            0,
+            "region {region}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&bam_out).unwrap(),
+            expected,
+            "region {region}"
+        );
+    }
+}
+
+#[test]
+fn threads_flag_is_byte_identical_for_view_and_sort() {
+    // completed library batch #8: `-@ N` must not change output bytes (worker-pool
+    // wiring is perf-only). `--no-PG` isolates payload from the @PG CL
+    // string, which legitimately embeds the thread arg.
+    let tmp = tmp_dir("threads");
+    let sam = fixtures_dir().join("dat").join("mpileup.1.sam");
+
+    let v4 = tmp.join("v4.bam");
+    let v1 = tmp.join("v1.bam");
+    for (out, n) in [(&v4, "-@4"), (&v1, "-@1")] {
+        assert_eq!(
+            exit_to_u8(view::main(&argv(
+                "view",
+                &[
+                    "--no-PG",
+                    n,
+                    "-b",
+                    "-o",
+                    out.to_str().unwrap(),
+                    sam.to_str().unwrap()
+                ]
+            ))),
+            0
+        );
+    }
+    assert_eq!(
+        std::fs::read(&v4).unwrap(),
+        std::fs::read(&v1).unwrap(),
+        "view -@ output must be byte-identical"
+    );
+
+    let s4 = tmp.join("s4.bam");
+    let s1 = tmp.join("s1.bam");
+    for (out, n) in [(&s4, "-@4"), (&s1, "-@1")] {
+        assert_eq!(
+            exit_to_u8(sort::main(&argv(
+                "sort",
+                &[
+                    "--no-PG",
+                    n,
+                    "-o",
+                    out.to_str().unwrap(),
+                    v1.to_str().unwrap()
+                ]
+            ))),
+            0
+        );
+    }
+    assert_eq!(
+        std::fs::read(&s4).unwrap(),
+        std::fs::read(&s1).unwrap(),
+        "sort -@ output must be byte-identical"
+    );
+}
+
+#[test]
+fn stats_cram_without_region_matches_bam_seq_quality() {
+    // completed library batch #2: no-region CRAM stats now use the full-record iterator,
+    // so sequence-length/quality/length SN lines match the BAM equivalent
+    // (NM-derived `mismatches`/`error rate` excepted — CRAM has no NM).
+    use samtools_rs::commands::stats;
+    let bam = htslib_fixtures_dir().join("range.bam");
+    let cram = htslib_fixtures_dir().join("range.cram");
+    let reference = htslib_fixtures_dir().join("ce.fa");
+    let tmp = tmp_dir("stats-cram");
+    let bo = tmp.join("bam.txt");
+    let co = tmp.join("cram.txt");
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[bam.to_str().unwrap(), "-o", bo.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &[
+                "-r",
+                reference.to_str().unwrap(),
+                cram.to_str().unwrap(),
+                "-o",
+                co.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let pick = |s: &str| -> Vec<String> {
+        s.lines()
+            .filter(|l| {
+                l.starts_with("SN\t") && !l.contains("mismatches:") && !l.contains("error rate:")
+            })
+            .map(str::to_string)
+            .collect()
+    };
+    let b = std::fs::read_to_string(&bo).unwrap();
+    let c = std::fs::read_to_string(&co).unwrap();
+    assert_eq!(pick(&b), pick(&c));
+    // Sanity: sequence/quality actually populated (not the old zeros).
+    assert!(b.contains("SN\ttotal length:\t11200"));
+    assert!(c.contains("SN\ttotal length:\t11200"));
+}
+
+#[test]
+fn checksum_cram_matches_bam_via_all_record_iterator() {
+    // completed library batch #2: whole-CRAM checksum via the htslib-rs all-record
+    // iterator must equal the BAM checksum (checksum is order-agnostic).
+    let _g = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let bam = htslib_fixtures_dir().join("range.bam");
+    let cram = htslib_fixtures_dir().join("range.cram");
+    let reference = htslib_fixtures_dir().join("ce.fa");
+    let tmp = tmp_dir("checksum-cram");
+    let bo = tmp.join("b.txt");
+    let co = tmp.join("c.txt");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "checksum",
+                bam.to_str().unwrap(),
+                "-o",
+                bo.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "checksum",
+                cram.to_str().unwrap(),
+                "-o",
+                co.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        checksum_all_row(&std::fs::read_to_string(&bo).unwrap()),
+        checksum_all_row(&std::fs::read_to_string(&co).unwrap()),
+    );
+}
+
+#[test]
+fn view_write_index_matches_post_pass_index() {
+    // completed library batch #9: `view --write-index` BAM output must produce a BAI
+    // byte-identical to a separate `samtools index` pass.
+    let bam = htslib_fixtures_dir().join("range.bam");
+    let tmp = tmp_dir("view-write-index");
+    let auto = tmp.join("auto.bam");
+    let post_bai = tmp.join("post.bam.bai");
+
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &[
+                "--write-index",
+                "-b",
+                "-o",
+                auto.to_str().unwrap(),
+                bam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    let auto_bai = auto.with_extension("bam.bai");
+    assert!(auto_bai.exists(), "view --write-index did not write a .bai");
+    let auto_bytes = std::fs::read(&auto_bai).unwrap();
+
+    assert_eq!(
+        exit_to_u8(index::main(&argv(
+            "index",
+            &[auto.to_str().unwrap(), post_bai.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        auto_bytes,
+        std::fs::read(&post_bai).unwrap(),
+        "--write-index BAI must equal the post-pass BAI"
+    );
+}
+
+#[test]
+fn view_star_region_selects_unplaced_reads() {
+    // HTSlib region grammar: `*` selects only unplaced (RNAME `*`) reads
+    // (completed library batch #10). Verified for SAM-text + count output.
+    let tmp = tmp_dir("view-star");
+    let sam = tmp.join("un.sam");
+    std::fs::write(
+        &sam,
+        "@HD\tVN:1.6\tSO:coordinate\n\
+         @SQ\tSN:ref1\tLN:100\n\
+         m1\t0\tref1\t10\t60\t5M\t*\t0\t0\tACGTA\tIIIII\n\
+         u1\t4\t*\t0\t0\t*\t*\t0\t0\tACGTA\tIIIII\n\
+         u2\t4\t*\t0\t0\t*\t*\t0\t0\tTTTTT\tIIIII\n",
+    )
+    .unwrap();
+    let bam = tmp.join("un.bam");
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &["-b", "-o", bam.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(index::main(&argv("index", &[bam.to_str().unwrap()]))),
+        0
+    );
+
+    let out = tmp.join("star.sam");
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &["-o", out.to_str().unwrap(), bam.to_str().unwrap(), "*"]
+        ))),
+        0
+    );
+    let body: Vec<String> = std::fs::read_to_string(&out)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.starts_with('@'))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(body.len(), 2);
+    assert!(body.iter().all(|l| l.split('\t').nth(2) == Some("*")));
+}
+
+#[test]
+fn consensus_simple_matches_upstream_fixtures() {
+    // completed library batch #1 wiring: `samtools consensus --mode simple` on the
+    // htslib-rs pileup engine, byte-exact vs test/consensus/expected/*.
+    let dir = fixtures_dir()
+        .parent()
+        .unwrap()
+        .join("test")
+        .join("consensus");
+    let sam = dir.join("consen1.sam");
+    let tmp = tmp_dir("consensus");
+
+    let cases: &[(&[&str], &str)] = &[
+        (&["-m", "simple", "-c", "0.6"], "1.out"),
+        (&["-m", "simple", "-c", "0.6", "--show-del", "yes"], "2.out"),
+        (&["-m", "simple", "-c", "0.6", "--show-ins", "no"], "3.out"),
+        (
+            &[
+                "-m",
+                "simple",
+                "-c",
+                "0.6",
+                "--show-del",
+                "yes",
+                "--show-ins",
+                "no",
+            ],
+            "4.out",
+        ),
+        (&["-f", "fastq", "-m", "simple", "-c", "0.6"], "1q.out"),
+        (
+            &[
+                "-f",
+                "fastq",
+                "-m",
+                "simple",
+                "-c",
+                "0.6",
+                "--show-del",
+                "yes",
+            ],
+            "2q.out",
+        ),
+        (
+            &[
+                "-f",
+                "fastq",
+                "-m",
+                "simple",
+                "-c",
+                "0.6",
+                "--show-ins",
+                "no",
+            ],
+            "3q.out",
+        ),
+        (&["-f", "pileup", "-m", "simple", "-c", "0.6"], "1p.out"),
+        (
+            &["-f", "fastq", "-m", "simple", "--call-fract", "0.600"],
+            "1q.out",
+        ),
+        (
+            &["-f", "fastq", "-m", "simple", "--call-fract", "0.601"],
+            "5q.out",
+        ),
+        (
+            &["-f", "pileup", "-m", "simple", "--call-fract", "0.601"],
+            "5p.out",
+        ),
+    ];
+
+    for (i, (args, expected)) in cases.iter().enumerate() {
+        let out = tmp.join(format!("c{i}"));
+        let mut a: Vec<&str> = args.to_vec();
+        a.push("-o");
+        a.push(out.to_str().unwrap());
+        a.push(sam.to_str().unwrap());
+        assert_eq!(
+            exit_to_u8(consensus::main(&argv("consensus", &a))),
+            0,
+            "case {expected}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(dir.join("expected").join(expected)).unwrap(),
+            "case {expected} args={args:?}"
+        );
+    }
+}
+
+#[test]
+fn coverage_matches_upstream_tabular_fixtures() {
+    // completed library batch #1: exact coverage — `%g`/`%.3g` formatting, min_depth
+    // gating of meandepth/meanbaseq, and pileup-arrival row ordering.
+    use samtools_rs::commands::coverage;
+    let d = fixtures_dir();
+    let sample = d.join("dat").join("sample.sam");
+    let tmp = tmp_dir("coverage-fix");
+    let sample1 = tmp.join("sample1.sam");
+    let text = std::fs::read_to_string(&sample).unwrap();
+    let filtered: String = text
+        .lines()
+        .filter(|l| !l.contains("A1"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&sample1, filtered).unwrap();
+
+    let cases: &[(&[&str], &str)] = &[
+        (&[], "1.expected"),
+        (&["--min-depth", "1"], "1.expected"),
+        (&["--min-depth", "2"], "2.expected"),
+        (&["--min-depth", "2", "-Q", "8", "-q", "45"], "3.expected"),
+    ];
+    for (args, exp) in cases {
+        let out = tmp.join(exp);
+        let mut a: Vec<&str> = args.to_vec();
+        a.push("-o");
+        a.push(out.to_str().unwrap());
+        a.push(sample.to_str().unwrap());
+        assert_eq!(
+            exit_to_u8(coverage::main(&argv("coverage", &a))),
+            0,
+            "{exp}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(d.join("coverage").join(exp)).unwrap(),
+            "coverage {exp} args={args:?}"
+        );
+    }
+
+    // Multi-input (sample.sam + sample1.sam).
+    for (md, exp) in [("1", "4.expected"), ("4", "5.expected")] {
+        let out = tmp.join(exp);
+        assert_eq!(
+            exit_to_u8(coverage::main(&argv(
+                "coverage",
+                &[
+                    "--min-depth",
+                    md,
+                    "-o",
+                    out.to_str().unwrap(),
+                    sample.to_str().unwrap(),
+                    sample1.to_str().unwrap(),
+                ]
+            ))),
+            0
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(d.join("coverage").join(exp)).unwrap(),
+            "coverage {exp}"
+        );
+    }
+}
+
+#[test]
+fn depth_large_pos_matches_upstream() {
+    // completed library batch #1: sparse depth (no OOM on LN:10001009800) + whitespace
+    // BED parsing — upstream large_pos depth fixtures byte-exact.
+    use samtools_rs::commands::depth;
+    let d = fixtures_dir().join("large_pos");
+    let tmp = tmp_dir("depth-largepos");
+
+    let o1 = tmp.join("depth.out");
+    assert_eq!(
+        exit_to_u8(depth::main(&argv(
+            "depth",
+            &[
+                "-o",
+                o1.to_str().unwrap(),
+                d.join("longref.sam").to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(&o1).unwrap(),
+        std::fs::read_to_string(d.join("depth.expected.out")).unwrap()
+    );
+
+    let o2 = tmp.join("depth_bed.out");
+    assert_eq!(
+        exit_to_u8(depth::main(&argv(
+            "depth",
+            &[
+                "-b",
+                d.join("test.bed").to_str().unwrap(),
+                "-o",
+                o2.to_str().unwrap(),
+                d.join("longref.sam").to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        std::fs::read_to_string(&o2).unwrap(),
+        std::fs::read_to_string(d.join("depth_bed.expected.out")).unwrap()
+    );
+}
+
+#[test]
+fn fixmate_matches_upstream_group() {
+    // TODO.md §13 / completed library batch #7: full upstream test_fixmate group
+    // byte-exact (modulo @PG, which the harness strips). Exercises
+    // del-then-append aux ordering (MQ/MC/ct) and MC:Z:* semantics.
+    use samtools_rs::commands::fixmate;
+    let d = fixtures_dir().join("fixmate");
+    let tmp = tmp_dir("fixmate-group");
+    let cases: &[(&[&str], &str)] = &[
+        (&["-z", "off", "-O", "sam"], "2_isize_overflow"),
+        (&["-O", "sam"], "3_reverse_read_pp_lt"),
+        (&["-O", "sam"], "4_reverse_read_pp_equal"),
+        (&["-cO", "sam"], "5_ct"),
+        (&["-cO", "sam"], "6_ct_replace"),
+        (&["-z", "off", "-O", "sam"], "7_two_read_mapped"),
+        (&["-z", "off", "-O", "sam"], "8_isize_overflow_64bit"),
+        (&["-O", "sam"], "sanitize"),
+    ];
+    for (args, name) in cases {
+        let out = tmp.join(format!("{name}.out"));
+        let mut a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        a.push("--no-PG".into());
+        a.push(d.join(format!("{name}.sam")).to_str().unwrap().into());
+        a.push(out.to_str().unwrap().into());
+        let refs: Vec<&str> = a.iter().map(String::as_str).collect();
+        assert_eq!(
+            exit_to_u8(fixmate::main(&argv("fixmate", &refs))),
+            0,
+            "{name}"
+        );
+        assert_eq!(
+            without_pg_lines(&std::fs::read_to_string(&out).unwrap()),
+            without_pg_lines(
+                &std::fs::read_to_string(d.join(format!("{name}.sam.expected"))).unwrap()
+            ),
+            "fixmate {name}"
+        );
+    }
+}
+
+#[test]
+fn addreplacerg_matches_upstream_group() {
+    // TODO.md §13: full upstream test_addrprg group byte-exact (modulo
+    // @PG). Covers -m overwrite_all/orphan_only, full `@RG\t..` -r spec
+    // (escaped tabs), incremental -r ID:/-r CN:, -w edit, -R overwrite.
+    let a = fixtures_dir().join("addrprg");
+    let tmp = tmp_dir("addrprg-group");
+    let cases: &[(&[&str], &str, &str)] = &[
+        (
+            &["-m", "overwrite_all"],
+            "1_fixup.sam",
+            "1_fixup.sam.expected",
+        ),
+        (
+            &["-m", "orphan_only"],
+            "2_fixup_orphan.sam",
+            "2_fixup_orphan.sam.expected",
+        ),
+        (
+            &["-r", "@RG\tID:1#8\tCN:SC"],
+            "4_fixup_norg.sam",
+            "4_fixup_norg.sam.expected",
+        ),
+        (
+            &["-r", "ID:1#8", "-r", "CN:SC"],
+            "4_fixup_norg.sam",
+            "4_fixup_norg.sam.expected",
+        ),
+        (
+            &[
+                "-w",
+                "-r",
+                "@RG\tID:1#8\tCN:Sanger\tDS:Testing the editing code.",
+            ],
+            "1_fixup.sam",
+            "5_editrg.sam.expected",
+        ),
+        (
+            &["-m", "overwrite_all", "-R", "1#8"],
+            "1_fixup.sam",
+            "1_fixup.sam.expected",
+        ),
+    ];
+    for (i, (args, input, expected)) in cases.iter().enumerate() {
+        let out = tmp.join(format!("o{i}"));
+        let mut v: Vec<String> = vec!["-O".into(), "sam".into()];
+        v.extend(args.iter().map(|s| s.to_string()));
+        v.push(a.join(input).to_str().unwrap().into());
+        v.push("-o".into());
+        v.push(out.to_str().unwrap().into());
+        let refs: Vec<&str> = v.iter().map(String::as_str).collect();
+        assert_eq!(
+            exit_to_u8(addreplacerg::main(&argv("addreplacerg", &refs))),
+            0,
+            "{expected}"
+        );
+        assert_eq!(
+            without_pg_lines(&std::fs::read_to_string(&out).unwrap()),
+            without_pg_lines(&std::fs::read_to_string(a.join(expected)).unwrap()),
+            "addrprg case {i} ({expected}) args={args:?}"
+        );
+    }
+}
+
+/// Drives the entire upstream `test/consensus/consensus.reg` harness
+/// in-process: every `INIT` line builds its BAM via `view` (with the
+/// `--write-index`), then every `P <name> ... consensus <args>` line is
+/// run and its output compared byte-for-byte to
+/// `test/consensus/expected/<name>`. Locks all 77 cases: simple +
+/// bayesian/recall, fasta/fastq/pileup, -a/-aa, -r, -T/--ref-qual,
+/// --min-MQ/--min-BQ, show-del/ins, and glued short options.
+#[test]
+fn consensus_matches_upstream_consensus_reg() {
+    use samtools_rs::commands::{consensus, view};
+    let dir = fixtures_dir().join("consensus");
+    let tmp = tmp_dir("consensus-reg");
+    // Stage the input SAM/FA(/fai) so relative names in the .reg resolve.
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let p = e.unwrap().path();
+        if matches!(
+            p.extension().and_then(|s| s.to_str()),
+            Some("sam") | Some("fa") | Some("fai")
+        ) {
+            std::fs::copy(&p, tmp.join(p.file_name().unwrap())).unwrap();
+        }
+    }
+    // Rewrite a bare relative fixture token to its staged abs path.
+    let abs = |t: &str| -> String {
+        if t.ends_with(".bam") || t.ends_with(".sam") || t.ends_with(".fa") || t.ends_with(".fai") {
+            tmp.join(t).to_str().unwrap().to_string()
+        } else {
+            t.to_string()
+        }
+    };
+    let reg = std::fs::read_to_string(dir.join("consensus.reg")).unwrap();
+    let mut n = 0usize;
+    for line in reg.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("INIT ") {
+            // INIT x $samtools view --write-index A.sam -o B.bam
+            let toks: Vec<&str> = rest.split_whitespace().collect();
+            let i = toks.iter().position(|&t| t == "view").unwrap();
+            let args: Vec<String> = toks[i + 1..].iter().map(|t| abs(t)).collect();
+            let a: Vec<&str> = args.iter().map(String::as_str).collect();
+            assert_eq!(
+                exit_to_u8(view::main(&argv("view", &a))),
+                0,
+                "INIT failed: {line}"
+            );
+        } else if let Some(rest) = line.strip_prefix("P ") {
+            // P <name> $samtools consensus $PARAM <args...>
+            // A few lines tee through a shell pipeline
+            // (`-o cons.tmp; cat cons.tmp; rm cons.tmp`); keep only the
+            // segment before the first `;` and drop its trailing
+            // `-o/--output cons.tmp` so we can supply our own `-o`.
+            let head = rest.split(';').next().unwrap();
+            let toks: Vec<&str> = head.split_whitespace().collect();
+            let name = toks[0];
+            let ci = toks.iter().position(|&t| t == "consensus").unwrap();
+            let out = tmp.join(format!("got.{name}"));
+            let mut args: Vec<String> = toks[ci + 1..]
+                .iter()
+                .filter(|&&t| t != "$PARAM")
+                .map(|t| abs(t))
+                .collect();
+            if matches!(args.last().map(String::as_str), Some(s) if s.ends_with("cons.tmp"))
+                && matches!(
+                    args.get(args.len().wrapping_sub(2)).map(String::as_str),
+                    Some("-o") | Some("--output")
+                )
+            {
+                args.truncate(args.len() - 2);
+            }
+            args.push("-o".into());
+            args.push(out.to_str().unwrap().to_string());
+            let a: Vec<&str> = args.iter().map(String::as_str).collect();
+            assert_eq!(
+                exit_to_u8(consensus::main(&argv("consensus", &a))),
+                0,
+                "consensus exit nonzero: {name} args={a:?}"
+            );
+            let got = std::fs::read(&out).unwrap();
+            let exp = std::fs::read(dir.join("expected").join(name)).unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                String::from_utf8_lossy(&exp),
+                "consensus.reg case {name} differs"
+            );
+            n += 1;
+        }
+    }
+    assert_eq!(n, 77, "expected 77 consensus.reg P-cases, ran {n}");
+}
+
+/// `samtools cram-size` default and `-v` reports are byte-exact vs
+/// the upstream `test/cram_size/cram_size.reg` fixtures (completed
+/// library batch #3). The `-e` "Container encodings" mode is included.
+#[test]
+fn cram_size_matches_upstream_cram_size_reg() {
+    let dir = fixtures_dir().join("cram_size");
+    let cram = dir.join("mpileup.1.cram");
+    let tmp = tmp_dir("cram-size");
+
+    for (args, expected) in [
+        (vec![], "normal.out"),
+        (vec!["-v"], "verbose.out"),
+        (vec!["-e"], "encodings.out"),
+    ] {
+        let out = tmp.join(expected);
+        let mut a: Vec<&str> = vec!["cram-size"];
+        a.extend_from_slice(&args);
+        a.push(cram.to_str().unwrap());
+        a.push("-o");
+        a.push(out.to_str().unwrap());
+        assert_eq!(
+            exit_to_u8(cram_size::main(&argv("cram-size", &a[1..]))),
+            0,
+            "args={a:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(dir.join("expected").join(expected)).unwrap(),
+            "cram-size {expected} must be byte-exact"
+        );
+    }
+}
+
+/// Full upstream `test_reference`: build an embed_ref CRAM with
+/// `view -e EXPR -O cram,embed_ref=1 -T ref`, then all four
+/// `samtools reference` invocations (MD path / `-e` embedded, with
+/// and without `-r`) are byte-exact vs the upstream fixtures —
+/// completed library batch #2 complete (embed_ref read+write + cram2ref).
+#[test]
+fn reference_embed_ref_full_test_reference_byte_exact() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let d = fixtures_dir();
+    let tmp = tmp_dir("reference-embed");
+    let cram = build_reference_embed_ref_cram(&tmp);
+    let md_full = d.join("reference/mpileup.MD.fa.expected");
+    let embed_full = d.join("reference/mpileup.embed.fa.expected");
+
+    let cases: Vec<(&[&str], String)> = vec![
+        (&[], std::fs::read_to_string(&md_full).unwrap()),
+        (&["-e"], std::fs::read_to_string(&embed_full).unwrap()),
+        (
+            &["-r", "17:1000-1500"],
+            fasta_region(&md_full, "17", 1000, 1500),
+        ),
+        (
+            &["-r", "17:1000-1500", "-e"],
+            fasta_region(&embed_full, "17", 1000, 1500),
+        ),
+    ];
+    for (i, (extra, expected)) in cases.into_iter().enumerate() {
+        let out = tmp.join(format!("reference_embed_{i}.fa"));
+        let mut a: Vec<String> = vec!["samtools".into(), "reference".into(), "-q".into()];
+        a.extend(extra.iter().map(|s| s.to_string()));
+        a.push(cram.to_str().unwrap().into());
+        a.push("-o".into());
+        a.push(out.to_str().unwrap().into());
+        assert_eq!(
+            exit_to_u8(samtools_run(
+                a.iter().map(std::ffi::OsString::from).collect()
+            )),
+            0,
+            "args={a:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            expected,
+            "reference embed case {i} must be byte-exact"
+        );
+    }
 }
