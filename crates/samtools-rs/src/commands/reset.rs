@@ -231,10 +231,14 @@ fn run_reset(
     }
 }
 
-/// Upstream `reset` output header: keep `@HD`, **drop `@SQ`** (all reads
-/// become unmapped), keep `@RG` (verbatim — raw field order) unless
-/// `--no-RG`, keep `@CO`/other lines, then add the samtools `@PG`
-/// (unless `--no-PG`). Returns `None` if the raw header is unavailable.
+/// Upstream `reset` output header (`reset.c:307-324`): a **fresh**
+/// header — `@HD\tVN:1.6` (`sam_hdr_init` + `SAM_FORMAT_VERSION`),
+/// then the input's `@RG` lines verbatim unless `--no-RG`
+/// (`getRGlines`), then the input's `@PG` lines verbatim with the
+/// `--reject-PG` cut (`getPGlines`) plus the samtools `@PG`. `@SQ`,
+/// `@CO`, the original `@HD`, and any other lines are dropped (all
+/// reads become unmapped). Returns `None` if the raw header is
+/// unavailable.
 fn reset_raw_header(path: &Path, settings: &ResetSettings<'_>) -> Option<String> {
     let raw = crate::header_text::read_raw_header_text(path).ok()?;
 
@@ -250,15 +254,16 @@ fn reset_raw_header(path: &Path, settings: &ResetSettings<'_>) -> Option<String>
     // order; keep them until the first whose `ID` matches, then drop
     // that one and **all subsequent @PG** ("from this PG onwards").
     let mut pg_cut = false;
-    let mut lines: Vec<String> = Vec::new();
+    let mut lines: Vec<String> = vec!["@HD\tVN:1.6".to_string()];
     for line in raw.lines() {
-        if line.starts_with("@SQ") || line.starts_with("@CO") {
+        if line.is_empty() {
             continue;
         }
-        if line.starts_with("@RG") && settings.remove_read_groups {
-            continue;
-        }
-        if line.starts_with("@PG") {
+        if line.starts_with("@RG") {
+            if !settings.remove_read_groups {
+                lines.push(line.to_string());
+            }
+        } else if line.starts_with("@PG") {
             if pg_cut {
                 continue;
             }
@@ -268,11 +273,9 @@ fn reset_raw_header(path: &Path, settings: &ResetSettings<'_>) -> Option<String>
                 pg_cut = true;
                 continue;
             }
+            lines.push(line.to_string());
         }
-        if line.is_empty() {
-            continue;
-        }
-        lines.push(line.to_string());
+        // @HD / @SQ / @CO / anything else: dropped (fresh header).
     }
     let mut text = lines.join("\n");
     text.push('\n');
@@ -290,11 +293,9 @@ fn run_reset_bam(
     fmt: OutFmt,
     settings: &ResetSettings<'_>,
 ) -> io::Result<()> {
-    let raw = if matches!(fmt, OutFmt::Sam) {
-        reset_raw_header(input, settings)
-    } else {
-        None
-    };
+    // Upstream rebuilds a fresh @HD/@RG/@PG header for *all* output
+    // formats (no @SQ); use it for BAM too so binary output drops @SQ.
+    let raw = reset_raw_header(input, settings);
     let mut reader = bam::io::Reader::new(File::open(input)?);
     run_reset_bam_reader(&mut reader, output, fmt, settings, raw.as_deref())
 }
@@ -331,11 +332,9 @@ fn run_reset_sam(
     fmt: OutFmt,
     settings: &ResetSettings<'_>,
 ) -> io::Result<()> {
-    let raw = if matches!(fmt, OutFmt::Sam) {
-        reset_raw_header(input, settings)
-    } else {
-        None
-    };
+    // Upstream rebuilds a fresh @HD/@RG/@PG header for *all* output
+    // formats (no @SQ); use it for BAM too so binary output drops @SQ.
+    let raw = reset_raw_header(input, settings);
     let bytes = normalize_legacy_sam_header_version(std::fs::read(input)?);
     let bytes = crate::sam_compat::normalize_sam_aux_int_types(&bytes);
     let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(bytes)));
@@ -632,8 +631,9 @@ fn open_output(
             Ok(Box::new(SamFile(w)))
         }
         (Some(p), OutFmt::Bam) => {
+            let hdr = bam_header(header, raw_header)?;
             let mut w = bam::io::Writer::new(File::create(p)?);
-            w.write_header(header)?;
+            w.write_header(&hdr)?;
             Ok(Box::new(BamFile(w)))
         }
         (None, OutFmt::Sam) => {
@@ -646,10 +646,24 @@ fn open_output(
             Ok(Box::new(SamStdout(w)))
         }
         (None, OutFmt::Bam) => {
+            let hdr = bam_header(header, raw_header)?;
             let mut w = bam::io::Writer::new(io::stdout());
-            w.write_header(header)?;
+            w.write_header(&hdr)?;
             Ok(Box::new(BamStdout(w)))
         }
+    }
+}
+
+/// Header for BAM output: the rebuilt `@HD/@RG/@PG` text parsed back
+/// into a structured header (so binary output also drops `@SQ`), or
+/// the in-memory header when no raw header is available (stdin path).
+fn bam_header(fallback: &sam::Header, raw_header: Option<&str>) -> io::Result<sam::Header> {
+    match raw_header {
+        Some(raw) => {
+            let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(raw.as_bytes())));
+            reader.read_header()
+        }
+        None => Ok(fallback.clone()),
     }
 }
 

@@ -1960,14 +1960,12 @@ fn merge_reconciles_rg_pg_byte_exact_vs_upstream() {
 
 /// Upstream `test_sort` minimiser case (`sort/minimiser-basic.sam`):
 /// `samtools reset --dupflag dat/auto_indexed.tmp.bam | samtools sort
-/// -m 10M -M -K10 -O SAM`. The minimiser sort must reorder the
-/// unmapped reads by their 62-bit minhash key and reverse-complement
-/// the records whose reverse-strand minimiser wins. We assert the
-/// alignment records are byte-identical to the upstream fixture (the
-/// point of the test) and that the `@HD` carries `SS:unsorted:minhash`.
-/// (`reset` BAM-output still keeps `@SQ` / `@HD VN:1.0` rather than
-/// upstream's dropped `@SQ` + `VN:1.6`; that header-fidelity gap is a
-/// separate `reset` follow-up and is intentionally excluded here.)
+/// -m 10M -M -K10 -O SAM`. The minimiser sort reorders the unmapped
+/// reads by their 62-bit minhash key and reverse-complements records
+/// whose reverse-strand minimiser wins; `reset` rebuilds the fresh
+/// `@HD VN:1.6` + `@RG` (no `@SQ`) header. Output is byte-identical to
+/// the upstream fixture under the harness' `ignore_pg_header` (`@PG`
+/// stripped) — header **and** all 569 records.
 #[test]
 fn sort_minimiser_basic_records_match_upstream() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
@@ -2013,24 +2011,18 @@ fn sort_minimiser_basic_records_match_upstream() {
 
     let got_text = std::fs::read_to_string(&got).unwrap();
     let exp_text = std::fs::read_to_string(dir.join("sort").join("minimiser-basic.sam")).unwrap();
-    let recs = |s: &str| -> String {
+    // The upstream harness compares with `ignore_pg_header => 1`
+    // (strip @PG runs); everything else — @HD/@RG header and all 569
+    // records — must be byte-identical.
+    let strip_pg = |s: &str| -> String {
         s.lines()
-            .filter(|l| !l.starts_with('@'))
+            .filter(|l| !l.starts_with("@PG"))
             .map(|l| format!("{l}\n"))
             .collect()
     };
     assert_eq!(
-        recs(&got_text),
-        recs(&exp_text),
-        "minimiser-sorted alignment records must be byte-identical to upstream"
-    );
-
-    let hd = got_text
-        .lines()
-        .find(|l| l.starts_with("@HD"))
-        .expect("@HD line");
-    assert!(
-        hd.contains("SO:unsorted") && hd.contains("SS:unsorted:minhash"),
-        "@HD must carry the minhash sort order, got: {hd}"
+        strip_pg(&got_text),
+        strip_pg(&exp_text),
+        "minimiser-basic must be byte-identical to upstream (modulo @PG)"
     );
 }
