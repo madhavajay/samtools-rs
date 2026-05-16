@@ -18,6 +18,7 @@ from pathlib import Path
 
 DEFAULT_GROUPS = [
     "test_reference",
+    "test_sort",
     "test_collate",
     "test_calmd",
     "test_idxstat",
@@ -53,6 +54,28 @@ def filtered_harness(src: Path, dst: Path, groups: set[str]) -> None:
     dst.write_text("".join(output))
 
 
+def prepare_sort_prereqs(root: Path) -> list[Path]:
+    """Stage files that upstream test_sort expects test_index to create."""
+
+    dat = root / "samtools" / "test" / "dat"
+    bam = dat / "auto_indexed.tmp.bam"
+    bai = dat / "auto_indexed.tmp.bam.bai"
+    existed = {path: path.exists() for path in (bam, bai)}
+    subprocess.run(
+        [
+            str(root / "samtools" / "samtools"),
+            "view",
+            "--write-index",
+            "-o",
+            str(bam),
+            str(dat / "mpileup.1.sam"),
+        ],
+        cwd=root / "samtools",
+        check=True,
+    )
+    return [path for path in (bam, bai) if not existed[path]]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -80,6 +103,10 @@ def main() -> int:
         target.write_bytes(args.samtools.read_bytes())
         target.chmod(0o755)
 
+    cleanup_paths: list[Path] = []
+    if "test_sort" in args.groups:
+        cleanup_paths.extend(prepare_sort_prereqs(root))
+
     filtered_harness(src, dst, set(args.groups))
     try:
         env = os.environ.copy()
@@ -92,6 +119,8 @@ def main() -> int:
         ).returncode
     finally:
         dst.unlink(missing_ok=True)
+        for path in cleanup_paths:
+            path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
