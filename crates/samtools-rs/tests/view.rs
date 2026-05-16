@@ -2157,3 +2157,88 @@ fn view_u_unselected_routes_into_bam_output_for_sam_input() {
     assert!(unsel_text.contains("\nr2\t"));
     assert!(!unsel_text.contains("\nr1\t"));
 }
+
+/// `view -b in.sam` must embed the samtools `@PG` in the **binary**
+/// BAM header (TODO-NEXT #4 / TODO.md). Round-trip via `view -h`:
+/// without `--no-PG` the BAM carries a `PN:samtools` `@PG`; with
+/// `--no-PG` it does not. Records are unaffected.
+#[test]
+fn view_b_embeds_pg_in_binary_bam_header() {
+    let tmp = tmp_dir("view-b-pg");
+    let sam = tmp.join("in.sam");
+    std::fs::write(
+        &sam,
+        "@HD\tVN:1.6\n@SQ\tSN:c1\tLN:10\nr1\t0\tc1\t1\t60\t4M\t*\t0\t0\tACGT\tIIII\n",
+    )
+    .unwrap();
+
+    // -b without --no-PG: BAM header gains a samtools @PG.
+    let bam = tmp.join("out.bam");
+    assert_eq!(
+        run(&["-b", sam.to_str().unwrap(), "-o", bam.to_str().unwrap()]),
+        0
+    );
+    let hdr = tmp.join("hdr.sam");
+    assert_eq!(
+        run(&[
+            "-H",
+            "--no-PG",
+            bam.to_str().unwrap(),
+            "-o",
+            hdr.to_str().unwrap(),
+        ]),
+        0
+    );
+    let hdr_text = std::fs::read_to_string(&hdr).unwrap();
+    assert!(
+        hdr_text
+            .lines()
+            .any(|l| l.starts_with("@PG") && l.contains("PN:samtools")),
+        "binary BAM header must carry the samtools @PG, got:\n{hdr_text}"
+    );
+
+    // -b --no-PG: no @PG in the BAM header.
+    let bam2 = tmp.join("out.nopg.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            "--no-PG",
+            sam.to_str().unwrap(),
+            "-o",
+            bam2.to_str().unwrap(),
+        ]),
+        0
+    );
+    let hdr2 = tmp.join("hdr2.sam");
+    assert_eq!(
+        run(&[
+            "-H",
+            "--no-PG",
+            bam2.to_str().unwrap(),
+            "-o",
+            hdr2.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(
+        !std::fs::read_to_string(&hdr2).unwrap().contains("@PG"),
+        "view -b --no-PG must not add a @PG"
+    );
+
+    // Records survive the SAM->BAM @PG-injection round-trip.
+    let recs = tmp.join("recs.sam");
+    assert_eq!(
+        run(&[
+            "--no-PG",
+            bam.to_str().unwrap(),
+            "-o",
+            recs.to_str().unwrap(),
+        ]),
+        0
+    );
+    let rt = std::fs::read_to_string(&recs).unwrap();
+    assert!(
+        rt.lines()
+            .any(|l| l.starts_with("r1\t") && l.contains("ACGT"))
+    );
+}

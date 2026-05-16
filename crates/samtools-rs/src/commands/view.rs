@@ -931,13 +931,13 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                     let raw = read_sam_path_bytes(input)?;
                     let (selected, unselected) = build_split_sam_text(&raw, opts)?;
                     htslib_rs::alignment_compat::write_bam_from_sam_reader(
-                        BufReader::new(io::Cursor::new(selected)),
+                        BufReader::new(io::Cursor::new(sam_bytes_with_pg(&selected, opts)?)),
                         dst_file,
                     )?;
                     if let Some(unselected_path) = opts.unselected_output.as_deref() {
                         let unselected_dst = File::create(unselected_path)?;
                         htslib_rs::alignment_compat::write_bam_from_sam_reader(
-                            BufReader::new(io::Cursor::new(unselected)),
+                            BufReader::new(io::Cursor::new(sam_bytes_with_pg(&unselected, opts)?)),
                             unselected_dst,
                         )?;
                     }
@@ -949,22 +949,34 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                             )?;
                         let filtered = filtered_sam_text(text.as_bytes(), opts)?;
                         htslib_rs::alignment_compat::write_bam_from_sam_reader(
-                            BufReader::new(io::Cursor::new(filtered)),
+                            BufReader::new(io::Cursor::new(sam_bytes_with_pg(&filtered, opts)?)),
                             dst_file,
                         )?;
                     } else {
-                        htslib_rs::alignment_compat::write_bam_matching_filter_from_sam_path(
-                            input, expr, dst_file,
+                        let text =
+                            htslib_rs::alignment_compat::view_sam_text_matching_filter_from_path(
+                                input, expr,
+                            )?;
+                        htslib_rs::alignment_compat::write_bam_from_sam_reader(
+                            BufReader::new(io::Cursor::new(sam_bytes_with_pg(
+                                text.as_bytes(),
+                                opts,
+                            )?)),
+                            dst_file,
                         )?;
                     }
                 } else if has_filters(opts) || has_record_rewrite(opts) {
                     let filtered = filtered_sam_text_from_path(input, opts)?;
                     htslib_rs::alignment_compat::write_bam_from_sam_reader(
-                        BufReader::new(io::Cursor::new(filtered)),
+                        BufReader::new(io::Cursor::new(sam_bytes_with_pg(&filtered, opts)?)),
                         dst_file,
                     )?;
                 } else {
-                    htslib_rs::alignment_compat::write_bam_from_sam_path(input, dst_file)?;
+                    let raw = read_sam_path_bytes(input)?;
+                    htslib_rs::alignment_compat::write_bam_from_sam_reader(
+                        BufReader::new(io::Cursor::new(sam_bytes_with_pg(&raw, opts)?)),
+                        dst_file,
+                    )?;
                 }
             }
             Exact::Bam => {
@@ -1741,6 +1753,33 @@ fn apply_pg_to_header(header_text: &str, opts: &Opts) -> io::Result<String> {
     };
     crate::pg::add_samtools_pg(header_text, argv)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Injects samtools' `@PG` chain entry into a SAM-text blob (header
+/// lines split from the body), so binary BAM/CRAM output produced by
+/// converting SAM text carries the `@PG` like upstream. A no-op under
+/// `--no-PG` or when no argv was captured.
+fn sam_bytes_with_pg(text: &[u8], opts: &Opts) -> io::Result<Vec<u8>> {
+    if opts.no_pg || opts.argv.is_none() {
+        return Ok(text.to_vec());
+    }
+    let s = match std::str::from_utf8(text) {
+        Ok(s) => s,
+        Err(_) => return Ok(text.to_vec()),
+    };
+    let mut header_end = 0;
+    for line in s.split_inclusive('\n') {
+        if line.starts_with('@') {
+            header_end += line.len();
+        } else {
+            break;
+        }
+    }
+    let new_header = apply_pg_to_header(&s[..header_end], opts)?;
+    let mut out = Vec::with_capacity(new_header.len() + (s.len() - header_end));
+    out.extend_from_slice(new_header.as_bytes());
+    out.extend_from_slice(&text[header_end..]);
+    Ok(out)
 }
 
 fn open_text_output(opts: &Opts) -> io::Result<Box<dyn Write>> {
