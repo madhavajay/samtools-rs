@@ -43,6 +43,7 @@ use crate::sam_global::current_global_args;
 /// Entry point for `samtools sort`.
 pub fn main(args: &[OsString]) -> ExitCode {
     let mut name_sort = false;
+    let mut natural_sort = true;
     let mut output: Option<PathBuf> = None;
     let mut output_fmt = OutFmt::Bam;
     let mut input: Option<PathBuf> = None;
@@ -64,6 +65,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
         match s {
             "-n" | "--name" => {
                 name_sort = true;
+            }
+            // `bam_sort.c` `-N`: name sort with lexicographical
+            // (byte `strcmp`) collation instead of natural order.
+            "-N" => {
+                name_sort = true;
+                natural_sort = false;
             }
             "-o" | "--output" => {
                 output = match iter.next().and_then(|a| a.to_str()) {
@@ -247,6 +254,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         write_index,
         if no_pg { None } else { Some(args) },
         minhash,
+        natural_sort,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -299,6 +307,7 @@ pub(crate) fn run_sort(
     write_index: bool,
     pg_argv: Option<&[OsString]>,
     minhash: Option<MinhashOpts>,
+    natural_sort: bool,
 ) -> io::Result<()> {
     let format = sam_io::sam_open_format(input)?;
     let (mut header, mut records) = match format.exact {
@@ -337,9 +346,9 @@ pub(crate) fn run_sort(
         keyed.sort_by(|a, b| minhash_cmp(&a.0, &b.0));
         records = keyed.into_iter().map(|(_, r)| r).collect();
     } else if let Some(tag) = tag_sort {
-        records.sort_by(|a, b| compare_by_tag(a, b, tag, name_sort));
+        records.sort_by(|a, b| compare_by_tag(a, b, tag, name_sort, natural_sort));
     } else if name_sort {
-        records.sort_by(name_cmp);
+        records.sort_by(|a, b| name_cmp(a, b, natural_sort));
     } else {
         // Coordinate sort: by (reference_sequence_id, alignment_start).
         records.sort_by(|a, b| {
@@ -366,7 +375,11 @@ pub(crate) fn run_sort(
                 tag[0] as char,
                 tag[1] as char,
                 if name_sort {
-                    "queryname:natural"
+                    if natural_sort {
+                        "queryname:natural"
+                    } else {
+                        "queryname:lexicographical"
+                    }
                 } else {
                     "coordinate"
                 }
@@ -375,7 +388,14 @@ pub(crate) fn run_sort(
     } else if name_sort {
         (
             "queryname".to_string(),
-            Some("queryname:natural".to_string()),
+            Some(
+                if natural_sort {
+                    "queryname:natural"
+                } else {
+                    "queryname:lexicographical"
+                }
+                .to_string(),
+            ),
         )
     } else {
         ("coordinate".to_string(), None)
@@ -1039,17 +1059,31 @@ fn minhash_cmp(a: &MinhashKey, b: &MinhashKey) -> Ordering {
         .then_with(|| a.rev.cmp(&b.rev))
 }
 
-/// Full `bam_sort.c` QueryName comparator.
-fn name_cmp(a: &RecordBuf, b: &RecordBuf) -> Ordering {
-    strnum_cmp(&name_key(a), &name_key(b)).then_with(|| qname_flag_key(a).cmp(&qname_flag_key(b)))
+/// Full `bam_sort.c` QueryName comparator. `bam_sort.c`'s `strnum_cmp`
+/// is natural-order unless `-N` (`!natural_sort`), where it is a plain
+/// byte `strcmp`.
+fn name_cmp(a: &RecordBuf, b: &RecordBuf, natural_sort: bool) -> Ordering {
+    let (ka, kb) = (name_key(a), name_key(b));
+    let primary = if natural_sort {
+        strnum_cmp(&ka, &kb)
+    } else {
+        ka.cmp(&kb)
+    };
+    primary.then_with(|| qname_flag_key(a).cmp(&qname_flag_key(b)))
 }
 
-fn compare_by_tag(a: &RecordBuf, b: &RecordBuf, tag: [u8; 2], name_sort: bool) -> Ordering {
+fn compare_by_tag(
+    a: &RecordBuf,
+    b: &RecordBuf,
+    tag: [u8; 2],
+    name_sort: bool,
+    natural_sort: bool,
+) -> Ordering {
     tag_sort_value(a, tag)
         .cmp(&tag_sort_value(b, tag))
         .then_with(|| {
             if name_sort {
-                name_cmp(a, b)
+                name_cmp(a, b, natural_sort)
             } else {
                 coordinate_key(a).cmp(&coordinate_key(b))
             }

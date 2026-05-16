@@ -1855,6 +1855,18 @@ fn sort_matches_upstream_test_sort_fixtures() {
             "dat/test_input_1_d.sam",
             "sort/tag.as.sort.expected.sam",
         ),
+        (
+            &["-t", "FI", "-m", "10M"],
+            "dat/test_input_1_d.sam",
+            "sort/tag.fi.sort.expected.sam",
+        ),
+        // `-N`: lexicographical (byte strcmp) name sort →
+        // @HD SS:queryname:lexicographical.
+        (
+            &["-N", "-m", "10M"],
+            "dat/test_input_1_b.bam",
+            "sort/name2.sort.expected.sam",
+        ),
     ];
     for (args, input, expected) in cases {
         let out = tmp.join(expected.replace('/', "_"));

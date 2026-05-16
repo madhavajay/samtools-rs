@@ -123,6 +123,7 @@ where
             false,
             None,
             None,
+            true,
         )?;
         Some(sorted_bam)
     } else {
@@ -251,6 +252,7 @@ where
         false,
         None,
         None,
+        true,
     )
 }
 
