@@ -10,9 +10,9 @@ use std::sync::Mutex;
 use htslib_rs::bam;
 use htslib_rs::sam;
 use samtools_rs::commands::{
-    addreplacerg, bedcov, calmd, cat, checksum, consensus, depad, faidx, fastq, fixmate, flagstat,
-    fqidx, idxstats, import, index, mpileup, reference, reheader, reset, rmdup, samples, sort,
-    split, view,
+    addreplacerg, bedcov, calmd, cat, checksum, consensus, cram_size, depad, faidx, fastq, fixmate,
+    flagstat, fqidx, idxstats, import, index, mpileup, reference, reheader, reset, rmdup, samples,
+    sort, split, view,
 };
 use samtools_rs::header_text;
 use samtools_rs::run as samtools_run;
@@ -8008,4 +8008,33 @@ fn consensus_matches_upstream_consensus_reg() {
         }
     }
     assert_eq!(n, 77, "expected 77 consensus.reg P-cases, ran {n}");
+}
+
+/// `samtools cram-size` default and `-v` reports are byte-exact vs
+/// the upstream `test/cram_size/cram_size.reg` fixtures (TODO-NEXT
+/// #3). The `-e` "Container encodings" mode is a separate sub-step.
+#[test]
+fn cram_size_matches_upstream_cram_size_reg() {
+    let dir = fixtures_dir().join("cram_size");
+    let cram = dir.join("mpileup.1.cram");
+    let tmp = tmp_dir("cram-size");
+
+    for (args, expected) in [(vec![], "normal.out"), (vec!["-v"], "verbose.out")] {
+        let out = tmp.join(expected);
+        let mut a: Vec<&str> = vec!["cram-size"];
+        a.extend_from_slice(&args);
+        a.push(cram.to_str().unwrap());
+        a.push("-o");
+        a.push(out.to_str().unwrap());
+        assert_eq!(
+            exit_to_u8(cram_size::main(&argv("cram-size", &a[1..]))),
+            0,
+            "args={a:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(dir.join("expected").join(expected)).unwrap(),
+            "cram-size {expected} must be byte-exact"
+        );
+    }
 }
