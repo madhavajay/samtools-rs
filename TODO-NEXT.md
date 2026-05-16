@@ -369,7 +369,22 @@ Everything else is ordinary samtools-rs porting + Phases 4–5.
   tests + upstream `test_stats` / `test_checksum` CRAM fixtures.
 - **Unblocks:** several CRAM-without-region gaps at once. Do this second.
 
-### 3. CRAM container / block / codec inventory API — 🟡 IN PROGRESS
+### 3. CRAM container / block / codec inventory API — ✅ DONE
+
+> **`cram-size` complete** (noodles `5c7edce` → htslib-rs `49d2eaa`
+> → samtools-rs `516e8b9`, building on the surface/method/normal-
+> verbose commits): `samtools cram-size`, `-v`, and `-e` are all
+> **byte-exact** vs `test/cram_size/cram_size.reg`
+> (`normal.out`/`verbose.out`/`encodings.out`), locked by
+> `cram_size_matches_upstream_cram_size_reg`. The final `-e` step
+> ported `cram_describe_encodings`/`cram_codec_describe` and the
+> htslib `tag_encoding_map` order (32 buckets,
+> `CRAM_MAP(a,b)=(a*3+b)&31`, prepend⇒reverse-within-bucket),
+> enabled by switching the vendored noodles `TagEncodings` to an
+> order-preserving `IndexMap`. `reference -e` (embedded-ref
+> extraction) can reuse this block walk; tracked under #2.
+
+Historical detail:
 
 > **Path resolved.** `noodles` here is a **vendored fork**
 > (`madhavajay/noodles`, submodule of `htslib-rs` at
