@@ -54,6 +54,9 @@ jobs:
       - name: Run passing samtools/test/test.pl subset
         run: python3 scripts/run-passing-parity-subset.py --samtools "$GITHUB_WORKSPACE/target/release/samtools"
 
+      - name: Run passing samtools/test regression.sh subset
+        run: python3 scripts/run-passing-regression-subset.py --samtools "$GITHUB_WORKSPACE/target/release/samtools"
+
       - name: Run samtools/test/test.pl against Rust binary
         run: |
           cp "$GITHUB_WORKSPACE/target/release/samtools" "$GITHUB_WORKSPACE/samtools/samtools"

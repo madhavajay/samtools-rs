@@ -28,6 +28,10 @@ Status values:
   `test_reference`, `test_collate`, `test_calmd`, `test_idxstat`,
   `test_quickcheck`, `test_markdup`, `test_ampliconclip`,
   and `test_ampliconstats`.
+- Required regression subset: CI also runs
+  `scripts/run-passing-regression-subset.py`, which executes stable upstream
+  `regression.sh` files. The enforced files are currently
+  `test/consensus/consensus.reg` and `test/cram_size/cram_size.reg`.
 - Full parity watch: CI still stages the Rust binary at the ignored
   `samtools/samtools` path and runs `cd samtools && perl test/test.pl || true`.
   Remove `|| true` only after all rows below are `passing` or explicitly
@@ -89,5 +93,6 @@ These are useful development checks, but they do not replace the upstream
 `test.pl` parity rows above.
 
 The required CI subset is maintained in
-`scripts/run-passing-parity-subset.py`; update its default group list whenever a
-row is stable enough to gate.
+`scripts/run-passing-parity-subset.py` and
+`scripts/run-passing-regression-subset.py`; update their default lists whenever
+a row or regression file is stable enough to gate.
