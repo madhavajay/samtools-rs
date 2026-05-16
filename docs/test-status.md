@@ -25,7 +25,7 @@ Status values:
   `scripts/run-passing-parity-subset.py`, which generates a temporary filtered
   copy of upstream `test.pl`. This is a stable CI subset rather than every
   row marked `passing`; the enforced groups are currently
-  `test_reference`, `test_sort`, `test_collate`, `test_calmd`,
+  `test_reference`, `test_dict`, `test_sort`, `test_collate`, `test_calmd`,
   `test_idxstat`, `test_quickcheck`, `test_head`, `test_markdup`,
   `test_bedcov`, `test_ampliconclip`, and `test_ampliconstats`.
 - Required regression subset: CI also runs
@@ -45,7 +45,7 @@ Status values:
 | `test_bgzip` | not-yet-ported | `bgzip` is an htslib tool, not currently in the samtools-rs binary scope. Decide whether to exclude from this parity run or add an htslib-rs CLI. |
 | `test_faidx` | partial | `faidx` builds `.fai` and extracts local uncompressed regions, including `-r`, `-o`, `--length`, `faidx -f` FASTQ mode, reverse-complement `-i`, and mark-strand modes. BGZI, compressed output/indexing, and exact warning text remain. |
 | `test_fqidx` | partial | FASTQ index build and local uncompressed region extraction exist, including reverse-complement `-i` and mark-strand modes. BGZI, compressed output/indexing, and exact warning text remain. |
-| `test_dict` | passing | TODO marks `dict.out`, `dict.alias.out`, and `dict.alt.out` byte-parity verified; covered by `crates/samtools-rs/tests/dict.rs`. |
+| `test_dict` | passing | The full upstream `test_dict` group passes (5/5): local FASTA, bgzip-compressed FASTA, stdin FASTA, alias header output, and alt-location header output. Covered by `crates/samtools-rs/tests/dict.rs`. |
 | `test_index` | partial | BAM/CSI/CRAI/SAM index build paths exist; threads, full `view -X`, merge/index interactions, and exact binary parity still need harness verification. |
 | `test_mpileup` | partial | Default text pileup is implemented on the `htslib-rs` pileup iterator (no longer a stub): multi-input + `-b`, `-f` reference, `-r` region, `-Q`/`-q`/`--ff`/`--rf`/`-A`/`-x`/`-o`, faithful `pileup_seq` encoding, HTSlib smart-overlap removal + orphan filter. Byte-exact vs upstream `mpileup.out.3` (`-B --ff 0x14`) and `mpileup.out.5` (overlap); `mpileup.out.1` matches on depth + read bases (quality chars differ only where HTSlib applies BAQ). Tests `mpileup_minus_b_ff_matches_upstream_out3`, `mpileup_overlap_removal_matches_upstream_out5`. BAQ-adjusted qualities from the completed BAQ/probaln surface, `@RG`-`SM` sample grouping, VCF/BCF (`-g`/`-v`), `-a`/`-aa` remain. |
 | `test_usage` | partial | Top-level dispatcher/help exists. Full upstream usage text for every subcommand is not yet verified. |
