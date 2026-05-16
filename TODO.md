@@ -455,7 +455,7 @@ underlying-library work.
 ## Submodule Pinning
 
 - [x] Pin `samtools/` to a specific upstream release tag once Phase 0 lands (record tag + commit in `README.md` and `version.rs`). Current pin: upstream tag `1.23.1`, commit `6efb9b6da35224cf804921dedecf9fb8f411365d`.
-- [x] Pin `htslib-rs/` to a known-green commit when Phase 0 lands. Current pin: `f61801c14d20fd551ac0a7c0ed7f87fdf59b105c` (merged TODO-NEXT #1-#12 library/infra blockers; prior: `3fadffc`, `8372873`, `530b27c`, `ca812dd`, `9cf30b3`, `e25f392`, `5b25622`, `da4d331`, `6bd6fb0`, `88bd29f`).
+- [x] Pin `htslib-rs/` to a known-green commit when Phase 0 lands. Current pin: `61e6e72f14f251e0849e8fe87a420eff374892af` (merged TODO-NEXT #1-#12 library/infra blockers, with vendored noodles PR #6 merged; prior: `f61801c`, `3fadffc`, `8372873`, `530b27c`, `ca812dd`, `9cf30b3`, `e25f392`, `5b25622`, `da4d331`, `6bd6fb0`, `88bd29f`).
 
 ## Repository Map (target end state)
 
