@@ -2241,6 +2241,60 @@ fn view_b_embeds_pg_in_binary_bam_header() {
         rt.lines()
             .any(|l| l.starts_with("r1\t") && l.contains("ACGT"))
     );
+
+    // BAM-input -> BAM-output also injects the @PG into the binary
+    // header (records streamed unchanged), suppressed by --no-PG.
+    let nopg_bam = tmp.join("base.nopg.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            "--no-PG",
+            sam.to_str().unwrap(),
+            "-o",
+            nopg_bam.to_str().unwrap(),
+        ]),
+        0
+    );
+    let bb = tmp.join("bam2bam.bam");
+    assert_eq!(
+        run(&["-b", nopg_bam.to_str().unwrap(), "-o", bb.to_str().unwrap()]),
+        0
+    );
+    let bbh = tmp.join("bb.sam");
+    assert_eq!(
+        run(&[
+            "-H",
+            "--no-PG",
+            bb.to_str().unwrap(),
+            "-o",
+            bbh.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(
+        std::fs::read_to_string(&bbh)
+            .unwrap()
+            .lines()
+            .any(|l| l.starts_with("@PG") && l.contains("PN:samtools")),
+        "BAM->BAM must inject the samtools @PG into the binary header"
+    );
+    let bbrecs = tmp.join("bb.recs.sam");
+    assert_eq!(
+        run(&[
+            "--no-PG",
+            bb.to_str().unwrap(),
+            "-o",
+            bbrecs.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(
+        std::fs::read_to_string(&bbrecs)
+            .unwrap()
+            .lines()
+            .any(|l| l.starts_with("r1\t") && l.contains("ACGT")),
+        "BAM->BAM @PG injection must preserve records"
+    );
 }
 
 /// `view -C` (SAM->CRAM) likewise embeds the samtools `@PG` in the

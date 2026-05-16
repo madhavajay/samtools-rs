@@ -1013,8 +1013,16 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                         htslib_rs::alignment_compat::write_bam_matching_filter_from_path(
                             input, expr, dst_file,
                         )?;
-                    } else {
+                    } else if opts.no_pg || opts.argv.is_none() {
                         htslib_rs::alignment_compat::write_bam_from_path(input, dst_file)?;
+                    } else {
+                        // BAM->BAM with binary @PG: rewrite only the
+                        // header text, stream records unchanged.
+                        htslib_rs::alignment_compat::write_bam_from_path_transforming_header(
+                            input,
+                            dst_file,
+                            |header_text| apply_pg_to_header(header_text, opts),
+                        )?;
                     }
                 } else {
                     let regions = parse_region_strings(input, &opts.regions)?;
