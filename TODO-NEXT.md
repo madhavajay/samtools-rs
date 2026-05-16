@@ -335,19 +335,40 @@ single-session work.
   tests + upstream `test_stats` / `test_checksum` CRAM fixtures.
 - **Unblocks:** several CRAM-without-region gaps at once. Do this second.
 
-### 3. CRAM container / block / codec inventory API
+### 3. CRAM container / block / codec inventory API — ⛔ BLOCKED (decision required)
 
-- **htslib-rs:** expose a minimal CRAM container/block/codec inventory
-  (CRAM internals are currently out of scope in `htslib-rs/README.md`).
-- **htslib-rs tests:** per-Content-ID / Data-Series byte tallies on a
-  reference CRAM fixture.
-- **samtools-rs wiring:** `cram-size` (entirely); `reference -e`
-  embedded-reference mode.
-- **samtools-rs tests:** `cram-size` integration test + upstream
-  `test_cram_size` fixture.
-- **Note:** if exposing CRAM internals is judged too costly, the
-  alternative decision is to drop `cram-size` from samtools-rs scope —
-  flag for a decision rather than half-implementing.
+> **Assessed (precise blocker).** `cram-size` needs, per container:
+> the block table (Content-ID, uncompressed/compressed size,
+> compression method, backing data-series) and the "Container
+> encodings" map (DataSeries → codec: `EXTERNAL(id)`,
+> `HUFFMAN(codes,lengths)`, `BYTE_ARRAY_STOP(stop,id)`,
+> `BYTE_ARRAY_LEN(len_codec,val_codec)`), plus tag encodings. In the
+> vendored **noodles-cram 0.93.0** these are all `pub(crate)` and not
+> re-exported, so they are unreachable from `htslib-rs` (which only
+> *consumes* noodles) **and** from `samtools-rs`:
+> - `CompressionHeader::{preservation_map,data_series_encodings,
+>   tag_encodings}` — `pub(crate)`.
+> - `DataSeriesEncodings`, `TagEncodings`, `PreservationMap` — type is
+>   `pub(crate)`.
+> - `io::reader::container::block::Block` (has public
+>   `compression_method`/`content_type`/`content_id`/
+>   `uncompressed_size`) — **not exported**; `Slice::decode_blocks()`
+>   only returns `(ContentId, Cow<[u8]>)` with no size/method metadata.
+>
+> Per the **Ground rules** ("Do not patch `noodles` … if a fix
+> genuinely cannot be done without a `noodles` change, stop and raise
+> it for a decision"), `cram-size` is **blocked on a scope decision**:
+> either (a) accept a minimal upstreamed/forked noodles-cram public
+> inventory surface, or (b) **drop `cram-size` from samtools-rs scope**
+> (the documented fallback in this item). Not half-implemented; no
+> noodles patch made. The dependent `reference -e` embedded-reference
+> mode shares this blocker.
+
+- **htslib-rs:** (blocked) would expose a CRAM container/block/codec
+  inventory — requires the noodles-cram accessors above to be public.
+- **samtools-rs wiring:** `cram-size` (entirely); `reference -e`.
+- **samtools-rs tests:** upstream `test/cram_size/cram_size.reg`
+  (`normal.out`/`verbose.out`/`encodings.out`).
 
 ### 4. `sam_hdr_add_pg` through the binary header
 
