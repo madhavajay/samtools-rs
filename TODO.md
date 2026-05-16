@@ -174,8 +174,8 @@ large-ref CSI, and embed_ref read+write.** Stable upstream groups/regression
 files include: `consensus` (all 77 `consensus.reg`), `sort` (all
 `test_sort`), `cram-size` (all 3), `reference` (all `test_reference`),
 `dict` (all `test_dict`), `head` (all `test_head`), `collate`, `calmd`,
-`idxstats`, `quickcheck`, `markdup`, `bedcov`, `ampliconclip`, and
-`ampliconstats`. Other commands have
+`idxstats`, `quickcheck`, `addreplacerg` (all `test_addrprg`), `markdup`,
+`bedcov`, `ampliconclip`, and `ampliconstats`. Other commands have
 substantial Rust coverage and partial upstream fixture parity, but remain
 tracked as `partial` until their full `test.pl` groups pass or are explicitly
 excluded. `phase` (`phase.c`, 843 LOC) and `targetcut` (`cut_target.c`, 257
@@ -420,7 +420,7 @@ The waves are ordered to land foundational machinery first (read/write/index) an
 
 ## Phase 4: Test Harness Integration
 
-- [~] **Parity gate setup**: confirmed the pinned upstream harness does not honor `-e samtools=<rust-binary-path>` for most commands because it constructs commands from `$$opts{bin}/samtools` after option parsing. CI now stages the Rust binary at the ignored `samtools/samtools` path, runs a required filtered `test.pl` copy for the stable subset maintained in `scripts/run-passing-parity-subset.py` (including `test_dict`, `test_head`, `test_sort`, whose `auto_indexed.tmp.bam` prerequisite is staged by the helper, and `test_bedcov`), runs a required `regression.sh` subset for `consensus.reg` and `cram_size.reg` via `scripts/run-passing-regression-subset.py`, and still runs the full `cd samtools && perl test/test.pl || true` harness as an advisory watch. **Pending:** promote additional stable groups/regression files into the required subsets and remove the full-harness `|| true` once the remaining tracked groups pass or are explicitly excluded.
+- [~] **Parity gate setup**: confirmed the pinned upstream harness does not honor `-e samtools=<rust-binary-path>` for most commands because it constructs commands from `$$opts{bin}/samtools` after option parsing. CI now stages the Rust binary at the ignored `samtools/samtools` path, runs a required filtered `test.pl` copy for the stable subset maintained in `scripts/run-passing-parity-subset.py` (including `test_dict`, `test_head`, `test_addrprg`, `test_sort`, whose `auto_indexed.tmp.bam` prerequisite is staged by the helper, and `test_bedcov`), runs a required `regression.sh` subset for `consensus.reg` and `cram_size.reg` via `scripts/run-passing-regression-subset.py`, and still runs the full `cd samtools && perl test/test.pl || true` harness as an advisory watch. **Pending:** promote additional stable groups/regression files into the required subsets and remove the full-harness `|| true` once the remaining tracked groups pass or are explicitly excluded.
 - [ ] **`@PG` handling**: where upstream expected outputs include `@PG` lines with a specific VN that we cannot reproduce, set `ignore_pg_header => 1` in those tests. Avoid touching the actual expected output files.
 - [x] **Status ledger**: `docs/test-status.md` tracks the upstream `test.pl` groups as `passing` / `partial` / `not-yet-ported` / `blocked`, including why CI still runs the parity harness with `|| true`.
 - [~] **Run progressively**: as each subcommand lands in Phase 3, enable its `test_<name>` or `.reg` file in CI when the group is stable in the upstream harness environment. The required subsets now run stable lists from `scripts/run-passing-parity-subset.py` and `scripts/run-passing-regression-subset.py`; additional passing/partial rows are still tracked in the status ledger and exercised by the advisory full harness.

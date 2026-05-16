@@ -210,9 +210,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
         match header_has_rg_id(&input, format.exact, &rg_id) {
             Ok(true) => {}
             Ok(false) => {
-                print_error(
-                    "addreplacerg",
-                    "RG ID supplied does not exist in header. Supply full @RG line with -r instead?",
+                eprintln!(
+                    "RG ID supplied does not exist in header. Supply full @RG line with -r instead?"
                 );
                 return ExitCode::from(1);
             }
