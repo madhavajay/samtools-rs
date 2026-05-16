@@ -1008,32 +1008,69 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                         BufReader::new(io::Cursor::new(sam_bytes_with_pg(&filtered, opts)?)),
                         dst_file,
                     )?;
-                } else if opts.regions.is_empty() {
-                    if let Some(expr) = filter.as_deref() {
-                        htslib_rs::alignment_compat::write_bam_matching_filter_from_path(
-                            input, expr, dst_file,
-                        )?;
-                    } else if opts.no_pg || opts.argv.is_none() {
-                        htslib_rs::alignment_compat::write_bam_from_path(input, dst_file)?;
-                    } else {
-                        // BAM->BAM with binary @PG: rewrite only the
-                        // header text, stream records unchanged.
-                        htslib_rs::alignment_compat::write_bam_from_path_transforming_header(
-                            input,
-                            dst_file,
-                            |header_text| apply_pg_to_header(header_text, opts),
-                        )?;
-                    }
                 } else {
-                    let regions = parse_region_strings(input, &opts.regions)?;
-                    if let Some(expr) = filter.as_deref() {
-                        htslib_rs::alignment_compat::write_bam_regions_matching_filter_from_path(
-                            input, &regions, expr, dst_file,
-                        )?;
+                    // Whether a binary @PG must be injected. When not,
+                    // keep the fast direct binary-copy paths.
+                    let want_pg = !opts.no_pg && opts.argv.is_some();
+                    if opts.regions.is_empty() {
+                        if let Some(expr) = filter.as_deref() {
+                            if want_pg {
+                                let text = htslib_rs::alignment_compat::view_bam_as_sam_text_matching_filter_from_path(
+                                    input, expr,
+                                )?;
+                                htslib_rs::alignment_compat::write_bam_from_sam_reader(
+                                    BufReader::new(io::Cursor::new(sam_bytes_with_pg(
+                                        text.as_bytes(),
+                                        opts,
+                                    )?)),
+                                    dst_file,
+                                )?;
+                            } else {
+                                htslib_rs::alignment_compat::write_bam_matching_filter_from_path(
+                                    input, expr, dst_file,
+                                )?;
+                            }
+                        } else if !want_pg {
+                            htslib_rs::alignment_compat::write_bam_from_path(input, dst_file)?;
+                        } else {
+                            // Rewrite only the header text; stream
+                            // records unchanged.
+                            htslib_rs::alignment_compat::write_bam_from_path_transforming_header(
+                                input,
+                                dst_file,
+                                |header_text| apply_pg_to_header(header_text, opts),
+                            )?;
+                        }
                     } else {
-                        htslib_rs::alignment_compat::write_bam_regions_from_path(
-                            input, &regions, dst_file,
-                        )?;
+                        let regions = parse_region_strings(input, &opts.regions)?;
+                        if !want_pg {
+                            if let Some(expr) = filter.as_deref() {
+                                htslib_rs::alignment_compat::write_bam_regions_matching_filter_from_path(
+                                    input, &regions, expr, dst_file,
+                                )?;
+                            } else {
+                                htslib_rs::alignment_compat::write_bam_regions_from_path(
+                                    input, &regions, dst_file,
+                                )?;
+                            }
+                        } else {
+                            let text = if let Some(expr) = filter.as_deref() {
+                                htslib_rs::alignment_compat::view_bam_regions_as_sam_text_matching_filter_from_path(
+                                    input, &regions, expr,
+                                )?
+                            } else {
+                                htslib_rs::alignment_compat::view_bam_regions_as_sam_text_from_path(
+                                    input, &regions,
+                                )?
+                            };
+                            htslib_rs::alignment_compat::write_bam_from_sam_reader(
+                                BufReader::new(io::Cursor::new(sam_bytes_with_pg(
+                                    text.as_bytes(),
+                                    opts,
+                                )?)),
+                                dst_file,
+                            )?;
+                        }
                     }
                 }
             }

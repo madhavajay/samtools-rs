@@ -2353,6 +2353,105 @@ fn view_b_sanitizer_bam_path_embeds_pg() {
     );
 }
 
+/// BAM-input filter and region binary copies inject the samtools
+/// `@PG` (routed via the SAM-text path when `@PG` is wanted),
+/// suppressed by `--no-PG` which keeps the fast binary copy
+/// (TODO-NEXT #4).
+#[test]
+fn view_b_bam_filter_and_region_paths_embed_pg() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("view-b-filter-region-pg");
+    let sam = tmp.join("in.sam");
+    std::fs::write(
+        &sam,
+        "@HD\tVN:1.6\n@SQ\tSN:c1\tLN:20\n\
+         r1\t0\tc1\t1\t60\t4M\t*\t0\t0\tACGT\tIIII\n\
+         r2\t0\tc1\t5\t10\t4M\t*\t0\t0\tACGT\tIIII\n",
+    )
+    .unwrap();
+    let bam = tmp.join("in.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            "--no-PG",
+            sam.to_str().unwrap(),
+            "-o",
+            bam.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &["index", bam.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let has_pg = |p: &std::path::Path| -> bool {
+        let h = tmp.join("h.sam");
+        assert_eq!(
+            run(&[
+                "-H",
+                "--no-PG",
+                p.to_str().unwrap(),
+                "-o",
+                h.to_str().unwrap()
+            ]),
+            0
+        );
+        std::fs::read_to_string(&h)
+            .unwrap()
+            .lines()
+            .any(|l| l.starts_with("@PG") && l.contains("PN:samtools"))
+    };
+
+    // BAM filter -> BAM
+    let f = tmp.join("f.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            "-e",
+            "mapq>=20",
+            bam.to_str().unwrap(),
+            "-o",
+            f.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(has_pg(&f), "BAM filter -> BAM must inject @PG");
+
+    // BAM region -> BAM
+    let r = tmp.join("r.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            bam.to_str().unwrap(),
+            "c1:1-3",
+            "-o",
+            r.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(has_pg(&r), "BAM region -> BAM must inject @PG");
+
+    // --no-PG keeps it absent.
+    let fn_ = tmp.join("fn.bam");
+    assert_eq!(
+        run(&[
+            "-b",
+            "--no-PG",
+            "-e",
+            "mapq>=20",
+            bam.to_str().unwrap(),
+            "-o",
+            fn_.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(!has_pg(&fn_), "view -b --no-PG must not add a @PG");
+}
+
 /// `view -C` (SAM->CRAM) likewise embeds the samtools `@PG` in the
 /// CRAM header unless `--no-PG` (TODO-NEXT #4).
 #[test]
