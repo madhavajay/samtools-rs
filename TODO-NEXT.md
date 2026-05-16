@@ -40,7 +40,8 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
 - **#8** correctness ✅ — `-@`/`--threads` accepted everywhere, output
   byte-identical regardless of count (perf worker-pool wiring deferred).
 - **#9** partial — `sort`/`view --write-index` BAI == post-pass BAI.
-  *Remaining:* `merge --write-index`, CSI/CRAI auto-write.
+  `merge --write-index` now also byte-verified. *Remaining:* CSI/CRAI
+  auto-write + true inline emission (perf only).
 - **#10** ✅ core — `.` (everything) and `*` (unplaced) both done for
   the upstream-tested SAM/count paths. *Remaining:* binary `*` output.
 - **#11** ✅ done — htslib-rs probaln/BAQ verified (realn fixtures) and
@@ -495,14 +496,16 @@ single-session work.
 
 ### 9. `auto_index` / index-save-during-write — 🟡 PARTIAL
 
-> `sort --write-index` (BAI) and now `view --write-index` (BAM file
-> output) both work via a post-write `index_compat::build_bai` pass that
-> is **byte-identical** to a separate `samtools index` run (test
-> `view_write_index_matches_post_pass_index`). The TODO deliverable
-> ("writer-produced index == post-pass byte-for-byte") is met for these.
-> **Remaining:** `merge --write-index`, CSI/CRAI auto-write, and true
-> inline (during-write) index emission instead of a post-write pass
-> (perf/streaming — not a correctness gap).
+> `sort --write-index`, `view --write-index`, **and `merge
+> --write-index`** all work via a post-write `index_compat::build_bai`
+> pass that is **byte-identical** to a separate `samtools index` run
+> (tests `view_write_index_matches_post_pass_index`,
+> `merge_write_index_builds_bai_for_coordinate_bam_output` now asserts
+> the BAI equals a post-pass index byte-for-byte). The TODO
+> deliverable ("writer-produced index == post-pass byte-for-byte") is
+> **met for all three writer paths**. **Remaining (not a correctness
+> gap):** CSI/CRAI auto-write, and true inline (during-write) index
+> emission instead of a post-write pass — perf/streaming only.
 
 - **htslib-rs:** write BAI/CSI/CRAI alongside the writer (some samtools-rs
   paths currently do a separate post-write index pass).
