@@ -67,7 +67,7 @@ samtools-rs status legend:
 - **htslib-rs coverage:** ⚠️
   - `read_associated_bam_index` returns `Box<dyn csi::BinningIndex>` — ✅
   - Per-reference mapped/unmapped counts from index meta — needs accessor — ❌ (must extend `htslib-rs::index_compat`)
-- **samtools-rs status:** 🟡 — BAM index counts exist, with streaming slow-path counts for SAM, reference-backed CRAM, and unindexed BAM; index-derived CRAM counting without an explicit reference and full harness parity remain.
+- **samtools-rs status:** 🟡 — BAM index counts exist, with streaming slow-path counts for SAM, BAM, and CRAM. CRAM works **with or without** an explicit reference (no-reference path uses the synthesizing-reference summary, since idxstats only needs the reference-independent reference id + flags); `samtools idxstats dat/test_input_1_a.cram` is byte-exact vs `idxstats/test_input_1_a.bam.expected` (test `idxstats_cram_without_reference_succeeds`). Full harness parity (index-meta fast path) remains.
 
 ### faidx / fqidx
 
@@ -88,7 +88,7 @@ samtools-rs status legend:
 - **C source:** `bam_stat.c`
 - **HTSlib APIs used:** `sam_open_format`, `sam_hdr_read`, `sam_read1`, `hts_set_threads`, `hts_set_opt` (CRAM_OPT_REQUIRED_FIELDS)
 - **htslib-rs coverage:** ✅ — `AlignmentRecordSummary` exposes flag/reference/mate/mapq accessors, with SAM/BAM/reference-backed CRAM summary helpers.
-- **samtools-rs status:** 🟡 — SAM, BAM, and reference-backed CRAM input are implemented with default text, `-O json`, and `-O tsv` output; CRAM input without an explicit reference remains unsupported.
+- **samtools-rs status:** 🟡 — SAM, BAM, and CRAM input are implemented with default text, `-O json`, and `-O tsv` output. CRAM works **with or without** an explicit reference (no-reference path uses the synthesizing-reference summary, since flagstat only needs reference-independent flags); CRAM `flagstat` output equals the BAM equivalent. Test `flagstat_cram_without_reference_succeeds`.
 
 ## Wave B — File Operations
 

@@ -38,7 +38,10 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
   (upstream `test_calmd` acceptance), getopt-style `-uAr` cluster split,
   `-A` applies recalculated BAQ to QUAL. Integration test
   `calmd_dash_u_a_r_emits_bgzf_bam_like_upstream`.
-- **#3, #4, #5, #7** assessed (large or possibly out-of-scope; #7 aux
+- **#5** ✅ done — `idxstats`/`flagstat` on CRAM without an explicit
+  reference, via the synthesizing-reference summary (`4aea535` /
+  `5f871a5`); byte-exact vs the BAM equivalents.
+- **#3, #4, #7** assessed (large or possibly out-of-scope; #7 aux
   mutation is functionally unblocked via `RecordBuf` — and an
   order-preserving `aux_del`/`aux_set_append` now exists in `fixmate`,
   the exact `bam_aux_del`+`bam_aux_append` semantics #7 wanted).
@@ -360,16 +363,27 @@ single-session work.
 - **samtools-rs tests:** `view -b`/`-C` `@PG` + `--no-PG` integration tests;
   re-check `test.pl` groups that assert on binary `@PG`.
 
-### 5. CRAM index meta accessor (`index_compat`)
+### 5. CRAM `idxstats`/`flagstat` without an explicit reference — ✅ DONE
 
-- **htslib-rs:** accessor to read per-reference counts from the CRAM index
-  meta, without needing the reference or decoding records.
-- **htslib-rs tests:** counts from a CRAM index match the reference-backed
-  record iteration counts.
-- **samtools-rs wiring:** `flagstat` / `idxstats` for CRAM input **without**
-  an explicit reference.
-- **samtools-rs tests:** `flagstat`/`idxstats` CRAM-no-reference integration
-  tests + upstream fixtures.
+> Solved without a CRAM-index-meta accessor: `idxstats`/`flagstat`
+> only use per-record **flags + reference id** (CRAM core/external
+> data, reference-independent); only the *sequence* is reconstructed
+> against the reference. htslib-rs `4aea535` adds
+> `summarize_cram_records_from_path_synthesizing_reference`, which
+> builds an all-`N` `fasta::Repository` sized from the CRAM header
+> `@SQ` lines so the noodles decoder runs without erroring while the
+> reference-independent fields stay byte-identical (the plain no-ref
+> path errors — noodles eagerly resolves). samtools-rs `5f871a5`
+> wires `idxstats`/`flagstat` to it when no `--reference` is given.
+> `samtools idxstats dat/test_input_1_a.cram` is byte-exact vs
+> `idxstats/test_input_1_a.bam.expected`; `flagstat` CRAM == BAM.
+> Tests: htslib-rs `cram_summaries_without_reference_match_bam_flags_and_tids`,
+> samtools-rs `idxstats_cram_without_reference_succeeds` /
+> `flagstat_cram_without_reference_succeeds`.
+
+- ~~**htslib-rs:** accessor to read per-reference counts from the CRAM
+  index meta~~ — superseded by the synthesizing-reference summary
+  (simpler, exact, no `.crai`-meta parsing needed).
 
 ### 6. Index BAMs lacking `@HD SO:coordinate` — ✅ DONE
 
@@ -520,8 +534,8 @@ single-session work.
 
 1. **#1 Pileup iterator** — by far the biggest unlock (≈5 subcommands).
 2. **#2 CRAM all-record iterator** — closes several CRAM-without-region gaps.
-3. **#4, #5, #6** — small, well-scoped htslib-rs additions that each finish a
-   specific parity gap.
+3. **#4** — small, well-scoped htslib-rs addition (binary `@PG`).
+   (#5 ✅ done, #6 ✅ done.)
 4. **#7–#12** — incremental hardening / correctness.
 
 ## Out of scope here (NOT library-blocked — large samtools-rs ports)
