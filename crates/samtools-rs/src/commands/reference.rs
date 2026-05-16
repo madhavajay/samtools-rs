@@ -216,25 +216,17 @@ fn reference_cram_path(
         .as_ref()
         .map(|region| region_target(&header, region))
         .transpose()?;
-    // noodles-cram 0.93.0 does not decode an embedded reference
-    // (`embed_ref`) — it treats the slice as requiring an external
-    // reference and panics on an empty repository — so the MD path
-    // needs a `--reference` to reconstruct SEQ. The upstream
-    // no-reference / `-e` embed_ref fixtures stay blocked on
-    // noodles CRAM container internals (TODO-NEXT #2/#3).
+    // The vendored noodles-cram now decodes an embedded reference
+    // (`embed_ref`) directly, so the MD path needs no external
+    // reference for embed_ref CRAM; fall back to `--reference` only
+    // when one is supplied (reference-compressed CRAM).
     let records = match crate::sam_global::current_global_args().reference {
         Some(reference) => {
             htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
                 input, reference,
             )?
         }
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "CRAM reference reconstruction needs -T/--reference \
-                 (noodles cannot decode embedded-reference CRAM)",
-            ));
-        }
+        None => htslib_rs::alignment_compat::query_cram_records_all_from_path(input)?,
     };
     for record in records {
         update_refs(&header, &mut refs, &record, target.as_ref())?;
