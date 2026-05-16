@@ -23,20 +23,22 @@ in `TODO.md` "Submodule Pinning"); every commit keeps both gates green.
   (`large_pos/depth{,_bed}`), and **consensus `recall`/Bayesian modes**
   (all 77 `consensus.reg`). *Remaining:* `targetcut`, `phase`,
   `ampliconstats`.
-- **#2** ✅ core + wiring — whole-CRAM all-record iterator; `stats` and
-  `checksum` no-region CRAM byte-identical to BAM (bar NM-derived
-  lines). `reference` CRAM MD path now wired
-  (`query_cram_records_all_from_path[_with_reference]`, `fefc4ff`):
-  with `-T/--reference`, `samtools reference` (whole-file + `-r`) on
-  the upstream embed_ref test CRAM is **byte-exact** vs
-  `reference/mpileup.MD.fa{,.reg}.expected`. ⛔ *Blocked on noodles:*
-  the upstream no-reference / `-e` invocations need embedded-reference
-  decoding, which **noodles-cram 0.93.0 does not implement** (it
-  treats embed_ref slices as requiring an external reference and
-  `expect()`-panics on an empty repository at
-  `io/reader/container/slice.rs:446`) — same noodles-internals family
-  as #3; raised for a decision (no noodles patch). Optional CRAM NM
-  recompute for exact `stats` mismatch/error-rate also still open.
+- **#2** ✅ core + wiring; embed_ref read path **fixed via the
+  vendored noodles fork**. Whole-CRAM all-record iterator; `stats`/
+  `checksum` no-region CRAM byte-identical to BAM (bar NM lines).
+  `reference` CRAM MD path wired (`query_cram_records_all_from_path
+  [_with_reference]`): with `-T` it is **byte-exact** vs
+  `reference/mpileup.MD.fa{,.reg}.expected`, and with the noodles
+  fix it also decodes a genuinely-embedded CRAM with **no** `-T`.
+  noodles fork patch (`7a09e02`, htslib-rs `5fe80f8`,
+  samtools-rs `b88e3ab`): `get_slice_reference_sequence` now prefers
+  the embedded-reference block over the RR flag and returns clean
+  `io::Error`s instead of `expect()`-panicking. *Remaining:* the
+  upstream no-`-T`/`-e` fixtures also need samtools-rs `view -O
+  cram,embed_ref=1` to **write** an embedded reference (noodles CRAM
+  *writer* gap) so the staged fixture is truly embed_ref, plus
+  `reference -e` extraction (shares #3's block exposure); optional
+  CRAM NM recompute for exact `stats` mismatch/error-rate.
 - **#8** correctness ✅ — `-@`/`--threads` accepted everywhere, output
   byte-identical regardless of count (perf worker-pool wiring deferred).
 - **#9** partial — `sort`/`view --write-index` BAI == post-pass BAI.
@@ -250,14 +252,19 @@ quick fix — verified by probing):
 shipped, tested and pinned. **Of the 12 numbered items: #1, #5, #6,
 #8, #10, #11, #12 ✅ done; #4 ✅ done for every noodles-decodable
 input→binary path; #7, #9 ✅ functionally done (only perf, no parity
-gap).** The only items NOT closed are **#2 (embed_ref CRAM) and #3
-(`cram-size`)**, both ⛔ blocked on noodles-cram 0.93.0 internals
-(`pub(crate)` / unimplemented embed_ref decode) — and the Ground
-rules forbid patching `noodles`, directing instead to "stop and raise
-it for a decision". That decision (upstream/fork a minimal noodles
-surface, or drop `cram-size`/embed_ref from scope) is the sole gate
-on those two. Everything else is ordinary samtools-rs porting +
-Phases 4–5.
+gap).** #2 and #3 are **no longer decision-blocked**: `noodles` here
+is an **owned vendored fork** (`madhavajay/noodles`, htslib-rs
+submodule) that already carries CRAM patches, so the Ground rule's
+"(and carry minimal patches)" clause sanctions minimal fork patches
+(the earlier "decision required" framing misread the rule as
+applying to the third-party registry crate). Progress: #2's embed_ref
+**read** path is fixed in the fork (`7a09e02`); #3's noodles
+inventory surface is now public (`0c719af`). **Remaining:** #3's
+per-block size/method exposure + the ~679-LOC `cram-size` port;
+#2's embed_ref **write** (noodles CRAM-writer gap) + `reference -e`;
+optional CRAM-NM recompute. All now ordinary (if large) port work
+via the sanctioned fork-patch path — no external decision gate.
+Everything else is ordinary samtools-rs porting + Phases 4–5.
 
 ## Ground rules for this pass
 
@@ -362,38 +369,35 @@ Phases 4–5.
   tests + upstream `test_stats` / `test_checksum` CRAM fixtures.
 - **Unblocks:** several CRAM-without-region gaps at once. Do this second.
 
-### 3. CRAM container / block / codec inventory API — ⛔ BLOCKED (decision required)
+### 3. CRAM container / block / codec inventory API — 🟡 IN PROGRESS
 
-> **Assessed (precise blocker).** `cram-size` needs, per container:
-> the block table (Content-ID, uncompressed/compressed size,
-> compression method, backing data-series) and the "Container
-> encodings" map (DataSeries → codec: `EXTERNAL(id)`,
-> `HUFFMAN(codes,lengths)`, `BYTE_ARRAY_STOP(stop,id)`,
-> `BYTE_ARRAY_LEN(len_codec,val_codec)`), plus tag encodings. In the
-> vendored **noodles-cram 0.93.0** these are all `pub(crate)` and not
-> re-exported, so they are unreachable from `htslib-rs` (which only
-> *consumes* noodles) **and** from `samtools-rs`:
-> - `CompressionHeader::{preservation_map,data_series_encodings,
->   tag_encodings}` — `pub(crate)`.
-> - `DataSeriesEncodings`, `TagEncodings`, `PreservationMap` — type is
->   `pub(crate)`.
-> - `io::reader::container::block::Block` (has public
->   `compression_method`/`content_type`/`content_id`/
->   `uncompressed_size`) — **not exported**; `Slice::decode_blocks()`
->   only returns `(ContentId, Cow<[u8]>)` with no size/method metadata.
+> **Path resolved.** `noodles` here is a **vendored fork**
+> (`madhavajay/noodles`, submodule of `htslib-rs` at
+> `htslib-rs/noodles/`, branch `htslib-rs-compat`) that already
+> carries CRAM patches (e.g. `75ab542 "Return CRAM reference lookup
+> errors"`). The Ground rule's "(and carry minimal patches)" clause
+> sanctions minimal patches to *this owned fork* (the earlier
+> "decision required" framing misread it as the third-party registry
+> crate). So #3 is unblocked via minimal fork patches.
 >
-> Per the **Ground rules** ("Do not patch `noodles` … if a fix
-> genuinely cannot be done without a `noodles` change, stop and raise
-> it for a decision"), `cram-size` is **blocked on a scope decision**:
-> either (a) accept a minimal upstreamed/forked noodles-cram public
-> inventory surface, or (b) **drop `cram-size` from samtools-rs scope**
-> (the documented fallback in this item). Not half-implemented; no
-> noodles patch made. The dependent `reference -e` embedded-reference
-> mode shares this blocker.
+> **Foundation landed** (noodles `0c719af`, htslib-rs `8d322da`,
+> samtools-rs `ea4f315`): `CompressionHeader::{preservation_map,
+> data_series_encodings,tag_encodings}` are now `pub`, and
+> `DataSeriesEncodings`/`TagEncodings`/`PreservationMap`/`Encoding`
+> (+ the `encoding`/`tag_encodings` modules) are public — the
+> inventory surface `cram-size` needs. htslib-rs 136 tests green,
+> samtools-rs workspace gate clean.
+>
+> **Remaining:** (a) expose per-block size/method metadata
+> (`Block`/`decode_blocks` currently drop it); (b) port `cram-size`
+> (~679 LOC C: block table, "Container encodings" with the codec
+> ID arithmetic, method-flag strings, ratios, summary) against the
+> new surface; verify byte-exact vs `test/cram_size/cram_size.reg`
+> (`normal.out`/`verbose.out`/`encodings.out`). Then `reference -e`.
 
-- **htslib-rs:** (blocked) would expose a CRAM container/block/codec
-  inventory — requires the noodles-cram accessors above to be public.
-- **samtools-rs wiring:** `cram-size` (entirely); `reference -e`.
+- **noodles fork:** ✅ compression-header inventory public; still
+  need block size/method exposure.
+- **samtools-rs wiring:** `cram-size` (port pending); `reference -e`.
 - **samtools-rs tests:** upstream `test/cram_size/cram_size.reg`
   (`normal.out`/`verbose.out`/`encodings.out`).
 
