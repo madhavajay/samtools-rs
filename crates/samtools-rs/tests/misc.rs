@@ -8042,3 +8042,72 @@ fn cram_size_matches_upstream_cram_size_reg() {
         );
     }
 }
+
+/// Full upstream `test_reference`: build an embed_ref CRAM with
+/// `view -e EXPR -O cram,embed_ref=1 -T ref`, then all four
+/// `samtools reference` invocations (MD path / `-e` embedded, with
+/// and without `-r`) are byte-exact vs the upstream fixtures —
+/// TODO-NEXT #2 complete (embed_ref read+write + cram2ref).
+#[test]
+fn reference_embed_ref_full_test_reference_byte_exact() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let d = fixtures_dir();
+    let sam = d.join("dat/mpileup.1.sam");
+    let refa = d.join("dat/mpileup.ref.fa");
+    let tmp = tmp_dir("reference-embed");
+    let cram = tmp.join("mpileup.1.tmp.cram");
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "view",
+                "--no-PG",
+                "-e",
+                "pos<1000||pos>1200",
+                "-O",
+                "cram,embed_ref=1",
+                "-T",
+                refa.to_str().unwrap(),
+                "-o",
+                cram.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+
+    let cases: [(&[&str], &str); 4] = [
+        (&[], "reference/mpileup.MD.fa.expected"),
+        (&["-e"], "reference/mpileup.embed.fa.expected"),
+        (
+            &["-r", "17:1000-1500"],
+            "reference/mpileup.MD.fa.reg.tmp.expected",
+        ),
+        (
+            &["-r", "17:1000-1500", "-e"],
+            "reference/mpileup.embed.fa.reg.tmp.expected",
+        ),
+    ];
+    for (extra, expected) in cases {
+        let out = tmp.join(expected.replace('/', "_"));
+        let mut a: Vec<String> =
+            vec!["samtools".into(), "reference".into(), "-q".into()];
+        a.extend(extra.iter().map(|s| s.to_string()));
+        a.push(cram.to_str().unwrap().into());
+        a.push("-o".into());
+        a.push(out.to_str().unwrap().into());
+        assert_eq!(
+            exit_to_u8(samtools_run(
+                a.iter().map(std::ffi::OsString::from).collect()
+            )),
+            0,
+            "args={a:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(d.join(expected)).unwrap(),
+            "{expected} must be byte-exact"
+        );
+    }
+}
