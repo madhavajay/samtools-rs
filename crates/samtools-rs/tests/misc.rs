@@ -202,6 +202,61 @@ fn depad_sam_matches_upstream_fixture() {
 }
 
 #[test]
+fn depad_bam_input_and_output_match_upstream_fixture() {
+    let tmp = tmp_dir("depad-bam");
+    let input_sam = fixtures_dir().join("dat").join("depad.001p.sam");
+    let input_bam = tmp.join("padded.bam");
+    let output_bam = tmp.join("depad.bam");
+    let output_sam = tmp.join("depad-from-bam.sam");
+    let reference = fixtures_dir().join("dat").join("depad.001.fa");
+    let expected = without_pg_lines(
+        &std::fs::read_to_string(fixtures_dir().join("dat").join("depad.001u.sam")).unwrap(),
+    );
+
+    htslib_rs::alignment_compat::write_bam_from_sam_path(
+        &input_sam,
+        std::fs::File::create(&input_bam).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(depad::main(&argv(
+            "depad",
+            &[
+                "-T",
+                reference.to_str().unwrap(),
+                "--no-PG",
+                "-o",
+                output_bam.to_str().unwrap(),
+                input_sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let bam_text =
+        htslib_rs::alignment_compat::view_bam_as_sam_text_from_path_with_limit(&output_bam, None)
+            .unwrap();
+    assert_eq!(bam_text, expected);
+
+    assert_eq!(
+        exit_to_u8(depad::main(&argv(
+            "depad",
+            &[
+                "-T",
+                reference.to_str().unwrap(),
+                "-s",
+                "--no-PG",
+                "-o",
+                output_sam.to_str().unwrap(),
+                input_bam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(std::fs::read_to_string(output_sam).unwrap(), expected);
+}
+
+#[test]
 fn checksum_bam_matches_upstream_default_fixture() {
     let tmp = tmp_dir("checksum-default");
     let output = tmp.join("chk1.out");
