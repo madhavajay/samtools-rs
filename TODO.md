@@ -186,9 +186,17 @@ groups for them. **Remaining: Phase 4/5 full-harness promotion and polish
 and perf triage).**
 
 Subcommands shipped (31 of ~40):
-- ✅ byte-parity verified: `flags`, `quickcheck`, `dict`, `head`
-- ✅ functional with partial-feature notes: `index`, `idxstats`, `samples` (incl. `-i`, `-f`, `-X`, stdin path lists), `flagstat`, `faidx`/`fqidx`
-- 🟡 partial implementation: `view` (SAM↔SAM, SAM→BAM/CRAM, count/header, region queries, `-f/-F/-G/-q` filters, `-L` BED, `-e` filter expression, `-x/--keep-tag` aux strip, `-z` sanitizer mutation, `-p`/`-U` for SAM-input binary output, SAM-output `@PG`/`--no-PG`), `cat` (SAM/BAM record-level concat, `-h`, `-b FILE` input lists, `-r region` for indexed BAM, `@PG`/`--no-PG`), `reheader` (SAM/BAM with `-c` filter, `@PG`/`--no-PG`), `fastq`/`fasta`/`bam2fq` (including `-O` original-quality tags, `-v INT` missing-quality defaults, `-U`/`--UMI-tag` UMI read-name suffixes, and `-i`/`--barcode-tag` CASAVA barcode fields), `split` (with `--no-PG`, `--write-index`), `sort` (in-memory coordinate/name/tag for SAM/BAM/reference-backed CRAM + `@PG`/`--no-PG`), `merge` (in-memory coordinate/name/tag + differing `@SQ` union/remap + `-R region`/`-L BED` + `@PG`/`--no-PG`), `collate` (in-memory name grouping plus `-f` fast primary-pair mode, `-n INT` temp-count compatibility, and legacy positional output prefixes for SAM/BAM/reference-backed CRAM + `@PG`/`--no-PG`), `import`, `rmdup` (single-end + paired-end + `@PG`/`--no-PG`), `markdup` (single-end + paired-end + barcode key + optical-distance `dt` tags + QCFAIL inclusion control + `--mode` compatibility + secondary/supplementary qname propagation + `-r`/`-s`/`-O`/`-o`/`@PG`/`--no-PG`), `bedcov` (CIGAR-walk), `coverage` (CIGAR-walk + ASCII histogram), `depth`, `addreplacerg` (SAM/BAM `-O sam|bam`, `overwrite_all` default, `@PG`/`--no-PG`), `fixmate` (name-sorted BAM/SAM, coordinate-sort rejection, mate TLEN recalculation, MC/MQ, `-m` mate-score tags, `-c` template-CIGAR `ct` tags, default sanitizer mutation, `-r` mode, `@PG`/`--no-PG`), `reset` (alignment field clear, default aux strip, `--reject-PG`/`--no-RG`/`--no-PG` matching upstream `noPGentry` semantics, `@PG` insertion), `depad`/`pad2unpad` (SAM `-T` padded reference to `-s` SAM output), `stats` (extensive SN coverage plus `-f`/`-F` flag filters, `-i` insert-size cap, `-m` insert-size bulk selection, `-l` read-length filtering, `-q` BWA trim counting, FFQ/LFQ quality histograms, GCF/GCL GC histograms, and approximate COV coverage histogram), `calmd`/`fillmd` (SAM/BAM/reference-backed CRAM text MD/NM + SAM BAQ paths + `-d` + `@PG`/`--no-PG`), `reference` (SAM/BAM MD-tag reconstruction + indexed BAM `-r` + `-o`/`-q`)
+- ✅ required upstream parity groups/regression files:
+  `quickcheck`, `dict`, `head`, `sort`, `collate`, `calmd`, `idxstats`,
+  `reference`, `addreplacerg`, `markdup`, `bedcov`, `split`,
+  `ampliconclip`, `ampliconstats`, plus `consensus` and `cram-size`.
+- ✅ focused/no upstream fixture group:
+  `flags`, `flagstat`, `samples`, `phase`, and `targetcut`.
+- 🟡 implemented but not yet full upstream group parity:
+  `faidx`/`fqidx`, `index`, `view`, `cat`, `reheader`,
+  `fastq`/`fasta`/`bam2fq`, `merge`, `import`, `rmdup`, `coverage`,
+  `depth`, `fixmate`, `reset`, `depad`/`pad2unpad`, `stats`,
+  `mpileup`, and `checksum`.
 
 Remaining subcommands and their blockers — **resolved** (kept for
 history; current truth in the banner + Progress Snapshot above):
@@ -267,7 +275,7 @@ Follow-up polish after the MVP:
 Three roughly orthogonal directions, each substantial:
 
 1. **Unblock the pileup-dependent subcommands.** Add a `bam_plp_*`-shaped iterator API to `htslib-rs::alignment_compat`. Unlocks: `mpileup`, `consensus`, `targetcut`, `phase`, `ampliconstats`, and the exact (byte-parity) versions of `depth`/`coverage`/`bedcov`. Estimate: days of careful design in `htslib-rs`, then each subcommand is its own piece on top.
-2. **Deepen the existing 28 partials toward byte-parity.** Pick a subcommand (probably `view` as the anchor) and drive every flag combination from `test.pl` to byte-for-byte. This is where the remaining byte-parity work, full filter expression support, and CRAM I/O need to land. Estimate: each `test_<name>` group is hours-to-a-day.
+2. **Deepen the existing partials toward byte-parity.** Pick a subcommand (probably `view` as the anchor) and drive every flag combination from `test.pl` to byte-for-byte. This is where the remaining byte-parity work, full filter expression support, and CRAM I/O need to land. Estimate: each `test_<name>` group is hours-to-a-day.
 3. **Wire the upstream `test.pl` as a gating CI run.** The parity job stages the Rust binary at the harness' ignored `samtools/samtools` path and still fires `|| true`. Flip it as subcommands land, using `docs/test-status.md` to track per-test status (passing / skipped / not-yet-ported / cosmetic-diff). Forces parity attention.
 
 Pick a direction and the per-subcommand TODOs below get rearranged accordingly.
