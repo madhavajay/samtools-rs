@@ -19,6 +19,7 @@ from pathlib import Path
 DEFAULT_GROUPS = [
     "test_reference",
     "test_dict",
+    "test_fqidx",
     "test_sort",
     "test_collate",
     "test_calmd",
