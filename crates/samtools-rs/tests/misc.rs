@@ -4679,7 +4679,7 @@ fn reset_matches_upstream_test_reset_fixtures() {
     use samtools_rs::commands::reset;
     // Byte-exact vs upstream test_reset (harness `hskip=1` drops the
     // first output line, `ignore_pg_header` strips @PG): -o SAM from a
-    // SAM input, -o SAM from a BAM input, and --no-RG; plus the
+    // SAM input, -o SAM from BAM/CRAM input, and --no-RG; plus the
     // reject.1 / reject.2 @PG-count assertions.
     let d = fixtures_dir();
     let tmp = tmp_dir("reset-fixtures");
@@ -4707,6 +4707,11 @@ fn reset_matches_upstream_test_reset_fixtures() {
             &["--dupflag", "-o", "@OUT@", "dat/test_input_1_a.bam"],
             "@OUT@",
             "reset/basic.bam.input.expected",
+        ),
+        (
+            &["--dupflag", "-o", "@OUT@", "dat/test_input_1_a.cram"],
+            "@OUT@",
+            "reset/basic.cram.input.expected",
         ),
         (
             &[
