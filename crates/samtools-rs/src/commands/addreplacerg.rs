@@ -1,7 +1,7 @@
 //! `samtools addreplacerg` — add or replace `@RG` lines and `RG:Z:` aux tags.
 //!
-//! Mirrors `main_addreplacerg` in `bam_addrprg.c`. Initial Rust port works on
-//! **SAM/BAM input → SAM/BAM output**:
+//! Mirrors `main_addreplacerg` in `bam_addrprg.c`. The Rust port works on
+//! **SAM/BAM/reference-backed CRAM input → SAM/BAM/CRAM output**:
 //!  - `-r '@RG\tID:foo\tSM:bar'` — full `@RG` line spec; merged into header.
 //!  - `-r 'ID:foo'` — incremental tag form (one tag per `-r`); combined into
 //!    a single `@RG` line.
@@ -22,8 +22,7 @@
 //!  - `-w` — overwrite an existing `@RG` header line with the same ID
 //!    instead of erroring.
 //!
-//! **Pending:** CRAM input, paired-end mate update, full `orphan_first`
-//! semantics.
+//! **Pending:** paired-end mate update, full `orphan_first` semantics.
 
 use bstr::BString;
 use std::ffi::OsString;
@@ -38,8 +37,9 @@ use htslib_rs::bgzf;
 use htslib_rs::format::Exact;
 use htslib_rs::sam::{self, alignment::RecordBuf};
 
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
 #[derive(Clone, Copy)]
 enum Mode {
@@ -157,6 +157,18 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
+    if input.as_os_str() != "-" && !input.exists() {
+        print_hts_open_missing(&input);
+        print_error(
+            "addreplacerg",
+            format!(
+                "could not open \"{}\": No such file or directory",
+                input.display()
+            ),
+        );
+        return ExitCode::from(1);
+    }
+
     let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,
         Err(e) => {
@@ -164,10 +176,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if !matches!(format.exact, Exact::Sam | Exact::Bam) {
+    if !matches!(format.exact, Exact::Sam | Exact::Bam | Exact::Cram) {
         print_error(
             "addreplacerg",
-            "only SAM and BAM input are currently supported (CRAM TODO)",
+            "only SAM, BAM, and reference-backed CRAM input are supported",
         );
         return ExitCode::from(1);
     }
@@ -489,10 +501,11 @@ fn rewrite_records(
     let (mut header, mut records) = match format.exact {
         Exact::Sam => read_sam_records(input)?,
         Exact::Bam => read_bam_records(input)?,
+        Exact::Cram => read_cram_records(input, reference)?,
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "only SAM and BAM input are currently supported (CRAM TODO)",
+                "only SAM, BAM, and reference-backed CRAM input are supported",
             ));
         }
     };
@@ -589,6 +602,26 @@ fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
         }
         records.push(record);
     }
+    Ok((header, records))
+}
+
+fn read_cram_records(
+    input: &Path,
+    reference: Option<&Path>,
+) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+    let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
+    let reference = reference
+        .map(Path::to_path_buf)
+        .or_else(|| current_global_args().reference)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CRAM input requires -T/--reference FILE or top-level --reference FILE",
+            )
+        })?;
+    let records = htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+        input, &reference,
+    )?;
     Ok((header, records))
 }
 

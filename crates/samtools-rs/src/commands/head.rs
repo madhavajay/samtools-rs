@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use flate2::read::MultiGzDecoder;
 use htslib_rs::format::Exact;
 
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::header_text::read_raw_header_text;
 use crate::io as sam_io;
 use crate::sam_global::current_global_args;
@@ -61,6 +61,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     let path = opts.path.as_ref().expect("stdin path handled above");
+    if !path.exists() {
+        print_hts_open_missing(path);
+        print_error(
+            "head",
+            format!(
+                "failed to open \"{}\" for reading: No such file or directory",
+                path.display()
+            ),
+        );
+        return ExitCode::from(1);
+    }
 
     let header_text = match read_raw_header_text(path) {
         Ok(t) => t,

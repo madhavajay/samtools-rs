@@ -30,7 +30,7 @@ use std::process::ExitCode;
 
 use htslib_rs::alignment_compat::{PileupRead, pileup_from_alignment_paths_with_options};
 
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Format {
@@ -301,6 +301,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
         print_error("consensus", "no input file");
         return ExitCode::from(1);
     };
+
+    if input.as_os_str() != "-" && !input.exists() {
+        print_hts_open_missing(&input);
+        print_error(
+            "consensus",
+            format!(
+                "Cannot open input file \"{}\": No such file or directory",
+                input.display()
+            ),
+        );
+        print_error("consensus", "failed");
+        return ExitCode::from(1);
+    }
 
     match run(&cfg, &input) {
         Ok(()) => ExitCode::SUCCESS,

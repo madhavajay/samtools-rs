@@ -9,11 +9,13 @@
 //! tag), `--keep-tag` (default deletes `NM`/`MD`), `--filter-len`,
 //! `--fail-len`, `--unmap-len`, `--clipped`, `--no-excluded`,
 //! `--rejects-file`, `--primer-counts`, `--tolerance`, `-f` stats,
-//! `-o`/`-O sam|bam`, `-b`, default `@PG`, `--no-PG`. Coordinate-sorted
-//! input headers have `@HD SO:` rewritten to `unknown`.
+//! `-o`/`-O sam|bam|cram`, `-b`, default `@PG`, `--no-PG`.
+//! Reference-backed CRAM input/output uses `-T`/`--reference` or top-level
+//! `--reference`. Coordinate-sorted input headers have `@HD SO:` rewritten
+//! to `unknown`.
 //!
 //! SAM output is byte-exact vs the upstream `test/ampliconclip` fixtures
-//! (raw-header preserving). **Pending:** CRAM, BGZF fast paths.
+//! (raw-header preserving). **Pending:** BGZF fast paths.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -23,7 +25,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use bstr::BString;
+use htslib_rs::bam;
 use htslib_rs::core::Position;
+use htslib_rs::format::Exact;
 use htslib_rs::sam::{
     self,
     alignment::{
@@ -37,12 +41,23 @@ use htslib_rs::sam::{
     },
 };
 
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
+use crate::io as sam_io;
+use crate::sam_global::current_global_args;
+
+const REPORTED_ERROR: &str = "__samtools_rs_reported_error__";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Clip {
     Soft,
     Hard,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutFmt {
+    Sam,
+    Bam,
+    Cram,
 }
 
 struct Params {
@@ -619,16 +634,23 @@ fn header_so_unknown(raw: &str) -> String {
 pub fn main(args: &[OsString]) -> ExitCode {
     let mut bedfile: Option<PathBuf> = None;
     let mut fnout: Option<PathBuf> = None;
-    let mut out_bam = true; // default wmode "wb"
+    let mut output_fmt = OutFmt::Bam; // default wmode "wb"
     let mut clip = Clip::Soft;
     let mut p = Params::default();
     let mut input: Option<PathBuf> = None;
+    let mut reference: Option<PathBuf> = None;
 
     let mut it = args.iter().skip(1).peekable();
     while let Some(arg) = it.next() {
         let s = arg.to_str().unwrap_or("");
         if let Some(v) = s.strip_prefix("--output-fmt=") {
-            out_bam = !v.eq_ignore_ascii_case("sam");
+            output_fmt = match parse_output_format(v) {
+                Ok(fmt) => fmt,
+                Err(e) => {
+                    print_error("ampliconclip", e);
+                    return ExitCode::from(1);
+                }
+            };
             continue;
         }
         if let Some(v) = s.strip_prefix("--filter-len=") {
@@ -643,15 +665,28 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-b" => bedfile = it.next().map(PathBuf::from),
             "-o" => fnout = it.next().map(PathBuf::from),
             "-f" => p.stats_file = it.next().map(PathBuf::from),
-            "-u" => out_bam = false,
+            "-u" => output_fmt = OutFmt::Sam,
             "-O" | "--output-fmt" => {
-                out_bam = !it
-                    .next()
-                    .and_then(|a| a.to_str())
-                    .is_some_and(|v| v.eq_ignore_ascii_case("sam"));
+                let Some(v) = it.next().and_then(|a| a.to_str()) else {
+                    print_error("ampliconclip", format!("missing value for {}", s));
+                    return ExitCode::from(1);
+                };
+                output_fmt = match parse_output_format(v) {
+                    Ok(fmt) => fmt,
+                    Err(e) => {
+                        print_error("ampliconclip", e);
+                        return ExitCode::from(1);
+                    }
+                };
             }
             "-@" | "--threads" => {
                 let _ = it.next();
+            }
+            "-T" | "--reference" => {
+                reference = it.next().map(PathBuf::from);
+            }
+            _ if s.starts_with("--reference=") => {
+                reference = Some(PathBuf::from(&s["--reference=".len()..]));
             }
             "--no-PG" => p.add_pg = false,
             "--soft-clip" => clip = Clip::Soft,
@@ -731,13 +766,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
     match run(
         &input,
         fnout.as_deref(),
-        out_bam,
+        output_fmt,
         clip,
         &bedfile,
         &mut p,
         args,
+        reference.as_deref(),
     ) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == io::ErrorKind::Other && e.to_string() == REPORTED_ERROR => {
+            ExitCode::from(1)
+        }
         Err(e) => {
             print_error_errno("ampliconclip", "ampliconclip failed", &e);
             ExitCode::from(1)
@@ -745,19 +784,59 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 }
 
+fn parse_output_format(value: &str) -> Result<OutFmt, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "sam" => Ok(OutFmt::Sam),
+        "bam" => Ok(OutFmt::Bam),
+        "cram" => Ok(OutFmt::Cram),
+        _ => Err(format!("unsupported output format \"{}\"", value)),
+    }
+}
+
+fn ampliconclip_reference(local: Option<&Path>) -> Option<PathBuf> {
+    local
+        .map(Path::to_path_buf)
+        .or_else(|| current_global_args().reference)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     input: &Path,
     output: Option<&Path>,
-    out_bam: bool,
+    output_fmt: OutFmt,
     clip: Clip,
     bedfile: &Path,
     p: &mut Params,
     args: &[OsString],
+    reference: Option<&Path>,
 ) -> io::Result<()> {
     let (mut bed, ref_order) = load_bed(bedfile, p.use_strand).map_err(io::Error::other)?;
-    let raw = crate::header_text::read_raw_header_text(input)?;
-    let (header, records) = crate::sam_compat::read_sam_records_tolerant(input)?;
+    if input != Path::new("-") && !input.exists() {
+        print_hts_open_missing(input);
+        print_error(
+            "ampliconclip",
+            "cannot open input file: No such file or directory",
+        );
+        return Err(io::Error::other(REPORTED_ERROR));
+    }
+    let reference = ampliconclip_reference(reference);
+    let format = sam_io::sam_open_format(input)?;
+    if !matches!(format.exact, Exact::Sam | Exact::Bam | Exact::Cram) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only SAM, BAM, and reference-backed CRAM input are supported",
+        ));
+    }
+    if format.exact == Exact::Cram || output_fmt == OutFmt::Cram {
+        let reference = reference.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CRAM input/output requires -T/--reference FILE or top-level --reference FILE",
+            )
+        })?;
+        crate::reference::ensure_fai_index(reference, None)?;
+    }
+    let (raw, header, records) = read_input_records(input, format.exact, reference.as_deref())?;
 
     let ref_names: Vec<String> = header
         .reference_sequences()
@@ -908,9 +987,23 @@ fn run(
         }
     }
 
-    write_sam_or_bam(output, out_bam, &header, &header_text, &kept)?;
+    write_records(
+        output,
+        output_fmt,
+        &header,
+        &header_text,
+        &kept,
+        reference.as_deref(),
+    )?;
     if let Some(rf) = &p.rejects_file {
-        write_sam_or_bam(Some(rf), out_bam, &header, &header_text, &rejected)?;
+        write_records(
+            Some(rf),
+            output_fmt,
+            &header,
+            &header_text,
+            &rejected,
+            reference.as_deref(),
+        )?;
     }
 
     let cmd = crate::pg::stringify_argv(args);
@@ -969,14 +1062,70 @@ fn finalize_clip(b: &mut RecordBuf, p: &Params, oat: Option<&str>) {
     }
 }
 
-fn write_sam_or_bam(
+fn read_input_records(
+    input: &Path,
+    exact: Exact,
+    reference: Option<&Path>,
+) -> io::Result<(String, sam::Header, Vec<RecordBuf>)> {
+    let raw = crate::header_text::read_raw_header_text_with_format(input, exact)?;
+    match exact {
+        Exact::Sam => {
+            let (header, records) = crate::sam_compat::read_sam_records_tolerant(input)?;
+            Ok((raw, header, records))
+        }
+        Exact::Bam => {
+            let mut reader = bam::io::Reader::new(File::open(input)?);
+            let header = reader.read_header()?;
+            let mut records = Vec::new();
+            loop {
+                let mut record = RecordBuf::default();
+                if reader.read_record_buf(&header, &mut record)? == 0 {
+                    break;
+                }
+                records.push(record);
+            }
+            Ok((raw, header, records))
+        }
+        Exact::Cram => {
+            let reference = reference.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "CRAM input requires -T/--reference FILE or top-level --reference FILE",
+                )
+            })?;
+            let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
+            let records =
+                htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+                    input, reference,
+                )?;
+            Ok((raw, header, records))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported input format",
+        )),
+    }
+}
+
+fn write_records(
     output: Option<&Path>,
-    out_bam: bool,
+    fmt: OutFmt,
     header: &sam::Header,
     header_text: &str,
     records: &[RecordBuf],
+    reference: Option<&Path>,
 ) -> io::Result<()> {
-    if out_bam {
+    let output = output.filter(|p| *p != Path::new("-"));
+    if fmt == OutFmt::Cram {
+        let reference = reference.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CRAM output requires -T/--reference FILE or top-level --reference FILE",
+            )
+        })?;
+        return write_cram_records(output, header, header_text, records, reference);
+    }
+    if fmt == OutFmt::Bam {
         use sam::alignment::io::Write as _;
         let mut hdr = header.clone();
         if let Ok(parsed) = header_text.parse::<sam::Header>() {
@@ -1010,6 +1159,53 @@ fn write_sam_or_bam(
     }
     out.flush()?;
     Ok(())
+}
+
+fn write_cram_records(
+    output: Option<&Path>,
+    header: &sam::Header,
+    header_text: &str,
+    records: &[RecordBuf],
+    reference: &Path,
+) -> io::Result<()> {
+    use sam::alignment::io::Write as _;
+
+    let mut hdr = header.clone();
+    if let Ok(parsed) = header_text.parse::<sam::Header>() {
+        hdr = parsed;
+    }
+    let (tmp_bam_file, tmp_bam_path) =
+        crate::tmp_file::create_temp_file("ampliconclip", Some("bam"))?;
+    {
+        let mut writer = bam::io::Writer::new(tmp_bam_file);
+        writer.write_header(&hdr)?;
+        for record in records {
+            writer.write_alignment_record(&hdr, record)?;
+        }
+    }
+
+    let result = match output {
+        Some(path) => {
+            let out = File::create(path)?;
+            htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+                tmp_bam_path.path(),
+                reference,
+                out,
+            )
+            .map(|_| ())
+        }
+        None => {
+            let out = io::stdout().lock();
+            htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+                tmp_bam_path.path(),
+                reference,
+                out,
+            )
+            .map(|_| ())
+        }
+    };
+    tmp_bam_path.close().ok();
+    result
 }
 
 #[derive(Default)]

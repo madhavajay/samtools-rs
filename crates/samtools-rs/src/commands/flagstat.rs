@@ -14,7 +14,7 @@ use crate::bam_flag::{
     BAM_FDUP, BAM_FMUNMAP, BAM_FPAIRED, BAM_FPROPER_PAIR, BAM_FQCFAIL, BAM_FREAD1, BAM_FREAD2,
     BAM_FSECONDARY, BAM_FSUPPLEMENTARY, BAM_FUNMAP,
 };
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
 use crate::sam_global::current_global_args;
 
@@ -82,6 +82,18 @@ pub fn main(args: &[OsString]) -> ExitCode {
         let _ = writeln!(io::stderr(), "Usage: samtools flagstat [options] <in.bam>");
         return ExitCode::from(1);
     };
+
+    if input.as_os_str() != "-" && !input.exists() {
+        print_hts_open_missing(&input);
+        print_error(
+            "flagstat",
+            format!(
+                "Cannot open input file \"{}\": No such file or directory",
+                input.display()
+            ),
+        );
+        return ExitCode::from(1);
+    }
 
     let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,

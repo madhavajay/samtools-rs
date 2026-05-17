@@ -126,6 +126,7 @@ fn sort_cram_input_uses_top_level_reference() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let tmp = tmp_dir("sort-cram");
     let out = tmp.join("sorted.sam");
+    let out_cram = tmp.join("sorted.cram");
     let fixtures = htslib_fixtures_dir();
     let reference = fixtures.join("ce.fa");
     let cram = fixtures.join("range.cram");
@@ -195,6 +196,39 @@ fn sort_cram_input_uses_top_level_reference() {
     let mut sorted = names.clone();
     sorted.sort_by(natural);
     assert_eq!(names, sorted);
+
+    let argv: Vec<OsString> = [
+        "samtools",
+        "--reference",
+        reference.to_str().unwrap(),
+        "sort",
+        "-n",
+        "--output-fmt=cram",
+        "-o",
+        out_cram.to_str().unwrap(),
+        cram.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(samtools_run(argv)), 0);
+
+    let records = htslib_rs::alignment_compat::summarize_cram_records_from_path_with_reference(
+        &out_cram, &reference,
+    )
+    .unwrap();
+    let cram_names: Vec<String> = records
+        .iter()
+        .filter_map(|record| {
+            record
+                .name_bytes()
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+        })
+        .collect();
+    assert!(!cram_names.is_empty());
+    let mut sorted_cram_names = cram_names.clone();
+    sorted_cram_names.sort_by(|a, b| natural(&a.as_str(), &b.as_str()));
+    assert_eq!(cram_names, sorted_cram_names);
 }
 
 #[test]
@@ -275,6 +309,42 @@ fn sort_sam_output_uses_htslib_float_aux_spelling() {
         text.contains("fa:f:6.022e+23"),
         "expected htslib float spelling, got:\n{text}"
     );
+}
+
+#[test]
+fn sort_bam_output_preserves_raw_header_pg_and_rg_field_order() {
+    let tmp = tmp_dir("sort-bam-raw-header");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("sorted.bam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@PG\tID:pg1\n",
+            "@RG\tPU:unit1\tID:rg1\tPG:pg1\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:rg1\tPG:Z:pg1\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "sort",
+        "--no-PG",
+        "-t",
+        "PG",
+        "-o",
+        out.to_str().unwrap(),
+        sam.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(sort::main(&argv)), 0);
+
+    let header_text = samtools_rs::header_text::read_raw_header_text(&out).unwrap();
+    assert!(header_text.contains("@PG\tID:pg1\n"));
+    assert!(header_text.contains("@RG\tPU:unit1\tID:rg1\tPG:pg1\n"));
 }
 
 #[test]
@@ -449,6 +519,75 @@ fn merge_write_index_builds_bai_for_coordinate_bam_output() {
         std::fs::read(tmp.join("merged.copy.bam.bai")).unwrap(),
         "merge --write-index BAI must equal a post-pass samtools index BAI"
     );
+}
+
+#[test]
+fn merge_writes_cram_output_with_top_level_reference() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("merge-cram-output");
+    let reference = tmp.join("ref.fa");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let bam_a = tmp.join("a.bam");
+    let bam_b = tmp.join("b.bam");
+    let out = tmp.join("merged.cram");
+
+    std::fs::write(&reference, ">chr1\nACGTTGCA\n").unwrap();
+    samtools_rs::reference::ensure_fai_index(&reference, None).unwrap();
+    std::fs::write(
+        &sam_a,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "b\t0\tchr1\t5\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+        ),
+    )
+    .unwrap();
+    htslib_rs::alignment_compat::write_bam_from_sam_path(
+        &sam_a,
+        std::fs::File::create(&bam_a).unwrap(),
+    )
+    .unwrap();
+    htslib_rs::alignment_compat::write_bam_from_sam_path(
+        &sam_b,
+        std::fs::File::create(&bam_b).unwrap(),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "samtools",
+        "--reference",
+        reference.to_str().unwrap(),
+        "merge",
+        "-f",
+        "--output-fmt=cram",
+        "-o",
+        out.to_str().unwrap(),
+        bam_a.to_str().unwrap(),
+        bam_b.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(samtools_run(argv)), 0);
+
+    let output_records =
+        htslib_rs::alignment_compat::summarize_cram_records_from_path_with_reference(
+            &out, &reference,
+        )
+        .unwrap();
+    assert_eq!(output_records.len(), 2);
+    assert_eq!(output_records[0].name_bytes(), Some(&b"a"[..]));
+    assert_eq!(output_records[1].name_bytes(), Some(&b"b"[..]));
 }
 
 #[test]
@@ -840,6 +979,46 @@ fn merge_reconciles_conflicting_read_group_headers() {
 }
 
 #[test]
+fn merge_remaps_rg_pg_by_appending_after_other_aux_fields() {
+    let tmp = tmp_dir("merge-aux-order");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:rg1\n",
+            "@PG\tID:pg1\n",
+            "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\t",
+            "RG:Z:rg1\tPG:Z:pg1\tAS:i:50\tFI:i:2\n",
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "--no-PG",
+        "-O",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        sam.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let record = text.lines().find(|l| l.starts_with("a\t")).unwrap();
+    assert_eq!(
+        record,
+        "a\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tAS:i:50\tFI:i:2\tRG:Z:rg1\tPG:Z:pg1"
+    );
+}
+
+#[test]
 fn merge_appends_comments_from_all_headers() {
     let tmp = tmp_dir("merge-comments");
     let sam_a = tmp.join("a.sam");
@@ -1214,6 +1393,55 @@ fn merge_tag_sort_orders_by_aux_tag_and_accepts_s_option() {
 }
 
 #[test]
+fn merge_tag_sort_ties_match_upstream_secondary_order() {
+    let tmp = tmp_dir("merge-tag-ties");
+    let sam_a = tmp.join("a.sam");
+    let sam_b = tmp.join("b.sam");
+    let out_coord = tmp.join("coord.sam");
+    let out_name = tmp.join("name.sam");
+    let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:20\n";
+    std::fs::write(
+        &sam_a,
+        format!("{header}x10\t0\tchr1\t1\t60\t4M\t*\t0\t0\tAAAA\t!!!!\tPG:Z:p\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam_b,
+        format!("{header}x7\t0\tchr1\t1\t60\t4M\t*\t0\t0\tCCCC\t####\tPG:Z:p\n"),
+    )
+    .unwrap();
+
+    let run = |args: &[&str], out: &PathBuf| {
+        let mut argv: Vec<OsString> = ["merge", "-f", "-t", "PG", "-O", "sam", "-o"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        argv.push(out.to_str().unwrap().into());
+        argv.extend(args.iter().map(OsString::from));
+        argv.push(sam_a.to_str().unwrap().into());
+        argv.push(sam_b.to_str().unwrap().into());
+        assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+        std::fs::read_to_string(out).unwrap()
+    };
+
+    let coord = run(&[], &out_coord);
+    let coord_names: Vec<_> = coord
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').next().unwrap())
+        .collect();
+    assert_eq!(coord_names, ["x10", "x7"]);
+
+    let name = run(&["-n"], &out_name);
+    let name_names: Vec<_> = name
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').next().unwrap())
+        .collect();
+    assert_eq!(name_names, ["x7", "x10"]);
+}
+
+#[test]
 fn merge_dash_output_writes_sam_to_stdout() {
     let tmp = tmp_dir("merge-dash-output");
     let sam_a = tmp.join("a.sam");
@@ -1512,6 +1740,7 @@ fn collate_cram_input_uses_top_level_reference() {
     let tmp = tmp_dir("collate-cram");
     let out_prefix = tmp.join("collated");
     let out = tmp.join("collated.sam");
+    let out_cram = tmp.join("collated.cram");
     let fixtures = htslib_fixtures_dir();
     let reference = fixtures.join("ce.fa");
     let cram = fixtures.join("range.cram");
@@ -1550,6 +1779,46 @@ fn collate_cram_input_uses_top_level_reference() {
             prev = n;
         }
     }
+
+    let argv: Vec<OsString> = [
+        "samtools",
+        "--reference",
+        reference.to_str().unwrap(),
+        "collate",
+        "-o",
+        out_cram.to_str().unwrap(),
+        cram.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(samtools_run(argv)), 0);
+
+    let records = htslib_rs::alignment_compat::summarize_cram_records_from_path_with_reference(
+        &out_cram, &reference,
+    )
+    .unwrap();
+    let cram_names: Vec<String> = records
+        .iter()
+        .filter_map(|record| {
+            record
+                .name_bytes()
+                .map(|name| String::from_utf8_lossy(name).into_owned())
+        })
+        .collect();
+    assert!(!cram_names.is_empty());
+    let mut seen = std::collections::HashSet::new();
+    let mut prev = "";
+    for n in &cram_names {
+        let n = n.as_str();
+        if n != prev {
+            assert!(
+                seen.insert(n),
+                "qname {n} not contiguous after CRAM shuffle"
+            );
+            prev = n;
+        }
+    }
 }
 
 #[test]
@@ -1557,7 +1826,7 @@ fn collate_rejects_invalid_output_format() {
     let argv: Vec<OsString> = [
         "collate",
         "--output-fmt",
-        "cram",
+        "vcf",
         sample_bam().to_str().unwrap(),
     ]
     .iter()
@@ -2051,6 +2320,81 @@ fn merge_reconciles_rg_pg_byte_exact_vs_upstream() {
             "merge {expected}"
         );
     }
+}
+
+#[test]
+fn merge_input_list_precedes_remaining_positionals_like_upstream() {
+    let d = fixtures_dir();
+    let tmp = tmp_dir("merge-input-list-order");
+    let list = tmp.join("inputs.fofn");
+    let out = tmp.join("merged.sam");
+    std::fs::write(
+        &list,
+        format!(
+            "{}\n{}\n",
+            d.join("dat/test_input_1_b.bam").display(),
+            d.join("dat/test_input_1_c.bam").display()
+        ),
+    )
+    .unwrap();
+
+    let argv: Vec<OsString> = [
+        "merge",
+        "-s",
+        "1",
+        "-O",
+        "sam",
+        "-b",
+        list.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        d.join("dat/test_input_1_a.bam").to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let strip_pg = |s: &str| -> String {
+        s.lines()
+            .filter(|l| !l.starts_with("@PG\t"))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    assert_eq!(
+        strip_pg(&std::fs::read_to_string(out).unwrap()),
+        strip_pg(&std::fs::read_to_string(d.join("merge/3.merge.expected.sam")).unwrap())
+    );
+}
+
+#[test]
+fn merge_template_coordinate_matches_upstream_fixture() {
+    let d = fixtures_dir();
+    let tmp = tmp_dir("merge-template-coordinate");
+    let out = tmp.join("merged.sam");
+    let argv: Vec<OsString> = [
+        "merge",
+        "--no-PG",
+        "-O",
+        "SAM",
+        "--template-coordinate",
+        "-o",
+        out.to_str().unwrap(),
+        d.join("merge/test_template_coordinate.1.sam")
+            .to_str()
+            .unwrap(),
+        d.join("merge/test_template_coordinate.2.sam")
+            .to_str()
+            .unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        std::fs::read_to_string(d.join("merge/test_template_coordinate.expected.sam")).unwrap()
+    );
 }
 
 /// All three upstream `test_sort` minimiser cases:

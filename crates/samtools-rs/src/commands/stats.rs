@@ -25,17 +25,19 @@ use crate::bam_flag::{
     BAM_FDUP, BAM_FMUNMAP, BAM_FPAIRED, BAM_FPROPER_PAIR, BAM_FQCFAIL, BAM_FREAD1, BAM_FREAD2,
     BAM_FREVERSE, BAM_FSECONDARY, BAM_FSUPPLEMENTARY, BAM_FUNMAP, str_to_flag,
 };
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
 
 use crate::sam_global::current_global_args;
-use crate::version::SAMTOOLS_VERSION;
+use crate::version::{C_HTSLIB_VERSION, SAMTOOLS_VERSION};
 
 /// Upstream `stats.c` `stats->ngc` — GC-fraction histogram array size.
 const NGC: usize = 200;
 /// Upstream `stats->nindels` (init = `nbases` = 300, never grown):
 /// indels longer than this are excluded from the ID distribution.
 const NINDELS: usize = 300;
+/// Upstream default `--GC-depth` bin size.
+const GCD_BIN_SIZE: usize = 20_000;
 
 #[derive(Clone, Debug)]
 struct StatsConfig {
@@ -93,8 +95,17 @@ impl Default for StatsConfig {
     }
 }
 
+fn stats_command_line(args: &[OsString]) -> String {
+    if args.is_empty() {
+        "stats".to_string()
+    } else {
+        crate::pg::stringify_argv(args)
+    }
+}
+
 /// Entry point for `samtools stats`.
 pub fn main(args: &[OsString]) -> ExitCode {
+    let command_line = stats_command_line(args);
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut target_file: Option<PathBuf> = None;
@@ -270,6 +281,18 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
+    if input.as_os_str() != "-" && !input.exists() {
+        print_hts_open_missing(&input);
+        print_error(
+            "stats",
+            format!(
+                "failed to open \"{}\": No such file or directory",
+                input.display()
+            ),
+        );
+        return ExitCode::from(1);
+    }
+
     let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,
         Err(e) => {
@@ -425,11 +448,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 .as_deref()
                 .map(|so| so == "coordinate")
                 .unwrap_or(false);
-            write_stats(&mut writer, &summaries, &config, is_sorted)
+            write_stats(&mut writer, &summaries, &config, is_sorted, &command_line)
         }
         StatsInput::Counts(counts) => {
             let is_sorted = counts.is_coordinate_sorted();
-            let combined = write_stats_counts(&mut writer, &counts, &config, is_sorted);
+            let combined =
+                write_stats_counts(&mut writer, &counts, &config, is_sorted, &command_line);
             // `-S`/`--split`: one `<prefix|input>_<value>.bamstat` per
             // tag value, prefix defaulting to the input path.
             combined.and_then(|()| {
@@ -444,7 +468,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     let path = format!("{prefix}_{value}.bamstat");
                     let file = File::create(&path)?;
                     let mut w = std::io::BufWriter::new(file);
-                    write_stats_counts(&mut w, sub, &config, sub.is_coordinate_sorted())?;
+                    write_stats_counts(
+                        &mut w,
+                        sub,
+                        &config,
+                        sub.is_coordinate_sorted(),
+                        &command_line,
+                    )?;
                     w.flush()?;
                 }
                 Ok(())
@@ -1370,6 +1400,12 @@ fn default_barcode_tags() -> Vec<BarcodeAcc> {
         .collect()
 }
 
+#[derive(Clone, Default)]
+struct GcDepthBin {
+    gc: f64,
+    depth: u32,
+}
+
 #[derive(Default)]
 struct StatsCounts {
     raw_total: u64,
@@ -1432,6 +1468,13 @@ struct StatsCounts {
     // Upstream `gc_1st`/`gc_2nd`: fixed `ngc`-sized GC-fraction arrays.
     first_gc_hist: Vec<u64>,
     last_gc_hist: Vec<u64>,
+    // Upstream GC-depth bins. Slot 0 is the zeroed sentinel allocated
+    // before any read is observed; real bins start at slot 1 and the
+    // current slot is excluded from the print loop, matching stats.c.
+    gcd_bins: Vec<GcDepthBin>,
+    gcd_tid: Option<usize>,
+    gcd_pos: Option<usize>,
+    gcd_current: usize,
     coverage_depths: BTreeMap<(usize, usize), u32>,
     // `-p`/`--remove-overlaps`: first-seen mate's clipped M/=/X
     // reference intervals (0-based half-open) per template qname, with
@@ -1631,14 +1674,17 @@ impl StatsCounts {
             let quals: Vec<u8> = rec.quality_scores().iter().flatten().collect();
             if quals.is_empty() && seq_len_u32 > 0 {
                 // `*` quality: HTSlib stores 0xFF per base.
-                self.max_qual = 255;
                 for cycle in 0..seq_len_u32 as usize {
-                    self.qual_sum += 255;
-                    self.qual_count += 1;
                     if order_first {
+                        self.max_qual = 255;
+                        self.qual_sum += 255;
+                        self.qual_count += 1;
                         increment_quality_hist(&mut self.first_qual_hist, cycle, 255);
                     }
                     if order_last {
+                        self.max_qual = 255;
+                        self.qual_sum += 255;
+                        self.qual_count += 1;
                         increment_quality_hist(&mut self.last_qual_hist, cycle, 255);
                     }
                 }
@@ -1650,15 +1696,20 @@ impl StatsCounts {
                 let len = quals.len();
                 for cycle in 0..len {
                     let q = quals[if reverse { len - 1 - cycle } else { cycle }];
-                    self.qual_sum += u64::from(q);
-                    self.qual_count += 1;
-                    if q > self.max_qual {
-                        self.max_qual = q;
-                    }
                     if order_first {
+                        self.qual_sum += u64::from(q);
+                        self.qual_count += 1;
+                        if q > self.max_qual {
+                            self.max_qual = q;
+                        }
                         increment_quality_hist(&mut self.first_qual_hist, cycle, q);
                     }
                     if order_last {
+                        self.qual_sum += u64::from(q);
+                        self.qual_count += 1;
+                        if q > self.max_qual {
+                            self.max_qual = q;
+                        }
                         increment_quality_hist(&mut self.last_qual_hist, cycle, q);
                     }
                 }
@@ -1825,13 +1876,35 @@ impl StatsCounts {
         let counted = self.total > pre_total || self.supplementary > pre_supp;
         if counted
             && flag & BAM_FUNMAP == 0
-            && let Some(refmap) = config.reference_seqs.as_ref()
             && let Some(rsid) = reference_sequence_id
             && let Some(p) = pos
-            && let Some((name, _)) = header.reference_sequences().get_index(rsid)
-            && let Some(refseq) = refmap.get(String::from_utf8_lossy(name.as_ref()).as_ref())
         {
-            self.count_mismatches_per_cycle(rec, flag, seq_len, refseq, p - 1, &chk_seq, &chk_qual);
+            if let Some(refmap) = config.reference_seqs.as_ref()
+                && let Some((name, _)) = header.reference_sequences().get_index(rsid)
+                && let Some(refseq) = refmap.get(String::from_utf8_lossy(name.as_ref()).as_ref())
+            {
+                self.update_gc_depth_reference(rsid, p - 1, seq_len, refseq);
+                self.count_mismatches_per_cycle(
+                    rec,
+                    flag,
+                    seq_len,
+                    refseq,
+                    p - 1,
+                    &chk_seq,
+                    &chk_qual,
+                );
+            } else {
+                let order_first =
+                    flag & BAM_FPAIRED == 0 || (flag & BAM_FREAD1 != 0 && flag & BAM_FREAD2 == 0);
+                let order_last =
+                    flag & BAM_FPAIRED != 0 && flag & BAM_FREAD2 != 0 && flag & BAM_FREAD1 == 0;
+                let gc_fraction = if order_first || order_last {
+                    read_gc_fraction(rec)
+                } else {
+                    0.0
+                };
+                self.update_gc_depth_no_reference(rsid, p - 1, gc_fraction);
+            }
         }
 
         // `-p`/`--remove-overlaps`: faithful port of `remove_overlaps`.
@@ -1995,7 +2068,7 @@ impl StatsCounts {
         quals: &[u8],
     ) {
         use sam::alignment::record::cigar::op::Kind;
-        fn nt16(b: u8) -> u8 {
+        fn read_nt16(b: u8) -> u8 {
             match b.to_ascii_uppercase() {
                 b'=' => 0,
                 b'A' => 1,
@@ -2013,6 +2086,15 @@ impl StatsCounts {
                 b'D' => 13,
                 b'B' => 14,
                 _ => 15,
+            }
+        }
+        fn ref_nt16(b: u8) -> u8 {
+            match b.to_ascii_uppercase() {
+                b'A' => 1,
+                b'C' => 2,
+                b'G' => 4,
+                b'T' => 8,
+                _ => 0,
             }
         }
         let is_fwd = flag & BAM_FREVERSE == 0;
@@ -2039,8 +2121,8 @@ impl StatsCounts {
                 Kind::Skip | Kind::Pad => {}
                 Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                     for _ in 0..ncig {
-                        let cread = seq_ascii.get(iread).copied().map(nt16).unwrap_or(0);
-                        let cref = refseq.get(pos0 + iref).copied().map(nt16).unwrap_or(0);
+                        let cread = seq_ascii.get(iread).copied().map(read_nt16).unwrap_or(0);
+                        let cref = refseq.get(pos0 + iref).copied().map(ref_nt16).unwrap_or(0);
                         let idx = if is_fwd {
                             icycle
                         } else {
@@ -2200,6 +2282,71 @@ impl StatsCounts {
                 Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
             }
         }
+    }
+
+    fn update_gc_depth_no_reference(&mut self, tid: usize, pos0: usize, gc_fraction: f64) {
+        let new_bin = self.gcd_bins.is_empty()
+            || self.gcd_tid != Some(tid)
+            || self
+                .gcd_pos
+                .map(|gcd_pos| pos0.saturating_sub(gcd_pos) > GCD_BIN_SIZE)
+                .unwrap_or(true);
+
+        if new_bin {
+            if self.gcd_bins.is_empty() {
+                self.gcd_bins.push(GcDepthBin::default());
+            }
+            self.gcd_tid = Some(tid);
+            self.gcd_pos = Some(pos0);
+            self.gcd_current += 1;
+            if self.gcd_current >= self.gcd_bins.len() {
+                self.gcd_bins.push(GcDepthBin::default());
+            }
+        }
+
+        if self.gcd_bins.is_empty() {
+            return;
+        }
+
+        let bin = &mut self.gcd_bins[self.gcd_current];
+        bin.depth = bin.depth.saturating_add(1);
+        bin.gc += gc_fraction;
+    }
+
+    fn update_gc_depth_reference(
+        &mut self,
+        tid: usize,
+        pos0: usize,
+        read_len: usize,
+        refseq: &[u8],
+    ) {
+        let read_end = pos0.saturating_add(read_len);
+        let new_bin = self.gcd_bins.is_empty()
+            || self.gcd_tid != Some(tid)
+            || self
+                .gcd_pos
+                .map(|gcd_pos| gcd_pos.saturating_add(GCD_BIN_SIZE) < read_end)
+                .unwrap_or(true);
+
+        if new_bin {
+            if self.gcd_bins.is_empty() {
+                self.gcd_bins.push(GcDepthBin::default());
+            }
+            self.gcd_tid = Some(tid);
+            self.gcd_pos = Some(pos0);
+            self.gcd_current += 1;
+            if self.gcd_current >= self.gcd_bins.len() {
+                self.gcd_bins.push(GcDepthBin::default());
+            }
+            self.gcd_bins[self.gcd_current].gc = reference_gc_percent(refseq, pos0, GCD_BIN_SIZE);
+        }
+
+        if self.gcd_bins.is_empty() {
+            return;
+        }
+
+        let bin = &mut self.gcd_bins[self.gcd_current];
+        bin.depth = bin.depth.saturating_add(1);
     }
 
     fn update_summary(&mut self, rec: &AlignmentRecordSummary, config: &StatsConfig) {
@@ -2544,12 +2691,13 @@ fn write_stats(
     recs: &[AlignmentRecordSummary],
     config: &StatsConfig,
     is_sorted: bool,
+    command_line: &str,
 ) -> io::Result<()> {
     let mut counts = StatsCounts::default();
     for rec in recs {
         counts.update_summary(rec, config);
     }
-    write_stats_counts(out, &counts, config, is_sorted)
+    write_stats_counts(out, &counts, config, is_sorted, command_line)
 }
 
 fn write_stats_counts(
@@ -2557,11 +2705,12 @@ fn write_stats_counts(
     counts: &StatsCounts,
     config: &StatsConfig,
     is_sorted: bool,
+    command_line: &str,
 ) -> io::Result<()> {
     writeln!(
         out,
-        "# This file was produced by samtools-rs stats (samtools-{}+htslib-rs)",
-        SAMTOOLS_VERSION
+        "# This file was produced by samtools stats ({}+htslib-{}) and can be plotted using plot-bamstats",
+        SAMTOOLS_VERSION, C_HTSLIB_VERSION
     )?;
     match (&counts.split_name, &config.split_tag) {
         (Some(name), Some(tag)) => writeln!(
@@ -2570,7 +2719,7 @@ fn write_stats_counts(
         )?,
         _ => writeln!(out, "# This file contains statistics for all reads.")?,
     }
-    writeln!(out, "# The command line was:  samtools-rs stats")?;
+    writeln!(out, "# The command line was:  {command_line}")?;
     writeln!(
         out,
         "# CHK, Checksum\t[2]Read Names\t[3]Sequences\t[4]Qualities"
@@ -2676,8 +2825,8 @@ fn write_stats_counts(
         "SN\terror rate:\t{}\t# mismatches / bases mapped (cigar)",
         c_e6(error_rate)
     )?;
-    let avg_len = if counts.raw_total > 0 {
-        counts.total_len as f64 / counts.raw_total as f64
+    let avg_len = if counts.total > 0 {
+        counts.total_len as f64 / counts.total as f64
     } else {
         0.0
     };
@@ -2741,7 +2890,7 @@ fn write_stats_counts(
         "SN\tpairs on different chromosomes:\t{}",
         counts.diffchr / 2
     )?;
-    let denom = counts.read1 + counts.read2;
+    let denom = counts.total;
     let proper_pct = if denom > 0 {
         100.0 * counts.proper_paired as f64 / denom as f64
     } else {
@@ -2874,15 +3023,104 @@ fn write_indel_cov_gcd(
         out,
         "# GC-depth. Use `grep ^GCD | cut -f 2-` to extract this part. The columns are: GC%, unique sequence percentiles, 10th, 25th, 50th, 75th and 90th depth percentile"
     )?;
-    // Every test reference span is far below the 20 kbp GC-depth bin
-    // size, so exactly one bin is ever accumulated. With upstream's
-    // pre-incremented `igcd` the printed row comes from the zeroed
-    // sentinel slot, yielding this fixed line whenever at least one
-    // mapped read was seen. (Multi-bin spans are not yet modelled.)
-    if counts.mapped > 0 {
-        writeln!(out, "GCD\t0.0\t100.000\t0.000\t0.000\t0.000\t0.000\t0.000")?;
+    write_gc_depth(out, counts)?;
+    Ok(())
+}
+
+fn write_gc_depth(out: &mut dyn Write, counts: &StatsCounts) -> io::Result<()> {
+    if counts.gcd_current == 0 {
+        return Ok(());
+    }
+
+    let mut bins = counts.gcd_bins.clone();
+    for bin in bins.iter_mut().take(counts.gcd_current) {
+        if bin.depth > 0 {
+            bin.gc = (100.0 * bin.gc / f64::from(bin.depth)).round();
+        }
+    }
+    bins.sort_by(|a, b| {
+        a.gc.partial_cmp(&b.gc)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.depth.cmp(&b.depth))
+    });
+
+    let avg_read_length = if counts.total > 0 {
+        counts.total_len as f64 / counts.total as f64
+    } else {
+        0.0
+    };
+    let depth_scale = avg_read_length / GCD_BIN_SIZE as f64;
+    let mut i = 0usize;
+    while i < counts.gcd_current {
+        let gc = bins[i].gc;
+        let mut n = 0usize;
+        while i + n < counts.gcd_current && (bins[i + n].gc - gc).abs() < 0.1 {
+            n += 1;
+        }
+        writeln!(
+            out,
+            "GCD\t{:.1}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}",
+            gc,
+            (i + n + 1) as f64 * 100.0 / (counts.gcd_current + 1) as f64,
+            gcd_percentile(&bins[i..i + n], 10) * depth_scale,
+            gcd_percentile(&bins[i..i + n], 25) * depth_scale,
+            gcd_percentile(&bins[i..i + n], 50) * depth_scale,
+            gcd_percentile(&bins[i..i + n], 75) * depth_scale,
+            gcd_percentile(&bins[i..i + n], 90) * depth_scale,
+        )?;
+        i += n;
     }
     Ok(())
+}
+
+fn gcd_percentile(bins: &[GcDepthBin], percentile: i32) -> f64 {
+    if bins.is_empty() {
+        return 0.0;
+    }
+    let n = percentile as f64 * (bins.len() + 1) as f64 / 100.0;
+    let k = n as usize;
+    if k == 0 {
+        return f64::from(bins[0].depth);
+    }
+    if k >= bins.len() {
+        return f64::from(bins[bins.len() - 1].depth);
+    }
+
+    let d = n - k as f64;
+    f64::from(bins[k - 1].depth) + d * f64::from(bins[k].depth - bins[k - 1].depth)
+}
+
+fn read_gc_fraction(rec: &(impl sam::alignment::Record + ?Sized)) -> f64 {
+    let seq_len = rec.sequence().len();
+    if seq_len == 0 {
+        return 0.0;
+    }
+    let gc = rec
+        .sequence()
+        .iter()
+        .filter(|b| matches!(b.to_ascii_uppercase(), b'G' | b'C'))
+        .count();
+    gc as f64 / seq_len as f64
+}
+
+fn reference_gc_percent(refseq: &[u8], pos0: usize, len: usize) -> f64 {
+    let mut gc = 0u32;
+    let mut count = 0u32;
+    for b in refseq.iter().skip(pos0).take(len) {
+        match b.to_ascii_uppercase() {
+            b'C' | b'G' => {
+                gc += 1;
+                count += 1;
+            }
+            b'A' | b'T' => count += 1,
+            _ => {}
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        f64::from(gc) / f64::from(count)
+    }
 }
 
 /// Faithful port of upstream `output_stats`' insert-size mean/sd: the

@@ -117,7 +117,12 @@ where
 /// `None`, matching the permissive behavior used by the current commands.
 pub fn parse_bed_line(line: &str) -> Option<BedInterval> {
     let s = line.trim_end();
-    if s.is_empty() || s.starts_with('#') || s.starts_with("track ") || s.starts_with("browser ") {
+    if s.is_empty()
+        || s.starts_with('#')
+        || s.starts_with("track ")
+        || s.starts_with("browser ")
+        || s.as_bytes().first().is_some_and(u8::is_ascii_whitespace)
+    {
         return None;
     }
 
@@ -127,7 +132,16 @@ pub fn parse_bed_line(line: &str) -> Option<BedInterval> {
     let mut fields = s.split_whitespace();
     let chrom = fields.next().unwrap_or("");
     let start: u64 = fields.next().and_then(|t| t.parse().ok()).unwrap_or(0);
-    let end: u64 = fields.next().and_then(|t| t.parse().ok()).unwrap_or(0);
+    let (start, end) = match fields.next().and_then(|t| t.parse().ok()) {
+        Some(end) => (start, end),
+        None => {
+            // samtools also accepts two-column BED-like input, but treats the
+            // point coordinate as 1-based rather than BED's usual 0-based
+            // start.
+            let start = start.saturating_sub(1);
+            (start, start.saturating_add(1))
+        }
+    };
     if chrom.is_empty() || end <= start {
         return None;
     }
@@ -158,6 +172,21 @@ mod tests {
             }
         );
         assert_eq!(interval.to_region_string(), "chr1:10-20");
+    }
+
+    #[test]
+    fn parses_two_column_point_as_one_based() {
+        let interval = parse_bed_line("chr1\t20").unwrap();
+
+        assert_eq!(
+            interval,
+            BedInterval {
+                chrom: "chr1".into(),
+                start: 19,
+                end: 20
+            }
+        );
+        assert_eq!(interval.to_region_string(), "chr1:20-20");
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! `samtools/bamtk.c`, including subcommand aliases.
 
 use std::ffi::OsString;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
 use crate::commands;
@@ -98,6 +98,10 @@ pub fn run(args: Vec<OsString>) -> ExitCode {
         if entry.name == sub_str || entry.aliases.contains(&sub_str) {
             // Pass argv from the subcommand name onwards (mirrors C's argv+1).
             let sub_args: Vec<OsString> = args[1..].to_vec();
+            if sub_args.len() == 1 && io::stdin().is_terminal() {
+                let _ = print_subcommand_usage(&mut io::stdout(), sub_str);
+                return ExitCode::SUCCESS;
+            }
             let code = (entry.entry)(&sub_args);
             // Flush stdout; mirror bamtk.c's final fclose(stdout) check.
             let mut out = io::stdout();
@@ -108,6 +112,10 @@ pub fn run(args: Vec<OsString>) -> ExitCode {
 
     let _ = writeln!(io::stderr(), "[main] unrecognized command '{}'", sub_str);
     ExitCode::from(1)
+}
+
+fn print_subcommand_usage<W: Write>(w: &mut W, subcommand: &str) -> io::Result<()> {
+    writeln!(w, "Usage: samtools {subcommand} [options]")
 }
 
 /// Registry of every supported subcommand. Order follows upstream
@@ -297,6 +305,11 @@ pub const SUBCOMMANDS: &[Subcommand] = &[
         name: "head",
         aliases: &[],
         entry: commands::head::main,
+    },
+    Subcommand {
+        name: "tview",
+        aliases: &[],
+        entry: commands::tview::main,
     },
     Subcommand {
         name: "view",

@@ -10,7 +10,6 @@
 //!
 //! Byte-exact (modulo the harness-stripped `Samtools version`/`Command
 //! line` lines) vs upstream `test/ampliconstats/stats{,_mixed,_partial}`.
-//! **Pending:** `--tcoord-bin` aggregation, CRAM, `--use-sample-name`.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -19,11 +18,21 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use htslib_rs::sam::alignment::{RecordBuf, record::cigar::op::Kind};
+use htslib_rs::{
+    bam,
+    format::Exact,
+    sam::{
+        self,
+        alignment::{RecordBuf, record::cigar::op::Kind},
+    },
+};
 
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
+use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
 const MAX_DEPTH: usize = 5;
+const REPORTED_MISSING_INPUT: &str = "__samtools_rs_reported_missing_input__";
 
 struct Args {
     flag_require: u32,
@@ -37,6 +46,7 @@ struct Args {
     tcoord_bin: i64,
     depth_bin: f64,
     multi_ref: bool,
+    use_sample_name: bool,
     argv: String,
     out: Option<PathBuf>,
 }
@@ -55,6 +65,7 @@ impl Default for Args {
             tcoord_bin: 1,
             depth_bin: 0.01,
             multi_ref: true,
+            use_sample_name: false,
             argv: String::new(),
             out: None,
         }
@@ -160,6 +171,14 @@ struct RefAmp {
     first_amp: usize,
     lstats: Stats,
     gstats: Stats,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TCoord {
+    start: u32,
+    end: u32,
+    freq: u32,
+    status: u32,
 }
 
 type BedData = (Vec<String>, HashMap<String, Vec<BedEntry>>);
@@ -1060,21 +1079,25 @@ fn dump_stats(
         let start_i: i64 = if nref == 1 { -1 } else { 0 };
         for i in start_i..ra.namp as i64 {
             let map = &s.tcoord[(i + 1) as usize];
-            let mut tp: Vec<(u32, u32, u32, u32)> = Vec::new();
+            let mut tp: Vec<TCoord> = Vec::new();
             for (&k, &v) in map {
                 if v & 0xffff_ffff == 0 {
                     continue;
                 }
-                tp.push((
-                    (k & 0xffff_ffff) as u32,
-                    (k >> 32) as u32,
-                    (v & 0xffff_ffff) as u32,
-                    (v >> 32) as u32,
-                ));
+                tp.push(TCoord {
+                    start: (k & 0xffff_ffff) as u32,
+                    end: (k >> 32) as u32,
+                    freq: (v & 0xffff_ffff) as u32,
+                    status: (v >> 32) as u32,
+                });
             }
-            // Upstream emits in hash-iteration order (unspecified) but
-            // fixtures have a single entry per amplicon here.
-            tp.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+            if args.tcoord_bin > 1 {
+                aggregate_tcoord(args.tcoord_bin, &mut tp);
+            } else {
+                // Upstream emits in hash-iteration order when not aggregating
+                // (unspecified); keep deterministic output for Rust tests.
+                sort_tcoord_by_frequency(&mut tp);
+            }
             write!(
                 out,
                 "{}TCOORD\t{}\t{}",
@@ -1083,11 +1106,11 @@ fn dump_stats(
                 i + 1 + ra.first_amp as i64
             )
             .ok();
-            for (s0, e0, f0, st0) in &tp {
-                if (*f0 as i64) < args.tcoord_min_count {
+            for t in &tp {
+                if (t.freq as i64) < args.tcoord_min_count {
                     continue;
                 }
-                write!(out, "\t{},{},{},{}", s0, e0, f0, st0).ok();
+                write!(out, "\t{},{},{},{}", t.start, t.end, t.freq, t.status).ok();
             }
             writeln!(out).ok();
         }
@@ -1163,7 +1186,7 @@ pub fn main(argv: &[OsString]) -> ExitCode {
         let mut val = || it.next().and_then(|v| v.to_str()).map(|x| x.to_string());
         match s {
             "-S" | "--single-ref" => args.multi_ref = false,
-            "-s" | "--use-sample-name" => {}
+            "-s" | "--use-sample-name" => args.use_sample_name = true,
             "-o" | "--output" => args.out = val().map(PathBuf::from),
             "-f" | "--flag-require" => {
                 args.flag_require = val().and_then(|v| parse_flag(&v)).unwrap_or(0)
@@ -1225,6 +1248,9 @@ pub fn main(argv: &[OsString]) -> ExitCode {
 
     match run(&args, &bedfile, &files) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == io::ErrorKind::Other && e.to_string() == REPORTED_MISSING_INPUT => {
+            ExitCode::from(255)
+        }
         Err(e) => {
             print_error_errno("ampliconstats", "ampliconstats failed", &e);
             ExitCode::from(1)
@@ -1246,6 +1272,19 @@ fn run(args: &Args, bedfile: &Path, files: &[PathBuf]) -> io::Result<()> {
     if files.is_empty() {
         return Ok(());
     }
+    for path in files {
+        if path != Path::new("-") && !path.exists() {
+            print_hts_open_missing(path);
+            print_error(
+                "ampliconstats",
+                format!(
+                    "Cannot open input file \"{}\": No such file or directory",
+                    path.display()
+                ),
+            );
+            return Err(io::Error::other(REPORTED_MISSING_INPUT));
+        }
+    }
 
     let mut out: Box<dyn Write> = match &args.out {
         Some(p) => Box::new(BufWriter::new(File::create(p)?)),
@@ -1253,7 +1292,7 @@ fn run(args: &Args, bedfile: &Path, files: &[PathBuf]) -> io::Result<()> {
     };
 
     // Header / SS from the first file.
-    let (header0, _) = crate::sam_compat::read_sam_records_tolerant(&files[0])?;
+    let (header0, _) = read_alignment_records(&files[0])?;
     let sq: Vec<(String, i64)> = header0
         .reference_sequences()
         .iter()
@@ -1337,7 +1376,7 @@ fn run(args: &Args, bedfile: &Path, files: &[PathBuf]) -> io::Result<()> {
 
     // Per-file.
     for f in files {
-        let (header, records) = crate::sam_compat::read_sam_records_tolerant(f)?;
+        let (header, records) = read_alignment_records(f)?;
         let fhsq: Vec<String> = header
             .reference_sequences()
             .keys()
@@ -1346,7 +1385,11 @@ fn run(args: &Args, bedfile: &Path, files: &[PathBuf]) -> io::Result<()> {
         if fhsq.len() != nref {
             return Err(io::Error::other("SAM headers are not consistent"));
         }
-        let sname = sample_name(f);
+        let sname = if args.use_sample_name {
+            header_sample_name(&header).unwrap_or_else(|| sample_name(f))
+        } else {
+            sample_name(f)
+        };
 
         for ra in refs.iter_mut() {
             ra.lstats.reset();
@@ -1432,4 +1475,193 @@ fn sample_name(path: &Path) -> String {
         }
     }
     n.to_string()
+}
+
+fn read_alignment_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+    match sam_io::sam_open_format(input)?.exact {
+        Exact::Sam => crate::sam_compat::read_sam_records_tolerant(input),
+        Exact::Bam => read_bam_records(input),
+        Exact::Cram => read_cram_records(input),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported alignment input",
+        )),
+    }
+}
+
+fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+    let mut reader = bam::io::Reader::new(File::open(input)?);
+    let header = reader.read_header()?;
+    let mut records = Vec::new();
+    loop {
+        let mut record = RecordBuf::default();
+        if reader.read_record_buf(&header, &mut record)? == 0 {
+            break;
+        }
+        records.push(record);
+    }
+    Ok((header, records))
+}
+
+fn read_cram_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+    let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
+    let records = if let Some(reference) = current_global_args().reference {
+        htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+            input, reference,
+        )?
+    } else {
+        htslib_rs::alignment_compat::query_cram_records_all_from_path(input)?
+    };
+    Ok((header, records))
+}
+
+fn header_sample_name(header: &sam::Header) -> Option<String> {
+    let sample_tag = sam::header::record::value::map::read_group::tag::SAMPLE;
+    header.read_groups().iter().find_map(|(_, rg)| {
+        rg.other_fields()
+            .get(&sample_tag)
+            .map(|sample| sample.to_string())
+    })
+}
+
+fn sort_tcoord_by_frequency(tpos: &mut [TCoord]) {
+    tpos.sort_by(|a, b| {
+        b.freq
+            .cmp(&a.freq)
+            .then(a.start.cmp(&b.start))
+            .then(a.end.cmp(&b.end))
+    });
+}
+
+fn aggregate_tcoord(tcoord_bin: i64, tpos: &mut Vec<TCoord>) {
+    if tcoord_bin <= 1 {
+        return;
+    }
+
+    sort_tcoord_by_frequency(tpos);
+    let n = tpos.len();
+    let mut j = 0usize;
+    while j < n {
+        let mut j2 = j + 1;
+        while j2 < n {
+            if tpos[j].freq != tpos[j2].freq {
+                break;
+            }
+            if tpos[j2].start as i64 - tpos[j].start as i64 >= tcoord_bin {
+                break;
+            }
+            j2 += 1;
+        }
+
+        if j2 - 1 > j {
+            let mut m = (j2 - 1 + j) / 2;
+            while m > 1 && tpos[m].start == tpos[m - 1].start {
+                m -= 1;
+            }
+            let mut j3 = m + 1;
+            while j3 < j2 {
+                if tpos[m].start != tpos[j3].start {
+                    break;
+                }
+                if tpos[m].end as i64 - tpos[j3].end as i64 >= tcoord_bin {
+                    break;
+                }
+                j3 += 1;
+            }
+            if j3 - 1 > m {
+                m = (j3 - 1 + m) / 2;
+            }
+            tpos.swap(j, m);
+            j = j2;
+        } else {
+            j += 1;
+        }
+    }
+
+    let half_bin = tcoord_bin / 2;
+    let mut k = 0usize;
+    let mut j = 0usize;
+    while j < n {
+        if tpos[j].freq == 0 {
+            j += 1;
+            continue;
+        }
+        if k < j {
+            tpos[k] = tpos[j];
+        }
+
+        for j2 in j + 1..n {
+            if (tpos[j].start as i64 - tpos[j2].start as i64).abs() < half_bin
+                && (tpos[j].end as i64 - tpos[j2].end as i64).abs() < half_bin
+                && tpos[j].status == tpos[j2].status
+            {
+                tpos[k].freq += tpos[j2].freq;
+                tpos[j2].freq = 0;
+            }
+        }
+        k += 1;
+        j += 1;
+    }
+    tpos.truncate(k);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TCoord, aggregate_tcoord};
+
+    #[test]
+    fn aggregate_tcoord_merges_nearby_same_status_into_most_frequent_site() {
+        let mut coords = vec![
+            TCoord {
+                start: 10,
+                end: 100,
+                freq: 2,
+                status: 1,
+            },
+            TCoord {
+                start: 12,
+                end: 103,
+                freq: 5,
+                status: 1,
+            },
+            TCoord {
+                start: 16,
+                end: 108,
+                freq: 1,
+                status: 1,
+            },
+            TCoord {
+                start: 13,
+                end: 104,
+                freq: 3,
+                status: 2,
+            },
+        ];
+
+        aggregate_tcoord(10, &mut coords);
+
+        assert_eq!(
+            coords,
+            vec![
+                TCoord {
+                    start: 12,
+                    end: 103,
+                    freq: 7,
+                    status: 1,
+                },
+                TCoord {
+                    start: 13,
+                    end: 104,
+                    freq: 3,
+                    status: 2,
+                },
+                TCoord {
+                    start: 16,
+                    end: 108,
+                    freq: 1,
+                    status: 1,
+                },
+            ]
+        );
+    }
 }

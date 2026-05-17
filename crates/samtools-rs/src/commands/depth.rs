@@ -22,9 +22,11 @@ use htslib_rs::core::Region;
 use htslib_rs::format::Exact;
 use htslib_rs::sam;
 
-use crate::bam_flag::{BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FUNMAP, str_to_flag};
-use crate::bedidx::load_bed_index;
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::bam_flag::{
+    BAM_FDUP, BAM_FPAIRED, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FUNMAP, str_to_flag,
+};
+use crate::bedidx::parse_bed_line;
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
 use crate::sam_global::current_global_args;
 
@@ -48,6 +50,8 @@ pub(crate) struct DepthRunConfig<'a> {
     pub(crate) exclude_flags: u32,
     pub(crate) include_any_flags: u32,
     pub(crate) require_flags: u32,
+    pub(crate) include_deletions: bool,
+    pub(crate) remove_overlaps: bool,
     pub(crate) region: Option<&'a str>,
     pub(crate) bed: Option<&'a Path>,
     pub(crate) reference: Option<&'a Path>,
@@ -62,6 +66,13 @@ struct DepthWalkConfig {
     min_read_len: usize,
     min_depth: u32,
     a_mode: AMode,
+    include_deletions: bool,
+    remove_overlaps: bool,
+}
+
+struct DepthRegion {
+    region: Region,
+    emit_empty: bool,
 }
 
 /// Entry point for `samtools depth`.
@@ -77,6 +88,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut exclude_flags = default_exclude_flags();
     let mut include_any_flags = 0;
     let mut require_flags = 0;
+    let mut include_deletions = false;
+    let mut remove_overlaps = false;
     let mut inputs: Vec<PathBuf> = Vec::new();
 
     let mut iter = args.iter().skip(1).peekable();
@@ -157,8 +170,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-H" => {
                 show_header = true;
             }
-            "-J" | "-s" | "-x" | "-X" => {
-                // Deletions / overlap-removal / scientific / custom-index variations not yet supported.
+            "-J" => {
+                include_deletions = true;
+            }
+            "-s" => {
+                remove_overlaps = true;
+            }
+            "-x" | "-X" => {
+                // Scientific / custom-index variations not yet supported.
             }
             "--help" => {
                 let _ = print_usage();
@@ -179,6 +198,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
 
     let mut has_cram = false;
     for path in &inputs {
+        if path.as_os_str() != "-" && !path.exists() {
+            print_hts_open_missing(path);
+            print_error(
+                "depth",
+                format!(
+                    "Cannot open input file \"{}\": No such file or directory",
+                    path.display()
+                ),
+            );
+            return ExitCode::from(1);
+        }
         let format = match sam_io::sam_open_format(path) {
             Ok(f) => f,
             Err(e) => {
@@ -192,24 +222,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
             _ => {
                 print_error(
                     "depth",
-                    "only SAM, BAM, and reference-backed CRAM input are currently supported",
+                    "only SAM, BAM, and CRAM input are currently supported",
                 );
                 return ExitCode::from(1);
             }
         }
     }
-
-    let reference = if has_cram {
-        match current_global_args().reference {
-            Some(reference) => Some(reference),
-            None => {
-                print_error("depth", "CRAM input requires top-level --reference FILE");
-                return ExitCode::from(1);
-            }
-        }
-    } else {
-        None
-    };
+    let reference = has_cram.then(|| current_global_args().reference).flatten();
 
     if has_cram && regions_need_index(region.as_deref(), bed.as_deref()).is_err() {
         print_error(
@@ -239,6 +258,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
             exclude_flags,
             include_any_flags,
             require_flags,
+            include_deletions,
+            remove_overlaps,
             region: region.as_deref(),
             bed: bed.as_deref(),
             reference: reference.as_deref(),
@@ -313,10 +334,15 @@ pub(crate) fn run_depth(
         min_read_len: config.min_read_len,
         min_depth: config.min_depth,
         a_mode: config.a_mode,
+        include_deletions: config.include_deletions,
+        remove_overlaps: config.remove_overlaps,
     };
     let mut regions = Vec::new();
     if let Some(region) = config.region {
-        regions.push(parse_region(region)?);
+        regions.push(DepthRegion {
+            region: parse_region(region)?,
+            emit_empty: true,
+        });
     }
     if let Some(bed) = config.bed {
         regions.extend(load_bed_regions(bed)?);
@@ -328,21 +354,11 @@ pub(crate) fn run_depth(
         let targets = match format.exact {
             Exact::Sam => collect_sam_depth(path, walk, &regions)?,
             Exact::Bam => collect_bam_depth(path, walk, &regions)?,
-            Exact::Cram => collect_cram_depth(
-                path,
-                config.reference.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "CRAM input requires top-level --reference FILE",
-                    )
-                })?,
-                walk,
-                &regions,
-            )?,
+            Exact::Cram => collect_cram_depth(path, config.reference, walk, &regions)?,
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "only SAM, BAM, and reference-backed CRAM input are currently supported",
+                    "only SAM, BAM, and CRAM input are currently supported",
                 ));
             }
         };
@@ -362,15 +378,16 @@ pub(crate) fn run_depth(
 fn collect_sam_depth(
     path: &Path,
     config: DepthWalkConfig,
-    regions: &[Region],
+    regions: &[DepthRegion],
 ) -> io::Result<Vec<DepthTarget>> {
     let mut reader = sam::io::Reader::new(BufReader::new(File::open(path)?));
     let header = reader.read_header()?;
     let mut targets = depth_targets(&header, regions)?;
+    let mut overlap_state = OverlapState::default();
 
     for result in reader.records() {
         let record = result?;
-        update_targets(&header, &mut targets, &record, config);
+        update_targets(&header, &mut targets, &record, config, &mut overlap_state);
     }
 
     Ok(targets)
@@ -379,11 +396,12 @@ fn collect_sam_depth(
 fn collect_bam_depth(
     path: &Path,
     config: DepthWalkConfig,
-    regions: &[Region],
+    regions: &[DepthRegion],
 ) -> io::Result<Vec<DepthTarget>> {
     let mut reader = bam::io::Reader::new(File::open(path)?);
     let header = reader.read_header()?;
     let mut targets = depth_targets(&header, regions)?;
+    let mut overlap_state = OverlapState::default();
 
     if regions.is_empty() {
         let mut record = bam::Record::default();
@@ -392,13 +410,26 @@ fn collect_bam_depth(
             if n == 0 {
                 break;
             }
-            update_targets(&header, &mut targets, &record, config);
+            update_targets(&header, &mut targets, &record, config, &mut overlap_state);
         }
     } else {
         for (i, region) in regions.iter().enumerate() {
-            for record in htslib_rs::alignment_compat::query_bam_records_from_path(path, region)? {
-                update_target(&header, &mut targets[i], &record, config);
+            let mut overlap_state = OverlapState::default();
+            for record in
+                htslib_rs::alignment_compat::query_bam_records_from_path(path, &region.region)?
+            {
+                update_target(
+                    &header,
+                    &mut targets[i],
+                    i,
+                    &record,
+                    config,
+                    &mut overlap_state,
+                );
             }
+        }
+        if config.a_mode == AMode::AllPositions {
+            mark_bam_reference_coverage(path, &header, &mut targets, config)?;
         }
     }
 
@@ -407,33 +438,119 @@ fn collect_bam_depth(
 
 fn collect_cram_depth(
     path: &Path,
-    reference: &Path,
+    reference: Option<&Path>,
     config: DepthWalkConfig,
-    regions: &[Region],
+    regions: &[DepthRegion],
 ) -> io::Result<Vec<DepthTarget>> {
     let header = htslib_rs::alignment_compat::read_cram_header_from_path(path)?;
     let mut targets = depth_targets(&header, regions)?;
 
     if regions.is_empty() {
+        let mut overlap_state = OverlapState::default();
         for target in &mut targets {
             let region = target_region(target)?;
-            for record in htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
-                path, &region, reference,
-            )? {
-                update_target(&header, target, &record, config);
+            for record in query_cram_depth_records(path, &region, reference)? {
+                update_target(&header, target, 0, &record, config, &mut overlap_state);
             }
         }
     } else {
         for (i, region) in regions.iter().enumerate() {
-            for record in htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
-                path, region, reference,
-            )? {
-                update_target(&header, &mut targets[i], &record, config);
+            let mut overlap_state = OverlapState::default();
+            for record in query_cram_depth_records(path, &region.region, reference)? {
+                update_target(
+                    &header,
+                    &mut targets[i],
+                    i,
+                    &record,
+                    config,
+                    &mut overlap_state,
+                );
             }
         }
     }
 
     Ok(targets)
+}
+
+fn query_cram_depth_records(
+    path: &Path,
+    region: &Region,
+    reference: Option<&Path>,
+) -> io::Result<Vec<sam::alignment::RecordBuf>> {
+    if let Some(reference) = reference {
+        htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
+            path, region, reference,
+        )
+    } else {
+        htslib_rs::alignment_compat::query_cram_records_from_path_synthesizing_reference(
+            path, region,
+        )
+    }
+}
+
+fn mark_bam_reference_coverage(
+    path: &Path,
+    header: &sam::Header,
+    targets: &mut [DepthTarget],
+    config: DepthWalkConfig,
+) -> io::Result<()> {
+    let mut reader = bam::io::Reader::new(File::open(path)?);
+    let _ = reader.read_header()?;
+    let mut record = bam::Record::default();
+
+    loop {
+        let n = reader.read_record(&mut record)?;
+        if n == 0 {
+            break;
+        }
+        mark_reference_coverage(header, targets, &record, config);
+    }
+
+    Ok(())
+}
+
+fn mark_reference_coverage(
+    header: &sam::Header,
+    targets: &mut [DepthTarget],
+    record: &(impl sam::alignment::Record + ?Sized),
+    config: DepthWalkConfig,
+) {
+    let flag = match record.flags() {
+        Ok(flags) => u16::from(flags) as u32,
+        Err(_) => return,
+    };
+    if !flag_passes(flag, config) {
+        return;
+    }
+    let mapq = match record.mapping_quality() {
+        Some(Ok(q)) => u8::from(q),
+        Some(Err(_)) => return,
+        None => 0,
+    };
+    if mapq < config.min_mapq {
+        return;
+    }
+    if config.min_read_len != 0
+        && read_length_used(record.cigar().iter()).unwrap_or_default() < config.min_read_len
+    {
+        return;
+    }
+    let tid = match record.reference_sequence_id(header).transpose() {
+        Ok(Some(t)) => t,
+        _ => return,
+    };
+    if record
+        .alignment_start()
+        .transpose()
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        return;
+    }
+    for target in targets.iter_mut().filter(|target| target.tid == tid) {
+        target.reference_has_coverage = true;
+    }
 }
 
 fn target_region(target: &DepthTarget) -> io::Result<Region> {
@@ -459,8 +576,29 @@ fn parse_region(s: &str) -> io::Result<Region> {
     })
 }
 
-fn load_bed_regions(path: &Path) -> io::Result<Vec<Region>> {
-    load_bed_index(path)?.to_htslib_regions()
+fn load_bed_regions(path: &Path) -> io::Result<Vec<DepthRegion>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut regions = Vec::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        let Some(interval) = parse_bed_line(&line) else {
+            continue;
+        };
+        let region = interval.to_region_string();
+        regions.push(DepthRegion {
+            region: region.parse::<Region>().map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("region \"{}\": {}", region, e),
+                )
+            })?,
+            emit_empty: false,
+        });
+    }
+
+    Ok(regions)
 }
 
 fn emit_depths(
@@ -491,7 +629,13 @@ fn emit_depths(
         let has_any = per_input_targets
             .iter()
             .any(|targets| !targets[target_index].depths.is_empty());
-        if !has_any && !matches!(a_mode, AMode::AllRefsAllPositions) {
+        let reference_has_coverage = per_input_targets
+            .iter()
+            .any(|targets| targets[target_index].reference_has_coverage);
+        let should_emit_empty_span = target.emit_empty
+            || matches!(a_mode, AMode::AllRefsAllPositions)
+            || (a_mode == AMode::AllPositions && reference_has_coverage);
+        if !has_any && !should_emit_empty_span {
             continue;
         }
 
@@ -500,9 +644,10 @@ fn emit_depths(
                 .iter()
                 .map(|targets| targets[target_index].depths.get(off))
                 .collect();
-            if a_mode == AMode::None
-                && (!depths.iter().any(|&d| d > 0) || !depths.iter().any(|&d| d >= min_depth))
-            {
+            let has_zero_mark = per_input_targets
+                .iter()
+                .any(|targets| targets[target_index].depths.is_zero_marked(off));
+            if a_mode == AMode::None && !depths.iter().any(|&d| d >= min_depth) && !has_zero_mark {
                 return Ok(());
             }
             write!(out, "{}\t{}", target.name, target.output_start + off)?;
@@ -579,8 +724,16 @@ impl Depths {
             *e = e.saturating_add(1);
         }
     }
+    fn mark(&mut self, offset: usize) {
+        if offset < self.span {
+            self.map.entry(offset).or_insert(0);
+        }
+    }
     fn get(&self, offset: usize) -> u32 {
         self.map.get(&offset).copied().unwrap_or(0)
+    }
+    fn is_zero_marked(&self, offset: usize) -> bool {
+        self.map.get(&offset).copied() == Some(0)
     }
     fn span(&self) -> usize {
         self.span
@@ -599,12 +752,14 @@ struct DepthTarget {
     output_start: usize,
     start0: usize,
     end0: usize,
+    emit_empty: bool,
+    reference_has_coverage: bool,
     depths: Depths,
 }
 
 fn depth_targets(
     header: &htslib_rs::sam::Header,
-    regions: &[Region],
+    regions: &[DepthRegion],
 ) -> io::Result<Vec<DepthTarget>> {
     if regions.is_empty() {
         Ok(header
@@ -619,6 +774,8 @@ fn depth_targets(
                     output_start: 1,
                     start0: 0,
                     end0: length,
+                    emit_empty: false,
+                    reference_has_coverage: false,
                     depths: Depths::new(length),
                 }
             })
@@ -626,7 +783,7 @@ fn depth_targets(
     } else {
         regions
             .iter()
-            .map(|region| depth_target_for_region(header, region))
+            .map(|region| depth_target_for_region(header, &region.region, region.emit_empty))
             .collect()
     }
 }
@@ -634,6 +791,7 @@ fn depth_targets(
 fn depth_target_for_region(
     header: &htslib_rs::sam::Header,
     region: &Region,
+    emit_empty: bool,
 ) -> io::Result<DepthTarget> {
     let tid = header
         .reference_sequences()
@@ -671,6 +829,8 @@ fn depth_target_for_region(
         output_start,
         start0,
         end0,
+        emit_empty,
+        reference_has_coverage: false,
         depths: Depths::new(length),
     })
 }
@@ -680,6 +840,7 @@ fn update_targets(
     targets: &mut [DepthTarget],
     record: &(impl sam::alignment::Record + ?Sized),
     config: DepthWalkConfig,
+    overlap_state: &mut OverlapState,
 ) {
     let flag = match record.flags() {
         Ok(flags) => u16::from(flags) as u32,
@@ -710,15 +871,32 @@ fn update_targets(
         _ => return,
     };
     for target in targets.iter_mut().filter(|target| target.tid == tid) {
-        update_target_cigar(target, record, start);
+        target.reference_has_coverage = true;
+    }
+    for (target_index, target) in targets
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, target)| target.tid == tid)
+    {
+        update_target_cigar(
+            target,
+            target_index,
+            record,
+            flag,
+            start,
+            config,
+            overlap_state,
+        );
     }
 }
 
 fn update_target(
     header: &sam::Header,
     target: &mut DepthTarget,
+    target_index: usize,
     record: &(impl sam::alignment::Record + ?Sized),
     config: DepthWalkConfig,
+    overlap_state: &mut OverlapState,
 ) {
     let flag = match record.flags() {
         Ok(flags) => u16::from(flags) as u32,
@@ -752,7 +930,16 @@ fn update_target(
         Ok(Some(p)) => usize::from(p) - 1,
         _ => return,
     };
-    update_target_cigar(target, record, start);
+    target.reference_has_coverage = true;
+    update_target_cigar(
+        target,
+        target_index,
+        record,
+        flag,
+        start,
+        config,
+        overlap_state,
+    );
 }
 
 fn flag_passes(flag: u32, config: DepthWalkConfig) -> bool {
@@ -786,16 +973,68 @@ fn read_length_used(
     Ok(len)
 }
 
+#[derive(Default)]
+struct OverlapState {
+    seen: std::collections::HashMap<OverlapKey, std::collections::BTreeSet<usize>>,
+}
+
+type OverlapKey = (usize, usize, Vec<u8>);
+
+#[derive(Default)]
+struct DepthOffsets {
+    count: Vec<usize>,
+    touch: Vec<usize>,
+}
+
 fn update_target_cigar(
     target: &mut DepthTarget,
+    target_index: usize,
+    record: &(impl sam::alignment::Record + ?Sized),
+    flag: u32,
+    start: usize,
+    config: DepthWalkConfig,
+    overlap_state: &mut OverlapState,
+) {
+    let positions = target_depth_offsets(target, record, start, config.include_deletions);
+
+    if config.remove_overlaps
+        && flag & BAM_FPAIRED != 0
+        && let Some(name) = record.name()
+    {
+        let key = (target_index, target.tid, name.to_vec());
+        let seen = overlap_state.seen.entry(key).or_default();
+        for abs_pos in positions.count {
+            if seen.insert(abs_pos) {
+                target.depths.add(abs_pos - target.start0);
+            }
+        }
+        for abs_pos in positions.touch {
+            if seen.insert(abs_pos) {
+                target.depths.mark(abs_pos - target.start0);
+            }
+        }
+    } else {
+        for abs_pos in positions.count {
+            target.depths.add(abs_pos - target.start0);
+        }
+        for abs_pos in positions.touch {
+            target.depths.mark(abs_pos - target.start0);
+        }
+    }
+}
+
+fn target_depth_offsets(
+    target: &DepthTarget,
     record: &(impl sam::alignment::Record + ?Sized),
     start: usize,
-) {
+    include_deletions: bool,
+) -> DepthOffsets {
+    let mut positions = DepthOffsets::default();
     let mut ref_pos = start;
     for op in record.cigar().iter() {
         let op = match op {
             Ok(op) => op,
-            Err(_) => break,
+            Err(_) => return positions,
         };
         let len = op.len();
         use htslib_rs::sam::alignment::record::cigar::op::Kind;
@@ -806,17 +1045,34 @@ fn update_target_cigar(
                 let hi = op_end.min(target.end0);
                 if hi > lo {
                     for p in lo..hi {
-                        target.depths.add(p - target.start0);
+                        positions.count.push(p);
                     }
                 }
                 ref_pos = op_end;
             }
-            Kind::Deletion | Kind::Skip => {
+            Kind::Deletion => {
+                let op_end = ref_pos.saturating_add(len);
+                let lo = ref_pos.max(target.start0);
+                let hi = op_end.min(target.end0);
+                if hi > lo {
+                    let offsets = if include_deletions {
+                        &mut positions.count
+                    } else {
+                        &mut positions.touch
+                    };
+                    for p in lo..hi {
+                        offsets.push(p);
+                    }
+                }
+                ref_pos = op_end;
+            }
+            Kind::Skip => {
                 ref_pos = ref_pos.saturating_add(len);
             }
             Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
         }
     }
+    positions
 }
 
 fn print_usage() -> io::Result<()> {

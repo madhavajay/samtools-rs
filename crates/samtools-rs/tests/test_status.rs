@@ -45,3 +45,32 @@ fn test_status_lists_all_top_level_test_pl_groups() {
         "docs/test-status.md is missing upstream test.pl groups: {missing:?}"
     );
 }
+
+#[test]
+fn test_status_rows_are_now_passing_or_external() {
+    let root = repo_root();
+    let status = std::fs::read_to_string(root.join("docs").join("test-status.md")).unwrap();
+    let mut unexpected = Vec::new();
+
+    for line in status.lines() {
+        if !line.starts_with("| `test_") {
+            continue;
+        }
+
+        let cols: Vec<_> = line.split('|').map(str::trim).collect();
+        if cols.len() < 4 {
+            unexpected.push(line.to_string());
+            continue;
+        }
+
+        let state = cols[2];
+        if state != "passing" && state != "external" {
+            unexpected.push(line.to_string());
+        }
+    }
+
+    assert!(
+        unexpected.is_empty(),
+        "docs/test-status.md has non-required-gate statuses after full harness promotion: {unexpected:?}"
+    );
+}

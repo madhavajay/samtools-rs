@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Pure Rust port of samtools, the SAM/BAM/CRAM toolkit."
 
+[[bench]]
+name = "smoke"
+harness = false
+
 [lints]
 workspace = true
 

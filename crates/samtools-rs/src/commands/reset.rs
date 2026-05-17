@@ -13,11 +13,11 @@
 //!
 //! `--dupflag` preserves duplicate flags, SAM stdin input works, CRAM input is
 //! supported for embedded-reference files, files with a top-level
-//! `--reference`, or files with a usable FASTA beside the CRAM; reverse-strand
-//! sequence/quality re-reversal is implemented, legacy SAM `@HD VN:1` input is
-//! accepted, `--no-RG` removes read-group headers and tags, and `--reject-PG` /
-//! `--no-PG` remove program header chains. `-x`/`--keep-tag` aux-tag filtering
-//! is honored.
+//! `--reference`, or files with a usable FASTA beside the CRAM; SAM/BAM/CRAM
+//! output is supported, reverse-strand sequence/quality re-reversal is
+//! implemented, legacy SAM `@HD VN:1` input is accepted, `--no-RG` removes
+//! read-group headers and tags, and `--reject-PG` / `--no-PG` remove program
+//! header chains. `-x`/`--keep-tag` aux-tag filtering is honored.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -38,7 +38,7 @@ use htslib_rs::sam::{
 };
 
 use crate::aux_list::{AuxTag, parse_aux_list};
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
 use crate::sam_global::current_global_args;
 
@@ -68,6 +68,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 output_fmt = match v.to_lowercase().as_str() {
                     "sam" => OutFmt::Sam,
                     "bam" => OutFmt::Bam,
+                    "cram" => OutFmt::Cram,
+                    _ => OutFmt::Bam,
+                };
+                fmt_explicit = true;
+            }
+            _ if s.starts_with("--output-fmt=") => {
+                let v = s.trim_start_matches("--output-fmt=");
+                output_fmt = match v.to_lowercase().as_str() {
+                    "sam" => OutFmt::Sam,
+                    "bam" => OutFmt::Bam,
+                    "cram" => OutFmt::Cram,
                     _ => OutFmt::Bam,
                 };
                 fmt_explicit = true;
@@ -162,6 +173,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
         // (incl. `.sam` and no/unknown extension) plain SAM text.
         output_fmt = if p.ends_with(".bam") {
             OutFmt::Bam
+        } else if p.ends_with(".cram") {
+            OutFmt::Cram
         } else {
             OutFmt::Sam
         };
@@ -169,6 +182,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
 
     let result = match input {
         Some(input) if input != Path::new("-") => {
+            if !input.exists() {
+                print_hts_open_missing(&input);
+                eprintln!("Could not open {}", input.display());
+                return ExitCode::from(1);
+            }
             let format = match sam_io::sam_open_format(&input) {
                 Ok(f) => f,
                 Err(e) => {
@@ -212,6 +230,7 @@ fn merge_keep_tags(keep_only: &mut Option<HashSet<AuxTag>>, tags: HashSet<AuxTag
 enum OutFmt {
     Sam,
     Bam,
+    Cram,
 }
 
 struct ResetSettings<'a> {
@@ -332,7 +351,7 @@ where
         reset_record(&mut record, settings);
         sink.write_record(&output_header, &record)?;
     }
-    Ok(())
+    sink.finish()
 }
 
 fn run_reset_sam(
@@ -458,7 +477,7 @@ where
         reset_record(&mut record, settings);
         sink.write_record(&output_header, &record)?;
     }
-    Ok(())
+    sink.finish()
 }
 
 fn run_reset_records(
@@ -477,7 +496,7 @@ fn run_reset_records(
         reset_record(&mut record, settings);
         sink.write_record(&output_header, &record)?;
     }
-    Ok(())
+    sink.finish()
 }
 
 fn reset_header(header: &mut sam::Header, settings: &ResetSettings<'_>) -> io::Result<()> {
@@ -673,12 +692,22 @@ fn complement_base(base: u8) -> u8 {
 
 trait Sink {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()>;
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct BamFile(bam::io::Writer<bgzf::io::Writer<File>>);
 struct BamStdout(bam::io::Writer<bgzf::io::Writer<io::Stdout>>);
 struct SamFile(File);
 struct SamStdout(io::Stdout);
+struct CramOut<W: Write> {
+    writer: bam::io::Writer<bgzf::io::Writer<File>>,
+    tmp_bam_path: crate::tmp_file::TempPath,
+    reference_path: crate::tmp_file::TempPath,
+    fai_path: PathBuf,
+    out: W,
+}
 
 impl Sink for BamFile {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
@@ -701,6 +730,36 @@ impl Sink for SamFile {
 impl Sink for SamStdout {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
         crate::sam_render::write_record(&mut self.0, header, record)
+    }
+}
+impl<W: Write> Sink for CramOut<W> {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        use sam::alignment::io::Write as _;
+        self.writer.write_alignment_record(header, record)
+    }
+
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        let this = *self;
+        let CramOut {
+            writer,
+            tmp_bam_path,
+            reference_path,
+            fai_path,
+            out,
+        } = this;
+        drop(writer);
+
+        let result = htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+            tmp_bam_path.path(),
+            reference_path.path(),
+            out,
+        )
+        .map(|_| ());
+
+        tmp_bam_path.close().ok();
+        reference_path.close().ok();
+        std::fs::remove_file(fai_path).ok();
+        result
     }
 }
 
@@ -726,6 +785,11 @@ fn open_output(
             w.write_header(&hdr)?;
             Ok(Box::new(BamFile(w)))
         }
+        (Some(p), OutFmt::Cram) => {
+            let hdr = bam_header(header, raw_header)?;
+            let out = File::create(p)?;
+            open_cram_output(hdr, out)
+        }
         (None, OutFmt::Sam) => {
             let mut w = io::stdout();
             if let Some(raw) = raw_header {
@@ -741,7 +805,34 @@ fn open_output(
             w.write_header(&hdr)?;
             Ok(Box::new(BamStdout(w)))
         }
+        (None, OutFmt::Cram) => {
+            let hdr = bam_header(header, raw_header)?;
+            open_cram_output(hdr, io::stdout())
+        }
     }
+}
+
+fn open_cram_output<W>(header: sam::Header, out: W) -> io::Result<Box<dyn Sink>>
+where
+    W: Write + 'static,
+{
+    let (mut reference_file, reference_path) =
+        crate::tmp_file::create_temp_file("reset-reference", Some("fa"))?;
+    reference_file.flush()?;
+    drop(reference_file);
+    let fai_path = crate::reference::ensure_fai_index(reference_path.path(), None)?;
+
+    let (tmp_bam_file, tmp_bam_path) = crate::tmp_file::create_temp_file("reset", Some("bam"))?;
+    let mut writer = bam::io::Writer::new(tmp_bam_file);
+    writer.write_header(&header)?;
+
+    Ok(Box::new(CramOut {
+        writer,
+        tmp_bam_path,
+        reference_path,
+        fai_path,
+        out,
+    }))
 }
 
 /// Header for BAM output: the rebuilt `@HD/@RG/@PG` text parsed back
@@ -761,7 +852,7 @@ fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
     writeln!(w, "Usage: samtools reset [options] [in.bam|in.sam|-]")?;
     writeln!(w, "  -o FILE                 output FILE")?;
-    writeln!(w, "  -O sam|bam              output format")?;
+    writeln!(w, "  -O sam|bam|cram         output format")?;
     writeln!(
         w,
         "  -x/--remove-tag TAG     drop the listed aux tags (comma-separated, ^ for keep)"

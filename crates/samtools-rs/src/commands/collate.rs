@@ -5,7 +5,8 @@
 //! name-hash bucketing with on-disk temp files for memory bounding. This
 //! initial Rust port performs an in-memory name sort for BAM/SAM/reference-backed
 //! CRAM inputs, which gives the same per-name grouping result but does not scale
-//! to inputs larger than memory.
+//! to inputs larger than memory. CRAM output is supported with a top-level
+//! `--reference`.
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
@@ -21,7 +22,7 @@ use htslib_rs::format::Exact;
 use htslib_rs::sam::{self, alignment::RecordBuf};
 
 use crate::bam_flag::{BAM_FREAD1, BAM_FREAD2, BAM_FSECONDARY, BAM_FSUPPLEMENTARY};
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
 use crate::sam_global::current_global_args;
 
@@ -139,6 +140,23 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    if !to_stdout && output_prefix.is_none() && positional_prefix.is_none() {
+        let _ = print_usage();
+        return ExitCode::from(1);
+    }
+
+    if input.as_os_str() != "-" && !input.exists() {
+        print_hts_open_missing(&input);
+        print_error(
+            "collate",
+            format!(
+                "Cannot open input file \"{}\": No such file or directory",
+                input.display()
+            ),
+        );
+        return ExitCode::from(1);
+    }
+
     let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,
         Err(e) => {
@@ -161,6 +179,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
             output_fmt = OutFmt::Sam;
         } else if p.ends_with(".bam") {
             output_fmt = OutFmt::Bam;
+        } else if p.ends_with(".cram") {
+            output_fmt = OutFmt::Cram;
         }
     }
 
@@ -169,10 +189,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
     } else {
         let prefix = output_prefix
             .or(positional_prefix)
-            .unwrap_or_else(|| "collated".to_string());
+            .expect("collate output destination checked above");
         let ext = match output_fmt {
             OutFmt::Sam => "sam",
             OutFmt::Bam => "bam",
+            OutFmt::Cram => "cram",
         };
         let path = if prefix.ends_with(&format!(".{}", ext)) {
             PathBuf::from(prefix)
@@ -202,6 +223,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
 enum OutFmt {
     Sam,
     Bam,
+    Cram,
 }
 
 enum OutputTarget {
@@ -213,6 +235,7 @@ fn parse_output_format(raw: &str) -> Result<OutFmt, String> {
     match raw.to_ascii_lowercase().as_str() {
         "sam" => Ok(OutFmt::Sam),
         "bam" => Ok(OutFmt::Bam),
+        "cram" => Ok(OutFmt::Cram),
         _ => Err(format!("unsupported output format \"{}\"", raw)),
     }
 }
@@ -275,7 +298,7 @@ fn run_collate(
     for rec in &records {
         writer.write_record(&header, rec)?;
     }
-    Ok(())
+    writer.finish()
 }
 
 /// Raw input header with the `@HD` line forced to `SO:unsorted
@@ -491,12 +514,21 @@ where
 
 trait CollateSink {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()>;
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct BamFile(bam::io::Writer<bgzf::io::Writer<File>>);
 struct BamStdout(bam::io::Writer<bgzf::io::Writer<io::Stdout>>);
 struct SamFile(File);
 struct SamStdout(io::Stdout);
+struct CramOut<W: Write> {
+    writer: bam::io::Writer<bgzf::io::Writer<File>>,
+    tmp_bam_path: crate::tmp_file::TempPath,
+    reference: PathBuf,
+    out: W,
+}
 
 impl CollateSink for BamFile {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
@@ -521,6 +553,33 @@ impl CollateSink for SamStdout {
         crate::sam_render::write_record(&mut self.0, header, record)
     }
 }
+impl<W: Write> CollateSink for CramOut<W> {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        use sam::alignment::io::Write as _;
+        self.writer.write_alignment_record(header, record)
+    }
+
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        let this = *self;
+        let CramOut {
+            writer,
+            tmp_bam_path,
+            reference,
+            out,
+        } = this;
+        drop(writer);
+
+        let result = htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+            tmp_bam_path.path(),
+            &reference,
+            out,
+        )
+        .map(|_| ());
+
+        tmp_bam_path.close().ok();
+        result
+    }
+}
 
 fn open_output(
     out: &OutputTarget,
@@ -538,6 +597,7 @@ fn open_output(
             writer.write_header(header)?;
             Ok(Box::new(BamStdout(writer)))
         }
+        (OutputTarget::Stdout, OutFmt::Cram) => open_cram_output(header, io::stdout()),
         (OutputTarget::File(p), OutFmt::Sam) => {
             let mut file = File::create(p)?;
             crate::sam_render::write_header(&mut file, header)?;
@@ -549,7 +609,35 @@ fn open_output(
             writer.write_header(header)?;
             Ok(Box::new(BamFile(writer)))
         }
+        (OutputTarget::File(p), OutFmt::Cram) => {
+            let out = File::create(p)?;
+            open_cram_output(header, out)
+        }
     }
+}
+
+fn open_cram_output<W>(header: &sam::Header, out: W) -> io::Result<Box<dyn CollateSink>>
+where
+    W: Write + 'static,
+{
+    let reference = current_global_args().reference.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CRAM output requires top-level --reference FILE",
+        )
+    })?;
+    crate::reference::ensure_fai_index(&reference, None)?;
+
+    let (tmp_bam_file, tmp_bam_path) = crate::tmp_file::create_temp_file("collate", Some("bam"))?;
+    let mut writer = bam::io::Writer::new(tmp_bam_file);
+    writer.write_header(header)?;
+
+    Ok(Box::new(CramOut {
+        writer,
+        tmp_bam_path,
+        reference,
+        out,
+    }))
 }
 
 fn print_usage() -> io::Result<()> {
@@ -566,6 +654,6 @@ fn print_usage() -> io::Result<()> {
     )?;
     writeln!(w, "  -r INT      working reads stored with -f")?;
     writeln!(w, "  -n INT      temporary file count (accepted)")?;
-    writeln!(w, "  --output-fmt sam|bam")?;
+    writeln!(w, "  --output-fmt sam|bam|cram")?;
     Ok(())
 }

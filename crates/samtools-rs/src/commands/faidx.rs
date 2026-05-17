@@ -7,11 +7,13 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Cursor, Write};
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
 /// Entry point for `samtools faidx`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -120,7 +122,28 @@ fn run_faidx(args: &[OsString], is_fastq: bool) -> Result<ExitCode, String> {
                 opts.mark_strand = parse_mark_strand(v)?;
                 i += 1;
             }
-            "-@" | "--threads" | "--output-fmt-opt" => {
+            "-@" | "--threads" => {
+                i += 1;
+                let v = args
+                    .get(i)
+                    .and_then(|a| a.to_str())
+                    .ok_or_else(|| format!("missing value for {s}"))?;
+                opts.threads = Some(parse_thread_count(v)?);
+                i += 1;
+            }
+            _ if s.starts_with("-@") && s.len() > 2 => {
+                opts.threads = Some(parse_thread_count(&s[2..])?);
+                i += 1;
+            }
+            _ if s.starts_with("--threads=") => {
+                let v = s
+                    .split_once('=')
+                    .map(|(_, value)| value)
+                    .unwrap_or_default();
+                opts.threads = Some(parse_thread_count(v)?);
+                i += 1;
+            }
+            "--output-fmt-opt" => {
                 i += 1;
                 args.get(i)
                     .ok_or_else(|| format!("missing value for {s}"))?;
@@ -130,6 +153,10 @@ fn run_faidx(args: &[OsString], is_fastq: bool) -> Result<ExitCode, String> {
                 i += 1;
             }
             "--continue" => {
+                opts.continue_on_missing = true;
+                i += 1;
+            }
+            "-c" => {
                 opts.continue_on_missing = true;
                 i += 1;
             }
@@ -158,11 +185,20 @@ fn run_faidx(args: &[OsString], is_fastq: bool) -> Result<ExitCode, String> {
     // Build-only path: a single positional arg and no region file.
     if opts.positional.len() == 1 && opts.region_file.is_none() {
         let input = &opts.positional[0];
+        if !input.exists() {
+            eprintln!(
+                "[E::fai_build3_core] Failed to open the file {} : No such file or directory",
+                input.display()
+            );
+            eprintln!("[faidx] Could not build fai index {}.fai", input.display());
+            return Ok(ExitCode::from(1));
+        }
         match build_index(
             input,
             opts.fai_path.as_deref(),
             opts.gzi_path.as_deref(),
             opts.is_fastq,
+            opts.worker_count(),
         ) {
             Ok(()) => Ok(ExitCode::SUCCESS),
             Err(e) => {
@@ -199,6 +235,15 @@ struct Opts {
     continue_on_missing: bool,
     reverse_complement: bool,
     mark_strand: MarkStrand,
+    threads: Option<usize>,
+}
+
+impl Opts {
+    fn worker_count(&self) -> Option<NonZero<usize>> {
+        self.threads
+            .or_else(|| current_global_args().threads)
+            .and_then(NonZero::new)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -218,6 +263,7 @@ fn build_index(
     fai_path: Option<&Path>,
     gzi_path: Option<&Path>,
     is_fastq: bool,
+    worker_count: Option<NonZero<usize>>,
 ) -> std::io::Result<()> {
     let src = std::fs::read(input)?;
     let fai_out = fai_path
@@ -230,7 +276,7 @@ fn build_index(
             Box::new(BufReader::new(Cursor::new(src)))
         }
         htslib_rs::bgzf_compat::CompressionKind::Gzip => {
-            let data = htslib_rs::bgzf_compat::read_auto(&src)?;
+            let data = htslib_rs::bgzf_compat::read_auto_with_worker_count(&src, worker_count)?;
             Box::new(BufReader::new(Cursor::new(data)))
         }
         htslib_rs::bgzf_compat::CompressionKind::Bgzf => {
@@ -241,7 +287,7 @@ fn build_index(
                 .unwrap_or_else(|| append_extension(input, "gzi"));
             htslib_rs::bgzf_compat::write_gzi_to_path(gzi_out, &gzi)?;
 
-            let data = htslib_rs::bgzf_compat::read_all(&src[..])?;
+            let data = htslib_rs::bgzf_compat::read_auto_with_worker_count(&src, worker_count)?;
             Box::new(BufReader::new(Cursor::new(data)))
         }
     };
@@ -267,18 +313,46 @@ fn run_retrieval(input: &Path, opts: &Opts) -> Result<(), String> {
     }
 
     let mut out = Vec::new();
+    let worker_count = opts.worker_count();
 
     if opts.is_fastq {
-        let index = read_or_build_fastq_index(input, opts.fai_path.as_deref())?;
-        let mut reader = read_indexed_source(input).map_err(|e| e.to_string())?;
+        let index = read_or_build_fastq_index(input, opts.fai_path.as_deref(), worker_count)?;
+        let mut reader = read_indexed_source(input, worker_count).map_err(|e| e.to_string())?;
         for region in regions {
+            if fastq_region_is_missing(&index, &region) && opts.continue_on_missing {
+                warn_missing_reference(&region);
+                warn_missing_reference(&region);
+                warn_failed_fetch(&region);
+                warn_missing_reference(&region);
+                warn_failed_fetch(&region);
+                let name = format_region_name(&region, opts.reverse_complement, &opts.mark_strand);
+                write_retrieval_record(&mut out, b'@', &name, &[], Some(&[]), opts.line_len, false)
+                    .map_err(|e| e.to_string())?;
+                continue;
+            }
             if let Some(action) = fastq_retrieval_bounds_action(&index, &region) {
                 match action {
                     RetrievalBoundsAction::Zero => {
                         warn_zero_length_region(&region);
+                        warn_zero_length_region(&region);
+                        let name =
+                            format_region_name(&region, opts.reverse_complement, &opts.mark_strand);
+                        write_retrieval_record(
+                            &mut out,
+                            b'@',
+                            &name,
+                            &[],
+                            Some(&[]),
+                            opts.line_len,
+                            false,
+                        )
+                        .map_err(|e| e.to_string())?;
                         continue;
                     }
-                    RetrievalBoundsAction::Truncated => warn_truncated_region(&region),
+                    RetrievalBoundsAction::Truncated => {
+                        warn_truncated_region(&region);
+                        warn_truncated_region(&region);
+                    }
                 }
             }
 
@@ -301,7 +375,7 @@ fn run_retrieval(input: &Path, opts: &Opts) -> Result<(), String> {
                         &sequence,
                         Some(&quality),
                         opts.line_len,
-                        should_include_length(&region),
+                        false,
                     )
                     .map_err(|e| e.to_string())?;
                 }
@@ -312,13 +386,34 @@ fn run_retrieval(input: &Path, opts: &Opts) -> Result<(), String> {
             }
         }
     } else {
-        let index = read_or_build_index(input, opts.fai_path.as_deref())?;
-        let mut reader = read_indexed_source(input).map_err(|e| e.to_string())?;
+        let index = read_or_build_index(input, opts.fai_path.as_deref(), worker_count)?;
+        let mut reader = read_indexed_source(input, worker_count).map_err(|e| e.to_string())?;
         for region in regions {
+            if region_is_missing(&index, &region) && opts.continue_on_missing {
+                warn_missing_reference(&region);
+                warn_missing_reference(&region);
+                warn_failed_fetch(&region);
+                let name = format_region_name(&region, opts.reverse_complement, &opts.mark_strand);
+                write_retrieval_record(&mut out, b'>', &name, &[], None, opts.line_len, false)
+                    .map_err(|e| e.to_string())?;
+                continue;
+            }
             if let Some(action) = retrieval_bounds_action(&index, &region) {
                 match action {
                     RetrievalBoundsAction::Zero => {
                         warn_zero_length_region(&region);
+                        let name =
+                            format_region_name(&region, opts.reverse_complement, &opts.mark_strand);
+                        write_retrieval_record(
+                            &mut out,
+                            b'>',
+                            &name,
+                            &[],
+                            None,
+                            opts.line_len,
+                            false,
+                        )
+                        .map_err(|e| e.to_string())?;
                         continue;
                     }
                     RetrievalBoundsAction::Truncated => warn_truncated_region(&region),
@@ -339,7 +434,7 @@ fn run_retrieval(input: &Path, opts: &Opts) -> Result<(), String> {
                         &sequence,
                         None,
                         opts.line_len,
-                        should_include_length(&region),
+                        false,
                     )
                     .map_err(|e| e.to_string())?;
                 }
@@ -351,12 +446,12 @@ fn run_retrieval(input: &Path, opts: &Opts) -> Result<(), String> {
         }
     }
 
-    write_output(opts.output.as_deref(), &out).map_err(|e| e.to_string())?;
+    write_output(opts.output.as_deref(), &out, worker_count).map_err(|e| e.to_string())?;
 
     if opts.write_index
         && let Some(output) = opts.output.as_deref()
     {
-        build_index(output, None, None, opts.is_fastq).map_err(|e| e.to_string())?;
+        build_index(output, None, None, opts.is_fastq, worker_count).map_err(|e| e.to_string())?;
     }
 
     Ok(())
@@ -365,6 +460,7 @@ fn run_retrieval(input: &Path, opts: &Opts) -> Result<(), String> {
 fn read_or_build_index(
     input: &Path,
     fai_path: Option<&Path>,
+    worker_count: Option<NonZero<usize>>,
 ) -> Result<htslib_rs::faidx_compat::Index, String> {
     let path = fai_path
         .map(Path::to_path_buf)
@@ -375,7 +471,7 @@ fn read_or_build_index(
             .map_err(|e| e.to_string());
     }
 
-    build_index(input, Some(&path), None, false).map_err(|e| e.to_string())?;
+    build_index(input, Some(&path), None, false, worker_count).map_err(|e| e.to_string())?;
     let file = File::open(&path).map_err(|e| e.to_string())?;
     htslib_rs::faidx_compat::read_index(BufReader::new(file)).map_err(|e| e.to_string())
 }
@@ -383,6 +479,7 @@ fn read_or_build_index(
 fn read_or_build_fastq_index(
     input: &Path,
     fai_path: Option<&Path>,
+    worker_count: Option<NonZero<usize>>,
 ) -> Result<htslib_rs::faidx_compat::FastqIndex, String> {
     let path = fai_path
         .map(Path::to_path_buf)
@@ -393,7 +490,7 @@ fn read_or_build_fastq_index(
             .map_err(|e| e.to_string());
     }
 
-    build_index(input, Some(&path), None, true).map_err(|e| e.to_string())?;
+    build_index(input, Some(&path), None, true, worker_count).map_err(|e| e.to_string())?;
     let file = File::open(&path).map_err(|e| e.to_string())?;
     htslib_rs::faidx_compat::read_fastq_index(BufReader::new(file)).map_err(|e| e.to_string())
 }
@@ -417,19 +514,32 @@ fn read_region_file(path: &Path) -> Result<Vec<String>, String> {
     Ok(regions)
 }
 
-fn read_indexed_source(input: &Path) -> io::Result<Cursor<Vec<u8>>> {
+fn parse_thread_count(raw: &str) -> Result<usize, String> {
+    raw.parse::<usize>()
+        .map_err(|_| format!("invalid thread count \"{raw}\""))
+}
+
+fn read_indexed_source(
+    input: &Path,
+    worker_count: Option<NonZero<usize>>,
+) -> io::Result<Cursor<Vec<u8>>> {
     let src = std::fs::read(input)?;
-    let data = htslib_rs::bgzf_compat::read_auto(&src)?;
+    let data = htslib_rs::bgzf_compat::read_auto_with_worker_count(&src, worker_count)?;
 
     Ok(Cursor::new(data))
 }
 
-fn write_output(output: Option<&Path>, data: &[u8]) -> io::Result<()> {
+fn write_output(
+    output: Option<&Path>,
+    data: &[u8],
+    worker_count: Option<NonZero<usize>>,
+) -> io::Result<()> {
     if let Some(path) = output {
         if is_bgzf_output_path(path) {
-            let encoded = htslib_rs::bgzf_compat::write_all_with_kind(
+            let encoded = htslib_rs::bgzf_compat::write_all_with_kind_and_worker_count(
                 data,
                 htslib_rs::bgzf_compat::CompressionKind::Bgzf,
+                worker_count,
             )?;
             std::fs::write(path, encoded)
         } else {
@@ -467,6 +577,21 @@ fn fastq_retrieval_bounds_action(
     let len = htslib_rs::faidx_compat::fastq_sequence_len(index, parsed.name)?;
 
     bounds_action(parsed, len)
+}
+
+fn region_is_missing(index: &htslib_rs::faidx_compat::Index, region: &str) -> bool {
+    htslib_rs::faidx_compat::sequence_len(index, region_reference_name(region)).is_none()
+}
+
+fn fastq_region_is_missing(index: &htslib_rs::faidx_compat::FastqIndex, region: &str) -> bool {
+    htslib_rs::faidx_compat::fastq_sequence_len(index, region_reference_name(region)).is_none()
+}
+
+fn region_reference_name(region: &str) -> &str {
+    region
+        .rsplit_once(':')
+        .map(|(name, _)| name)
+        .unwrap_or(region)
 }
 
 fn bounds_action(parsed: ParsedRegionBounds<'_>, len: u64) -> Option<RetrievalBoundsAction> {
@@ -523,11 +648,21 @@ fn parse_region_position(value: &str) -> Option<u64> {
 }
 
 fn warn_zero_length_region(region: &str) {
-    eprintln!("[W::fai_get_val] Zero length sequence returned for {region}");
+    eprintln!("[faidx] Zero length sequence: {region}");
 }
 
 fn warn_truncated_region(region: &str) {
-    eprintln!("[W::fai_get_val] Truncated sequence returned for {region}");
+    eprintln!("[faidx] Truncated sequence: {region}");
+}
+
+fn warn_missing_reference(region: &str) {
+    eprintln!(
+        "[W::fai_get_val] Reference {region} not found in FASTA file, returning empty sequence"
+    );
+}
+
+fn warn_failed_fetch(region: &str) {
+    eprintln!("[faidx] Failed to fetch sequence in {region}");
 }
 
 fn is_bgzf_output_path(path: &Path) -> bool {
@@ -611,10 +746,6 @@ fn format_region_name(region: &str, reverse_complement: bool, mark_strand: &Mark
     }
 }
 
-fn should_include_length(region: &str) -> bool {
-    region.contains(':')
-}
-
 fn reverse_complement_in_place(sequence: &mut [u8]) {
     sequence.reverse();
     for base in sequence {
@@ -690,4 +821,170 @@ fn print_usage(is_fastq: bool) -> std::io::Result<()> {
         "  Builds <file.fa>.fai (and emits sequences for regions, TODO)."
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::PathBuf;
+
+    use crate::sam_global::{SamGlobalArgs, set_current_global_args};
+
+    use super::run_faidx;
+
+    fn argv(args: &[impl AsRef<str>]) -> Vec<OsString> {
+        args.iter().map(|s| OsString::from(s.as_ref())).collect()
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn faidx_local_threads_use_bgzf_worker_output_path() {
+        let dir = tmp_dir("samtools-rs-faidx-local-threads");
+        let input = dir.join("ref.fa");
+        let output = dir.join("out.fa.bgz");
+        fs::write(&input, b">sq\nACGTACGT\n").unwrap();
+
+        run_faidx(&argv(&["faidx", input.to_str().unwrap()]), false).unwrap();
+        run_faidx(
+            &argv(&[
+                "faidx",
+                "-@2",
+                "-o",
+                output.to_str().unwrap(),
+                input.to_str().unwrap(),
+                "sq:1-4",
+            ]),
+            false,
+        )
+        .unwrap();
+
+        let encoded = fs::read(&output).unwrap();
+        assert_eq!(
+            htslib_rs::bgzf_compat::detect_compression_kind(&encoded),
+            htslib_rs::bgzf_compat::CompressionKind::Bgzf
+        );
+        assert_eq!(
+            htslib_rs::bgzf_compat::read_auto_with_worker_count(
+                &encoded,
+                std::num::NonZero::new(2)
+            )
+            .unwrap(),
+            b">sq:1-4\nACGT\n"
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn faidx_global_threads_feed_bgzf_output_path() {
+        let dir = tmp_dir("samtools-rs-faidx-global-threads");
+        let input = dir.join("ref.fa");
+        let output = dir.join("out.fa.bgz");
+        fs::write(&input, b">sq\nACGTACGT\n").unwrap();
+        run_faidx(&argv(&["faidx", input.to_str().unwrap()]), false).unwrap();
+
+        set_current_global_args(SamGlobalArgs {
+            threads: Some(2),
+            ..SamGlobalArgs::default()
+        });
+        let result = run_faidx(
+            &argv(&[
+                "faidx",
+                "-o",
+                output.to_str().unwrap(),
+                input.to_str().unwrap(),
+                "sq:5-8",
+            ]),
+            false,
+        );
+        set_current_global_args(SamGlobalArgs::default());
+
+        result.unwrap();
+        let encoded = fs::read(&output).unwrap();
+        assert_eq!(
+            htslib_rs::bgzf_compat::read_auto_with_worker_count(
+                &encoded,
+                std::num::NonZero::new(2)
+            )
+            .unwrap(),
+            b">sq:5-8\nACGT\n"
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fqidx_threads_use_bgzf_worker_output_path() {
+        let dir = tmp_dir("samtools-rs-fqidx-threads");
+        let input = dir.join("reads.fq");
+        let local_output = dir.join("local.fq.bgz");
+        let global_output = dir.join("global.fq.bgz");
+        fs::write(&input, b"@r1\nACGTACGT\n+\nabcdefgh\n").unwrap();
+
+        run_faidx(&argv(&["fqidx", input.to_str().unwrap()]), true).unwrap();
+        run_faidx(
+            &argv(&[
+                "fqidx",
+                "-@2",
+                "-o",
+                local_output.to_str().unwrap(),
+                input.to_str().unwrap(),
+                "r1:1-4",
+            ]),
+            true,
+        )
+        .unwrap();
+
+        set_current_global_args(SamGlobalArgs {
+            threads: Some(2),
+            ..SamGlobalArgs::default()
+        });
+        let result = run_faidx(
+            &argv(&[
+                "fqidx",
+                "-o",
+                global_output.to_str().unwrap(),
+                input.to_str().unwrap(),
+                "r1:5-8",
+            ]),
+            true,
+        );
+        set_current_global_args(SamGlobalArgs::default());
+        result.unwrap();
+
+        let local_encoded = fs::read(&local_output).unwrap();
+        let global_encoded = fs::read(&global_output).unwrap();
+        for encoded in [&local_encoded, &global_encoded] {
+            assert_eq!(
+                htslib_rs::bgzf_compat::detect_compression_kind(encoded),
+                htslib_rs::bgzf_compat::CompressionKind::Bgzf
+            );
+        }
+
+        assert_eq!(
+            htslib_rs::bgzf_compat::read_auto_with_worker_count(
+                &local_encoded,
+                std::num::NonZero::new(2)
+            )
+            .unwrap(),
+            b"@r1:1-4\nACGT\n+\nabcd\n"
+        );
+        assert_eq!(
+            htslib_rs::bgzf_compat::read_auto_with_worker_count(
+                &global_encoded,
+                std::num::NonZero::new(2)
+            )
+            .unwrap(),
+            b"@r1:5-8\nACGT\n+\nefgh\n"
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

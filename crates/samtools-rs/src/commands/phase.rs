@@ -21,7 +21,7 @@ use htslib_rs::format::Exact;
 use htslib_rs::math::kf_lgamma;
 
 use crate::bam_flag::{BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FUNMAP};
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io::sam_open_format;
 
 const MAX_VARS: usize = 256;
@@ -80,6 +80,18 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+
+    if cfg.input.as_os_str() != "-" && !cfg.input.exists() {
+        print_hts_open_missing(&cfg.input);
+        print_error(
+            "phase",
+            format!(
+                "Couldn't open '{}': No such file or directory",
+                cfg.input.display()
+            ),
+        );
+        return ExitCode::from(1);
+    }
 
     let mut report = Vec::new();
     match run(&cfg, &mut report) {

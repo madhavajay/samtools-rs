@@ -38,6 +38,16 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
 
     let input_path = opts.input.clone().unwrap_or_else(|| PathBuf::from("-"));
+    if input_path.as_os_str() != "-" && !input_path.exists() {
+        print_error(
+            "dict",
+            format!(
+                "Cannot open {}: No such file or directory",
+                input_path.display()
+            ),
+        );
+        return ExitCode::from(1);
+    }
 
     let is_alt = match opts.alt_path.as_ref() {
         Some(p) => match read_alt_names(p) {

@@ -12,7 +12,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::header_text::read_raw_header_text;
 use crate::io as sam_io;
 use crate::reference::matching_reference;
@@ -67,6 +67,18 @@ pub fn main(args: &[OsString]) -> ExitCode {
 
     let mut overall = ExitCode::SUCCESS;
     for input in &inputs {
+        if input.path.as_os_str() != "-" && !input.path.exists() {
+            print_hts_open_missing(&input.path);
+            print_error(
+                "samples",
+                format!(
+                    "Failed to open \"{}\" for reading: No such file or directory",
+                    input.path.display()
+                ),
+            );
+            overall = ExitCode::from(1);
+            continue;
+        }
         if let Err(e) = print_samples_for(&mut out, input, &opts) {
             print_error_errno(
                 "samples",

@@ -13,15 +13,16 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use htslib_rs::core::Region;
 use htslib_rs::format::Exact;
 use htslib_rs::sam;
+use indexmap::IndexMap;
 
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
 
 #[derive(Debug, Default)]
@@ -67,6 +68,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
 
     let input = input.unwrap_or_else(|| PathBuf::from("-"));
+    if input.as_os_str() != "-" && !input.exists() {
+        print_hts_open_missing(&input);
+        print_error(
+            "reference",
+            format!(
+                "failed to open file '{}': No such file or directory",
+                input.display()
+            ),
+        );
+        return ExitCode::from(1);
+    }
     let mut writer = match sam_io::open_text_output(opts.output.as_deref()) {
         Ok(writer) => writer,
         Err(e) => {
@@ -266,7 +278,11 @@ fn reference_cram_path(
     // (`embed_ref`) directly, so the MD path needs no external
     // reference for embed_ref CRAM; fall back to `--reference` only
     // when one is supplied (reference-compressed CRAM).
-    let records = match crate::sam_global::current_global_args().reference {
+    let reference_path = match crate::sam_global::current_global_args().reference {
+        Some(reference) => Some(reference),
+        None => reference_from_header_uri(input)?,
+    };
+    let records = match reference_path.as_deref() {
         Some(reference) => {
             htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
                 input, reference,
@@ -274,8 +290,21 @@ fn reference_cram_path(
         }
         None => htslib_rs::alignment_compat::query_cram_records_all_from_path(input)?,
     };
-    for record in records {
-        update_refs(&header, &mut refs, &record, target.as_ref())?;
+    if let Some(reference) = reference_path.as_deref() {
+        let reference_sequences = read_fasta_sequences(reference)?;
+        for record in records {
+            update_refs_from_reference(
+                &header,
+                &mut refs,
+                &record,
+                target.as_ref(),
+                &reference_sequences,
+            )?;
+        }
+    } else {
+        for record in records {
+            update_refs(&header, &mut refs, &record, target.as_ref())?;
+        }
     }
     dump_refs(writer, &refs, target.as_ref(), opts.quiet)
 }
@@ -389,6 +418,67 @@ where
         return Ok(());
     };
     if build_ref(record, &mut ref_buf.seq)? {
+        ref_buf.touched = true;
+    }
+    Ok(())
+}
+
+fn update_refs_from_reference<R>(
+    header: &sam::Header,
+    refs: &mut [RefBuf],
+    record: &R,
+    target: Option<&RegionTarget>,
+    reference_sequences: &IndexMap<String, Vec<u8>>,
+) -> io::Result<()>
+where
+    R: sam::alignment::Record + ?Sized,
+{
+    let tid = match record.reference_sequence_id(header).transpose()? {
+        Some(tid) => tid,
+        None => return Ok(()),
+    };
+    if let Some(target) = target
+        && (target.tid != tid || !record_overlaps(record, target)?)
+    {
+        return Ok(());
+    }
+    let Some(ref_buf) = refs.get_mut(tid) else {
+        return Ok(());
+    };
+    let Some((name, _)) = header.reference_sequences().get_index(tid) else {
+        return Ok(());
+    };
+    let name = String::from_utf8_lossy(name.as_ref());
+    let Some(reference_sequence) = reference_sequences.get(name.as_ref()) else {
+        return Ok(());
+    };
+    let Some(start) = record.alignment_start().transpose()? else {
+        return Ok(());
+    };
+    let mut ref_pos = usize::from(start).saturating_sub(1);
+    let mut touched = false;
+
+    use sam::alignment::record::cigar::op::Kind;
+    for result in record.cigar().iter() {
+        let op = result?;
+        match op.kind() {
+            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch | Kind::Deletion => {
+                for _ in 0..op.len() {
+                    if ref_pos < ref_buf.seq.len()
+                        && let Some(base) = reference_sequence.get(ref_pos).copied()
+                    {
+                        ref_buf.seq[ref_pos] = base.to_ascii_uppercase();
+                        touched = true;
+                    }
+                    ref_pos += 1;
+                }
+            }
+            Kind::Skip => ref_pos += op.len(),
+            Kind::Insertion | Kind::SoftClip | Kind::HardClip | Kind::Pad => {}
+        }
+    }
+
+    if touched {
         ref_buf.touched = true;
     }
     Ok(())
@@ -575,14 +665,7 @@ fn dump_refs(
         } else {
             &[][..]
         };
-        writeln!(
-            writer,
-            ">{}:{}-{} length: {}",
-            ref_buf.name,
-            target.start,
-            target.end,
-            seq.len()
-        )?;
+        writeln!(writer, ">{}:{}-{}", ref_buf.name, target.start, target.end)?;
         write_fasta_sequence(writer, seq)?;
         if !quiet {
             eprintln!(
@@ -613,6 +696,23 @@ fn dump_refs(
     Ok(())
 }
 
+fn reference_from_header_uri(input: &Path) -> io::Result<Option<PathBuf>> {
+    let header_text = crate::header_text::read_raw_header_text_with_format(input, Exact::Cram)?;
+    for line in header_text.lines().filter(|line| line.starts_with("@SQ\t")) {
+        for field in line.split('\t').skip(1) {
+            let Some(uri) = field.strip_prefix("UR:") else {
+                continue;
+            };
+            let path = uri.strip_prefix("file://").unwrap_or(uri);
+            let path = PathBuf::from(path);
+            if path.is_file() {
+                return Ok(Some(path));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn write_fasta_sequence(writer: &mut dyn Write, seq: &[u8]) -> io::Result<()> {
     for chunk in seq.chunks(60) {
         writer.write_all(chunk)?;
@@ -630,6 +730,38 @@ fn percent_non_n(seq: &[u8]) -> f64 {
         .filter(|base| base.eq_ignore_ascii_case(&b'N'))
         .count();
     100.0 - n as f64 * 100.0 / seq.len() as f64
+}
+
+fn read_fasta_sequences(path: &Path) -> io::Result<IndexMap<String, Vec<u8>>> {
+    let reader = BufReader::new(File::open(path)?);
+    let mut sequences = IndexMap::new();
+    let mut current_name: Option<String> = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        if let Some(rest) = line.strip_prefix('>') {
+            let name = rest
+                .split_whitespace()
+                .next()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty FASTA header"))?
+                .to_string();
+            sequences.entry(name.clone()).or_insert_with(Vec::new);
+            current_name = Some(name);
+        } else if !line.trim().is_empty() {
+            let Some(name) = current_name.as_ref() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "FASTA sequence appears before first header",
+                ));
+            };
+            sequences
+                .get_mut(name)
+                .expect("current FASTA record exists")
+                .extend(line.trim().bytes().map(|b| b.to_ascii_uppercase()));
+        }
+    }
+
+    Ok(sequences)
 }
 
 fn print_usage() -> io::Result<()> {

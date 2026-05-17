@@ -20,7 +20,7 @@ use htslib_rs::csi::BinningIndex;
 use htslib_rs::format::Exact;
 
 use crate::bam_flag::BAM_FUNMAP;
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::header_text::read_raw_header_text_with_format;
 use crate::io as sam_io;
 use crate::sam_global::current_global_args;
@@ -57,6 +57,18 @@ pub fn main(args: &[OsString]) -> ExitCode {
         let _ = print_usage();
         return ExitCode::from(1);
     };
+
+    if input.as_os_str() != "-" && !input.exists() {
+        print_hts_open_missing(&input);
+        print_error(
+            "idxstats",
+            format!(
+                "failed to open \"{}\": No such file or directory",
+                input.display()
+            ),
+        );
+        return ExitCode::from(1);
+    }
 
     let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,

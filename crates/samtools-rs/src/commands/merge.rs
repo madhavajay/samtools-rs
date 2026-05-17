@@ -3,11 +3,12 @@
 //! Mirrors `bam_merge` in `bam_sort.c`. This initial Rust port loads all
 //! records from BAM/SAM inputs into memory and sorts by coordinate (or name
 //! with `-n`) before writing the merged output. K-way streaming merge
-//! and CRAM are TODO. `-R` and `-L` restrict indexed BAM inputs by region/BED.
-//! Coordinate-sorted BAM outputs can also write a BAI via `--write-index`.
+//! is TODO. CRAM output is supported with a top-level `--reference`. `-R` and
+//! `-L` restrict indexed BAM inputs by region/BED. Coordinate-sorted BAM
+//! outputs can also write a BAI via `--write-index`.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -19,7 +20,7 @@ use htslib_rs::bgzf;
 use htslib_rs::format::Exact;
 use htslib_rs::sam::{self, alignment::RecordBuf};
 
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
 use crate::sam_global::current_global_args;
 
@@ -35,6 +36,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut region: Option<String> = None;
     let mut bed: Option<PathBuf> = None;
     let mut tag_sort: Option<[u8; 2]> = None;
+    let mut template_coordinate = false;
     let mut input_lists: Vec<PathBuf> = Vec::new();
     // `-s SEED` seeds the @RG/@PG ID-collision PRNG (default: HTSlib uses
     // time(); 0 keeps merges deterministic when unspecified).
@@ -44,6 +46,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut combine_rg = false;
     let mut combine_pg = false;
     let mut attach_rg = false;
+    let mut customized_index = false;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -95,6 +98,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
             "-L" => {
                 bed = iter.next().map(PathBuf::from);
+            }
+            "-X" | "--customized-index" => {
+                customized_index = true;
+            }
+            "--template-coordinate" => {
+                template_coordinate = true;
             }
             "-b" => {
                 let Some(path) = iter.next() else {
@@ -165,15 +174,34 @@ pub fn main(args: &[OsString]) -> ExitCode {
         (out, inputs)
     };
 
+    let mut listed_inputs = Vec::new();
     for list in &input_lists {
         match read_input_list(list) {
-            Ok(list_inputs) => inputs.extend(list_inputs),
+            Ok(list_inputs) => listed_inputs.extend(list_inputs),
             Err(e) => {
                 print_error("merge", e.to_string());
                 return ExitCode::from(1);
             }
         }
     }
+    if !listed_inputs.is_empty() {
+        listed_inputs.extend(inputs);
+        inputs = listed_inputs;
+    }
+
+    let custom_index_paths = if customized_index {
+        if inputs.len() % 2 != 0 {
+            print_error(
+                "merge",
+                "-X requires one custom index path for each input alignment",
+            );
+            return ExitCode::from(1);
+        }
+        let index_paths = inputs.split_off(inputs.len() / 2);
+        Some(index_paths)
+    } else {
+        None
+    };
 
     if inputs.is_empty() {
         let _ = print_usage();
@@ -197,6 +225,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     for path in &inputs {
+        if path.as_os_str() != "-" && !path.exists() {
+            print_hts_open_missing(path);
+            print_error(
+                "merge",
+                format!(
+                    "fail to open \"{}\": No such file or directory",
+                    path.display()
+                ),
+            );
+            return ExitCode::from(1);
+        }
         let format = match sam_io::sam_open_format(path) {
             Ok(f) => f,
             Err(e) => {
@@ -218,13 +257,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     let write_index = local_write_index || current_global_args().write_index;
-    let order = match tag_sort {
-        Some(tag) => MergeOrder::Tag {
+    let order = match (template_coordinate, tag_sort) {
+        (true, _) => MergeOrder::TemplateCoordinate,
+        (false, Some(tag)) => MergeOrder::Tag {
             tag,
             name_secondary: name_sort,
         },
-        None if name_sort => MergeOrder::Name,
-        None => MergeOrder::Coordinate,
+        (false, None) if name_sort => MergeOrder::Name,
+        (false, None) => MergeOrder::Coordinate,
     };
 
     if write_index {
@@ -263,6 +303,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         write_index,
         if no_pg { None } else { Some(args) },
         seed,
+        custom_index_paths.as_deref(),
         match (region.as_deref(), bed.as_deref()) {
             (Some(r), None) => MergeRestriction::Region(r),
             (None, Some(path)) => MergeRestriction::Bed(path),
@@ -281,6 +322,7 @@ fn parse_output_format(raw: &str) -> Result<OutFmt, String> {
     match raw.to_ascii_lowercase().as_str() {
         "sam" => Ok(OutFmt::Sam),
         "bam" => Ok(OutFmt::Bam),
+        "cram" => Ok(OutFmt::Cram),
         _ => Err(format!("unsupported output format \"{}\"", raw)),
     }
 }
@@ -316,6 +358,7 @@ fn read_input_list(path: &Path) -> io::Result<Vec<PathBuf>> {
 pub(crate) enum OutFmt {
     Sam,
     Bam,
+    Cram,
 }
 
 pub(crate) enum MergeRestriction<'a> {
@@ -329,6 +372,7 @@ pub(crate) enum MergeOrder {
     Coordinate,
     Name,
     Tag { tag: [u8; 2], name_secondary: bool },
+    TemplateCoordinate,
 }
 
 /// `-c` (combine identical @RG IDs), `-p` (same for @PG), `-r` (attach a
@@ -350,8 +394,18 @@ pub(crate) fn run_merge(
     write_index: bool,
     pg_argv: Option<&[OsString]>,
     seed: i64,
+    custom_index_paths: Option<&[PathBuf]>,
     restriction: MergeRestriction<'_>,
 ) -> io::Result<()> {
+    if let Some(paths) = custom_index_paths
+        && paths.len() != inputs.len()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "-X requires one custom index path for each input alignment",
+        ));
+    }
+
     let filter = match restriction {
         MergeRestriction::Region(r) => Some(RegionFilter::Regions(vec![
             r.parse::<htslib_rs::core::Region>().map_err(|e| {
@@ -372,27 +426,48 @@ pub(crate) fn run_merge(
     // (upstream `samtools merge` PRNG-suffixes colliding IDs).
     let (merged_header_text, trans, force_rg) = reconcile_merge_headers(inputs, seed, id_mode)?;
 
-    let (mut header, mut records) = read_records(&inputs[0], filter.as_ref())?;
+    let (mut header, mut records) = read_records(
+        &inputs[0],
+        filter.as_ref(),
+        custom_index_paths
+            .and_then(|paths| paths.first())
+            .map(PathBuf::as_path),
+    )?;
     let first_reference_id_map: Vec<_> = (0..header.reference_sequences().len()).collect();
     remap_records(&mut records, &first_reference_id_map)?;
+    let mut warned_missing_tags = HashSet::new();
     for rec in &mut records {
-        remap_record_rg_pg(rec, &trans.rg[0], &trans.pg[0], force_rg[0].as_deref());
+        remap_record_rg_pg(
+            rec,
+            &trans.rg[0],
+            &trans.pg[0],
+            force_rg[0].as_deref(),
+            &mut warned_missing_tags,
+        );
     }
 
     for (idx, path) in inputs[1..].iter().enumerate() {
-        let (input_header, mut input_records) = read_records(path, filter.as_ref())?;
+        let (input_header, mut input_records) = read_records(
+            path,
+            filter.as_ref(),
+            custom_index_paths
+                .and_then(|paths| paths.get(idx + 1))
+                .map(PathBuf::as_path),
+        )?;
         let reference_id_map = merge_reference_sequences(&mut header, &input_header)?;
         merge_header_metadata(&mut header, &input_header)?;
         merge_read_groups(&mut header, &input_header)?;
         merge_programs(&mut header, &input_header)?;
         merge_comments(&mut header, &input_header);
         remap_records(&mut input_records, &reference_id_map)?;
+        let mut warned_missing_tags = HashSet::new();
         for rec in &mut input_records {
             remap_record_rg_pg(
                 rec,
                 &trans.rg[idx + 1],
                 &trans.pg[idx + 1],
                 force_rg[idx + 1].as_deref(),
+                &mut warned_missing_tags,
             );
         }
         records.append(&mut input_records);
@@ -403,39 +478,52 @@ pub(crate) fn run_merge(
             tag,
             name_secondary,
         } => records.sort_by(|a, b| compare_by_tag(a, b, tag, name_secondary)),
-        MergeOrder::Name => records.sort_by_key(name_key),
+        MergeOrder::TemplateCoordinate => {
+            let lib_lookup = super::sort::library_lookup(&header);
+            let mut keyed = Vec::with_capacity(records.len());
+            for record in records.drain(..) {
+                let key = super::sort::template_coordinate_key(&record, &lib_lookup)
+                    .map_err(io::Error::other)?;
+                keyed.push((key, record));
+            }
+            keyed.sort_by(|a, b| super::sort::template_coordinate_cmp(&a.0, &b.0));
+            records = keyed.into_iter().map(|(_, record)| record).collect();
+        }
+        MergeOrder::Name => records.sort_by(natural_name_cmp),
         MergeOrder::Coordinate => records.sort_by_key(coordinate_key),
     }
 
-    if let MergeOrder::Tag {
-        tag,
-        name_secondary,
-    } = order
-    {
-        set_sort_order(
+    match order {
+        MergeOrder::Tag {
+            tag,
+            name_secondary,
+        } => set_sort_order(
             &mut header,
             "unsorted",
+            None,
             Some(&format!(
                 "unsorted:{}{}:{}",
                 tag[0] as char,
                 tag[1] as char,
                 if name_secondary {
-                    "queryname:lexicographical"
+                    "queryname:natural"
                 } else {
                     "coordinate"
                 }
             )),
-        );
-    } else {
-        set_sort_order(
-            &mut header,
-            if matches!(order, MergeOrder::Name) {
-                "queryname"
-            } else {
-                "coordinate"
-            },
-            None,
-        );
+        ),
+        MergeOrder::TemplateCoordinate => {
+            set_sort_order(
+                &mut header,
+                "unsorted",
+                Some("query"),
+                Some("unsorted:template-coordinate"),
+            );
+        }
+        MergeOrder::Name => {
+            set_sort_order(&mut header, "queryname", None, Some("queryname:natural"))
+        }
+        MergeOrder::Coordinate => set_sort_order(&mut header, "coordinate", None, None),
     }
 
     if let Some(argv) = pg_argv {
@@ -450,15 +538,25 @@ pub(crate) fn run_merge(
         // the upstream merge/* fixtures); name/tag merge sets SO/SS.
         let mut header_text = match order {
             MergeOrder::Coordinate => merged_header_text,
-            MergeOrder::Name => {
-                apply_hd_so(&merged_header_text, "queryname", Some("queryname:natural"))
-            }
+            MergeOrder::Name => apply_hd_so(
+                &merged_header_text,
+                "queryname",
+                None,
+                Some("queryname:natural"),
+            ),
+            MergeOrder::TemplateCoordinate => apply_hd_so(
+                &merged_header_text,
+                "unsorted",
+                Some("query"),
+                Some("unsorted:template-coordinate"),
+            ),
             MergeOrder::Tag {
                 tag,
                 name_secondary,
             } => apply_hd_so(
                 &merged_header_text,
                 "unsorted",
+                None,
                 Some(&format!(
                     "unsorted:{}{}:{}",
                     tag[0] as char,
@@ -489,6 +587,7 @@ pub(crate) fn run_merge(
         for rec in &records {
             writer.write_record(&header, rec)?;
         }
+        writer.finish()?;
     }
 
     if write_index {
@@ -510,6 +609,7 @@ enum RegionFilter {
 fn read_records(
     input: &Path,
     filter: Option<&RegionFilter>,
+    custom_index_path: Option<&Path>,
 ) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
     let format = sam_io::sam_open_format(input)?;
     match (format.exact, filter) {
@@ -520,7 +620,7 @@ fn read_records(
         )),
         (Exact::Bam, None) => read_bam_records(input),
         (Exact::Bam, Some(RegionFilter::Regions(regions))) => {
-            read_bam_records_in_regions(input, regions)
+            read_bam_records_in_regions(input, custom_index_path, regions)
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -547,14 +647,20 @@ fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
 /// Returns the records as `RecordBuf` for downstream sorting and writing.
 fn read_bam_records_in_regions(
     input: &Path,
+    custom_index_path: Option<&Path>,
     regions: &[htslib_rs::core::Region],
 ) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
     let header = htslib_rs::alignment_compat::read_bam_header_from_path(input)?;
+    let query_input = match custom_index_path {
+        Some(index_path) => explicit_indexed_path(input, index_path),
+        None => input.to_path_buf(),
+    };
     let regions = canonicalize_regions_for_header(&header, regions)?;
     let mut records = Vec::new();
     let mut seen = HashSet::new();
     for region in &regions {
-        let bam_records = htslib_rs::alignment_compat::query_bam_records_from_path(input, region)?;
+        let bam_records =
+            htslib_rs::alignment_compat::query_bam_records_from_path(&query_input, region)?;
         for bam_record in bam_records {
             let buf = sam::alignment::RecordBuf::try_from_alignment_record(&header, &bam_record)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -564,6 +670,15 @@ fn read_bam_records_in_regions(
         }
     }
     Ok((header, records))
+}
+
+fn explicit_indexed_path(input: &Path, index: &Path) -> PathBuf {
+    PathBuf::from(format!(
+        "{}{}{}",
+        input.to_string_lossy(),
+        htslib_rs::index_compat::INDEX_DELIMITER,
+        index.to_string_lossy()
+    ))
 }
 
 fn canonicalize_regions_for_header(
@@ -799,9 +914,9 @@ fn merge_programs(output_header: &mut sam::Header, input_header: &sam::Header) -
     Ok(())
 }
 
-/// Sets the `@HD` `SO:`/`SS:` fields in raw header text (preserving the
-/// other fields/lines verbatim); used for name/tag merges only.
-fn apply_hd_so(raw: &str, so: &str, ss: Option<&str>) -> String {
+/// Sets the `@HD` `SO:`/`GO:`/`SS:` fields in raw header text (preserving
+/// the other fields/lines verbatim); used for name/tag/template merges.
+fn apply_hd_so(raw: &str, so: &str, go: Option<&str>, ss: Option<&str>) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut had_hd = false;
     for line in raw.lines() {
@@ -809,10 +924,13 @@ fn apply_hd_so(raw: &str, so: &str, ss: Option<&str>) -> String {
             had_hd = true;
             let kept: Vec<&str> = line
                 .split('\t')
-                .filter(|f| !f.starts_with("SO:") && !f.starts_with("SS:"))
+                .filter(|f| !f.starts_with("SO:") && !f.starts_with("GO:") && !f.starts_with("SS:"))
                 .collect();
             let mut nl = kept.join("\t");
             nl.push_str(&format!("\tSO:{so}"));
+            if let Some(go) = go {
+                nl.push_str(&format!("\tGO:{go}"));
+            }
             if let Some(ss) = ss {
                 nl.push_str(&format!("\tSS:{ss}"));
             }
@@ -822,9 +940,10 @@ fn apply_hd_so(raw: &str, so: &str, ss: Option<&str>) -> String {
         }
     }
     if !had_hd {
+        let go = go.map(|go| format!("\tGO:{go}")).unwrap_or_default();
         let hd = match ss {
-            Some(ss) => format!("@HD\tVN:1.6\tSO:{so}\tSS:{ss}"),
-            None => format!("@HD\tVN:1.6\tSO:{so}"),
+            Some(ss) => format!("@HD\tVN:1.6\tSO:{so}{go}\tSS:{ss}"),
+            None => format!("@HD\tVN:1.6\tSO:{so}{go}"),
         };
         lines.insert(0, hd);
     }
@@ -1009,14 +1128,19 @@ fn reconcile_merge_headers(
 /// Remaps a record's `RG:Z:` / `PG:Z:` aux values through the trans maps.
 fn remap_record_rg_pg(
     record: &mut RecordBuf,
-    rg: &std::collections::HashMap<String, String>,
-    pg: &std::collections::HashMap<String, String>,
+    rg: &HashMap<String, String>,
+    pg: &HashMap<String, String>,
     force_rg: Option<&str>,
+    warned_missing_tags: &mut HashSet<([u8; 2], String)>,
 ) {
+    use htslib_rs::sam::alignment::record::data::field::Tag;
     use htslib_rs::sam::alignment::record_buf::data::field::Value;
     // `-r`: force RG:Z: to the filename-derived id on every record.
     if let Some(stem) = force_rg {
-        let t = htslib_rs::sam::alignment::record::data::field::Tag::from([b'R', b'G']);
+        // `bam_translate` remaps PG before the forced RG is appended, so
+        // records with both tags end with `PG:Z:<mapped> RG:Z:<stem>`.
+        remap_aux_string_append_tail(record, [b'P', b'G'], pg, warned_missing_tags);
+        let t = Tag::from([b'R', b'G']);
         // Upstream `-r` deletes any existing RG then appends the new one
         // at the tail (order-preserving, like bam_aux_del+bam_aux_append).
         let mut fields: Vec<_> = record
@@ -1027,41 +1151,50 @@ fn remap_record_rg_pg(
             .collect();
         fields.push((t, Value::String(bstr::BString::from(stem))));
         *record.data_mut() = fields.into_iter().collect();
-        // PG is still remapped below; skip the RG map.
-        let t = htslib_rs::sam::alignment::record::data::field::Tag::from([b'P', b'G']);
-        if let Some(Value::String(v)) = record.data().get(&t) {
-            let cur = String::from_utf8_lossy(v).into_owned();
-            match pg.get(&cur) {
-                Some(n) => {
-                    record
-                        .data_mut()
-                        .insert(t, Value::String(bstr::BString::from(n.clone())));
-                }
-                None => {
-                    record.data_mut().remove(&t);
-                }
-            }
-        }
         return;
     }
     for (tag, map) in [([b'R', b'G'], rg), ([b'P', b'G'], pg)] {
-        let t = htslib_rs::sam::alignment::record::data::field::Tag::from(tag);
-        if let Some(Value::String(v)) = record.data().get(&t) {
-            let cur = String::from_utf8_lossy(v).into_owned();
-            match map.get(&cur) {
-                Some(n) => {
-                    record
-                        .data_mut()
-                        .insert(t, Value::String(bstr::BString::from(n.clone())));
-                }
-                // Upstream `bam_translate`: a tag with no corresponding
-                // header entry is dropped ("tag lost").
-                None => {
-                    record.data_mut().remove(&t);
-                }
-            }
-        }
+        remap_aux_string_append_tail(record, tag, map, warned_missing_tags);
     }
+}
+
+fn remap_aux_string_append_tail(
+    record: &mut RecordBuf,
+    tag: [u8; 2],
+    map: &HashMap<String, String>,
+    warned_missing_tags: &mut HashSet<([u8; 2], String)>,
+) {
+    use htslib_rs::sam::alignment::record::data::field::Tag;
+    use htslib_rs::sam::alignment::record_buf::data::field::Value;
+
+    let t = Tag::from(tag);
+    let Some(Value::String(v)) = record.data().get(&t) else {
+        return;
+    };
+    let cur = String::from_utf8_lossy(v).into_owned();
+
+    let mut fields: Vec<_> = record
+        .data()
+        .iter()
+        .filter(|(tg, _)| *tg != t)
+        .map(|(tg, v)| (tg, v.clone()))
+        .collect();
+
+    if let Some(n) = map.get(&cur) {
+        fields.push((t, Value::String(bstr::BString::from(n.clone()))));
+    } else if warned_missing_tags.insert((tag, cur.clone())) {
+        let tag_name = std::str::from_utf8(&tag).unwrap_or("??");
+        let read_name = record
+            .name()
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .unwrap_or_else(|| "*".to_string());
+        eprintln!(
+            "[bam_translate] {tag_name} tag \"{cur}\" on read \"{read_name}\" encountered with no corresponding entry in header, tag lost. Unknown tags are only reported once per input file for each tag ID."
+        );
+    }
+    // Otherwise upstream `bam_translate` drops a tag with no corresponding
+    // header entry ("tag lost").
+    *record.data_mut() = fields.into_iter().collect();
 }
 
 fn merge_comments(output_header: &mut sam::Header, input_header: &sam::Header) {
@@ -1088,12 +1221,52 @@ fn compare_by_tag(a: &RecordBuf, b: &RecordBuf, tag: [u8; 2], name_sort: bool) -
         .cmp(&tag_sort_value(b, tag))
         .then_with(|| {
             if name_sort {
-                name_key(a).cmp(&name_key(b))
+                natural_name_cmp(a, b)
             } else {
                 coordinate_key(a).cmp(&coordinate_key(b))
             }
         })
-        .then_with(|| name_key(a).cmp(&name_key(b)))
+}
+
+fn natural_name_cmp(a: &RecordBuf, b: &RecordBuf) -> Ordering {
+    strnum_cmp(&name_key(a), &name_key(b))
+}
+
+fn strnum_cmp(a: &[u8], b: &[u8]) -> Ordering {
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+            let (si, sj) = (i, j);
+            while i < a.len() && a[i].is_ascii_digit() {
+                i += 1;
+            }
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+
+            let na = trim_leading_zeroes(&a[si..i]);
+            let nb = trim_leading_zeroes(&b[sj..j]);
+            match na.len().cmp(&nb.len()).then_with(|| na.cmp(nb)) {
+                Ordering::Equal => {}
+                o => return o,
+            }
+        } else {
+            match a[i].cmp(&b[j]) {
+                Ordering::Equal => {
+                    i += 1;
+                    j += 1;
+                }
+                o => return o,
+            }
+        }
+    }
+
+    a.len().cmp(&b.len())
+}
+
+fn trim_leading_zeroes(s: &[u8]) -> &[u8] {
+    let trimmed = s.iter().position(|&b| b != b'0').unwrap_or(s.len());
+    &s[trimmed..]
 }
 
 #[derive(Clone, Debug)]
@@ -1185,12 +1358,21 @@ fn read_sam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
     Ok((header, records))
 }
 
-fn set_sort_order(header: &mut sam::Header, so: &str, ss: Option<&str>) {
+fn set_sort_order(header: &mut sam::Header, so: &str, go: Option<&str>, ss: Option<&str>) {
     use bstr::BString;
+    use sam::header::record::value::map::header::tag::GROUP_ORDER;
     use sam::header::record::value::map::{self, Map};
     if let Some(hd) = header.header_mut() {
         hd.other_fields_mut()
             .insert(map::header::tag::SORT_ORDER, BString::from(so));
+        match go {
+            Some(go) => {
+                hd.other_fields_mut().insert(GROUP_ORDER, BString::from(go));
+            }
+            None => {
+                hd.other_fields_mut().shift_remove(&GROUP_ORDER);
+            }
+        }
         match ss {
             Some(ss) => {
                 hd.other_fields_mut()
@@ -1205,6 +1387,9 @@ fn set_sort_order(header: &mut sam::Header, so: &str, ss: Option<&str>) {
         let mut hd: Map<map::Header> = Map::default();
         hd.other_fields_mut()
             .insert(map::header::tag::SORT_ORDER, BString::from(so));
+        if let Some(go) = go {
+            hd.other_fields_mut().insert(GROUP_ORDER, BString::from(go));
+        }
         if let Some(ss) = ss {
             hd.other_fields_mut()
                 .insert(map::header::tag::SUBSORT_ORDER, BString::from(ss));
@@ -1215,12 +1400,21 @@ fn set_sort_order(header: &mut sam::Header, so: &str, ss: Option<&str>) {
 
 trait MergeSink {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()>;
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct BamFile(bam::io::Writer<bgzf::io::Writer<File>>);
 struct BamStdout(bam::io::Writer<bgzf::io::Writer<io::Stdout>>);
 struct SamFile(File);
 struct SamStdout(io::Stdout);
+struct CramOut<W: Write> {
+    writer: bam::io::Writer<bgzf::io::Writer<File>>,
+    tmp_bam_path: crate::tmp_file::TempPath,
+    reference: PathBuf,
+    out: W,
+}
 
 impl MergeSink for BamFile {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
@@ -1245,6 +1439,33 @@ impl MergeSink for SamStdout {
         crate::sam_render::write_record(&mut self.0, header, record)
     }
 }
+impl<W: Write> MergeSink for CramOut<W> {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        use sam::alignment::io::Write as _;
+        self.writer.write_alignment_record(header, record)
+    }
+
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        let this = *self;
+        let CramOut {
+            writer,
+            tmp_bam_path,
+            reference,
+            out,
+        } = this;
+        drop(writer);
+
+        let result = htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+            tmp_bam_path.path(),
+            &reference,
+            out,
+        )
+        .map(|_| ());
+
+        tmp_bam_path.close().ok();
+        result
+    }
+}
 
 fn open_output(
     out: Option<&Path>,
@@ -1263,6 +1484,10 @@ fn open_output(
             writer.write_header(header)?;
             Ok(Box::new(BamFile(writer)))
         }
+        (Some(p), OutFmt::Cram) => {
+            let out = File::create(p)?;
+            open_cram_output(header, out)
+        }
         (None, OutFmt::Sam) => {
             let mut stdout = io::stdout();
             crate::sam_render::write_header(&mut stdout, header)?;
@@ -1273,7 +1498,32 @@ fn open_output(
             writer.write_header(header)?;
             Ok(Box::new(BamStdout(writer)))
         }
+        (None, OutFmt::Cram) => open_cram_output(header, io::stdout()),
     }
+}
+
+fn open_cram_output<W>(header: &sam::Header, out: W) -> io::Result<Box<dyn MergeSink>>
+where
+    W: Write + 'static,
+{
+    let reference = current_global_args().reference.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CRAM output requires top-level --reference FILE",
+        )
+    })?;
+    crate::reference::ensure_fai_index(&reference, None)?;
+
+    let (tmp_bam_file, tmp_bam_path) = crate::tmp_file::create_temp_file("merge", Some("bam"))?;
+    let mut writer = bam::io::Writer::new(tmp_bam_file);
+    writer.write_header(header)?;
+
+    Ok(Box::new(CramOut {
+        writer,
+        tmp_bam_path,
+        reference,
+        out,
+    }))
 }
 
 fn write_bam_index(path: &Path) -> io::Result<()> {
@@ -1303,7 +1553,222 @@ fn print_usage() -> io::Result<()> {
         "  -L BED          restrict indexed BAM inputs to BED intervals"
     )?;
     writeln!(w, "  -o FILE         output to FILE")?;
-    writeln!(w, "  --output-fmt sam|bam")?;
+    writeln!(w, "  --output-fmt sam|bam|cram")?;
     writeln!(w, "  --write-index   write BAI index for BAM file output")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bstr::BString;
+    use htslib_rs::sam::alignment::record::data::field::Tag;
+    use htslib_rs::sam::alignment::record_buf::data::field::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "samtools-rs-merge-{}-{}-{}",
+            name,
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_sam_header(dir: &Path, name: &str, text: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn record_with_string_tags(name: &str, tags: &[([u8; 2], &str)]) -> RecordBuf {
+        let mut record = RecordBuf::default();
+        *record.name_mut() = Some(BString::from(name));
+        for (tag, value) in tags {
+            record.data_mut().insert(
+                Tag::from(*tag),
+                Value::String(BString::from(value.as_bytes())),
+            );
+        }
+        record
+    }
+
+    fn aux_string(record: &RecordBuf, tag: [u8; 2]) -> Option<String> {
+        match record.data().get(&Tag::from(tag)) {
+            Some(Value::String(s)) => Some(String::from_utf8_lossy(s).into_owned()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn reconcile_merge_headers_unions_sq_and_preserves_input_header_text() {
+        let dir = tmp_dir("header-union");
+        let init_text = "@HD\tVN:1.4\tSO:unknown\n@SQ\tSN:fish\tLN:133\tSP:frog\n";
+        let translate_text = "@HD\tVN:1.4\tSO:unknown\n@SQ\tSN:donkey\tLN:133\n@SQ\tSN:fish\tLN:133\n@RG\tID:fish\tPU:trans\n";
+        let first = write_sam_header(&dir, "first.sam", init_text);
+        let second = write_sam_header(&dir, "second.sam", translate_text);
+
+        let (merged, trans, force_rg) = reconcile_merge_headers(
+            &[first.clone(), second.clone()],
+            0x1234330e,
+            MergeIdMode::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            merged,
+            concat!(
+                "@HD\tVN:1.4\tSO:unknown\n",
+                "@SQ\tSN:fish\tLN:133\tSP:frog\n",
+                "@SQ\tSN:donkey\tLN:133\n",
+                "@RG\tID:fish\tPU:trans\n",
+            )
+        );
+        assert!(trans.rg[0].is_empty());
+        assert_eq!(trans.rg[1].get("fish").map(String::as_str), Some("fish"));
+        assert!(trans.pg.iter().all(HashMap::is_empty));
+        assert_eq!(force_rg, vec![None, None]);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), init_text);
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), translate_text);
+    }
+
+    #[test]
+    fn reconcile_merge_headers_remaps_colliding_rg_pg_header_fields() {
+        let dir = tmp_dir("rg-pg-collision");
+        let first_text = concat!(
+            "@HD\tVN:1.4\tSO:unknown\n",
+            "@SQ\tSN:fish\tLN:133\tSP:frog\n",
+            "@RG\tID:fish\tPU:out\n",
+            "@PG\tXX:dummyx\tID:fish\tDS:out\n",
+            "@PG\tPP:fish\tID:hook\tDS:out\n",
+        );
+        let second_text = concat!(
+            "@HD\tVN:1.4\tSO:unknown\n",
+            "@SQ\tSN:donkey\tLN:133\n",
+            "@SQ\tSN:fish\tLN:133\n",
+            "@RG\tID:fish\tPU:trans\n",
+            "@PG\tXX:dummy\tID:fish\tDS:trans\n",
+            "@PG\tPP:fish\tID:hook\tDS:trans\n",
+        );
+        let first = write_sam_header(&dir, "first.sam", first_text);
+        let second = write_sam_header(&dir, "second.sam", second_text);
+
+        let (merged, trans, _) =
+            reconcile_merge_headers(&[first, second], 0x1234330e, MergeIdMode::default()).unwrap();
+
+        let second_rg = trans.rg[1].get("fish").unwrap();
+        let second_pg_fish = trans.pg[1].get("fish").unwrap();
+        let second_pg_hook = trans.pg[1].get("hook").unwrap();
+
+        assert_eq!(trans.rg[0].get("fish").map(String::as_str), Some("fish"));
+        assert!(second_rg.starts_with("fish-"));
+        assert_eq!(trans.pg[0].get("fish").map(String::as_str), Some("fish"));
+        assert_eq!(trans.pg[0].get("hook").map(String::as_str), Some("hook"));
+        assert!(second_pg_fish.starts_with("fish-"));
+        assert!(second_pg_hook.starts_with("hook-"));
+
+        assert!(merged.contains("@RG\tID:fish\tPU:out\n"));
+        assert!(merged.contains(&format!("@RG\tID:{second_rg}\tPU:trans\n")));
+        assert!(merged.contains("@PG\tXX:dummyx\tID:fish\tDS:out\n"));
+        assert!(merged.contains("@PG\tPP:fish\tID:hook\tDS:out\n"));
+        assert!(merged.contains(&format!("@PG\tXX:dummy\tID:{second_pg_fish}\tDS:trans\n")));
+        assert!(merged.contains(&format!(
+            "@PG\tPP:{second_pg_fish}\tID:{second_pg_hook}\tDS:trans\n"
+        )));
+    }
+
+    #[test]
+    fn reconcile_merge_headers_attach_rg_uses_filename_stem() {
+        let dir = tmp_dir("attach-rg");
+        let input_text = concat!(
+            "@HD\tVN:1.4\tSO:unknown\n",
+            "@SQ\tSN:fish\tLN:133\n",
+            "@RG\tID:old\tSM:sample\n",
+        );
+        let input = write_sam_header(&dir, "filename.sam", input_text);
+
+        let (merged, trans, force_rg) = reconcile_merge_headers(
+            &[input],
+            0x1234330e,
+            MergeIdMode {
+                attach_rg: true,
+                ..MergeIdMode::default()
+            },
+        )
+        .unwrap();
+
+        assert!(trans.rg[0].is_empty());
+        assert_eq!(force_rg, vec![Some("filename".to_string())]);
+        assert!(merged.contains("@RG\tID:filename\tSM:sample\n"));
+    }
+
+    #[test]
+    fn remap_record_rg_pg_translates_known_rg_pg_tags() {
+        let mut record = record_with_string_tags(
+            "123456789",
+            &[([b'R', b'G'], "hello"), ([b'P', b'G'], "quail")],
+        );
+        let rg = HashMap::from([("hello".to_string(), "goodbye".to_string())]);
+        let pg = HashMap::from([("quail".to_string(), "bird".to_string())]);
+        let mut warned = HashSet::new();
+
+        remap_record_rg_pg(&mut record, &rg, &pg, None, &mut warned);
+
+        assert_eq!(
+            aux_string(&record, [b'R', b'G']).as_deref(),
+            Some("goodbye")
+        );
+        assert_eq!(aux_string(&record, [b'P', b'G']).as_deref(), Some("bird"));
+        assert!(warned.is_empty());
+    }
+
+    #[test]
+    fn remap_record_rg_pg_drops_unknown_tags_once() {
+        let rg = HashMap::new();
+        let pg = HashMap::new();
+        let mut warned = HashSet::new();
+        let mut record = record_with_string_tags(
+            "123456789",
+            &[([b'R', b'G'], "rg4hello"), ([b'P', b'G'], "pg5hello")],
+        );
+
+        remap_record_rg_pg(&mut record, &rg, &pg, None, &mut warned);
+
+        assert_eq!(aux_string(&record, [b'R', b'G']), None);
+        assert_eq!(aux_string(&record, [b'P', b'G']), None);
+        assert!(warned.contains(&([b'R', b'G'], "rg4hello".to_string())));
+        assert!(warned.contains(&([b'P', b'G'], "pg5hello".to_string())));
+
+        let mut second = record_with_string_tags(
+            "987654321",
+            &[([b'R', b'G'], "rg4hello"), ([b'P', b'G'], "pg5hello")],
+        );
+        remap_record_rg_pg(&mut second, &rg, &pg, None, &mut warned);
+
+        assert_eq!(aux_string(&second, [b'R', b'G']), None);
+        assert_eq!(aux_string(&second, [b'P', b'G']), None);
+        assert_eq!(warned.len(), 2);
+    }
+
+    #[test]
+    fn remap_record_rg_pg_force_rg_appends_filename_rg() {
+        let mut record = record_with_string_tags(
+            "123456789",
+            &[([b'R', b'G'], "old"), ([b'P', b'G'], "quail")],
+        );
+        let rg = HashMap::new();
+        let pg = HashMap::from([("quail".to_string(), "bird".to_string())]);
+        let mut warned = HashSet::new();
+
+        remap_record_rg_pg(&mut record, &rg, &pg, Some("file"), &mut warned);
+
+        assert_eq!(aux_string(&record, [b'P', b'G']).as_deref(), Some("bird"));
+        assert_eq!(aux_string(&record, [b'R', b'G']).as_deref(), Some("file"));
+        assert!(warned.is_empty());
+    }
 }
