@@ -402,10 +402,15 @@ fn rewrite_cram_with_header<W: Write>(
     Ok(())
 }
 
+/// Re-encodes a CRAM with a replaced header. Despite the historical name,
+/// this writes a real CRAM (not SAM text): writing SAM to a CRAM-named
+/// destination produced files that failed format detection, so re-`cat`-ing
+/// or `reheader`-ing the result was rejected. The body mirrors
+/// [`rewrite_cram_with_header`]'s spool-then-encode path.
 fn rewrite_cram_as_sam_with_header_text<W: Write>(
     new_header_text: &str,
     input_cram: &Path,
-    mut output: W,
+    output: W,
 ) -> io::Result<()> {
     let reference = cram_reference_for_input(input_cram)?;
     let old_text =
@@ -414,15 +419,27 @@ fn rewrite_cram_as_sam_with_header_text<W: Write>(
             reference.path(),
             None,
         )?;
-    output.write_all(new_header_text.as_bytes())?;
+
+    let mut merged = Vec::new();
+    merged.extend_from_slice(new_header_text.as_bytes());
+    if !merged.ends_with(b"\n") {
+        merged.push(b'\n');
+    }
     for line in strip_header_lines(old_text.as_bytes()).split(|&b| b == b'\n') {
         if line.is_empty() {
             continue;
         }
         let normalized = normalize_reheader_cram_sam_line(line);
-        output.write_all(normalized.as_bytes())?;
-        output.write_all(b"\n")?;
+        merged.extend_from_slice(normalized.as_bytes());
+        merged.push(b'\n');
     }
+
+    let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(merged)));
+    htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
+        &mut reader,
+        reference.path(),
+        output,
+    )?;
     Ok(())
 }
 

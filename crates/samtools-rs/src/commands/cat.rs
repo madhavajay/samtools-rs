@@ -312,34 +312,71 @@ fn run_cram_cat(
         None => None,
     };
 
-    let mut out: Box<dyn Write> = match output {
-        Some(path) => Box::new(File::create(path)?),
-        None => Box::new(io::stdout()),
-    };
-    crate::sam_render::write_header(&mut out, &header)?;
+    // Spool the concatenated stream as SAM into a temp file, then re-encode
+    // it as a real CRAM. Writing SAM text directly to a `.cram`-named output
+    // (the previous behaviour) produced a file that failed format detection,
+    // so `cat`-ing the result again (e.g. `cat -p` parts) was rejected.
+    let mut reference: Option<PathBuf> = None;
+    let (tmp_file, tmp_path) = crate::tmp_file::create_temp_file("cat", Some("sam"))?;
+    {
+        let mut spool: Box<dyn Write> = Box::new(tmp_file);
+        crate::sam_render::write_header(&mut spool, &header)?;
 
-    for input in selected_inputs {
-        let input_reference = reference_from_header_uri(input, Exact::Cram)?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("CRAM input {} requires @SQ UR tags", input.display()),
-            )
-        })?;
-        let text = if let Some(region) = parsed_region.as_ref() {
-            htslib_rs::alignment_compat::view_cram_regions_as_sam_text_from_path_with_reference(
-                input,
-                &input_reference,
-                std::slice::from_ref(region),
-                false,
-            )?
-        } else {
-            htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
-                input,
-                &input_reference,
-                None,
-            )?
-        };
-        write_sam_record_lines(&mut out, &crate::sam_render::fix_sam_text(&text))?;
+        for input in selected_inputs {
+            let input_reference =
+                reference_from_header_uri(input, Exact::Cram)?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("CRAM input {} requires @SQ UR tags", input.display()),
+                    )
+                })?;
+            let text = if let Some(region) = parsed_region.as_ref() {
+                htslib_rs::alignment_compat::view_cram_regions_as_sam_text_from_path_with_reference(
+                    input,
+                    &input_reference,
+                    std::slice::from_ref(region),
+                    false,
+                )?
+            } else {
+                htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+                    input,
+                    &input_reference,
+                    None,
+                )?
+            };
+            write_sam_record_lines(&mut spool, &crate::sam_render::fix_sam_text(&text))?;
+            if reference.is_none() {
+                reference = Some(input_reference);
+            }
+        }
+        spool.flush()?;
+    }
+
+    let reference = reference.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cat: no CRAM inputs selected for this part",
+        )
+    })?;
+    crate::reference::ensure_fai_index(&reference, None)?;
+
+    match output {
+        Some(path) => {
+            let out = File::create(path)?;
+            htslib_rs::alignment_compat::write_cram_from_sam_path_with_reference(
+                tmp_path.path(),
+                &reference,
+                out,
+            ).map(|_| ())?;
+        }
+        None => {
+            let out = io::stdout().lock();
+            htslib_rs::alignment_compat::write_cram_from_sam_path_with_reference(
+                tmp_path.path(),
+                &reference,
+                out,
+            ).map(|_| ())?;
+        }
     }
 
     Ok(())
