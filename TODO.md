@@ -173,9 +173,10 @@ aux mutation, threads, write-index, SO-less index, region grammar, BAQ,
 large-ref CSI, and embed_ref read+write.** Stable upstream groups/regression
 files include: `consensus` (all 77 `consensus.reg`), `sort` (all
 `test_sort`), `cram-size` (all 3), `reference` (all `test_reference`),
-`dict` (all `test_dict`), `head` (all `test_head`), `collate`, `calmd`,
-`idxstats`, `quickcheck`, `addreplacerg` (all `test_addrprg`), `markdup`,
-`bedcov`, `split` (all `test_split`), `ampliconclip`, and `ampliconstats`.
+`dict` (all `test_dict`), `faidx`, `fqidx`, `head` (all `test_head`),
+`collate`, `calmd`, `idxstats`, `quickcheck`, `addreplacerg` (all
+`test_addrprg`), `markdup`, `bedcov`, `split` (all `test_split`),
+`coverage`, `import`, `ampliconclip`, and `ampliconstats`.
 Other commands have
 substantial Rust coverage and partial upstream fixture parity, but remain
 tracked as `partial` until their full `test.pl` groups pass or are explicitly
@@ -187,16 +188,16 @@ and perf triage).**
 
 Subcommands shipped (31 of ~40):
 - ✅ required upstream parity groups/regression files:
-  `quickcheck`, `dict`, `head`, `sort`, `collate`, `calmd`, `idxstats`,
-  `reference`, `addreplacerg`, `markdup`, `bedcov`, `split`, `reset`,
-  `ampliconclip`, `ampliconstats`, plus `consensus` and `cram-size`.
+  `quickcheck`, `dict`, `faidx`, `fqidx`, `head`, `sort`, `collate`,
+  `calmd`, `idxstats`, `reference`, `addreplacerg`, `markdup`, `bedcov`,
+  `split`, `coverage`, `import`, `reset`, `ampliconclip`,
+  `ampliconstats`, plus `consensus` and `cram-size`.
 - ✅ focused/no upstream fixture group:
   `flags`, `flagstat`, `samples`, `phase`, and `targetcut`.
 - 🟡 implemented but not yet full upstream group parity:
-  `faidx`/`fqidx`, `index`, `view`, `cat`, `reheader`,
-  `fastq`/`fasta`/`bam2fq`, `merge`, `import`, `rmdup`, `coverage`,
-  `depth`, `fixmate`, `depad`/`pad2unpad`, `stats`,
-  `mpileup`, and `checksum`.
+  `index`, `view`, `cat`, `reheader`, `fastq`/`fasta`/`bam2fq`, `merge`,
+  `rmdup`, `depth`, `fixmate`, `depad`/`pad2unpad`, `stats`, `mpileup`,
+  and `checksum`.
 
 Remaining subcommands and their blockers — **resolved** (kept for
 history; current truth in the banner + Progress Snapshot above):
@@ -398,7 +399,7 @@ The waves are ordered to land foundational machinery first (read/write/index) an
 - [~] `reheader` (`bam_reheader.c`) — basic SAM/BAM header replacement (record-level rewrite) with default `@PG` insertion, `--no-PG` suppression, and `-c <command>` external header filtering. **Pending:** BGZF block-level BAM fast path and CRAM `--in-place`.
 - [~] `addreplacerg` (`bam_addrprg.c`) — SAM/BAM add/replace `@RG` + `RG:Z`. `-r` now unescapes `\t`/`\n` so a full `@RG\tID:..\tCN:..` spec works; incremental `-r KEY:VAL`, `-R ID` (rejected if absent), default-first-`@RG`-ID, `-m overwrite_all|orphan_only`, `-w` edit, `-O sam|bam`, `-o`, `@PG`/`--no-PG`. **Byte-exact vs the whole upstream `test_addrprg` group** (`addrprg/{1,2,4,5}` + `-R` overwrite, modulo `@PG`; `addrprg/3` = expected `-R` failure); integration test `addreplacerg_matches_upstream_group`. **Pending:** CRAM input/output, mate-aware updates, full orphan-first semantics.
 - [~] `fastq` / `fasta` / `bam2fq` (`bam_fastq.c`) — basic single-stream output works for SAM and BAM (records written to stdout, `-o FILE`, or `-0 FILE`), with `-f`/`--require-flags`, `--rf`/`--include-flags`, `-F`/`--exclude-flags`, `-G`, the upstream default `0x900` secondary/supplementary exclusion, read-name suffix controls (`-n`/`-N`), `-O` original-quality `OQ` tag output, `-v INT` missing-quality defaults for FASTQ, `-U`/`--UMI-tag` UMI read-name suffixes, `-i`/`--barcode-tag` CASAVA barcode fields, upstream-style name-grouped paired split outputs (`-1`/`-2`/`-s`/`-0`) that pick the best per-readpart record per qname-group and route R1+R2 to `-1`/`-2`, R1-only or R2-only singletons to `-s` (falling back to `-1`/`-2` when `-s` is absent), and READ_OTHER to `-0` (falling back to `-s` when `-0` is absent), per-record interleaved output when `-1` and `-2` paths alias to the same file, SAM/BAM selected aux comments via `-T` in single and split output modes, all-tag SAM/BAM comments via `-T ''` / `-T '*'` in single and split-output FASTQ mode, SAM/BAM `B` array aux comment formatting, SAM/BAM single and split-output FASTQ tag filtering via `-d`/`--tag TAG[:VALUE]` and `-D`/`--tag-file TAG:FILE`, accumulating `-t` (`RG,BC,QT` upstream shortcut) and `-T TAG,...` selections that union rather than override, repeated `-d TAG[:VAL]` / `-D TAG:FILE` invocations that union value sets for the same tag and reject mismatched tags, FASTA reverse-complement of reverse-strand records, per-record `--i1`/`--i2` index FASTQ extraction with `--index-format` (default `i*i*`), `--quality-tag` (default `QT`), and `--barcode-tag`, and the upstream SAM-input all-tags fixture `bam2fq/15.fq.expected` matches for `-T ''` and `-t -T '*'`. `bam2fq/{1,2,3,4,6,7,9,11,13,15,16,17,18,19,20}.{1,2,s}.fq.expected` and `bam2fq/11.fa.expected` fixtures pass against the current Rust binary. **Pending:** exact upstream name-grouped one-record-per-qname index emission, index emission for stdin input, CASAVA paired-end barcode propagation, exact upstream behavior for `-i`/`--index-format` interaction with split mode, CRAM.
-- [~] `import` (`bam_import.c`) — basic single FASTA/FASTQ and paired FASTQ (`-1`/`-2`, `--r1`/`--r2`, `-s` interleaved, plus two positional inputs) → SAM/BAM (`-O bam` / `--bam`), including positional single input plus `-0` single-read alias, `-0` singleton input alongside paired `-1`/`-2`, positional interleaved FASTQ detection from `/1`/`/2` read names, no-op `--no-PG`, CASAVA parsing (`-i`) with upstream-style reverse comments, SRA name2 (`-N`), UMI extraction (`-U`/`--UMI-tag`) with reverse comments, CASAVA barcode sequence tags (`--barcode-tag`), FASTQ definition aux tags (`-T`) including upstream-style float exponent spelling, explicit index reads (`--i1`/`--i2`) for `-0`, `-s`, positional interleaved, and paired `-1`/`-2` inputs with barcode sequence/quality tags (`--barcode-tag`/`--quality-tag`) and `-b`, and read-group header/tag support (`-R`/`-r`) with repeated `-r` accumulation, `-r` precedence over `-R`, and `-r` ID validation. Direct comparisons against `test/import/*.expected.sam` for the currently implemented import fixture commands pass. **Pending:** full paired singleton/other grouping parity, full read-group parity, CRAM output.
+- [x] `import` (`bam_import.c`) — basic single FASTA/FASTQ and paired FASTQ (`-1`/`-2`, `--r1`/`--r2`, `-s` interleaved, plus two positional inputs) → SAM/BAM (`-O bam` / `--bam`), including positional single input plus `-0` single-read alias, `-0` singleton input alongside paired `-1`/`-2`, positional interleaved FASTQ detection from `/1`/`/2` read names, no-op `--no-PG`, CASAVA parsing (`-i`) with upstream-style reverse comments, SRA name2 (`-N`), UMI extraction (`-U`/`--UMI-tag`) with reverse comments, CASAVA barcode sequence tags (`--barcode-tag`), FASTQ definition aux tags (`-T`) including upstream-style float exponent spelling, explicit index reads (`--i1`/`--i2`) for `-0`, `-s`, positional interleaved, and paired `-1`/`-2` inputs with barcode sequence/quality tags (`--barcode-tag`/`--quality-tag`) and `-b`, and read-group header/tag support (`-R`/`-r`) with repeated `-r` accumulation, `-r` precedence over `-R`, and `-r` ID validation. **Byte-exact vs the full upstream `test_import` group (21/21)**, including the roundtrip cases that pipe through `fastq`. **Pending (not fixture-covered):** CRAM output.
 
 ### Wave C — Editing / Mate-aware
 
