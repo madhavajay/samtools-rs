@@ -518,6 +518,15 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
                 opts.output = Some(PathBuf::from(v));
                 i += 1;
             }
+            "-ho" => {
+                opts.header = HeaderMode::Include;
+                i += 1;
+                let v = args
+                    .get(i)
+                    .ok_or_else(|| ParseError::Err("missing value for -ho".into()))?;
+                opts.output = Some(PathBuf::from(v));
+                i += 1;
+            }
             "-U" | "--unoutput" | "--output-unselected" => {
                 i += 1;
                 let v = args
