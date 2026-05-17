@@ -305,8 +305,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let parsed_regions: Vec<Region> = positional_regions
         .iter()
         .cloned()
-        .chain(target_regions)
+        .chain(target_regions.iter().cloned())
         .collect();
+    let ref_stats_regions = if target_file.is_some() {
+        target_regions.clone()
+    } else {
+        positional_regions.clone()
+    };
     if config.cov_threshold > 0 && parsed_regions.is_empty() {
         print_error(
             "stats",
@@ -451,7 +456,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             && let Some(header) = read_input_header(&input, format.exact)?
         {
             let dims = ref_dims(&header);
-            let merged = merge_ref_regions(&header, &parsed_regions)?;
+            let merged = merge_ref_regions(&header, &ref_stats_regions)?;
             write_ref_stats(&mut writer, &dims, &merged, config.reference_seqs.as_ref())?;
         }
         Ok(())

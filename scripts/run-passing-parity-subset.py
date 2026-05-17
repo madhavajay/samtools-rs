@@ -33,6 +33,7 @@ DEFAULT_GROUPS = [
     "test_bedcov",
     "test_split",
     "test_coverage",
+    "test_stats",
     "test_reset",
     "test_ampliconclip",
     "test_ampliconstats",

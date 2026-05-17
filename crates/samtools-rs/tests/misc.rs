@@ -6733,12 +6733,13 @@ fn stats_matches_upstream_stat_fixtures() {
     // `--ref-stats` RFS section (upstream compares only `grep ^RFS`):
     // stat/16 no reference (GC/N = -1), stat/17 reference-backed GC/N
     // (plain and `--ref-stats-chunk -1` no-op), stat/18 positional
-    // region, stat/19 `-t` target file (overlapping intervals merged).
+    // region, stat/19 `-t` target file (overlapping intervals merged,
+    // including the harness' extra positional-region variant).
     let test1_fa = p(&stat.join("test1.fa"));
     let sam = p(&stat.join("11_target.sam"));
     let bam = p(&stat.join("11_target.bam"));
     let targets = p(&stat.join("11.stats.targets"));
-    let rfs_cases: [(Vec<String>, &str); 5] = [
+    let rfs_cases: [(Vec<String>, &str); 6] = [
         (vec![sam.clone()], "16.stats.expected"),
         (
             vec!["-r".into(), test1_fa.clone(), sam.clone()],
@@ -6770,6 +6771,17 @@ fn stats_matches_upstream_stat_fixtures() {
                 "-t".into(),
                 targets.clone(),
                 sam.clone(),
+            ],
+            "19.stats.expected",
+        ),
+        (
+            vec![
+                "-r".into(),
+                test1_fa.clone(),
+                "-t".into(),
+                targets.clone(),
+                bam.clone(),
+                "ref1".into(),
             ],
             "19.stats.expected",
         ),
