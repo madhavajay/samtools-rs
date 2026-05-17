@@ -550,9 +550,10 @@ fn read_bam_records_in_regions(
     regions: &[htslib_rs::core::Region],
 ) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
     let header = htslib_rs::alignment_compat::read_bam_header_from_path(input)?;
+    let regions = canonicalize_regions_for_header(&header, regions)?;
     let mut records = Vec::new();
     let mut seen = HashSet::new();
-    for region in regions {
+    for region in &regions {
         let bam_records = htslib_rs::alignment_compat::query_bam_records_from_path(input, region)?;
         for bam_record in bam_records {
             let buf = sam::alignment::RecordBuf::try_from_alignment_record(&header, &bam_record)
@@ -563,6 +564,52 @@ fn read_bam_records_in_regions(
         }
     }
     Ok((header, records))
+}
+
+fn canonicalize_regions_for_header(
+    header: &sam::Header,
+    regions: &[htslib_rs::core::Region],
+) -> io::Result<Vec<htslib_rs::core::Region>> {
+    regions
+        .iter()
+        .map(|region| {
+            let name = canonical_reference_name(header, region.name()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "region reference sequence does not exist: {}",
+                        region.name()
+                    ),
+                )
+            })?;
+
+            Ok(htslib_rs::core::Region::new(name, region.interval()))
+        })
+        .collect()
+}
+
+fn canonical_reference_name(header: &sam::Header, name: &[u8]) -> Option<Vec<u8>> {
+    let reference_sequences = header.reference_sequences();
+
+    if let Some(i) = reference_sequences.get_index_of(name) {
+        let (canonical_name, _) = reference_sequences.get_index(i)?;
+        return Some(canonical_name.to_vec());
+    }
+
+    reference_sequences
+        .iter()
+        .find_map(|(canonical_name, reference_sequence)| {
+            reference_sequence
+                .other_fields()
+                .get(&sam::header::record::value::map::reference_sequence::tag::ALTERNATIVE_NAMES)
+                .filter(|alternative_names| {
+                    alternative_names
+                        .as_slice()
+                        .split(|&b| b == b',')
+                        .any(|alternative_name| alternative_name == name)
+                })
+                .map(|_| canonical_name.to_vec())
+        })
 }
 
 fn record_key(record: &RecordBuf) -> (Vec<u8>, u16, Option<usize>, Option<usize>, String) {

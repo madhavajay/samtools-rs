@@ -2,6 +2,7 @@
 //! `samtools collate`, all of which share the same in-memory sort backbone.
 
 use std::ffi::OsString;
+use std::io::Cursor;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Mutex;
@@ -1843,6 +1844,46 @@ fn merge_l_bed_restricts_to_indexed_records_and_deduplicates_overlaps() {
 
     let unique: std::collections::HashSet<_> = bed_records.iter().copied().collect();
     assert_eq!(unique.len(), bed_records.len());
+}
+
+#[test]
+fn merge_l_bed_resolves_reference_aliases() {
+    let tmp = tmp_dir("merge-bed-alias");
+    let bam = tmp.join("alias.bam");
+    let sam = b"@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:r3\tLN:50\tAN:ref3\nr1\t0\tref3\t1\t30\t1M\t*\t0\t0\tA\t!\nr2\t0\tr3\t10\t30\t1M\t*\t0\t0\tC\t!\n";
+    let bam_data =
+        htslib_rs::alignment_compat::write_bam_from_sam_reader(Cursor::new(sam), Vec::new())
+            .unwrap();
+    std::fs::write(&bam, bam_data).unwrap();
+    let idx_argv: Vec<OsString> = ["index", bam.to_str().unwrap()]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    assert_eq!(exit_to_u8(samtools_rs::commands::index::main(&idx_argv)), 0);
+
+    let bed = tmp.join("regions.bed");
+    std::fs::write(&bed, "ref3\t0\t1\n").unwrap();
+    let out = tmp.join("out.sam");
+    let argv: Vec<OsString> = [
+        "merge",
+        "-f",
+        "-L",
+        bed.to_str().unwrap(),
+        "--output-fmt",
+        "sam",
+        "-o",
+        out.to_str().unwrap(),
+        bam.to_str().unwrap(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    assert_eq!(exit_to_u8(merge::main(&argv)), 0);
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("\n@SQ\tSN:r3\tLN:50\tAN:ref3\n"));
+    assert!(text.contains("\nr1\t0\tr3\t1\t30\t1M\t*\t0\t0\tA\t!"));
+    assert!(!text.contains("\nr2\t"));
 }
 
 #[test]
