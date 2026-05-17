@@ -2075,6 +2075,32 @@ fn view_glued_ho_writes_header_to_output_path() {
 }
 
 #[test]
+fn view_bam_output_resolves_reference_aliases() {
+    let tmp = tmp_dir("view-reference-alias");
+    let sam = tmp.join("input.sam");
+    let out = tmp.join("out.bam");
+    std::fs::write(
+        &sam,
+        b"@HD\tVN:1.6\n@SQ\tSN:r3\tLN:50\tAN:ref3\nr1\t0\tref3\t1\t30\t1M\t*\t0\t0\tA\t!\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        run(&[
+            "-ho",
+            out.to_str().unwrap(),
+            "--no-PG",
+            sam.to_str().unwrap()
+        ]),
+        0
+    );
+    let text =
+        htslib_rs::alignment_compat::view_bam_as_sam_text_from_path_with_limit(&out, None).unwrap();
+    assert!(text.contains("\n@SQ\tSN:r3\tLN:50\tAN:ref3\n"));
+    assert!(text.contains("\nr1\t0\tr3\t1\t30\t1M\t*\t0\t0\tA\t!"));
+}
+
+#[test]
 fn view_p_unmap_unselected_routes_into_bam_output_for_sam_input() {
     let tmp = tmp_dir("view-unmap-bam");
     let input = tmp.join("input.sam");
