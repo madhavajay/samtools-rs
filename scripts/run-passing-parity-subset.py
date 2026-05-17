@@ -21,6 +21,7 @@ DEFAULT_GROUPS = [
     "test_dict",
     "test_faidx",
     "test_fqidx",
+    "test_import",
     "test_sort",
     "test_collate",
     "test_calmd",
