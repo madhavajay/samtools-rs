@@ -1156,12 +1156,8 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
             reject_unselected_binary_output(opts)?;
         }
         let filter = combined_filter_expr(opts);
-        let dst = opts
-            .output
-            .clone()
-            .ok_or_else(|| io::Error::other("CRAM output to stdout requires -o file (TODO)"))?;
         let reference = cram_reference(opts)?;
-        let dst_file = File::create(&dst)?;
+        let dst_file = open_binary_output(opts)?;
         match input_exact {
             Exact::Sam => {
                 let needs_split = opts.unselected_output.is_some() || opts.unmap_unselected;
@@ -1488,12 +1484,8 @@ fn run_sam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
 
     if effective_out_fmt == OutputFmt::Cram {
         reject_unselected_binary_output(opts)?;
-        let dst = opts
-            .output
-            .clone()
-            .ok_or_else(|| io::Error::other("CRAM output to stdout requires -o file (TODO)"))?;
         let reference = cram_reference(opts)?;
-        let dst_file = File::create(&dst)?;
+        let dst_file = open_binary_output(opts)?;
         let filter = combined_filter_expr(opts);
         if let Some(expr) = filter.as_deref() {
             if has_record_rewrite(opts) {
@@ -1625,12 +1617,8 @@ fn run_bam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
     if effective_out_fmt == OutputFmt::Cram {
         reject_unselected_binary_output(opts)?;
         let filter = combined_filter_expr(opts);
-        let dst = opts
-            .output
-            .clone()
-            .ok_or_else(|| io::Error::other("CRAM output to stdout requires -o file (TODO)"))?;
         let reference = cram_reference(opts)?;
-        let dst_file = File::create(&dst)?;
+        let dst_file = open_binary_output(opts)?;
         if let Some(expr) = filter.as_deref() {
             htslib_rs::alignment_compat::write_cram_matching_filter_from_bam_reader_with_reference(
                 io::Cursor::new(input),
@@ -1760,11 +1748,7 @@ fn run_cram_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
     if effective_out_fmt == OutputFmt::Cram {
         reject_unselected_binary_output(opts)?;
         let filter = combined_filter_expr(opts);
-        let dst = opts
-            .output
-            .clone()
-            .ok_or_else(|| io::Error::other("CRAM output to stdout requires -o file (TODO)"))?;
-        let dst_file = File::create(&dst)?;
+        let dst_file = open_binary_output(opts)?;
         if let Some(expr) = filter.as_deref() {
             htslib_rs::alignment_compat::write_cram_matching_filter_from_reader_with_reference(
                 io::Cursor::new(input),
