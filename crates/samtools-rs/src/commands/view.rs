@@ -1181,7 +1181,95 @@ fn parse_subsample(raw: &str) -> Result<Subsample, ParseError> {
     Ok(Subsample { seed, fraction })
 }
 
+/// Temp directory holding a `-X` data file plus its explicit index under the
+/// default name; removed recursively on drop.
+struct StagedIndexDir {
+    dir: PathBuf,
+    bam: PathBuf,
+}
+
+impl StagedIndexDir {
+    fn bam_path(&self) -> &Path {
+        &self.bam
+    }
+}
+
+impl Drop for StagedIndexDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Picks the index suffix from the provided file: sniff the BAI/CSI magic,
+/// then fall back to the path extension, then to `bai`.
+fn customized_index_extension(index: &Path) -> &'static str {
+    let mut magic = [0u8; 4];
+    if let Ok(mut f) = File::open(index)
+        && f.read_exact(&mut magic).is_ok()
+    {
+        match &magic {
+            b"CSI\x01" => return "csi",
+            b"BAI\x01" => return "bai",
+            _ => {}
+        }
+    }
+    match index.extension().and_then(|e| e.to_str()) {
+        Some("csi") => "csi",
+        Some("crai") => "crai",
+        _ => "bai",
+    }
+}
+
+/// `-X`/`--customized-index`: the region helpers otherwise resolve the index
+/// next to the data file, ignoring the explicit path. Stage a temp directory
+/// holding the data file plus the provided index under the default-probe name
+/// so those lookups succeed without polluting the source tree.
+fn stage_customized_index(input: &Path, index: &Path) -> io::Result<StagedIndexDir> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!(
+        "samtools-rs-xidx-{}-{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&dir)?;
+
+    let file_name = input
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "input has no file name"))?;
+    let staged_bam = dir.join(file_name);
+    // Hard-link when possible (same filesystem); fall back to a copy.
+    if fs::hard_link(input, &staged_bam).is_err() {
+        fs::copy(input, &staged_bam)?;
+    }
+
+    let mut staged_index = staged_bam.clone().into_os_string();
+    staged_index.push(".");
+    staged_index.push(customized_index_extension(index));
+    fs::copy(index, PathBuf::from(staged_index))?;
+
+    Ok(StagedIndexDir {
+        dir,
+        bam: staged_bam,
+    })
+}
+
 fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
+    let staged_index_dir = if opts.customized_index
+        && let Some(index) = opts.index_path.as_deref()
+        && index.exists()
+    {
+        Some(stage_customized_index(input, index)?)
+    } else {
+        None
+    };
+    let input: &Path = staged_index_dir
+        .as_ref()
+        .map(StagedIndexDir::bam_path)
+        .unwrap_or(input);
+
     let effective_out_fmt = resolved_output_fmt(opts)?;
 
     // Count-only mode.

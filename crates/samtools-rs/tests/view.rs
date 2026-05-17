@@ -1418,6 +1418,70 @@ fn view_dash_cap_x_accepts_legacy_custom_index_synopsis() {
 }
 
 #[test]
+fn view_dash_cap_x_uses_index_at_nondefault_path() {
+    // `view -X in.bam custom/dir/in.bam.bai region` — the explicit index
+    // lives in a directory with no default-location index next to the BAM.
+    // The region query must still succeed using the provided index, and
+    // must not create an index beside the source BAM.
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("view-x-nondefault");
+    let data_dir = tmp.join("data");
+    let idx_dir = tmp.join("idx");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&idx_dir).unwrap();
+
+    let bam = data_dir.join("range.bam");
+    std::fs::copy(htslib_fixtures_dir().join("range.bam"), &bam).unwrap();
+    let custom_bai = idx_dir.join("range.bam.bai");
+    std::fs::copy(htslib_fixtures_dir().join("range.bam.bai"), &custom_bai).unwrap();
+    // Ensure there is no default-location index beside the BAM.
+    assert!(!data_dir.join("range.bam.bai").exists());
+
+    let region = "CHROMOSOME_II:2980-2980";
+    let expected = tmp.join("expected.txt");
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "view",
+                "-c",
+                "-o",
+                expected.to_str().unwrap(),
+                htslib_fixtures_dir().join("range.bam").to_str().unwrap(),
+                region,
+            ],
+        ))),
+        0
+    );
+
+    let xed = tmp.join("xed.txt");
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "view",
+                "-X",
+                "-c",
+                "-o",
+                xed.to_str().unwrap(),
+                bam.to_str().unwrap(),
+                custom_bai.to_str().unwrap(),
+                region,
+            ],
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&expected).unwrap(),
+        std::fs::read_to_string(&xed).unwrap()
+    );
+    // The source BAM directory must stay clean (no leaked default index).
+    assert!(!data_dir.join("range.bam.bai").exists());
+    assert!(!data_dir.join("range.bam.csi").exists());
+}
+
+#[test]
 fn view_bam_region_expr_sam_output_succeeds() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let tmp = tmp_dir("bam-region-expr-sam");
