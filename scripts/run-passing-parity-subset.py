@@ -28,6 +28,7 @@ DEFAULT_GROUPS = [
     "test_addrprg",
     "test_markdup",
     "test_bedcov",
+    "test_split",
     "test_ampliconclip",
     "test_ampliconstats",
 ]
