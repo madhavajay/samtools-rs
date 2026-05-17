@@ -12,11 +12,12 @@
 //!  - `--no-PG` — suppress the default `@PG` line.
 //!  - `--write-index` — build BAI indexes for BAM outputs.
 //!  - `-p N` — width for `%#` padding.
+//!  - `-` — read SAM or BAM from stdin.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -129,19 +130,21 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
-    let format = match sam_io::sam_open_format(&input) {
-        Ok(f) => f,
-        Err(e) => {
-            print_error("split", e.to_string());
+    if input.as_os_str() != "-" {
+        let format = match sam_io::sam_open_format(&input) {
+            Ok(f) => f,
+            Err(e) => {
+                print_error("split", e.to_string());
+                return ExitCode::from(1);
+            }
+        };
+        if !matches!(format.exact, Exact::Sam | Exact::Bam) {
+            print_error(
+                "split",
+                "only SAM and BAM input are currently supported (CRAM TODO)",
+            );
             return ExitCode::from(1);
         }
-    };
-    if !matches!(format.exact, Exact::Sam | Exact::Bam) {
-        print_error(
-            "split",
-            "only SAM and BAM input are currently supported (CRAM TODO)",
-        );
-        return ExitCode::from(1);
     }
 
     let options = SplitOptions {
@@ -186,15 +189,19 @@ struct SplitOptions<'a> {
 }
 
 fn run_split(input: &Path, options: SplitOptions<'_>) -> io::Result<()> {
-    let format = sam_io::sam_open_format(input)?;
-    let (header, records) = match format.exact {
-        Exact::Sam => read_sam_records(input)?,
-        Exact::Bam => read_bam_records(input)?,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "only SAM and BAM input are currently supported (CRAM TODO)",
-            ));
+    let (header, records) = if input.as_os_str() == "-" {
+        read_stdin_records()?
+    } else {
+        let format = sam_io::sam_open_format(input)?;
+        match format.exact {
+            Exact::Sam => read_sam_records(input)?,
+            Exact::Bam => read_bam_records(input)?,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "only SAM and BAM input are currently supported (CRAM TODO)",
+                ));
+            }
         }
     };
 
@@ -395,7 +402,15 @@ fn append_extension(path: &Path, ext: &str) -> PathBuf {
 }
 
 fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
-    let mut reader = bam::io::Reader::new(File::open(input)?);
+    read_bam_records_from_reader(&mut bam::io::Reader::new(File::open(input)?))
+}
+
+fn read_bam_records_from_reader<R>(
+    reader: &mut bam::io::Reader<R>,
+) -> io::Result<(sam::Header, Vec<RecordBuf>)>
+where
+    R: Read,
+{
     let header = reader.read_header()?;
     let mut records = Vec::new();
     loop {
@@ -409,7 +424,17 @@ fn read_bam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
 }
 
 fn read_sam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
-    let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
+    read_sam_records_from_reader(&mut sam::io::Reader::new(BufReader::new(File::open(
+        input,
+    )?)))
+}
+
+fn read_sam_records_from_reader<R>(
+    reader: &mut sam::io::Reader<R>,
+) -> io::Result<(sam::Header, Vec<RecordBuf>)>
+where
+    R: io::BufRead,
+{
     let header = reader.read_header()?;
     let mut records = Vec::new();
     loop {
@@ -420,6 +445,20 @@ fn read_sam_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
         records.push(record);
     }
     Ok((header, records))
+}
+
+fn read_stdin_records() -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+    let mut bytes = Vec::new();
+    io::stdin().read_to_end(&mut bytes)?;
+    if bytes.first() == Some(&b'@') {
+        let text =
+            String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(text)));
+        return read_sam_records_from_reader(&mut reader);
+    }
+
+    let mut reader = bam::io::Reader::new(Cursor::new(bytes));
+    read_bam_records_from_reader(&mut reader)
 }
 
 fn read_sam_header(input: &Path) -> io::Result<sam::Header> {
