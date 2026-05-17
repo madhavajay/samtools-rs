@@ -2054,6 +2054,27 @@ fn view_h_flag_sam_output_appends_pg_line() {
 }
 
 #[test]
+fn view_glued_ho_writes_header_to_output_path() {
+    let tmp = tmp_dir("view-glued-ho");
+    let sam = tmp.join("input.sam");
+    let out = tmp.join("out.bam");
+    std::fs::write(
+        &sam,
+        b"@HD\tVN:1.6\n@SQ\tSN:ref\tLN:100\nr1\t0\tref\t1\t20\t2M\t*\t0\t0\tAC\t!!\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        run(&["-ho", out.to_str().unwrap(), sam.to_str().unwrap()]),
+        0
+    );
+    let text =
+        htslib_rs::alignment_compat::view_bam_as_sam_text_from_path_with_limit(&out, None).unwrap();
+    assert!(text.starts_with("@HD\t"));
+    assert!(text.contains("\nr1\t"));
+}
+
+#[test]
 fn view_p_unmap_unselected_routes_into_bam_output_for_sam_input() {
     let tmp = tmp_dir("view-unmap-bam");
     let input = tmp.join("input.sam");
