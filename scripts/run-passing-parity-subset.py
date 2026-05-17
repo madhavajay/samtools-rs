@@ -34,6 +34,7 @@ DEFAULT_GROUPS = [
     "test_split",
     "test_coverage",
     "test_stats",
+    "test_depad",
     "test_reset",
     "test_ampliconclip",
     "test_ampliconstats",

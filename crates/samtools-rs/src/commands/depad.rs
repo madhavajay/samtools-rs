@@ -1,11 +1,11 @@
 //! `samtools depad` — convert padded SAM alignments to unpadded SAM.
 //!
-//! This is a first samtools-rs slice: SAM input with `-T` padded FASTA
-//! reference and SAM output. BAM/CRAM input and binary output remain pending.
+//! This is a first samtools-rs slice: SAM/BAM input with `-T` padded FASTA
+//! reference and SAM/BAM output. CRAM input/output remains pending.
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -18,7 +18,7 @@ use crate::io as sam_io;
 pub fn main(args: &[OsString]) -> ExitCode {
     let mut reference: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
-    let mut output_sam = false;
+    let mut output_format = OutputFormat::Bam;
     let mut no_pg = false;
     let mut positional = Vec::new();
 
@@ -43,14 +43,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 output = Some(PathBuf::from(path));
             }
             "-s" => {
-                output_sam = true;
+                output_format = OutputFormat::Sam;
             }
             "-u" | "-1" => {
-                print_error(
-                    "depad",
-                    "binary depad output is not yet supported; use -s for SAM output",
-                );
-                return ExitCode::from(1);
+                output_format = OutputFormat::Bam;
             }
             "-O" | "--output-fmt" => {
                 let Some(format) = iter.next().and_then(|a| a.to_str()) else {
@@ -58,13 +54,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     let _ = print_usage();
                     return ExitCode::from(1);
                 };
-                if format.eq_ignore_ascii_case("sam") {
-                    output_sam = true;
-                } else {
-                    print_error(
-                        "depad",
-                        "only SAM depad output is currently supported (use -O sam)",
-                    );
+                output_format = OutputFormat::parse(format).unwrap_or_else(|| {
+                    print_error("depad", format!("unsupported output format {}", format));
+                    OutputFormat::Invalid
+                });
+                if output_format == OutputFormat::Invalid {
                     return ExitCode::from(1);
                 }
             }
@@ -94,22 +88,26 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
-    if !output_sam
-        && !matches!(
-            output
-                .as_deref()
-                .and_then(|p| p.extension())
-                .and_then(|e| e.to_str())
-                .map(str::to_ascii_lowercase)
-                .as_deref(),
-            Some("sam")
-        )
-    {
-        print_error(
-            "depad",
-            "only SAM depad output is currently supported; use -s or an .sam output path",
-        );
-        return ExitCode::from(1);
+    if matches!(
+        output
+            .as_deref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("sam")
+    ) {
+        output_format = OutputFormat::Sam;
+    } else if matches!(
+        output
+            .as_deref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("bam")
+    ) {
+        output_format = OutputFormat::Bam;
     }
 
     let input = &positional[0];
@@ -121,15 +119,23 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     };
 
-    if format.exact != Exact::Sam {
+    if !matches!(format.exact, Exact::Sam | Exact::Bam) {
         print_error(
             "depad",
-            "only SAM input is currently supported (BAM/CRAM TODO)",
+            "only SAM and BAM input are currently supported (CRAM TODO)",
         );
         return ExitCode::from(1);
     }
 
-    let result = run_depad_sam(input, reference, output.as_deref(), !no_pg, args);
+    let result = run_depad(
+        input,
+        format.exact,
+        reference,
+        output.as_deref(),
+        output_format,
+        !no_pg,
+        args,
+    );
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -139,18 +145,79 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 }
 
-fn run_depad_sam(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputFormat {
+    Sam,
+    Bam,
+    Invalid,
+}
+
+impl OutputFormat {
+    fn parse(value: &str) -> Option<Self> {
+        let head = value.split(',').next().unwrap_or(value);
+        match head.to_ascii_lowercase().as_str() {
+            "sam" => Some(Self::Sam),
+            "bam" => Some(Self::Bam),
+            _ => None,
+        }
+    }
+}
+
+fn run_depad(
     input: &Path,
+    input_format: Exact,
     reference: &Path,
     output: Option<&Path>,
+    output_format: OutputFormat,
     add_pg: bool,
     argv: &[OsString],
 ) -> io::Result<()> {
+    let sam = depadded_sam_bytes(input, input_format, reference, add_pg, argv)?;
+    match output_format {
+        OutputFormat::Sam => {
+            let mut writer = sam_io::open_text_output(output)?;
+            writer.write_all(&sam)?;
+            sam_io::check_sam_close(&mut writer)
+        }
+        OutputFormat::Bam => {
+            let writer: Box<dyn Write> = match output {
+                Some(path) => Box::new(File::create(path)?),
+                None => Box::new(io::stdout()),
+            };
+            htslib_rs::alignment_compat::write_bam_from_sam_reader(
+                BufReader::new(Cursor::new(sam)),
+                writer,
+            )?;
+            Ok(())
+        }
+        OutputFormat::Invalid => unreachable!("validated during argument parsing"),
+    }
+}
+
+fn depadded_sam_bytes(
+    input: &Path,
+    input_format: Exact,
+    reference: &Path,
+    add_pg: bool,
+    argv: &[OsString],
+) -> io::Result<Vec<u8>> {
     let references = read_padded_references(reference)?;
-    let mut reader = BufReader::new(File::open(input)?);
-    let mut writer = sam_io::open_text_output(output)?;
-    depad_sam_reader(&mut reader, &references, add_pg, argv, &mut writer)?;
-    sam_io::check_sam_close(&mut writer)
+    let mut output = Vec::new();
+    match input_format {
+        Exact::Sam => {
+            let mut reader = BufReader::new(File::open(input)?);
+            depad_sam_reader(&mut reader, &references, add_pg, argv, &mut output)?;
+        }
+        Exact::Bam => {
+            let sam = htslib_rs::alignment_compat::view_bam_as_sam_text_from_path_with_limit(
+                input, None,
+            )?;
+            let mut reader = BufReader::new(Cursor::new(sam.into_bytes()));
+            depad_sam_reader(&mut reader, &references, add_pg, argv, &mut output)?;
+        }
+        _ => unreachable!("validated by caller"),
+    }
+    Ok(output)
 }
 
 fn depad_sam_reader<R, W>(
@@ -508,10 +575,11 @@ fn print_usage() -> io::Result<()> {
     let mut w = io::stderr().lock();
     writeln!(
         w,
-        "Usage: samtools depad -T REF.fa -s [-o OUT.sam] <in.sam>"
+        "Usage: samtools depad -T REF.fa [options] <in.sam|in.bam>"
     )?;
     writeln!(w, "  -T FILE       padded reference FASTA")?;
-    writeln!(w, "  -s            write SAM output (currently required)")?;
+    writeln!(w, "  -s            write SAM output")?;
+    writeln!(w, "  -u, -1        write BAM output")?;
     writeln!(w, "  -o FILE       write output to FILE")?;
     writeln!(w, "  --no-PG       do not add a new @PG header line")?;
     Ok(())
