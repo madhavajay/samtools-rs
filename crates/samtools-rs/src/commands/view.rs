@@ -1229,11 +1229,8 @@ fn stage_customized_index(input: &Path, index: &Path) -> io::Result<StagedIndexD
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!(
-        "samtools-rs-xidx-{}-{}",
-        std::process::id(),
-        nanos
-    ));
+    let dir_name = format!("samtools-rs-xidx-{}-{}", std::process::id(), nanos);
+    let dir = std::env::temp_dir().join(dir_name);
     fs::create_dir_all(&dir)?;
 
     let file_name = input
@@ -3587,7 +3584,7 @@ fn write_sam_text_records_split<W: Write>(
     }
 
     let tail = strip_header_lines(bytes);
-    let header_has_sq = sam_header_has_sq(bytes);
+    let header_has_sq = sam_header_has_sq(bytes) || sam_reference_dictionary_present(opts);
     if has_filters(opts)
         || opts.filter_expr.is_some()
         || !opts.regions.is_empty()
@@ -3966,6 +3963,15 @@ fn sam_header_has_sq(bytes: &[u8]) -> bool {
     sam_header_lines(bytes)
         .split(|&b| b == b'\n')
         .any(|line| line.starts_with(b"@SQ\t") || line.starts_with(b"@SQ "))
+}
+
+/// `-t FILE` / `-T FILE` supply a reference dictionary that is injected as
+/// `@SQ` lines into the output header (see
+/// [`inject_reference_dictionary_if_missing`]). When either is given, mapped
+/// records are valid even though the input SAM itself carries no `@SQ`, so
+/// record validation must treat the effective header as having `@SQ`.
+fn sam_reference_dictionary_present(opts: &Opts) -> bool {
+    opts.reference_index.is_some() || explicit_reference_path(opts).is_some()
 }
 
 fn format_sam_cigar_ops(ops: &[SamCigarOp]) -> Vec<u8> {
@@ -4792,7 +4798,7 @@ fn cram_summary_passes(
     if opts.only_unplaced && record.reference_sequence_id().is_some() {
         return false;
     }
-    if opts.min_query_len != 0 && record.sequence_bytes().len() < opts.min_query_len {
+    if opts.min_query_len != 0 && record.cigar_query_len() < opts.min_query_len {
         return false;
     }
     if let Some(qfilter) = opts.qname_filter.as_ref() {
@@ -4862,7 +4868,7 @@ fn stream_sam_records<W: Write>(
     let mut reader = reader;
     let mut line: Vec<u8> = Vec::with_capacity(1024);
     let mut in_records = false;
-    let mut header_has_sq = false;
+    let mut header_has_sq = sam_reference_dictionary_present(opts);
     let mut line_no = 0usize;
     let expr_filter = opts
         .filter_expr
