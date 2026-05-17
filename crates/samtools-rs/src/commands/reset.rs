@@ -11,7 +11,9 @@
 //!  - drops common aligner-added aux tags (NM, MD, AS, XS, SA, MC, MQ,
 //!    NH, HI) by default
 //!
-//! `--dupflag` preserves duplicate flags, SAM stdin input works, reverse-strand
+//! `--dupflag` preserves duplicate flags, SAM stdin input works, CRAM input is
+//! supported for embedded-reference files, files with a top-level
+//! `--reference`, or files with a usable FASTA beside the CRAM; reverse-strand
 //! sequence/quality re-reversal is implemented, legacy SAM `@HD VN:1` input is
 //! accepted, `--no-RG` removes read-group headers and tags, and `--reject-PG` /
 //! `--no-PG` remove program header chains. `-x`/`--keep-tag` aux-tag filtering
@@ -38,6 +40,7 @@ use htslib_rs::sam::{
 use crate::aux_list::{AuxTag, parse_aux_list};
 use crate::diagnostics::{print_error, print_error_errno};
 use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
 const DEFAULT_DROP_TAGS: &[&[u8; 2]] = &[
     b"NM", b"MD", b"AS", b"XS", b"SA", b"MC", b"MQ", b"NH", b"HI", b"ms",
@@ -173,10 +176,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            if !matches!(format.exact, Exact::Sam | Exact::Bam) {
+            if !matches!(format.exact, Exact::Sam | Exact::Bam | Exact::Cram) {
                 print_error(
                     "reset",
-                    "only SAM and BAM input are currently supported (CRAM TODO)",
+                    "only SAM, BAM, and CRAM input are currently supported",
                 );
                 return ExitCode::from(1);
             }
@@ -231,6 +234,7 @@ fn run_reset(
     match input_format {
         Exact::Sam => run_reset_sam(input, output, fmt, settings),
         Exact::Bam => run_reset_bam(input, output, fmt, settings),
+        Exact::Cram => run_reset_cram(input, output, fmt, settings),
         _ => unreachable!("input format checked by caller"),
     }
 }
@@ -346,6 +350,63 @@ fn run_reset_sam(
     run_reset_sam_reader(&mut reader, output, fmt, settings, raw.as_deref())
 }
 
+fn run_reset_cram(
+    input: &Path,
+    output: Option<&Path>,
+    fmt: OutFmt,
+    settings: &ResetSettings<'_>,
+) -> io::Result<()> {
+    let raw = reset_raw_header(input, settings);
+    let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
+    let records = read_cram_records_for_reset(input)?;
+    run_reset_records(header, records, output, fmt, settings, raw.as_deref())
+}
+
+fn read_cram_records_for_reset(input: &Path) -> io::Result<Vec<RecordBuf>> {
+    if let Some(reference) = current_global_args().reference {
+        return htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+            input, reference,
+        );
+    }
+
+    match htslib_rs::alignment_compat::query_cram_records_all_from_path(input) {
+        Ok(records) => Ok(records),
+        Err(first_err) => {
+            let first_kind = first_err.kind();
+            let first_msg = first_err.to_string();
+            for reference in nearby_fasta_candidates(input)? {
+                if let Ok(records) =
+                    htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+                        input, &reference,
+                    )
+                {
+                    return Ok(records);
+                }
+            }
+            Err(io::Error::new(first_kind, first_msg))
+        }
+    }
+}
+
+fn nearby_fasta_candidates(input: &Path) -> io::Result<Vec<PathBuf>> {
+    let Some(parent) = input.parent() else {
+        return Ok(Vec::new());
+    };
+
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(parent)? {
+        let path = entry?.path();
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if matches!(ext.to_ascii_lowercase().as_str(), "fa" | "fasta" | "fna") {
+            candidates.push(path);
+        }
+    }
+    candidates.sort();
+    Ok(candidates)
+}
+
 fn run_reset_stdin(
     output: Option<&Path>,
     fmt: OutFmt,
@@ -394,6 +455,25 @@ where
         if reader.read_record_buf(&header, &mut record)? == 0 {
             break;
         }
+        reset_record(&mut record, settings);
+        sink.write_record(&output_header, &record)?;
+    }
+    Ok(())
+}
+
+fn run_reset_records(
+    header: sam::Header,
+    records: impl IntoIterator<Item = RecordBuf>,
+    output: Option<&Path>,
+    fmt: OutFmt,
+    settings: &ResetSettings<'_>,
+    raw_header: Option<&str>,
+) -> io::Result<()> {
+    let mut output_header = header.clone();
+    reset_header(&mut output_header, settings)?;
+    let mut sink = open_output(output, fmt, &output_header, raw_header)?;
+
+    for mut record in records {
         reset_record(&mut record, settings);
         sink.write_record(&output_header, &record)?;
     }
