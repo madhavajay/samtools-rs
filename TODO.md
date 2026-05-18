@@ -82,10 +82,14 @@ Dependency changes for the current Phase 4/5 branch:
 
 Current Phase 4/5 branch work:
 - Promoted full upstream groups into the required parity subset
-  (counts below are **pre-bgzip and unverified** — see the session-2
-  caution; `test_view`/`test_cat`/`test_reheader` in particular were
-  silently skipped when first promoted and only genuinely passed after
-  the PR #43 fixes):
+  (per-group counts below are **pre-bgzip, illustrative only**;
+  superseded by the authoritative bgzip-honest whole-suite figure —
+  **998 total / 966 passed / 0 failed / 32 xfail** on `main`
+  `81b4d87`, see "Authoritative whole-suite parity". The per-group
+  splits are kept for historical context, not as verified counts;
+  `test_view`/`test_cat`/`test_reheader` in particular were silently
+  skipped when first promoted and only genuinely passed after the PR
+  #43 fixes):
   `test_merge` (28/28), `test_fixmate` (42 total: 40 passed,
   2 expected failures), `test_reheader` (7/7), `test_cat` (26/26),
   `test_index` (26/26), `test_checksum` (14/14),
@@ -215,6 +219,21 @@ validation on `work-sam-float-renderer`:
 `cargo test --workspace` (**2601 passing, 0 failing**) all green; the
 upstream `bam2fq/{5,8,10,12}` fixtures now match byte-for-byte.
 
+**Authoritative whole-suite parity (2026-05-18, `main` at `81b4d87`,
+post-PR-#44, release binary, `bgzip`+`tabix` on `PATH` — bgzip-honest):**
+full upstream `perl test/test.pl`:
+- total **998**, passed **966**, failed **0**, expected failure **32**,
+  unexpected pass **0**, exit 0.
+- This supersedes every pre-bgzip per-group tally below as the
+  trustworthy project-level signal. `test.pl` emits no per-group
+  breakdown, so individual "NNN total: NNN passed" lines are *not*
+  separately re-measured — treat the whole-suite figure as
+  authoritative and the per-group splits as historical/illustrative.
+- Reproduced via `scripts/run-passing-parity-subset.py` /
+  `run-passing-regression-subset.py`, which now hard-fail without
+  `bgzip`/`tabix` (Task 0 preflight guard), so this number cannot
+  silently regress to a false green again.
+
 Latest known validation (on `main` at `39d22d5`, post-PR-#43-merge):
 - Full samtools-rs CI green on PR #43: rust-gate (`cargo fmt --all
   --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
@@ -231,16 +250,17 @@ Latest known validation (on `main` at `39d22d5`, post-PR-#43-merge):
   do not rely on its counts.
 - New focused tests added across PRs: `fastq_index_files_extract_from_barcode_tag`, `fastq_routes_r1_only_singletons_to_singleton_output`, `fastq_dash_t_and_dash_cap_t_combine_aux_tags`, `fastq_interleaves_read1_read2_when_paths_alias`, `fastq_repeated_dash_d_unions_same_tag_values`, `fasta_reverse_strand_record_reverse_complemented_in_output`, `view_qname_file_filters_records_by_name`, `view_r_and_dash_cap_r_filter_by_read_group`, `view_d_and_dash_cap_d_filter_by_aux_tag`, `addreplacerg_defaults_to_first_header_rg_and_preserves_lines`, `addreplacerg_r_overwrite_all_removes_other_header_rg_lines`, and `addreplacerg_dash_cap_r_unknown_id_is_rejected`.
 
-Estimated whole-project completion: **~80–85% (moderate confidence)**.
-- Breadth ~95% (all ~40 subcommands implemented). Parity on the gated
-  path is now credible: PR #43's parity-gate (full `test.pl` + subsets,
-  with `tabix`) is green and was independently reproduced locally with
-  `bgzip`. Remaining ~15–20% is genuine non-fixture hardening + perf +
-  the trust reset (preflight guard, count reconciliation).
-- Confidence is only *moderate*: every per-group "promoted/passing"
-  tally elsewhere in this file was measured pre-bgzip and is suspect
-  until re-reconciled (task 1 in `What to do next`). A tight estimate
-  is blocked on that reconciliation, not on more implementation.
+Estimated whole-project completion: **~88–92% (good confidence)**.
+- Breadth ~95% (all ~40 subcommands implemented). Parity is now a
+  trustworthy signal: the authoritative bgzip-honest whole-suite run
+  above is **998/966 passed, 0 failed, 32 expected failure** on current
+  `main`, and the preflight guard (Task 0) makes a future false green
+  impossible. The trust reset that previously capped confidence is
+  resolved.
+- Confidence raised from *moderate* to *good*: the count uncertainty is
+  retired at the project level (Task 1 done). Residual gap (~8–12%) is
+  genuine non-fixture hardening + perf + a few latent encoder gaps
+  (`seqs_per_slice`, Task 2), not unknown parity risk.
 - **Not done.** The library/infra blockers and Phase 3 command
   implementation are complete, and the full upstream `test/test.pl` harness
   is now required, but `TODO.md` still tracks non-fixture hardening and
@@ -281,12 +301,16 @@ What to do next (remaining tasks, priority order):
      `make -C htslib-rs/htslib tabix bgzip`; export that dir on `PATH`.
      Done: README "Parity testing" section.
 
-1. **Reconcile TODO.md / `docs/test-status.md` with reality.** Every
-   "promoted/passing" count below (e.g. *"test_view 445: 427 passed,
-   18 expected failures"*, the promoted-group tallies) was measured
-   **without `bgzip`** and is untrustworthy. Re-run the full suite WITH
-   `bgzip`/`tabix`, then correct or annotate the counts. Until done,
-   treat all such numbers as suspect, not fact.
+1. **[DONE 2026-05-18] Reconcile TODO.md / `docs/test-status.md` with
+   reality.** Resolved at the project level: the authoritative
+   bgzip-honest whole-suite run (see "Authoritative whole-suite parity"
+   above) is **998 total / 966 passed / 0 failed / 32 expected
+   failure** on `main` `81b4d87`. `test.pl` emits no per-group
+   breakdown, so the individual pre-bgzip "NNN total: NNN passed"
+   tallies are not re-measured one-by-one; they are annotated as
+   historical/illustrative and the whole-suite figure is the
+   authoritative signal. The preflight guard (Task 0) prevents this
+   from silently regressing again.
 
 2. **`seqs_per_slice` is ignored by the CRAM writer.** `view -O
    CRAM,seqs_per_slice=N` produces a single container/slice regardless
@@ -345,10 +369,13 @@ RESOLVED** (see **Completed Library / Infra Batch** below; the
 
 > ⚠️ **Counts caution:** specific per-group tallies in this snapshot and
 > the sections below (e.g. *"test_view 445: 427 passed"*) were measured
-> **before** the bgzip trust reset and may be wrong. The credible signal
-> is "PR #43 parity-gate green in CI" (full `test.pl` + subsets with
-> `tabix`). Re-reconcile the numbers per `What to do next` task 1 before
-> citing them as fact.
+> **before** the bgzip trust reset and are illustrative only. The
+> authoritative signal is the bgzip-honest whole-suite run: **998 total
+> / 966 passed / 0 failed / 32 expected failure** on `main` `81b4d87`
+> (see "Authoritative whole-suite parity"; Task 1 done 2026-05-18).
+> `test.pl` emits no per-group breakdown, so per-group splits are not
+> separately re-verified — cite the whole-suite figure as fact, the
+> per-group numbers as historical.
 
 **Phases 0–2 complete; Waves A/B/C/D substantially complete and
 byte-exact for the upstream-fixtured subcommands. The completed

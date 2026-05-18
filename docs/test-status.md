@@ -1,5 +1,13 @@
 # samtools test.pl Status
 
+> **Authoritative (2026-05-18, `main` `81b4d87`, bgzip+tabix honest):**
+> full `perl test/test.pl` = **998 total / 966 passed / 0 failed / 32
+> expected failure / 0 unexpected pass**. `test.pl` emits no per-group
+> breakdown, so the individual "(NNN/NNN)" counts in the table below are
+> historical/illustrative — the whole-suite figure is the verified
+> signal. The parity subset runners now hard-fail without bgzip/tabix
+> (preflight guard), so this cannot silently regress to a false green.
+
 This tracks the upstream `samtools/test/test.pl` groups against the Rust
 `samtools-rs-cli` binary. CI now fails on both the stable subset helper and
 the full upstream harness. `test_bgzip` is supplied by the external htslib
