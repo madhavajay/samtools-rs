@@ -8,6 +8,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+import _parity_preflight
+
 
 @dataclass(frozen=True)
 class Regression:
@@ -66,7 +68,10 @@ def main() -> int:
         default=None,
         help="Rust samtools binary to stage at samtools/samtools before running",
     )
+    _parity_preflight.add_preflight_arg(parser)
     args = parser.parse_args()
+
+    _parity_preflight.enforce(args.allow_missing_bgzip)
 
     root = repo_root()
     samtools_dir = root / "samtools"

@@ -71,6 +71,20 @@ perl test/test.pl
 The pinned upstream harness constructs most commands from `./samtools`, so the
 Rust binary is staged at the ignored `samtools/samtools` path before running it.
 
+`bgzip` and `tabix` **must** be on `PATH` before running the parity or
+regression subsets. Upstream `test.pl` *silently skips* (does not fail)
+any group whose input generation needs them, so a missing `bgzip` turns a
+run into a false green. The subset runners
+(`scripts/run-passing-{parity,regression}-subset.py`) now hard-error
+unless both tools are found. They are prebuilt in the vendored htslib:
+
+```sh
+make -C htslib-rs/htslib tabix bgzip
+export PATH="$PWD/htslib-rs/htslib:$PATH"
+```
+
+(CI installs the `tabix` apt package, which provides both.)
+
 Local developers may regenerate expected outputs from the C samtools
 (requires `autoconf`, a C toolchain, and the `htslib` C library):
 

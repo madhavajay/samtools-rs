@@ -270,12 +270,16 @@ What to do next (remaining tasks, priority order):
    is missing from `PATH`, then returns 0. This hid 7 real bugs (see
    the 2026-05-18 session-2 handoff). CI is honest (installs `tabix`);
    only local runs lie.
-   - [ ] Add a preflight check to both subset scripts that hard-errors
+   - [x] Add a preflight check to both subset scripts that hard-errors
      (non-zero, loud message) if `bgzip`/`tabix` are not on `PATH`,
-     instead of letting test.pl skip silently.
-   - [ ] Document the requirement (`README`/dev setup): prebuilt at
+     instead of letting test.pl skip silently. Done: shared
+     `scripts/_parity_preflight.py`, wired into both runners; exits 3
+     with a remediation message, `--allow-missing-bgzip` /
+     `SAMTOOLS_RS_ALLOW_MISSING_BGZIP=1` opt-out for degraded runs.
+   - [x] Document the requirement (`README`/dev setup): prebuilt at
      `htslib-rs/htslib/{bgzip,tabix}` via
      `make -C htslib-rs/htslib tabix bgzip`; export that dir on `PATH`.
+     Done: README "Parity testing" section.
 
 1. **Reconcile TODO.md / `docs/test-status.md` with reality.** Every
    "promoted/passing" count below (e.g. *"test_view 445: 427 passed,
