@@ -1722,7 +1722,11 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                     cram_sam_reader_writer(opts, &mut reader, reference, dst_file)?;
                 } else if let Some(expr) = filter.as_deref() {
                     htslib_rs::alignment_compat::write_cram_matching_filter_from_bam_path_with_reference(
-                        input, reference, expr, dst_file,
+                        input,
+                        reference,
+                        expr,
+                        cram_write_options(opts),
+                        dst_file,
                     )?;
                 } else {
                     htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference_and_options(
@@ -1798,7 +1802,11 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                     write_cram_from_sam_text_via_bam(opts, &filtered, reference, dst_file)?;
                 } else if let Some(expr) = filter.as_deref() {
                     htslib_rs::alignment_compat::write_cram_matching_filter_from_path_with_reference(
-                        input, reference, expr, dst_file,
+                        input,
+                        reference,
+                        expr,
+                        cram_write_options(opts),
+                        dst_file,
                     )?;
                 } else {
                     htslib_rs::alignment_compat::write_cram_from_path_with_reference_and_options(
@@ -1831,11 +1839,20 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                     write_cram_from_sam_text_via_bam(opts, &filtered, reference, dst_file)?;
                 } else if let Some(expr) = filter.as_deref() {
                     htslib_rs::alignment_compat::write_cram_regions_matching_filter_from_path_with_reference(
-                        input, reference, &regions, expr, dst_file,
+                        input,
+                        reference,
+                        &regions,
+                        expr,
+                        cram_write_options(opts),
+                        dst_file,
                     )?;
                 } else {
                     htslib_rs::alignment_compat::write_cram_regions_from_path_with_reference(
-                        input, reference, &regions, dst_file,
+                        input,
+                        reference,
+                        &regions,
+                        cram_write_options(opts),
+                        dst_file,
                     )?;
                 }
             }
@@ -2123,6 +2140,7 @@ fn run_sam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
                     &mut reader,
                     reference,
                     expr,
+                    cram_write_options(opts),
                     dst_file,
                 )?;
             }
@@ -2250,6 +2268,7 @@ fn run_bam_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
                 io::Cursor::new(input),
                 &reference,
                 expr,
+                cram_write_options(opts),
                 dst_file,
             )?;
         } else if opts.reference.is_some() || opts.reference_index.is_some() {
@@ -2398,6 +2417,7 @@ fn run_cram_stdin(opts: &Opts, input: &[u8]) -> io::Result<ExitCode> {
                 io::Cursor::new(input),
                 reference,
                 expr,
+                cram_write_options(opts),
                 dst_file,
             )?;
         } else {

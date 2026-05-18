@@ -3649,3 +3649,35 @@ fn view_cram_seqs_per_slice_partitions_into_multiple_containers() {
     );
     assert!(cram_container_count(&opt_out) > 1);
 }
+
+#[test]
+fn view_cram_seqs_per_slice_applies_on_filtered_output() {
+    // The filter CRAM-output path must also honor seqs_per_slice (the
+    // Task 2 follow-up: filter/region writers, not just full-file).
+    let tmp = tmp_dir("cram-seqs-per-slice-filtered");
+    let sam = htslib_fixtures_dir().join("ce#1000.sam");
+    let reference = htslib_fixtures_dir().join("ce.fa");
+
+    // `-e mapq>=0` keeps every record; with seqs_per_slice=100 the
+    // filtered CRAM output must still span multiple containers.
+    let out = tmp.join("filtered.cram");
+    assert_eq!(
+        run(&[
+            "-C",
+            "-T",
+            reference.to_str().unwrap(),
+            "-e",
+            "mapq>=0",
+            "-O",
+            "cram,seqs_per_slice=100",
+            "-o",
+            out.to_str().unwrap(),
+            sam.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(
+        cram_container_count(&out) > 1,
+        "seqs_per_slice=100 must apply on the filtered CRAM write path"
+    );
+}
