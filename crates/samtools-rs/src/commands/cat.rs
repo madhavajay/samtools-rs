@@ -363,19 +363,19 @@ fn run_cram_cat(
     match output {
         Some(path) => {
             let out = File::create(path)?;
-            htslib_rs::alignment_compat::write_cram_from_sam_path_with_reference(
+            let _ = htslib_rs::alignment_compat::write_cram_from_sam_path_with_reference(
                 tmp_path.path(),
                 &reference,
                 out,
-            ).map(|_| ())?;
+            )?;
         }
         None => {
             let out = io::stdout().lock();
-            htslib_rs::alignment_compat::write_cram_from_sam_path_with_reference(
+            let _ = htslib_rs::alignment_compat::write_cram_from_sam_path_with_reference(
                 tmp_path.path(),
                 &reference,
                 out,
-            ).map(|_| ())?;
+            )?;
         }
     }
 
