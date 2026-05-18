@@ -283,7 +283,13 @@ branch going forward.)
 
 What to do next (remaining tasks, priority order):
 
-0. **Trust reset — local gate honesty (do first).** The local parity
+> **Status 2026-05-18:** Tasks 0, 1, 2 are **complete** (Task 0 + 1
+> merged in samtools-rs PR #45; Task 2 via noodles #9 + htslib-rs #10
+> merged + samtools-rs #46 green). **Task 3 (Phase 4/5 hardening) is
+> now the primary remaining work.** Tasks 0–2 are kept below as a
+> closed record, not open work.
+
+0. **[DONE 2026-05-18] Trust reset — local gate honesty.** The local parity
    gate silently false-greens: `scripts/run-passing-parity-subset.py`
    and `run-passing-regression-subset.py` drive upstream `test.pl`,
    which **skips** any group whose data-gen needs `bgzip` when `bgzip`
@@ -312,18 +318,41 @@ What to do next (remaining tasks, priority order):
    authoritative signal. The preflight guard (Task 0) prevents this
    from silently regressing again.
 
-2. **`seqs_per_slice` is ignored by the CRAM writer.** `view -O
-   CRAM,seqs_per_slice=N` produces a single container/slice regardless
-   of N (`cram-size` confirms 1 container/1 slice for 962 records).
-   Latent — not currently failing a fixture, but a real CRAM-encoder
-   correctness gap. Plumb `seqs_per_slice` (and likely
-   `records_per_container`) through to the noodles CRAM writer.
+2. **[DONE 2026-05-18] `seqs_per_slice` plumbed through the CRAM
+   writer.** Was latent: `view -O cram,seqs_per_slice=N` produced one
+   container/slice regardless of N (the `-O cram,<opt>` suffix loop
+   only honored `embed_ref` and the value was parsed as a no-op).
+   Fixed end-to-end via the bottom-up roll-up:
+   - noodles PR #9 (merged): `records_per_slice` /
+     `slices_per_container` on writer `Options` + `Builder` setters,
+     default-preserving; sync+async writers and the container builder
+     size from them.
+   - htslib-rs PR #10 (merged, `main` `140aa4f`): `CramWriteOptions`
+     + `write_cram_from_{sam,bam,path}_with_reference_and_options`
+     entry points; noodles pin bumped.
+   - samtools-rs PR #46 (green, both gates): `Opts.records_per_slice`
+     / `slices_per_container`; `apply_output_fmt_option` parses
+     `seqs_per_slice=` / `slices_per_slice=`; the `-O cram,<opt>`
+     suffix loop now routes through it (still lenient on unknowns);
+     CRAM-write call sites use the `_and_options` variants.
+   - Verified: `ce#1000.sam` → 1 container by default, >1 with
+     `seqs_per_slice=100` (via `-O cram,...` and
+     `--output-fmt-option`). Bgzip-honest `test_view` parity
+     unchanged (445 / 427 passed / 0 failed / 18 xfail).
+   - Follow-up (not blocking): filter/region CRAM-output combinations
+     with `seqs_per_slice` still use defaults (matches the prior
+     `embed_ref` scoping to core full-file write paths); plumb
+     `_and_options` into the filter/region CRAM writers when needed.
 
-3. **Continue Phase 4/5 non-fixture hardening** from synced `main`,
+3. **(NOW PRIMARY) Continue Phase 4/5 non-fixture hardening** from
+   synced `main`,
    one short-lived branch at a time (one large PR per batch — see the
    workflow rule). Tracked follow-ups:
    - `view`: reference-dependent expression counts, multi-file inputs,
      paired-aware filters, deeper CRAM performance/streaming parity.
+   - CRAM `seqs_per_slice` / `slices_per_slice` for the **filter and
+     region** CRAM-output paths (full-file paths done in Task 2; the
+     filter/region writers still use encoder defaults).
    - `cat`/`reheader`: now re-encode CRAM (correct but slow) — upstream
      does container/BGZF block-level copy; perf parity pending.
    - Threads: propagate worker pools through remaining BAM/CRAM

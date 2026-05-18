@@ -1,5 +1,7 @@
 # samtools-rs
 
+[![CI](https://github.com/madhavajay/samtools-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/madhavajay/samtools-rs/actions/workflows/ci.yml?query=branch%3Amain)
+
 Pure Rust port of [samtools](https://github.com/samtools/samtools) — the SAM/BAM/CRAM toolkit.
 
 This project mirrors the upstream `samtools` command-line interface and ports
