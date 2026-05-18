@@ -3576,3 +3576,76 @@ fn view_c_embeds_pg_in_binary_cram_header() {
         "view -C --no-PG must not add a samtools @PG"
     );
 }
+
+fn cram_container_count(path: &std::path::Path) -> usize {
+    let file = std::fs::File::open(path).unwrap();
+    let mut reader = htslib_rs::cram::io::reader::Builder::default().build_from_reader(file);
+    reader.read_header().unwrap();
+
+    let mut containers = 0;
+    let mut container = htslib_rs::cram::io::reader::Container::default();
+    while reader.read_container(&mut container).unwrap() != 0 {
+        containers += 1;
+    }
+    containers
+}
+
+#[test]
+fn view_cram_seqs_per_slice_partitions_into_multiple_containers() {
+    let tmp = tmp_dir("cram-seqs-per-slice");
+    let sam = htslib_fixtures_dir().join("ce#1000.sam");
+    let reference = htslib_fixtures_dir().join("ce.fa");
+
+    // Default: the ~1000-record file collapses into one container.
+    let default_out = tmp.join("default.cram");
+    assert_eq!(
+        run(&[
+            "-C",
+            "-T",
+            reference.to_str().unwrap(),
+            "-o",
+            default_out.to_str().unwrap(),
+            sam.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert_eq!(cram_container_count(&default_out), 1);
+
+    // `-O cram,seqs_per_slice=100` must cut a new slice/container
+    // every 100 records, yielding multiple containers.
+    let chunked_out = tmp.join("chunked.cram");
+    assert_eq!(
+        run(&[
+            "-C",
+            "-T",
+            reference.to_str().unwrap(),
+            "-O",
+            "cram,seqs_per_slice=100",
+            "-o",
+            chunked_out.to_str().unwrap(),
+            sam.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(
+        cram_container_count(&chunked_out) > 1,
+        "seqs_per_slice=100 should produce more than one container"
+    );
+
+    // The same option via --output-fmt-option must behave identically.
+    let opt_out = tmp.join("opt.cram");
+    assert_eq!(
+        run(&[
+            "-C",
+            "-T",
+            reference.to_str().unwrap(),
+            "--output-fmt-option",
+            "seqs_per_slice=100",
+            "-o",
+            opt_out.to_str().unwrap(),
+            sam.to_str().unwrap(),
+        ]),
+        0
+    );
+    assert!(cram_container_count(&opt_out) > 1);
+}
