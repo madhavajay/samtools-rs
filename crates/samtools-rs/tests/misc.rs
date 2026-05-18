@@ -9388,6 +9388,61 @@ fn threads_flag_is_byte_identical_for_view_and_sort() {
 }
 
 #[test]
+fn threads_flag_is_byte_identical_for_stats() {
+    // Extends the worker-pool perf-only invariant to the reader-side
+    // `stats` text path: `-@ N` must not change output bytes.
+    let tmp = tmp_dir("threads-stats");
+    let sam = fixtures_dir().join("dat").join("mpileup.1.sam");
+
+    // Stage a BAM so the BGZF reader worker pool is exercised.
+    let bam = tmp.join("in.bam");
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &[
+                "--no-PG",
+                "-b",
+                "-o",
+                bam.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+    let bam = bam.to_str().unwrap();
+
+    let t1 = tmp.join("stats.t1");
+    let t4 = tmp.join("stats.t4");
+    for (out, n) in [(&t1, "1"), (&t4, "4")] {
+        assert_eq!(
+            exit_to_u8(samtools_run(argv(
+                "samtools",
+                &["stats", "-@", n, "-o", out.to_str().unwrap(), bam],
+            ))),
+            0,
+            "stats -@ {n}"
+        );
+    }
+    // `#` comment lines legitimately embed the command line (which
+    // includes `-@ N` and the distinct `-o` path) and the version
+    // banner; the perf-only invariant is that the data body is
+    // identical regardless of thread count.
+    let body = |p: &std::path::Path| -> String {
+        std::fs::read_to_string(p)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        body(&t1),
+        body(&t4),
+        "stats -@ data body must be identical across thread counts"
+    );
+}
+
+#[test]
 fn stats_cram_without_region_matches_bam_seq_quality() {
     // completed library batch #2: no-region CRAM stats now use the full-record iterator,
     // so sequence-length/quality/length SN lines match the BAM equivalent
