@@ -283,11 +283,17 @@ branch going forward.)
 
 What to do next (remaining tasks, priority order):
 
-> **Status 2026-05-18:** Tasks 0, 1, 2 are **complete** (Task 0 + 1
-> merged in samtools-rs PR #45; Task 2 via noodles #9 + htslib-rs #10
-> merged + samtools-rs #46 green). **Task 3 (Phase 4/5 hardening) is
-> now the primary remaining work.** Tasks 0–2 are kept below as a
-> closed record, not open work.
+> **Status 2026-05-18:** Tasks 0, 1, 2, **and 3 are complete.**
+> Task 0 + 1 merged in samtools-rs PR #45; Task 2 via noodles #9 +
+> htslib-rs #10 + samtools-rs #46. Task 3's tracked follow-ups all
+> landed: filter/region `seqs_per_slice` (htslib-rs #11, samtools-rs
+> #48), exit-code breadth (#49), paired/mate count-mode expr (#50),
+> `stats -@` thread byte-identity (#51), and the cat/reheader BGZF
+> block-level fast path (noodles #10 → htslib-rs #12 → samtools-rs
+> #53 (cat) + #54 (reheader)). The prioritized Tasks 0–3 backlog is
+> **exhausted**; what remains below is open-ended deeper hardening
+> with no fixture failures, to be scoped with the user. Tasks 0–3
+> are kept as a closed record, not open work.
 
 0. **[DONE 2026-05-18] Trust reset — local gate honesty.** The local parity
    gate silently false-greens: `scripts/run-passing-parity-subset.py`
@@ -344,23 +350,33 @@ What to do next (remaining tasks, priority order):
      `embed_ref` scoping to core full-file write paths); plumb
      `_and_options` into the filter/region CRAM writers when needed.
 
-3. **(NOW PRIMARY) Continue Phase 4/5 non-fixture hardening** from
-   synced `main`,
-   one short-lived branch at a time (one large PR per batch — see the
-   workflow rule). Tracked follow-ups:
-   - `view`: reference-dependent expression counts, multi-file inputs,
-     paired-aware filters, deeper CRAM performance/streaming parity.
-   - CRAM `seqs_per_slice` / `slices_per_slice` for the **filter and
-     region** CRAM-output paths (full-file paths done in Task 2; the
-     filter/region writers still use encoder defaults).
-   - `cat`/`reheader`: now re-encode CRAM (correct but slow) — upstream
-     does container/BGZF block-level copy; perf parity pending.
-   - Threads: propagate worker pools through remaining BAM/CRAM
-     readers/writers, then compare parallelism vs C samtools.
-   - Exit codes / byte-parity smoke: broaden direct C-vs-Rust coverage
-     across all subcommands and error classes.
-   - `rmdup`, broader pileup/COV/GCD edge cases, `stats` CRAM no-region
-     per-cycle/quality parity.
+3. **[DONE 2026-05-18] Phase 4/5 non-fixture hardening — tracked
+   follow-ups.** All items that were enumerated here landed:
+   - [x] `view` paired-aware filters / reference-dependent expression
+     counts — already worked; locked in count mode (#50).
+   - [x] CRAM `seqs_per_slice` / `slices_per_slice` for the filter and
+     region CRAM-output paths (htslib-rs #11, samtools-rs #48; full-
+     file paths were Task 2).
+   - [x] `cat` BAM container/BGZF block-level copy fast path (noodles
+     #10 `read_raw_frame`/`EOF` → htslib-rs #12
+     `append_bam_alignment_frames` → samtools-rs #53), all-or-nothing
+     with the record-level path as universal fallback.
+   - [x] `reheader` BAM BGZF block-level fast path (samtools-rs #54,
+     same primitive/fallback).
+   - [x] Threads: worker-pool byte-identity invariant extended to
+     `stats` (#51); view/sort/index already covered.
+   - [x] Exit codes: broadened C-vs-Rust error-class coverage (#49).
+
+   **Remaining (open-ended, no fixture failures — scope with user
+   before starting):**
+   - `cat`/`reheader` **CRAM** container-level fast path (BAM done;
+     CRAM still re-encodes — correct but slow).
+   - Deeper thread *parallelism* parity vs C samtools (the correctness
+     invariant is locked; actual internal parallelization of remaining
+     readers/writers is perf-only).
+   - `view` multi-file inputs; deeper CRAM streaming/perf parity.
+   - `rmdup`, broader pileup/COV/GCD edge cases, `stats` CRAM
+     no-region per-cycle/quality parity.
 
 4. After every commit keep the full local gate green (with `bgzip`/
    `tabix` on `PATH`): `cargo fmt --all --check`, `cargo clippy
