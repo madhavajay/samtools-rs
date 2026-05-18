@@ -15,7 +15,7 @@
 //!  - `-n` — name sort (default is coordinate sort).
 //!  - `-t TAG` — sort by auxiliary tag, using coordinate/name as secondary key.
 //!  - `-o FILE` — output file (default stdout).
-//!  - `-O sam|bam`, `--output-fmt sam|bam` — output format (default: bam).
+//!  - `-O sam|bam|cram`, `--output-fmt sam|bam|cram` — output format (default: bam).
 //!  - `-@`/`--threads`, `-m`/`--max-mem`, `-T`/`--temp` — accepted but ignored.
 //!  - `--no-PG` — accepted, silently ignored.
 //!  - `--write-index` — write a BAI next to coordinate-sorted BAM output.
@@ -28,11 +28,10 @@
 //!    molecular id, `is_upper_of_pair`); `@HD` gets `GO:query`.
 //!    Byte-identical to `sort/template-coordinate.sort.expected.sam`.
 //!
-//! Not yet supported: external merge (large inputs spill to disk),
-//! CRAM output.
+//! Not yet supported: external merge (large inputs spill to disk).
 
 use std::cmp::Ordering;
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -44,7 +43,7 @@ use htslib_rs::bgzf;
 use htslib_rs::format::Exact;
 use htslib_rs::sam::{self, alignment::RecordBuf};
 
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
 use crate::sam_global::current_global_args;
 
@@ -109,6 +108,16 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     print_error("sort", format!("missing value for {}", s));
                     return ExitCode::from(1);
                 };
+                output_fmt = match parse_output_format(v) {
+                    Ok(fmt) => fmt,
+                    Err(e) => {
+                        print_error("sort", e);
+                        return ExitCode::from(1);
+                    }
+                };
+            }
+            _ if s.starts_with("--output-fmt=") => {
+                let v = s.trim_start_matches("--output-fmt=");
                 output_fmt = match parse_output_format(v) {
                     Ok(fmt) => fmt,
                     Err(e) => {
@@ -243,6 +252,20 @@ pub fn main(args: &[OsString]) -> ExitCode {
         None
     };
 
+    if let Some(input) = input.as_deref()
+        && !input.exists()
+    {
+        print_hts_open_missing(input);
+        print_error(
+            "sort",
+            format!(
+                "can't open \"{}\": No such file or directory",
+                input.display()
+            ),
+        );
+        return ExitCode::from(1);
+    }
+
     match run_sort(
         input.as_deref(),
         output.as_deref(),
@@ -267,6 +290,7 @@ fn parse_output_format(raw: &str) -> Result<OutFmt, String> {
     match raw.to_ascii_lowercase().as_str() {
         "sam" => Ok(OutFmt::Sam),
         "bam" => Ok(OutFmt::Bam),
+        "cram" => Ok(OutFmt::Cram),
         _ => Err(format!("unsupported output format \"{}\"", raw)),
     }
 }
@@ -284,6 +308,7 @@ fn parse_tag(raw: &str) -> Result<[u8; 2], String> {
 pub(crate) enum OutFmt {
     Sam,
     Bam,
+    Cram,
 }
 
 /// `samtools sort -M` minimiser parameters.
@@ -309,6 +334,17 @@ pub(crate) fn run_sort(
     natural_sort: bool,
     template_coordinate: bool,
 ) -> io::Result<()> {
+    if input.is_none()
+        && matches!(fmt, OutFmt::Sam)
+        && !name_sort
+        && tag_sort.is_none()
+        && !write_index
+        && minhash.is_none()
+        && !template_coordinate
+    {
+        return run_sort_stdin_raw_sam_coordinate(output, pg_argv);
+    }
+
     let (mut header, mut records, raw_header_text) = read_input_records(input)?;
 
     let mut minhash_mapped = false;
@@ -429,6 +465,7 @@ pub(crate) fn run_sort(
         for rec in &records {
             writer.write_record(&header, rec)?;
         }
+        writer.finish()?;
     }
 
     if write_index {
@@ -574,13 +611,14 @@ where
     Ok((header, records))
 }
 
-fn coordinate_key(r: &RecordBuf) -> (i32, i64) {
+fn coordinate_key(r: &RecordBuf) -> (i32, i64, u8) {
     let tid = r
         .reference_sequence_id()
         .map(|t| t as i32)
         .unwrap_or(i32::MAX);
     let pos = r.alignment_start().map(usize::from).unwrap_or(0) as i64;
-    (tid, pos)
+    let rev = u8::from(r.flags().is_reverse_complemented());
+    (tid, pos, rev)
 }
 
 fn name_key(r: &RecordBuf) -> Vec<u8> {
@@ -1185,7 +1223,7 @@ fn compare_by_tag(
 
 /// `bam_sort.c` `lookup_libraries`: `@RG ID` → `LB` (only RGs with an
 /// `LB` tag are recorded).
-fn library_lookup(header: &sam::Header) -> std::collections::HashMap<Vec<u8>, Vec<u8>> {
+pub(crate) fn library_lookup(header: &sam::Header) -> std::collections::HashMap<Vec<u8>, Vec<u8>> {
     let mut m = std::collections::HashMap::new();
     for (id, rg) in header.read_groups() {
         const LB: [u8; 2] = [b'L', b'B'];
@@ -1314,7 +1352,7 @@ fn unclipped_other_end(op0: i64, mc: &[u8]) -> i64 {
     op0 + refpos
 }
 
-struct TemplateCoordinateKey {
+pub(crate) struct TemplateCoordinateKey {
     tid1: i32,
     tid2: i32,
     pos1: i64,
@@ -1327,7 +1365,7 @@ struct TemplateCoordinateKey {
     is_upper_of_pair: bool,
 }
 
-fn template_coordinate_key(
+pub(crate) fn template_coordinate_key(
     r: &RecordBuf,
     lib_lookup: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
 ) -> Result<TemplateCoordinateKey, String> {
@@ -1425,7 +1463,10 @@ fn compare_mid(m1: &[u8], m2: &[u8]) -> Ordering {
 }
 
 /// `bam_sort.c` `bam1_cmp_template_coordinate`.
-fn template_coordinate_cmp(a: &TemplateCoordinateKey, b: &TemplateCoordinateKey) -> Ordering {
+pub(crate) fn template_coordinate_cmp(
+    a: &TemplateCoordinateKey,
+    b: &TemplateCoordinateKey,
+) -> Ordering {
     a.tid1
         .cmp(&b.tid1)
         .then_with(|| a.tid2.cmp(&b.tid2))
@@ -1570,12 +1611,21 @@ fn set_sort_order(header: &mut sam::Header, so: &str, go: Option<&str>, ss: Opti
 
 trait SortSink {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()>;
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct BamFile(bam::io::Writer<bgzf::io::Writer<File>>);
 struct BamStdout(bam::io::Writer<bgzf::io::Writer<io::Stdout>>);
 struct SamFile(File);
 struct SamStdout(io::Stdout);
+struct CramOut<W: Write> {
+    writer: bam::io::Writer<bgzf::io::Writer<File>>,
+    tmp_bam_path: crate::tmp_file::TempPath,
+    reference: PathBuf,
+    out: W,
+}
 
 impl SortSink for BamFile {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
@@ -1598,6 +1648,33 @@ impl SortSink for SamFile {
 impl SortSink for SamStdout {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
         crate::sam_render::write_record(&mut self.0, header, record)
+    }
+}
+impl<W: Write> SortSink for CramOut<W> {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        use sam::alignment::io::Write as _;
+        self.writer.write_alignment_record(header, record)
+    }
+
+    fn finish(self: Box<Self>) -> io::Result<()> {
+        let this = *self;
+        let CramOut {
+            writer,
+            tmp_bam_path,
+            reference,
+            out,
+        } = this;
+        drop(writer);
+
+        let result = htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+            tmp_bam_path.path(),
+            &reference,
+            out,
+        )
+        .map(|_| ());
+
+        tmp_bam_path.close().ok();
+        result
     }
 }
 
@@ -1644,6 +1721,114 @@ fn apply_hd_sort_order(raw: &str, so: &str, go: Option<&str>, ss: Option<&str>) 
     s
 }
 
+fn run_sort_stdin_raw_sam_coordinate(
+    output: Option<&Path>,
+    pg_argv: Option<&[OsString]>,
+) -> io::Result<()> {
+    let mut bytes = Vec::new();
+    io::stdin().read_to_end(&mut bytes)?;
+    if bytes.first() != Some(&b'@') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "raw SAM coordinate sort requires SAM text on stdin",
+        ));
+    }
+
+    let text =
+        std::str::from_utf8(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let (raw_header, mut records) = parse_raw_sam_for_coordinate_sort(text)?;
+    let mut header_text = apply_hd_sort_order(&raw_header, "coordinate", None, None);
+    if let Some(argv) = pg_argv {
+        header_text = crate::pg::add_samtools_pg(&header_text, argv).map_err(io::Error::other)?;
+    }
+
+    records.sort_by_key(|record| record.key);
+
+    match output {
+        Some(path) => {
+            let mut out = File::create(path)?;
+            out.write_all(header_text.as_bytes())?;
+            for record in records {
+                out.write_all(record.line.as_bytes())?;
+                out.write_all(b"\n")?;
+            }
+        }
+        None => {
+            let mut out = io::stdout();
+            out.write_all(header_text.as_bytes())?;
+            for record in records {
+                out.write_all(record.line.as_bytes())?;
+                out.write_all(b"\n")?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Clone)]
+struct RawSamRecord {
+    key: (i32, i64, u8),
+    line: String,
+}
+
+fn parse_raw_sam_for_coordinate_sort(text: &str) -> io::Result<(String, Vec<RawSamRecord>)> {
+    let mut raw_header = String::new();
+    let mut lines = text.split_inclusive('\n').peekable();
+    while let Some(line) = lines.peek().copied() {
+        if !line.starts_with('@') {
+            break;
+        }
+        raw_header.push_str(line);
+        let _ = lines.next();
+    }
+
+    let mut tid_by_name = std::collections::HashMap::new();
+    for line in raw_header.lines() {
+        if !line.starts_with("@SQ\t") {
+            continue;
+        }
+        let Some(name) = line
+            .split('\t')
+            .skip(1)
+            .find_map(|field| field.strip_prefix("SN:"))
+        else {
+            continue;
+        };
+        let next_tid = tid_by_name.len() as i32;
+        tid_by_name.entry(name.to_string()).or_insert(next_tid);
+    }
+
+    let mut records = Vec::new();
+    for line in lines {
+        let line = line.trim_end_matches('\n').trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.len() < 11 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SAM record has fewer than 11 fields",
+            ));
+        }
+        let flag = fields[1].parse::<u32>().unwrap_or(0);
+        let tid = if fields[2] == "*" {
+            i32::MAX
+        } else {
+            tid_by_name.get(fields[2]).copied().unwrap_or(i32::MAX)
+        };
+        let pos = fields[3].parse::<i64>().unwrap_or(0);
+        let rev = u8::from(flag & 0x10 != 0);
+        records.push(RawSamRecord {
+            key: (tid, pos, rev),
+            line: line.to_string(),
+        });
+    }
+
+    Ok((raw_header, records))
+}
+
 fn open_output(
     out: Option<&Path>,
     fmt: OutFmt,
@@ -1658,9 +1843,14 @@ fn open_output(
         }
         (Some(p), OutFmt::Bam) => {
             let file = File::create(p)?;
-            let mut writer = bam::io::Writer::new(file);
-            writer.write_header(header)?;
+            let mut bgzf_writer = bgzf::io::Writer::new(file);
+            write_bam_raw_header(&mut bgzf_writer, header, header_text)?;
+            let writer = bam::io::Writer::from(bgzf_writer);
             Ok(Box::new(BamFile(writer)))
+        }
+        (Some(p), OutFmt::Cram) => {
+            let out = File::create(p)?;
+            open_cram_output(header, header_text, out)
         }
         (None, OutFmt::Sam) => {
             let mut stdout = io::stdout();
@@ -1668,11 +1858,77 @@ fn open_output(
             Ok(Box::new(SamStdout(stdout)))
         }
         (None, OutFmt::Bam) => {
-            let mut writer = bam::io::Writer::new(io::stdout());
-            writer.write_header(header)?;
+            let mut bgzf_writer = bgzf::io::Writer::new(io::stdout());
+            write_bam_raw_header(&mut bgzf_writer, header, header_text)?;
+            let writer = bam::io::Writer::from(bgzf_writer);
             Ok(Box::new(BamStdout(writer)))
         }
+        (None, OutFmt::Cram) => open_cram_output(header, header_text, io::stdout()),
     }
+}
+
+fn open_cram_output<W>(
+    header: &sam::Header,
+    header_text: &str,
+    out: W,
+) -> io::Result<Box<dyn SortSink>>
+where
+    W: Write + 'static,
+{
+    let reference = current_global_args().reference.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CRAM output requires top-level --reference FILE",
+        )
+    })?;
+    crate::reference::ensure_fai_index(&reference, None)?;
+
+    let (tmp_bam_file, tmp_bam_path) = crate::tmp_file::create_temp_file("sort", Some("bam"))?;
+    let mut bgzf_writer = bgzf::io::Writer::new(tmp_bam_file);
+    write_bam_raw_header(&mut bgzf_writer, header, header_text)?;
+    let writer = bam::io::Writer::from(bgzf_writer);
+
+    Ok(Box::new(CramOut {
+        writer,
+        tmp_bam_path,
+        reference,
+        out,
+    }))
+}
+
+fn write_bam_raw_header<W>(
+    writer: &mut W,
+    header: &sam::Header,
+    header_text: &str,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    writer.write_all(b"BAM\x01")?;
+    write_i32_le(writer, header_text.len())?;
+    writer.write_all(header_text.as_bytes())?;
+
+    let refs = header.reference_sequences();
+    write_i32_le(writer, refs.len())?;
+    for (name, reference_sequence) in refs {
+        let name: &[u8] = name.as_ref();
+        let c_name =
+            CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        let name = c_name.as_bytes_with_nul();
+        write_i32_le(writer, name.len())?;
+        writer.write_all(name)?;
+        write_i32_le(writer, usize::from(reference_sequence.length()))?;
+    }
+
+    Ok(())
+}
+
+fn write_i32_le<W>(writer: &mut W, n: usize) -> io::Result<()>
+where
+    W: Write,
+{
+    let n = i32::try_from(n).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    writer.write_all(&n.to_le_bytes())
 }
 
 fn write_bam_index(path: &Path) -> io::Result<()> {
@@ -1699,7 +1955,7 @@ fn print_usage() -> io::Result<()> {
         "  -t TAG          sort by auxiliary tag, then coordinate/name"
     )?;
     writeln!(w, "  -o FILE         write output to FILE (default stdout)")?;
-    writeln!(w, "  --output-fmt sam|bam")?;
+    writeln!(w, "  --output-fmt sam|bam|cram")?;
     writeln!(
         w,
         "  -@/-m/-T/-K     accepted but currently ignored (in-memory sort only)"

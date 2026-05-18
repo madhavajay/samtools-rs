@@ -24,7 +24,7 @@
 //! base-quality characters differ on non-`-B` inputs (depths and read
 //! bases match exactly — see `mpileup.out.1`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -35,21 +35,36 @@ use htslib_rs::alignment_compat::{
     PileupColumn, PileupOptions, PileupRead, pileup_from_alignment_paths_with_options,
     pileup_from_alignment_paths_with_reference_and_options,
 };
+use htslib_rs::format::Exact;
+use htslib_rs::{bam, sam};
 
 use crate::bam_flag::{BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FUNMAP, str_to_flag};
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::bedidx::{BedInterval, parse_bed_line};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
+use crate::io as sam_io;
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum AMode {
+    #[default]
+    None,
+    AllPositions,
+    AllRefsAllPositions,
+}
 
 struct Config {
     inputs: Vec<PathBuf>,
     reference: Option<PathBuf>,
     region: Option<String>,
     output: Option<PathBuf>,
+    positions: Option<PathBuf>,
     min_base_q: u8,
     min_map_q: u8,
+    a_mode: AMode,
     exclude_flags: u16,
     require_flags: u16,
     detect_overlaps: bool,
     count_orphans: bool,
+    compute_baq: bool,
 }
 
 impl Default for Config {
@@ -59,12 +74,15 @@ impl Default for Config {
             reference: None,
             region: None,
             output: None,
+            positions: None,
             min_base_q: 13,
             min_map_q: 0,
+            a_mode: AMode::None,
             exclude_flags: (BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP) as u16,
             require_flags: 0,
             detect_overlaps: true,
             count_orphans: false,
+            compute_baq: true,
         }
     }
 }
@@ -84,9 +102,20 @@ fn normalize_args(args: &[OsString]) -> Vec<OsString> {
                 continue;
             }
             out.push(arg.clone());
-        } else if s.len() > 2 && s.starts_with('-') && VALUE_SHORT.contains(&s.as_bytes()[1]) {
-            out.push(OsString::from(format!("-{}", &s[1..2])));
-            out.push(OsString::from(&s[2..]));
+        } else if s.len() > 2 && s.starts_with('-') {
+            let bytes = s.as_bytes();
+            let mut i = 1;
+            while i < bytes.len() {
+                let opt = bytes[i];
+                out.push(OsString::from(format!("-{}", opt as char)));
+                i += 1;
+                if VALUE_SHORT.contains(&opt) {
+                    if i < bytes.len() {
+                        out.push(OsString::from(&s[i..]));
+                    }
+                    break;
+                }
+            }
         } else {
             out.push(arg.clone());
         }
@@ -124,6 +153,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0);
             }
+            "-l" | "--positions" => {
+                cfg.positions = iter.next().map(PathBuf::from);
+            }
             "--ff" | "--excl-flags" => match iter.next().and_then(|a| a.to_str()) {
                 Some(v) => match str_to_flag(v) {
                     Some(f) => cfg.exclude_flags = f as u16,
@@ -145,15 +177,23 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
             // Accepted no-ops / not-yet-modelled boolean options.
             "-A" | "--count-orphans" => cfg.count_orphans = true,
-            "-B" | "--no-BAQ" | "-E" | "--redo-BAQ" | "-a" | "-aa" | "-R" | "--ignore-RG"
-            | "-s" | "--output-MQ" | "-O" | "--output-BP" | "-M" | "--output-mods" | "-6"
-            | "--illumina1.3+" | "--no-PG" => {}
+            "-a" => {
+                cfg.a_mode = match cfg.a_mode {
+                    AMode::None => AMode::AllPositions,
+                    _ => AMode::AllRefsAllPositions,
+                };
+            }
+            "-aa" => {
+                cfg.a_mode = AMode::AllRefsAllPositions;
+            }
+            "-B" | "--no-BAQ" => cfg.compute_baq = false,
+            "-E" | "--redo-BAQ" | "-R" | "--ignore-RG" | "-s" | "--output-MQ" | "-O"
+            | "--output-BP" | "-M" | "--output-mods" | "-6" | "--illumina1.3+" | "--no-PG" => {}
             "-x" | "--ignore-overlaps-removal" | "--ignore-overlaps" => {
                 cfg.detect_overlaps = false;
             }
             // Accepted options whose value is consumed but not yet modelled.
-            "-d" | "--max-depth" | "-l" | "--positions" | "-G" | "--exclude-RG" | "-C"
-            | "--adjust-MQ" => {
+            "-d" | "--max-depth" | "-G" | "--exclude-RG" | "-C" | "--adjust-MQ" => {
                 let _ = iter.next();
             }
             _ if s.starts_with('-') && s != "-" => {
@@ -179,6 +219,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    for input in &cfg.inputs {
+        if input.as_os_str() != "-" && !input.exists() {
+            print_hts_open_missing(input);
+            eprintln!(
+                "[mpileup] failed to open {}: No such file or directory",
+                input.display()
+            );
+            return ExitCode::from(1);
+        }
+    }
+
     match run(&cfg) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -201,6 +252,24 @@ fn read_input_list(path: &Path) -> io::Result<Vec<PathBuf>> {
         out.push(PathBuf::from(line));
     }
     Ok(out)
+}
+
+fn read_bed_intervals(path: &Path) -> io::Result<Vec<BedInterval>> {
+    let file = File::open(path)?;
+    let mut intervals = Vec::new();
+    for line in BufReader::new(file).lines() {
+        if let Some(interval) = parse_bed_line(&line?) {
+            intervals.push(interval);
+        }
+    }
+    Ok(intervals)
+}
+
+fn bed_contains(intervals: &[BedInterval], name: &str, pos: usize) -> bool {
+    let pos0 = (pos - 1) as u64;
+    intervals
+        .iter()
+        .any(|iv| iv.chrom == name && iv.start <= pos0 && pos0 < iv.end)
 }
 
 /// Parses a region string into `(name, 1-based-begin, 1-based-end-inclusive)`.
@@ -267,6 +336,38 @@ fn read_fasta(path: &Path) -> io::Result<HashMap<String, Vec<u8>>> {
     Ok(refs)
 }
 
+fn read_reference_lengths(path: &Path) -> io::Result<Vec<(String, usize)>> {
+    let format = sam_io::sam_open_format(path)?;
+    let header = match format.exact {
+        Exact::Sam => {
+            let mut reader = sam::io::Reader::new(BufReader::new(File::open(path)?));
+            reader.read_header()?
+        }
+        Exact::Bam => {
+            let mut reader = bam::io::Reader::new(File::open(path)?);
+            reader.read_header()?
+        }
+        Exact::Cram => htslib_rs::alignment_compat::read_cram_header_from_path(path)?,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsupported alignment input",
+            ));
+        }
+    };
+
+    Ok(header
+        .reference_sequences()
+        .iter()
+        .map(|(name, def)| {
+            (
+                String::from_utf8_lossy(name).into_owned(),
+                usize::from(def.length()),
+            )
+        })
+        .collect())
+}
+
 fn run(cfg: &Config) -> io::Result<()> {
     let options = PileupOptions {
         exclude_flags: cfg.exclude_flags,
@@ -274,6 +375,7 @@ fn run(cfg: &Config) -> io::Result<()> {
         min_mapping_quality: cfg.min_map_q,
         detect_overlaps: cfg.detect_overlaps,
         discard_orphans: !cfg.count_orphans,
+        apply_baq: cfg.compute_baq && cfg.reference.is_some(),
     };
 
     let has_cram = cfg.inputs.iter().any(|p| is_cram(p));
@@ -307,6 +409,19 @@ fn run(cfg: &Config) -> io::Result<()> {
         None => None,
     };
     let region = cfg.region.as_deref().map(parse_region);
+    let bed_intervals = match cfg.positions.as_ref() {
+        Some(path) => Some(read_bed_intervals(path)?),
+        None => None,
+    };
+    let reference_lengths = if cfg.a_mode != AMode::None {
+        read_reference_lengths(&cfg.inputs[0])?
+    } else {
+        Vec::new()
+    };
+    let reference_length_by_name: HashMap<&str, usize> = reference_lengths
+        .iter()
+        .map(|(name, len)| (name.as_str(), *len))
+        .collect();
 
     let mut writer: Box<dyn Write> = match cfg.output.as_ref() {
         Some(p) => Box::new(io::BufWriter::new(File::create(p)?)),
@@ -319,29 +434,134 @@ fn run(cfg: &Config) -> io::Result<()> {
         cfg.inputs.len()
     );
 
-    let mut line: Vec<u8> = Vec::new();
-    for column in &columns {
-        if let Some((name, beg, end)) = &region
-            && (column.reference_name != *name || column.position < *beg || column.position > *end)
-        {
-            continue;
+    if cfg.a_mode == AMode::None {
+        for column in &columns {
+            if !column_allowed(column, region.as_ref(), bed_intervals.as_deref()) {
+                continue;
+            }
+            write_pileup_line(
+                &mut writer,
+                cfg,
+                refs.as_ref(),
+                Some(column),
+                &column.reference_name,
+                column.position,
+            )?;
         }
+    } else {
+        let columns_by_position: HashMap<(&str, usize), &PileupColumn> = columns
+            .iter()
+            .map(|column| ((column.reference_name.as_str(), column.position), column))
+            .collect();
+        let covered_refs: HashSet<&str> = columns
+            .iter()
+            .map(|column| column.reference_name.as_str())
+            .collect();
 
-        let ref_seq = refs
-            .as_ref()
-            .and_then(|m| m.get(&column.reference_name))
-            .map(Vec::as_slice);
-        let pos0 = column.position - 1;
-        let ref_base = ref_seq
-            .and_then(|s| s.get(pos0).copied())
-            .unwrap_or(b'N')
-            .to_ascii_uppercase();
+        if let Some((name, beg, end)) = &region {
+            let ref_len = reference_length_by_name
+                .get(name.as_str())
+                .copied()
+                .unwrap_or(*end);
+            let end = (*end).min(ref_len);
+            for pos in *beg..=end {
+                if bed_intervals
+                    .as_deref()
+                    .is_some_and(|intervals| !bed_contains(intervals, name, pos))
+                {
+                    continue;
+                }
+                write_pileup_line(
+                    &mut writer,
+                    cfg,
+                    refs.as_ref(),
+                    columns_by_position.get(&(name.as_str(), pos)).copied(),
+                    name,
+                    pos,
+                )?;
+            }
+        } else if let Some(intervals) = bed_intervals.as_deref() {
+            for interval in intervals {
+                if cfg.a_mode == AMode::AllPositions
+                    && !covered_refs.contains(interval.chrom.as_str())
+                {
+                    continue;
+                }
+                for pos0 in interval.start..interval.end {
+                    let pos = usize::try_from(pos0 + 1).unwrap_or(usize::MAX);
+                    write_pileup_line(
+                        &mut writer,
+                        cfg,
+                        refs.as_ref(),
+                        columns_by_position
+                            .get(&(interval.chrom.as_str(), pos))
+                            .copied(),
+                        &interval.chrom,
+                        pos,
+                    )?;
+                }
+            }
+        } else {
+            for (name, len) in &reference_lengths {
+                if cfg.a_mode == AMode::AllPositions && !covered_refs.contains(name.as_str()) {
+                    continue;
+                }
+                for pos in 1..=*len {
+                    write_pileup_line(
+                        &mut writer,
+                        cfg,
+                        refs.as_ref(),
+                        columns_by_position.get(&(name.as_str(), pos)).copied(),
+                        name,
+                        pos,
+                    )?;
+                }
+            }
+        }
+    }
 
-        line.clear();
-        line.extend_from_slice(column.reference_name.as_bytes());
-        write!(line, "\t{}\t", column.position).unwrap();
-        line.push(ref_base);
+    writer.flush()
+}
 
+fn column_allowed(
+    column: &PileupColumn,
+    region: Option<&(String, usize, usize)>,
+    bed_intervals: Option<&[BedInterval]>,
+) -> bool {
+    if let Some((name, beg, end)) = region
+        && (column.reference_name != *name || column.position < *beg || column.position > *end)
+    {
+        return false;
+    }
+    if let Some(intervals) = bed_intervals
+        && !bed_contains(intervals, &column.reference_name, column.position)
+    {
+        return false;
+    }
+    true
+}
+
+fn write_pileup_line(
+    writer: &mut dyn Write,
+    cfg: &Config,
+    refs: Option<&HashMap<String, Vec<u8>>>,
+    column: Option<&PileupColumn>,
+    reference_name: &str,
+    position: usize,
+) -> io::Result<()> {
+    let ref_seq = refs.and_then(|m| m.get(reference_name)).map(Vec::as_slice);
+    let pos0 = position - 1;
+    let ref_base = ref_seq
+        .and_then(|s| s.get(pos0).copied())
+        .unwrap_or(b'N')
+        .to_ascii_uppercase();
+
+    let mut line = Vec::new();
+    line.extend_from_slice(reference_name.as_bytes());
+    write!(line, "\t{position}\t").unwrap();
+    line.push(ref_base);
+
+    if let Some(column) = column {
         for reads in &column.reads_by_input {
             let mut seq: Vec<u8> = Vec::new();
             let mut qual: Vec<u8> = Vec::new();
@@ -368,11 +588,14 @@ fn run(cfg: &Config) -> io::Result<()> {
                 line.extend_from_slice(&qual);
             }
         }
-        line.push(b'\n');
-        writer.write_all(&line)?;
+    } else {
+        for _ in &cfg.inputs {
+            line.extend_from_slice(b"\t0\t*\t*");
+        }
     }
 
-    writer.flush()
+    line.push(b'\n');
+    writer.write_all(&line)
 }
 
 fn is_cram(p: &Path) -> bool {

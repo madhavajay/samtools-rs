@@ -710,6 +710,16 @@ pub fn main(args: &[OsString]) -> ExitCode {
 
     let file_size = match std::fs::metadata(&input) {
         Ok(m) => m.len() as i64,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            crate::diagnostics::print_error(
+                "cram_size",
+                format!(
+                    "failed to open file '{}': No such file or directory",
+                    input.display()
+                ),
+            );
+            return ExitCode::from(1);
+        }
         Err(e) => {
             crate::diagnostics::print_error_errno("cram-size", "stat input", &e);
             return ExitCode::from(1);

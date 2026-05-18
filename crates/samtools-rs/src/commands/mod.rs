@@ -42,4 +42,5 @@ pub mod sort;
 pub mod split;
 pub mod stats;
 pub mod targetcut;
+pub mod tview;
 pub mod view;

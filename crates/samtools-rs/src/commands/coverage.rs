@@ -27,7 +27,7 @@ use htslib_rs::format::Exact;
 use htslib_rs::sam;
 
 use crate::bam_flag::{BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FUNMAP, str_to_flag};
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
 use crate::sam_global::current_global_args;
 
@@ -42,8 +42,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut output: Option<PathBuf> = None;
     let mut region: Option<String> = None;
     let mut inputs: Vec<PathBuf> = Vec::new();
-    let mut histogram = false;
-    let mut n_bins: usize = 80;
+    let mut output_mode = CoverageOutputMode::Tabular;
+    let mut full_utf = true;
+    let mut n_bins: Option<isize> = None;
     let mut exclude_flags = default_exclude_flags();
     let mut include_any_flags = 0;
 
@@ -114,20 +115,27 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 Err(()) => return ExitCode::from(1),
             },
             "-w" | "--n-bins" => {
-                if let Some(v) = iter.next().and_then(|a| a.to_str())
-                    && let Ok(parsed) = v.parse::<usize>()
-                    && parsed > 0
-                {
-                    n_bins = parsed;
+                n_bins = iter
+                    .next()
+                    .and_then(|a| a.to_str())
+                    .and_then(|v| v.parse::<isize>().ok());
+                if matches!(output_mode, CoverageOutputMode::Tabular) {
+                    output_mode = CoverageOutputMode::Histogram;
                 }
             }
-            "-m" | "--histogram" | "-A" | "--ascii" => {
-                histogram = true;
+            "-m" | "--histogram" => {
+                if matches!(output_mode, CoverageOutputMode::Tabular) {
+                    output_mode = CoverageOutputMode::Histogram;
+                }
+            }
+            "-A" | "--ascii" => {
+                if matches!(output_mode, CoverageOutputMode::Tabular) {
+                    output_mode = CoverageOutputMode::Histogram;
+                }
+                full_utf = false;
             }
             "-D" | "--plot-depth" => {
-                // Currently routed through the same ASCII histogram as -m;
-                // the upstream depth plot variant is not yet implemented.
-                histogram = true;
+                output_mode = CoverageOutputMode::DepthPlot;
             }
             "--help" => {
                 let _ = print_usage();
@@ -148,6 +156,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
 
     let mut has_cram = false;
     for path in &inputs {
+        if path.as_os_str() != "-" && !path.exists() {
+            print_hts_open_missing(path);
+            print_error(
+                "coverage",
+                format!(
+                    "Could not open \"{}\": No such file or directory",
+                    path.display()
+                ),
+            );
+            return ExitCode::from(1);
+        }
         let format = match sam_io::sam_open_format(path) {
             Ok(f) => f,
             Err(e) => {
@@ -161,24 +180,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
             _ => {
                 print_error(
                     "coverage",
-                    "only SAM, BAM, and reference-backed CRAM input are currently supported",
+                    "only SAM, BAM, and CRAM input are currently supported",
                 );
                 return ExitCode::from(1);
             }
         }
     }
-
-    let reference = if has_cram {
-        match current_global_args().reference {
-            Some(reference) => Some(reference),
-            None => {
-                print_error("coverage", "CRAM input requires top-level --reference FILE");
-                return ExitCode::from(1);
-            }
-        }
-    } else {
-        None
-    };
+    let reference = has_cram.then(|| current_global_args().reference).flatten();
 
     let mut writer = match sam_io::open_text_output(output.as_deref()) {
         Ok(writer) => writer,
@@ -188,7 +196,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     };
 
-    if !no_header && !histogram {
+    if !no_header && matches!(output_mode, CoverageOutputMode::Tabular) {
         let _ = writeln!(
             writer,
             "#rname\tstartpos\tendpos\tnumreads\tcovbases\tcoverage\tmeandepth\tmeanbaseq\tmeanmapq"
@@ -206,8 +214,9 @@ pub fn main(args: &[OsString]) -> ExitCode {
             min_read_len,
             exclude_flags,
             include_any_flags,
-            histogram,
-            n_bins,
+            output_mode,
+            full_utf,
+            n_bins: histogram_bins(n_bins),
         },
         region.as_deref(),
         reference.as_deref(),
@@ -244,6 +253,24 @@ fn parse_flag_value(value: Option<&OsString>, option: &str) -> Result<u32, ()> {
     Ok(flags as u32)
 }
 
+fn histogram_bins(explicit: Option<isize>) -> usize {
+    if let Some(n) = explicit
+        && n > 0
+    {
+        return n as usize;
+    }
+
+    let columns = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<isize>().ok())
+        .unwrap_or(0);
+    if columns > 60 {
+        (columns - 40) as usize
+    } else {
+        40
+    }
+}
+
 fn read_input_list(path: &Path) -> io::Result<Vec<PathBuf>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -267,8 +294,16 @@ struct CoverageConfig {
     min_read_len: usize,
     exclude_flags: u32,
     include_any_flags: u32,
-    histogram: bool,
+    output_mode: CoverageOutputMode,
+    full_utf: bool,
     n_bins: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoverageOutputMode {
+    Tabular,
+    Histogram,
+    DepthPlot,
 }
 
 fn run_coverage(
@@ -285,21 +320,11 @@ fn run_coverage(
         let refs = match sam_io::sam_open_format(path)?.exact {
             Exact::Sam => collect_sam_coverage(path, config, region.as_ref())?,
             Exact::Bam => collect_bam_coverage(path, config, region.as_ref())?,
-            Exact::Cram => collect_cram_coverage(
-                path,
-                reference.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "CRAM input requires top-level --reference FILE",
-                    )
-                })?,
-                config,
-                region.as_ref(),
-            )?,
+            Exact::Cram => collect_cram_coverage(path, reference, config, region.as_ref())?,
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "only SAM, BAM, and reference-backed CRAM input are currently supported",
+                    "only SAM, BAM, and CRAM input are currently supported",
                 ));
             }
         };
@@ -311,13 +336,18 @@ fn run_coverage(
         }
     }
     if let Some(refs) = merged_refs {
-        if config.histogram {
+        if matches!(
+            config.output_mode,
+            CoverageOutputMode::Histogram | CoverageOutputMode::DepthPlot
+        ) {
             emit_histogram(
                 out,
                 &refs,
                 config.min_depth,
                 config.max_depth,
                 config.n_bins,
+                config.full_utf,
+                config.output_mode == CoverageOutputMode::DepthPlot,
             )?;
         } else {
             emit_coverage(out, &refs, config.min_depth, config.max_depth)?;
@@ -381,7 +411,7 @@ fn collect_sam_coverage(
 
 fn collect_cram_coverage(
     path: &Path,
-    reference: &Path,
+    reference: Option<&Path>,
     config: CoverageConfig,
     region: Option<&Region>,
 ) -> io::Result<Vec<RefStats>> {
@@ -389,23 +419,35 @@ fn collect_cram_coverage(
     let mut refs = coverage_targets(&header, region)?;
 
     if let Some(region) = region {
-        for record in htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
-            path, region, reference,
-        )? {
+        for record in query_cram_coverage_records(path, region, reference)? {
             update_targets(&header, &mut refs, &record, config);
         }
     } else {
         for rs in &mut refs {
             let region = ref_region(rs)?;
-            for record in htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
-                path, &region, reference,
-            )? {
+            for record in query_cram_coverage_records(path, &region, reference)? {
                 update_target(&header, rs, &record, config);
             }
         }
     }
 
     Ok(refs)
+}
+
+fn query_cram_coverage_records(
+    path: &Path,
+    region: &Region,
+    reference: Option<&Path>,
+) -> io::Result<Vec<sam::alignment::RecordBuf>> {
+    if let Some(reference) = reference {
+        htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
+            path, region, reference,
+        )
+    } else {
+        htslib_rs::alignment_compat::query_cram_records_from_path_synthesizing_reference(
+            path, region,
+        )
+    }
 }
 
 fn merge_coverage_refs(merged: &mut [RefStats], next: Vec<RefStats>) -> io::Result<()> {
@@ -419,6 +461,7 @@ fn merge_coverage_refs(merged: &mut [RefStats], next: Vec<RefStats>) -> io::Resu
     for (left, right) in merged.iter_mut().zip(next) {
         if left.name != right.name
             || left.length != right.length
+            || left.reference_length != right.reference_length
             || left.output_start != right.output_start
             || left.output_end != right.output_end
             || left.start0 != right.start0
@@ -441,6 +484,7 @@ fn merge_coverage_refs(merged: &mut [RefStats], next: Vec<RefStats>) -> io::Resu
             *l = l.saturating_add(r);
         }
         left.num_reads = left.num_reads.saturating_add(right.num_reads);
+        left.total_reads = left.total_reads.saturating_add(right.total_reads);
         left.aligned_bases = left.aligned_bases.saturating_add(right.aligned_bases);
         left.mapq_sum = left.mapq_sum.saturating_add(right.mapq_sum);
     }
@@ -569,42 +613,44 @@ fn emit_coverage(
     Ok(())
 }
 
-/// Emits an ASCII histogram per reference/region in the spirit of upstream
-/// `samtools coverage -m`. Each row spans `n_bins` columns; the y-axis runs
-/// over 10 rows of "percent covered" with `.` and `:` as level marks and `|`
-/// as the side border. Byte-for-byte parity with the C tool is **not**
-/// pursued here — the UTF-8 box-drawing path, summary sidebar text, and
-/// x-axis labels are deliberately omitted; the goal is a serviceable plot
-/// that uses the per-position depths we already compute.
+/// Emits the upstream-shaped histogram/depth-plot view used by `coverage -m`,
+/// `coverage -A`, and `coverage -D`.
 fn emit_histogram(
     out: &mut dyn Write,
     refs: &[RefStats],
     min_depth: u32,
     max_depth: Option<u32>,
     n_bins: usize,
+    full_utf: bool,
+    plot_depth: bool,
 ) -> io::Result<()> {
     const N_ROWS: usize = 10;
 
-    for rs in refs {
+    for (idx, rs) in refs.iter().enumerate() {
+        if idx > 0 {
+            writeln!(out)?;
+        }
         let region_len = rs.length.max(1);
-        let bin_width = ((region_len as f64) / n_bins as f64).max(1.0);
+        let hist_size = n_bins.min(region_len).max(1);
+        let bin_width = (region_len / hist_size).max(1);
 
-        // Count positions per bin that meet the minimum-depth threshold.
-        // hist[i] is in units of "covered positions in bin i".
-        let mut hist = vec![0u64; n_bins];
+        let mut hist = vec![0u64; hist_size];
         for (i, &depth) in rs.depths.iter().enumerate() {
             let depth = cap_depth(depth, max_depth);
-            if depth >= min_depth {
-                let bin = ((i as f64) / bin_width).floor() as usize;
-                let bin = bin.min(n_bins.saturating_sub(1));
+            let bin = i / bin_width;
+            if bin >= hist_size {
+                continue;
+            }
+            if plot_depth {
+                hist[bin] = hist[bin].saturating_add(depth as u64);
+            } else if depth >= min_depth {
                 hist[bin] += 1;
             }
         }
-        // hist_data[i] is the percentage of positions covered within bin i.
-        let mut hist_data = vec![0.0f64; n_bins];
+        let mut hist_data = vec![0.0f64; hist_size];
         let mut max_val = 0.0f64;
-        for i in 0..n_bins {
-            hist_data[i] = 100.0 * hist[i] as f64 / bin_width;
+        for i in 0..hist_size {
+            hist_data[i] = if plot_depth { 1.0 } else { 100.0 } * hist[i] as f64 / bin_width as f64;
             if hist_data[i] > max_val {
                 max_val = hist_data[i];
             }
@@ -614,55 +660,249 @@ fn emit_histogram(
             out,
             "{} ({}bp)",
             rs.name,
-            readable_bp(rs.length as u64).trim_end()
+            readable_bp_c(rs.reference_length as f64).trim_end()
         )?;
 
-        let row_size = (max_val / N_ROWS as f64).max(f64::MIN_POSITIVE);
+        let row_size = max_val / N_ROWS as f64;
+        let render = HistRenderContext {
+            min_depth,
+            max_depth,
+            bin_width,
+            max_val,
+            plot_depth,
+        };
         for row in (0..N_ROWS).rev() {
             let current = row as f64 * row_size;
-            write!(out, ">{:7.2}% |", current)?;
-            for &value in hist_data.iter().take(n_bins) {
-                let diff = ((value - current) / row_size).round() as i64;
-                let glyph = if diff <= 0 {
-                    ' '
-                } else if diff == 1 {
-                    '.'
-                } else {
-                    ':'
-                };
-                write!(out, "{}", glyph)?;
+            if plot_depth {
+                write!(out, ">{:8.1} ", current)?;
+            } else {
+                write!(out, ">{:7.2}% ", current)?;
             }
-            writeln!(out, "|")?;
+            write!(out, "{}", if full_utf { "│" } else { "|" })?;
+            for &value in hist_data.iter().take(hist_size) {
+                let diff = if row_size > 0.0 {
+                    ((blockchar_len(full_utf) as f64 * (value - current) / row_size).round()
+                        as isize)
+                        - 1
+                } else {
+                    -1
+                };
+                if diff < 0 {
+                    write!(out, " ")?;
+                } else {
+                    write!(out, "{}", block_char(diff as usize, full_utf))?;
+                }
+            }
+            write!(out, "{}", if full_utf { "│" } else { "|" })?;
+            write_hist_sidebar(out, row, rs, render)?;
+            writeln!(out)?;
         }
+        write_hist_axis(out, rs, bin_width, hist_size)?;
     }
     Ok(())
+}
+
+fn blockchar_len(full_utf: bool) -> usize {
+    if full_utf { 8 } else { 2 }
+}
+
+fn block_char(diff: usize, full_utf: bool) -> &'static str {
+    if full_utf {
+        const BLOCKS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+        BLOCKS[diff.min(BLOCKS.len() - 1)]
+    } else {
+        const BLOCKS: [&str; 2] = [".", ":"];
+        BLOCKS[diff.min(BLOCKS.len() - 1)]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HistRenderContext {
+    min_depth: u32,
+    max_depth: Option<u32>,
+    bin_width: usize,
+    max_val: f64,
+    plot_depth: bool,
+}
+
+fn write_hist_sidebar(
+    out: &mut dyn Write,
+    row: usize,
+    rs: &RefStats,
+    render: HistRenderContext,
+) -> io::Result<()> {
+    let summary = coverage_summary(rs, render.min_depth, render.max_depth);
+    write!(out, " ")?;
+    match row {
+        9 => write!(out, "Number of reads: {}", rs.num_reads)?,
+        8 => {
+            let filtered = rs.total_reads.saturating_sub(rs.num_reads);
+            if filtered > 0 {
+                write!(out, "    ({} filtered)", filtered)?;
+            }
+        }
+        7 => write!(
+            out,
+            "Covered bases:   {}bp",
+            readable_bp_c(summary.covbases as f64)
+        )?,
+        6 => write!(
+            out,
+            "Percent covered: {}%",
+            c_printf_g(summary.coverage_pct, 4)
+        )?,
+        5 => write!(
+            out,
+            "Mean coverage:   {}x",
+            c_printf_g(summary.meandepth, 3)
+        )?,
+        4 => write!(out, "Mean baseQ:      {}", c_printf_g(summary.meanbaseq, 3))?,
+        3 => write!(out, "Mean mapQ:       {}", c_printf_g(summary.meanmapq, 3))?,
+        1 => write!(
+            out,
+            "Histo bin width: {}bp",
+            readable_bp_c(render.bin_width as f64)
+        )?,
+        0 => {
+            if render.plot_depth {
+                write!(out, "Histo max cov:   {}", c_printf_g(render.max_val, 5))?;
+            } else {
+                write!(out, "Histo max bin:   {}%", c_printf_g(render.max_val, 5))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn write_hist_axis(
+    out: &mut dyn Write,
+    rs: &RefStats,
+    bin_width: usize,
+    hist_size: usize,
+) -> io::Result<()> {
+    write!(
+        out,
+        "     {}",
+        center_text(&readable_bp_c(rs.output_start as f64), 10)
+    )?;
+    for rest in (10..10 * (hist_size / 10)).step_by(10) {
+        write!(
+            out,
+            "{}",
+            center_text(
+                &readable_bp_c((rs.output_start - 1 + bin_width * rest) as f64),
+                10
+            )
+        )?;
+    }
+    let last_padding = hist_size % 10;
+    write!(
+        out,
+        "{:>width$}{}",
+        " ",
+        center_text(&readable_bp_c(rs.output_end as f64), 10),
+        width = last_padding
+    )?;
+    writeln!(out)
+}
+
+fn center_text(text: &str, width: usize) -> String {
+    let len = text.len();
+    if len >= width {
+        return text.to_string();
+    }
+    let padding = (width - len) / 2;
+    let padding_ex = (width - len) % 2;
+    if padding >= 1 {
+        format!(
+            " {:>text_width$}{:>right_width$}",
+            text,
+            "",
+            text_width = len + padding,
+            right_width = padding - 1 + padding_ex
+        )
+    } else {
+        text.to_string()
+    }
+}
+
+struct CoverageSummary {
+    covbases: u64,
+    coverage_pct: f64,
+    meandepth: f64,
+    meanbaseq: f64,
+    meanmapq: f64,
+}
+
+fn coverage_summary(rs: &RefStats, min_depth: u32, max_depth: Option<u32>) -> CoverageSummary {
+    let mut covbases = 0u64;
+    let mut summed_coverage = 0u64;
+    let mut summed_baseq = 0u64;
+    let mut quality_bases = 0u64;
+    for (i, &raw) in rs.depths.iter().enumerate() {
+        let d = cap_depth(raw, max_depth);
+        if d >= min_depth {
+            covbases += 1;
+            summed_coverage += d as u64;
+            summed_baseq += rs.baseq_pos[i];
+            quality_bases += rs.baseqn_pos[i] as u64;
+        }
+    }
+    CoverageSummary {
+        covbases,
+        coverage_pct: if rs.length > 0 {
+            covbases as f64 / rs.length as f64 * 100.0
+        } else {
+            0.0
+        },
+        meandepth: if rs.length > 0 {
+            summed_coverage as f64 / rs.length as f64
+        } else {
+            0.0
+        },
+        meanbaseq: if quality_bases > 0 {
+            summed_baseq as f64 / quality_bases as f64
+        } else {
+            0.0
+        },
+        meanmapq: if rs.num_reads > 0 {
+            rs.mapq_sum as f64 / rs.num_reads as f64
+        } else {
+            0.0
+        },
+    }
 }
 
 fn cap_depth(depth: u32, max_depth: Option<u32>) -> u32 {
     max_depth.map_or(depth, |max| depth.min(max))
 }
 
-fn readable_bp(bp: u64) -> String {
-    if bp >= 1_000_000_000 {
-        format!("{:.1}G", bp as f64 / 1_000_000_000.0)
-    } else if bp >= 1_000_000 {
-        format!("{:.1}M", bp as f64 / 1_000_000.0)
-    } else if bp >= 1_000 {
-        format!("{:.1}K", bp as f64 / 1_000.0)
+fn readable_bp_c(mut bp: f64) -> String {
+    let units = ["", "K", "M", "G", "T"];
+    let mut unit = 0usize;
+    while bp >= 1000.0 && unit < units.len() - 1 {
+        bp /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bp:.0}{}", units[unit])
     } else {
-        format!("{}", bp)
+        format!("{bp:.unit$}{}", units[unit])
     }
 }
 
 struct RefStats {
     tid: usize,
     name: String,
+    reference_length: usize,
     length: usize,
     output_start: usize,
     output_end: usize,
     start0: usize,
     end0: usize,
     depths: Vec<u32>,
+    total_reads: u64,
     num_reads: u64,
     aligned_bases: u64,
     /// Per-position summed base quality / count of quality bases, so the
@@ -713,12 +953,14 @@ fn coverage_targets(
             Ok(vec![RefStats {
                 tid,
                 name: String::from_utf8_lossy(region.name()).into_owned(),
+                reference_length: ref_len,
                 length,
                 output_start,
                 output_end,
                 start0,
                 end0,
                 depths: vec![0u32; length],
+                total_reads: 0,
                 num_reads: 0,
                 aligned_bases: 0u64,
                 baseq_pos: vec![0u64; length],
@@ -735,12 +977,14 @@ fn coverage_targets(
                 RefStats {
                     tid,
                     name: String::from_utf8_lossy(name).into_owned(),
+                    reference_length: length,
                     length,
                     output_start: 1,
                     output_end: length,
                     start0: 0,
                     end0: length,
                     depths: vec![0u32; length],
+                    total_reads: 0,
                     num_reads: 0,
                     aligned_bases: 0u64,
                     baseq_pos: vec![0u64; length],
@@ -762,6 +1006,14 @@ fn update_targets(
         Ok(flags) => u16::from(flags) as u32,
         Err(_) => return,
     };
+    let tid = match record.reference_sequence_id(header).transpose() {
+        Ok(Some(t)) => t,
+        _ => return,
+    };
+    let Some(rs) = refs.iter_mut().find(|rs| rs.tid == tid) else {
+        return;
+    };
+    rs.total_reads += 1;
     if !flag_passes(flag, config) {
         return;
     }
@@ -778,14 +1030,6 @@ fn update_targets(
     {
         return;
     }
-    let tid = match record.reference_sequence_id(header).transpose() {
-        Ok(Some(t)) => t,
-        _ => return,
-    };
-    let Some(rs) = refs.iter_mut().find(|rs| rs.tid == tid) else {
-        return;
-    };
-
     update_target_after_filter(rs, record, mapq, config.min_baseq);
 }
 
@@ -799,6 +1043,15 @@ fn update_target(
         Ok(flags) => u16::from(flags) as u32,
         Err(_) => return,
     };
+    if record
+        .reference_sequence_id(header)
+        .transpose()
+        .unwrap_or_default()
+        != Some(rs.tid)
+    {
+        return;
+    }
+    rs.total_reads += 1;
     if !flag_passes(flag, config) {
         return;
     }
@@ -815,15 +1068,6 @@ fn update_target(
     {
         return;
     }
-    if record
-        .reference_sequence_id(header)
-        .transpose()
-        .unwrap_or_default()
-        != Some(rs.tid)
-    {
-        return;
-    }
-
     update_target_after_filter(rs, record, mapq, config.min_baseq);
 }
 
@@ -908,7 +1152,10 @@ fn update_target_after_filter(
                                 None => min_baseq == 0,
                             }
                         } else {
-                            min_baseq == 0
+                            const MISSING_QUALITY: u8 = 0xff;
+                            rs.baseq_pos[offset] += MISSING_QUALITY as u64;
+                            rs.baseqn_pos[offset] += 1;
+                            true
                         };
                         if passes_baseq {
                             rs.depths[offset] = rs.depths[offset].saturating_add(1);
@@ -936,6 +1183,9 @@ fn print_usage() -> io::Result<()> {
     writeln!(w, "  -q INT       min mapping quality [0]")?;
     writeln!(w, "  -Q INT       min base quality [0]")?;
     writeln!(w, "  -d INT       max per-position depth cap")?;
+    writeln!(w, "  -m           show coverage histogram")?;
+    writeln!(w, "  -D           plot per-bin mean depth")?;
+    writeln!(w, "  -A           use ASCII histogram characters")?;
     writeln!(w, "  -H           no header")?;
     writeln!(w, "  -o FILE      output FILE")?;
     writeln!(w, "  -r REGION    restrict to REGION")?;

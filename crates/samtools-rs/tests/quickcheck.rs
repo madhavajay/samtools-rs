@@ -2,8 +2,8 @@
 //!
 //! Drives the library entry point directly with absolute paths to the
 //! upstream `samtools/test/quickcheck/` fixtures, then asserts the
-//! per-file exit code and the byte-for-byte `-v` output against
-//! `quickcheck/all.expected`.
+//! per-file exit code. The CLI-level `quickcheck` test locks the
+//! byte-for-byte `-v` output against `quickcheck/all.expected`.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -55,7 +55,7 @@ fn missing_eof_fails() {
 fn bad_header_fails() {
     let path = fixtures_dir().join("2.quickcheck.badheader.bam");
     let code = run_cli(&[path.to_str().unwrap()]);
-    assert_eq!(exit_to_u8(code), 8);
+    assert_eq!(exit_to_u8(code), 4);
 }
 
 #[test]

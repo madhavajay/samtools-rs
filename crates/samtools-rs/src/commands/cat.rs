@@ -6,8 +6,7 @@
 //! (output), and `-p N/M` for CRAM.
 //!
 //! This Rust port implements record-level concatenation (decompress +
-//! re-encode) for SAM and BAM. CRAM concatenation and `-p` are not yet
-//! supported.
+//! re-encode) for BAM and the upstream-fixtured CRAM paths.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -18,9 +17,9 @@ use std::process::ExitCode;
 use htslib_rs::bam;
 use htslib_rs::bgzf;
 use htslib_rs::format::Exact;
-use htslib_rs::sam::{self, alignment::RecordBuf};
+use htslib_rs::sam;
 
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
 
 /// Entry point for `samtools cat`.
@@ -29,6 +28,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut output: Option<PathBuf> = None;
     let mut no_pg = false;
     let mut region: Option<String> = None;
+    let mut part: Option<Part> = None;
     let mut input_lists: Vec<PathBuf> = Vec::new();
     let mut inputs: Vec<PathBuf> = Vec::new();
     let mut iter = args.iter().skip(1).peekable();
@@ -56,7 +56,20 @@ pub fn main(args: &[OsString]) -> ExitCode {
             "-r" => {
                 region = iter.next().and_then(|a| a.to_str().map(str::to_owned));
             }
-            "-p" | "-q" | "-f" => {
+            "-p" => {
+                let Some(v) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("cat", "missing value for -p");
+                    return ExitCode::from(1);
+                };
+                match parse_part(v) {
+                    Ok(parsed) => part = Some(parsed),
+                    Err(e) => {
+                        print_error("cat", e);
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            "-q" | "-f" => {
                 // Reserved upstream flags not yet supported.
                 print_error(
                     "cat",
@@ -98,6 +111,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     // Determine input format from the first file.
+    if inputs[0].as_os_str() != "-" && !inputs[0].exists() {
+        print_hts_open_missing(&inputs[0]);
+        print_error(
+            "cat",
+            format!(
+                "failed to open file '{}': No such file or directory",
+                inputs[0].display()
+            ),
+        );
+        return ExitCode::from(1);
+    }
     let format = match sam_io::sam_open_format(&inputs[0]) {
         Ok(f) => f,
         Err(e) => {
@@ -107,14 +131,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
 
     let result = match format.exact {
-        Exact::Sam => run_sam_cat(
-            &inputs,
-            header_file.as_deref(),
-            output.as_deref(),
-            !no_pg,
-            args,
-            region.as_deref(),
-        ),
+        Exact::Sam => {
+            let _ = writeln!(io::stderr(), "[main_cat] ERROR: input is not BAM or CRAM");
+            return ExitCode::from(1);
+        }
         Exact::Bam => run_bam_cat(
             &inputs,
             header_file.as_deref(),
@@ -123,9 +143,18 @@ pub fn main(args: &[OsString]) -> ExitCode {
             args,
             region.as_deref(),
         ),
+        Exact::Cram => run_cram_cat(
+            &inputs,
+            header_file.as_deref(),
+            output.as_deref(),
+            !no_pg,
+            args,
+            region.as_deref(),
+            part,
+        ),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "only SAM and BAM input are currently supported (CRAM TODO)",
+            "unsupported input format for cat",
         )),
     };
 
@@ -136,6 +165,28 @@ pub fn main(args: &[OsString]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct Part {
+    index: usize,
+    total: usize,
+}
+
+fn parse_part(raw: &str) -> Result<Part, String> {
+    let Some((index, total)) = raw.split_once('/') else {
+        return Err(format!("malformed region {raw}. Should be e.g. '1/10'"));
+    };
+    let index = index
+        .parse::<usize>()
+        .map_err(|_| format!("malformed region {raw}. Should be e.g. '1/10'"))?;
+    let total = total
+        .parse::<usize>()
+        .map_err(|_| format!("malformed region {raw}. Should be e.g. '1/10'"))?;
+    if index == 0 || total == 0 || index > total {
+        return Err(format!("malformed region {raw}. Should be e.g. '1/10'"));
+    }
+    Ok(Part { index, total })
 }
 
 fn read_input_list(path: &Path) -> io::Result<Vec<PathBuf>> {
@@ -220,24 +271,18 @@ fn run_bam_cat(
     writer.finish()
 }
 
-fn run_sam_cat(
+fn run_cram_cat(
     inputs: &[PathBuf],
     header_file: Option<&Path>,
     output: Option<&Path>,
     add_pg: bool,
     argv: &[OsString],
     region: Option<&str>,
+    part: Option<Part>,
 ) -> io::Result<()> {
-    if let Some(region) = region {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("-r region \"{region}\" is currently supported for indexed BAM input only"),
-        ));
-    }
-
     for input in inputs {
         let format = sam_io::sam_open_format(input)?;
-        if format.exact != Exact::Sam {
+        if format.exact != Exact::Cram {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "all cat inputs must use the same format",
@@ -250,82 +295,125 @@ fn run_sam_cat(
             let mut reader = sam::io::Reader::new(BufReader::new(File::open(p)?));
             reader.read_header()?
         }
-        None => {
-            let mut reader = sam::io::Reader::new(BufReader::new(File::open(&inputs[0])?));
-            reader.read_header()?
-        }
+        None => htslib_rs::alignment_compat::read_cram_header_from_path(&inputs[0])?,
     };
     if add_pg {
         header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
     }
 
-    let mut writer: Box<dyn SamSink> = match output {
-        Some(p) => Box::new(SamFileSink::new(p, &header)?),
-        None => Box::new(SamStdoutSink::new(&header)?),
+    let selected_inputs = inputs_for_part(inputs, part);
+    let parsed_region = match region {
+        Some(r) => Some(r.parse::<htslib_rs::core::Region>().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid -r region \"{r}\": {e}"),
+            )
+        })?),
+        None => None,
     };
 
-    for input in inputs {
-        let mut reader = sam::io::Reader::new(BufReader::new(File::open(input)?));
-        let input_header = reader.read_header()?;
-        loop {
-            let mut record = RecordBuf::default();
-            if reader.read_record_buf(&input_header, &mut record)? == 0 {
-                break;
+    // Spool the concatenated stream as SAM into a temp file, then re-encode
+    // it as a real CRAM. Writing SAM text directly to a `.cram`-named output
+    // (the previous behaviour) produced a file that failed format detection,
+    // so `cat`-ing the result again (e.g. `cat -p` parts) was rejected.
+    let mut reference: Option<PathBuf> = None;
+    let (tmp_file, tmp_path) = crate::tmp_file::create_temp_file("cat", Some("sam"))?;
+    {
+        let mut spool: Box<dyn Write> = Box::new(tmp_file);
+        crate::sam_render::write_header(&mut spool, &header)?;
+
+        for input in selected_inputs {
+            let input_reference =
+                reference_from_header_uri(input, Exact::Cram)?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("CRAM input {} requires @SQ UR tags", input.display()),
+                    )
+                })?;
+            let text = if let Some(region) = parsed_region.as_ref() {
+                htslib_rs::alignment_compat::view_cram_regions_as_sam_text_from_path_with_reference(
+                    input,
+                    &input_reference,
+                    std::slice::from_ref(region),
+                    false,
+                )?
+            } else {
+                htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+                    input,
+                    &input_reference,
+                    None,
+                )?
+            };
+            write_sam_record_lines(&mut spool, &crate::sam_render::fix_sam_text(&text))?;
+            if reference.is_none() {
+                reference = Some(input_reference);
             }
-            writer.write_record(&header, &record)?;
+        }
+        spool.flush()?;
+    }
+
+    let reference = reference.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cat: no CRAM inputs selected for this part",
+        )
+    })?;
+    crate::reference::ensure_fai_index(&reference, None)?;
+
+    match output {
+        Some(path) => {
+            let out = File::create(path)?;
+            let _ = htslib_rs::alignment_compat::write_cram_from_sam_path_with_reference(
+                tmp_path.path(),
+                &reference,
+                out,
+            )?;
+        }
+        None => {
+            let out = io::stdout().lock();
+            let _ = htslib_rs::alignment_compat::write_cram_from_sam_path_with_reference(
+                tmp_path.path(),
+                &reference,
+                out,
+            )?;
         }
     }
-    writer.finish()
+
+    Ok(())
 }
 
-trait SamSink {
-    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()>;
-    fn finish(self: Box<Self>) -> io::Result<()>;
+fn inputs_for_part(inputs: &[PathBuf], part: Option<Part>) -> &[PathBuf] {
+    let Some(part) = part else {
+        return inputs;
+    };
+    let start = (part.index - 1) * inputs.len() / part.total;
+    let end = part.index * inputs.len() / part.total;
+    &inputs[start..end]
 }
 
-struct SamFileSink {
-    writer: File,
-}
-
-impl SamFileSink {
-    fn new(path: &Path, header: &sam::Header) -> io::Result<Self> {
-        let mut writer = File::create(path)?;
-        crate::sam_render::write_header(&mut writer, header)?;
-        Ok(Self { writer })
+fn reference_from_header_uri(input: &Path, exact: Exact) -> io::Result<Option<PathBuf>> {
+    let header_text = crate::header_text::read_raw_header_text_with_format(input, exact)?;
+    for line in header_text.lines().filter(|line| line.starts_with("@SQ\t")) {
+        for field in line.split('\t').skip(1) {
+            let Some(uri) = field.strip_prefix("UR:") else {
+                continue;
+            };
+            let path = uri.strip_prefix("file://").unwrap_or(uri);
+            let path = PathBuf::from(path);
+            if path.is_file() {
+                return Ok(Some(path));
+            }
+        }
     }
+    Ok(None)
 }
 
-impl SamSink for SamFileSink {
-    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
-        // Shared renderer: htslib `%g` float aux spelling.
-        crate::sam_render::write_record(&mut self.writer, header, record)
+fn write_sam_record_lines(out: &mut dyn Write, text: &str) -> io::Result<()> {
+    for line in text.lines().filter(|line| !line.starts_with('@')) {
+        out.write_all(line.as_bytes())?;
+        out.write_all(b"\n")?;
     }
-
-    fn finish(self: Box<Self>) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-struct SamStdoutSink {
-    writer: io::Stdout,
-}
-
-impl SamStdoutSink {
-    fn new(header: &sam::Header) -> io::Result<Self> {
-        let mut writer = io::stdout();
-        crate::sam_render::write_header(&mut writer, header)?;
-        Ok(Self { writer })
-    }
-}
-
-impl SamSink for SamStdoutSink {
-    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
-        crate::sam_render::write_record(&mut self.writer, header, record)
-    }
-
-    fn finish(self: Box<Self>) -> io::Result<()> {
-        Ok(())
-    }
+    Ok(())
 }
 
 trait BamSink {

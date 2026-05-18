@@ -13,6 +13,12 @@ pub const SAMTOOLS_VERSION: &str = "1.23.1";
 /// sibling `htslib-rs` workspace, not C HTSlib.
 pub const HTSLIB_VERSION: &str = "1.23.1+htslib-rs";
 
+/// C HTSlib version string tracked by the bundled `htslib` submodule.
+///
+/// A few user-facing compatibility banners, notably `stats`, include the
+/// upstream HTSlib version string rather than the Rust workspace label.
+pub const C_HTSLIB_VERSION: &str = "1.23.1-25-g336c98a5";
+
 /// Returns [`SAMTOOLS_VERSION`].
 pub fn samtools_version() -> &'static str {
     SAMTOOLS_VERSION

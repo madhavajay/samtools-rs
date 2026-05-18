@@ -16,6 +16,7 @@ use samtools_rs::commands::{
 };
 use samtools_rs::header_text;
 use samtools_rs::run as samtools_run;
+use samtools_rs::sam_global::{SamGlobalArgs, set_current_global_args};
 
 static GLOBAL_ARGS_LOCK: Mutex<()> = Mutex::new(());
 
@@ -40,6 +41,13 @@ fn htslib_fixtures_dir() -> PathBuf {
         .join("htslib-rs")
         .join("htslib")
         .join("test")
+}
+
+fn non_header_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(str::to_string)
+        .collect()
 }
 
 fn exit_to_u8(code: ExitCode) -> u8 {
@@ -74,7 +82,7 @@ fn fasta_region(path: &Path, name: &str, start: usize, end: usize) -> String {
     }
 
     let slice = &seq[start - 1..end];
-    let mut out = format!(">{name}:{start}-{end} length: {}\n", end - start + 1);
+    let mut out = format!(">{name}:{start}-{end}\n");
     for chunk in slice.as_bytes().chunks(60) {
         out.push_str(std::str::from_utf8(chunk).unwrap());
         out.push('\n');
@@ -162,6 +170,49 @@ fn without_pg_lines(text: &str) -> String {
         .collect()
 }
 
+fn without_pg_m5_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.starts_with("@PG\t"))
+        .map(|line| {
+            if line.starts_with('@') {
+                let fields = line
+                    .split('\t')
+                    .filter(|field| !field.starts_with("M5:"))
+                    .collect::<Vec<_>>();
+                return format!("{}\n", fields.join("\t"));
+            }
+
+            format!("{line}\n")
+        })
+        .collect()
+}
+
+fn without_pg_md_nm_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| !line.starts_with("@PG\t"))
+        .map(|line| {
+            if line.starts_with('@') {
+                let fields = line
+                    .split('\t')
+                    .filter(|field| !field.starts_with("M5:"))
+                    .collect::<Vec<_>>();
+                return format!("{}\n", fields.join("\t"));
+            }
+
+            let fields = line
+                .split('\t')
+                .filter(|field| !field.starts_with("MD:Z:") && !field.starts_with("NM:i:"))
+                .collect::<Vec<_>>();
+            format!("{}\n", fields.join("\t"))
+        })
+        .collect()
+}
+
+fn write_unpadded_fasta(src: &Path, dst: &Path) {
+    let text = std::fs::read_to_string(src).unwrap();
+    std::fs::write(dst, text.replace('*', "")).unwrap();
+}
+
 #[test]
 fn flagstat_succeeds() {
     let p = sample_bam();
@@ -196,7 +247,7 @@ fn depad_sam_matches_upstream_fixture() {
     );
 
     assert_eq!(
-        std::fs::read_to_string(output).unwrap(),
+        without_pg_m5_lines(&std::fs::read_to_string(output).unwrap()),
         without_pg_lines(&std::fs::read_to_string(expected).unwrap())
     );
 }
@@ -236,7 +287,7 @@ fn depad_bam_input_and_output_match_upstream_fixture() {
     let bam_text =
         htslib_rs::alignment_compat::view_bam_as_sam_text_from_path_with_limit(&output_bam, None)
             .unwrap();
-    assert_eq!(bam_text, expected);
+    assert_eq!(without_pg_m5_lines(&bam_text), expected);
 
     assert_eq!(
         exit_to_u8(depad::main(&argv(
@@ -253,7 +304,93 @@ fn depad_bam_input_and_output_match_upstream_fixture() {
         ))),
         0
     );
-    assert_eq!(std::fs::read_to_string(output_sam).unwrap(), expected);
+    assert_eq!(
+        without_pg_m5_lines(&std::fs::read_to_string(output_sam).unwrap()),
+        expected
+    );
+}
+
+#[test]
+fn depad_cram_input_and_output_roundtrip() {
+    let tmp = tmp_dir("depad-cram");
+    let input_sam = tmp.join("padded.sam");
+    let input_bam = tmp.join("padded.bam");
+    let input_cram = tmp.join("padded.cram");
+    let output_sam = tmp.join("depad-from-cram.sam");
+    let output_cram = tmp.join("depad.out");
+    let reference = tmp.join("padded.fa");
+    let unpadded_reference = tmp.join("unpadded.fa");
+    let expected = concat!(
+        "@HD\tVN:1.6\n",
+        "@SQ\tSN:ref\tLN:4\n",
+        "r1\t0\tref\t1\t60\t2M1I2M\t*\t0\t0\tACAGT\tIIIII\n",
+    );
+
+    std::fs::write(&reference, ">ref\nAC*GT\n").unwrap();
+    std::fs::write(
+        &input_sam,
+        "@HD\tVN:1.6\n@SQ\tSN:ref\tLN:5\nr1\t0\tref\t1\t60\t5M\t*\t0\t0\tACAGT\tIIIII\n",
+    )
+    .unwrap();
+    samtools_rs::reference::ensure_fai_index(&reference, None).unwrap();
+    htslib_rs::alignment_compat::write_bam_from_sam_path(
+        &input_sam,
+        std::fs::File::create(&input_bam).unwrap(),
+    )
+    .unwrap();
+    htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+        &input_bam,
+        &reference,
+        std::fs::File::create(&input_cram).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(depad::main(&argv(
+            "depad",
+            &[
+                "-T",
+                reference.to_str().unwrap(),
+                "-s",
+                "--no-PG",
+                "-o",
+                output_sam.to_str().unwrap(),
+                input_cram.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        without_pg_md_nm_lines(&std::fs::read_to_string(output_sam).unwrap()),
+        expected
+    );
+
+    assert_eq!(
+        exit_to_u8(depad::main(&argv(
+            "depad",
+            &[
+                "-T",
+                reference.to_str().unwrap(),
+                "--output-fmt=cram",
+                "--no-PG",
+                "-o",
+                output_cram.to_str().unwrap(),
+                input_sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    write_unpadded_fasta(&reference, &unpadded_reference);
+    samtools_rs::reference::ensure_fai_index(&unpadded_reference, None).unwrap();
+    let cram_text =
+        htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+            &output_cram,
+            &unpadded_reference,
+            None,
+        )
+        .unwrap();
+    assert_eq!(without_pg_md_nm_lines(&cram_text), expected);
 }
 
 #[test]
@@ -950,7 +1087,7 @@ fn reference_region_outputs_requested_slice_and_bam_input() {
         );
     }
 
-    let expected = ">chr1:3-7 length: 5\nGTATG\n";
+    let expected = ">chr1:3-7\nGTATG\n";
     assert_eq!(std::fs::read_to_string(sam_out).unwrap(), expected);
     assert_eq!(std::fs::read_to_string(bam_out).unwrap(), expected);
 }
@@ -986,7 +1123,7 @@ fn reference_region_uses_indexed_bam_query_path() {
 
     assert_eq!(
         std::fs::read_to_string(output).unwrap(),
-        ">chr1:3-7 length: 5\nGTATG\n"
+        ">chr1:3-7\nGTATG\n"
     );
 }
 
@@ -1409,30 +1546,28 @@ fn cat_no_pg_suppresses_pg() {
 }
 
 #[test]
-fn cat_sam_inputs_write_sam_output_with_single_header() {
-    let tmp = tmp_dir("cat-sam");
-    let sam_a = tmp.join("a.sam");
-    let sam_b = tmp.join("b.sam");
-    let out = tmp.join("cat.sam");
+fn cat_bam_inputs_write_bam_output_with_single_header() {
+    let tmp = tmp_dir("cat-bam");
+    let bam_a = tmp.join("a.bam");
+    let bam_b = tmp.join("b.bam");
+    let out = tmp.join("cat.bam");
     let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:100\n";
-    std::fs::write(
-        &sam_a,
-        format!("{header}a1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n"),
-    )
-    .unwrap();
-    std::fs::write(
-        &sam_b,
-        format!("{header}b1\t0\tchr1\t5\t60\t4M\t*\t0\t0\tTGCA\t####\n"),
-    )
-    .unwrap();
+    write_bam_from_sam_text(
+        &bam_a,
+        &format!("{header}a1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n"),
+    );
+    write_bam_from_sam_text(
+        &bam_b,
+        &format!("{header}b1\t0\tchr1\t5\t60\t4M\t*\t0\t0\tTGCA\t####\n"),
+    );
 
     assert_eq!(
         exit_to_u8(cat::main(&argv(
             "cat",
             &[
                 "--no-PG",
-                sam_a.to_str().unwrap(),
-                sam_b.to_str().unwrap(),
+                bam_a.to_str().unwrap(),
+                bam_b.to_str().unwrap(),
                 "-o",
                 out.to_str().unwrap(),
             ]
@@ -1440,7 +1575,8 @@ fn cat_sam_inputs_write_sam_output_with_single_header() {
         0
     );
 
-    let text = std::fs::read_to_string(out).unwrap();
+    let text =
+        htslib_rs::alignment_compat::view_bam_as_sam_text_from_path_with_limit(&out, None).unwrap();
     assert_eq!(text.matches("@SQ\tSN:chr1").count(), 1);
     assert!(text.lines().any(|line| line.starts_with("a1\t")));
     assert!(text.lines().any(|line| line.starts_with("b1\t")));
@@ -1450,30 +1586,27 @@ fn cat_sam_inputs_write_sam_output_with_single_header() {
 #[test]
 fn cat_reads_inputs_from_file_list_before_positionals() {
     let tmp = tmp_dir("cat-input-list");
-    let sam_a = tmp.join("a.sam");
-    let sam_b = tmp.join("b.sam");
-    let sam_c = tmp.join("c.sam");
+    let bam_a = tmp.join("a.bam");
+    let bam_b = tmp.join("b.bam");
+    let bam_c = tmp.join("c.bam");
     let list = tmp.join("inputs.txt");
-    let out = tmp.join("cat.sam");
+    let out = tmp.join("cat.bam");
     let header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:100\n";
-    std::fs::write(
-        &sam_a,
-        format!("{header}a1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n"),
-    )
-    .unwrap();
-    std::fs::write(
-        &sam_b,
-        format!("{header}b1\t0\tchr1\t5\t60\t4M\t*\t0\t0\tTGCA\t####\n"),
-    )
-    .unwrap();
-    std::fs::write(
-        &sam_c,
-        format!("{header}c1\t0\tchr1\t9\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n"),
-    )
-    .unwrap();
+    write_bam_from_sam_text(
+        &bam_a,
+        &format!("{header}a1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n"),
+    );
+    write_bam_from_sam_text(
+        &bam_b,
+        &format!("{header}b1\t0\tchr1\t5\t60\t4M\t*\t0\t0\tTGCA\t####\n"),
+    );
+    write_bam_from_sam_text(
+        &bam_c,
+        &format!("{header}c1\t0\tchr1\t9\t60\t4M\t*\t0\t0\tAAAA\t!!!!\n"),
+    );
     std::fs::write(
         &list,
-        format!("{}\n\n{}\n", sam_a.display(), sam_b.display()),
+        format!("{}\n\n{}\n", bam_a.display(), bam_b.display()),
     )
     .unwrap();
 
@@ -1484,7 +1617,7 @@ fn cat_reads_inputs_from_file_list_before_positionals() {
                 "--no-PG",
                 "-b",
                 list.to_str().unwrap(),
-                sam_c.to_str().unwrap(),
+                bam_c.to_str().unwrap(),
                 "-o",
                 out.to_str().unwrap(),
             ]
@@ -1492,13 +1625,23 @@ fn cat_reads_inputs_from_file_list_before_positionals() {
         0
     );
 
-    let text = std::fs::read_to_string(out).unwrap();
+    let text =
+        htslib_rs::alignment_compat::view_bam_as_sam_text_from_path_with_limit(&out, None).unwrap();
     let names: Vec<_> = text
         .lines()
         .filter(|line| !line.starts_with('@'))
         .map(|line| line.split('\t').next().unwrap().to_string())
         .collect();
     assert_eq!(names, ["a1", "b1", "c1"]);
+}
+
+#[test]
+fn cat_rejects_sam_input_like_upstream() {
+    let sam = fixtures_dir().join("dat").join("view.001.sam");
+    assert_eq!(
+        exit_to_u8(cat::main(&argv("cat", &["--no-PG", sam.to_str().unwrap()]))),
+        1
+    );
 }
 
 #[test]
@@ -1515,6 +1658,19 @@ fn reheader_succeeds() {
         0
     );
     let _ = tmp; // keep around
+}
+
+#[test]
+fn reheader_rejects_sam_input_like_upstream() {
+    let hdr = fixtures_dir().join("reheader").join("hdr.sam");
+    let sam = fixtures_dir().join("dat").join("view.001.sam");
+    assert_eq!(
+        exit_to_u8(reheader::main(&argv(
+            "reheader",
+            &[hdr.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        1
+    );
 }
 
 #[test]
@@ -1970,6 +2126,51 @@ fn fastq_index_files_extract_from_barcode_tag() {
             "@foo\nCGGGGGGT\n+\nPqq1qqqR\n"
         );
     }
+}
+
+#[test]
+fn fastq_index_files_accept_headerless_sam() {
+    let tmp = tmp_dir("fastq-index-headerless-sam");
+    let sam = tmp.join("in.sam");
+    let single_out = tmp.join("0.fq");
+    let i1_out = tmp.join("i1.fq");
+    let i2_out = tmp.join("i2.fq");
+    std::fs::write(
+        &sam,
+        "foo\t4\t*\t0\t0\t*\t*\t0\t0\tACCCCCCCCCCCCCCCCCCCCT\txYYYYYYYYYYYYYYYYYYYYz\tBC:Z:AGGGGGGT-CGGGGGGT\tQT:Z:Xyyy1yyZ-Pqq1qqqR\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(fastq::main(&argv(
+            "fastq",
+            &[
+                "--index-format",
+                "i8n1i8",
+                "--i1",
+                i1_out.to_str().unwrap(),
+                "--i2",
+                i2_out.to_str().unwrap(),
+                "-0",
+                single_out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&single_out).unwrap(),
+        "@foo\nACCCCCCCCCCCCCCCCCCCCT\n+\nxYYYYYYYYYYYYYYYYYYYYz\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&i1_out).unwrap(),
+        "@foo\nAGGGGGGT\n+\nXyyy1yyZ\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&i2_out).unwrap(),
+        "@foo\nCGGGGGGT\n+\nPqq1qqqR\n"
+    );
 }
 
 #[test]
@@ -2945,6 +3146,217 @@ fn fastq_single_sam_aux_path_reverse_complements_reverse_reads() {
 }
 
 #[test]
+fn fastq_single_default_path_reverse_complements_sam_and_bam_reads() {
+    let tmp = tmp_dir("fastq-single-default-reverse");
+    let sam = tmp.join("in.sam");
+    let bam = tmp.join("in.bam");
+    let sam_out = tmp.join("sam.fq");
+    let bam_out = tmp.join("bam.fq");
+    let text = concat!(
+        "@HD\tVN:1.6\n",
+        "@SQ\tSN:chr1\tLN:8\n",
+        "forward\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!#$%\n",
+        "reverse\t16\tchr1\t1\t60\t4M\t*\t0\t0\tACGC\t1234\n",
+    );
+    std::fs::write(&sam, text).unwrap();
+    write_bam_from_sam_text(&bam, text);
+
+    for (input, output) in [(&sam, &sam_out), (&bam, &bam_out)] {
+        assert_eq!(
+            exit_to_u8(fastq::main(&argv(
+                "fastq",
+                &["-o", output.to_str().unwrap(), input.to_str().unwrap(),]
+            ))),
+            0
+        );
+    }
+
+    let expected = concat!("@forward\nACGT\n+\n!#$%\n", "@reverse\nGCGT\n+\n4321\n",);
+    assert_eq!(std::fs::read_to_string(sam_out).unwrap(), expected);
+    assert_eq!(std::fs::read_to_string(bam_out).unwrap(), expected);
+}
+
+#[test]
+fn fastq_no_sc_matches_upstream_soft_clip_fixtures() {
+    let fixtures = fixtures_dir();
+    let input = fixtures.join("dat").join("bam2fq.sc.sam");
+    let expected_dir = fixtures.join("bam2fq");
+    let tmp = tmp_dir("fastq-no-sc-fixtures");
+    let cases: [(&[&str], &str); 4] = [
+        (
+            &["-O", "--no-sc", "--no-sc-bkp", "-T", "s0"],
+            "21.fq.expected",
+        ),
+        (&["-O", "--no-sc", "-Ts0"], "22.fq.expected"),
+        (&["-O", "--no-sc"], "23.fq.expected"),
+        (
+            &["-O", "--no-sc", "--sc-aux", "s1", "-Ts0,s1"],
+            "24.fq.expected",
+        ),
+    ];
+
+    for (args, expected) in cases {
+        let out = tmp.join(expected);
+        let mut argv_parts = args.to_vec();
+        argv_parts.extend(["-o", out.to_str().unwrap(), input.to_str().unwrap()]);
+        assert_eq!(exit_to_u8(fastq::main(&argv("fastq", &argv_parts))), 0);
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            std::fs::read_to_string(expected_dir.join(expected)).unwrap(),
+            "{expected}"
+        );
+    }
+}
+
+#[test]
+fn fastq_cram_input_uses_top_level_reference() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let fixtures = fixtures_dir();
+    let tmp = tmp_dir("fastq-cram-ref-path");
+    let sam = fixtures.join("dat").join("bam2fq.001.sam");
+    let cram = tmp.join("in.cram");
+    let sam_fq = tmp.join("sam.fq");
+    let cram_fq = tmp.join("cram.fq");
+    let sam_no_suffix = tmp.join("sam.n.fq");
+    let cram_no_suffix = tmp.join("cram.n.fq");
+    let reference = tmp.join("ref.fa");
+    let ref_dir = fixtures.join("dat").join("cram_md5");
+    std::fs::write(
+        &reference,
+        format!(
+            ">ref1\n{}\n>ref2\n{}\n",
+            std::fs::read_to_string(ref_dir.join("08c04d512d4797d9ba2a156c1daba468")).unwrap(),
+            std::fs::read_to_string(ref_dir.join("7c35feac7036c1cdef3bee0cc4b21437")).unwrap()
+        ),
+    )
+    .unwrap();
+    samtools_rs::reference::ensure_fai_index(&reference, None).unwrap();
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "view",
+                "-C",
+                "--no-PG",
+                "-o",
+                cram.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    for (extra, sam_out, cram_out) in [
+        (&[][..], &sam_fq, &cram_fq),
+        (&["-n"][..], &sam_no_suffix, &cram_no_suffix),
+    ] {
+        let mut sam_args = vec!["fastq"];
+        sam_args.extend(extra.iter().copied());
+        sam_args.extend(["-o", sam_out.to_str().unwrap(), sam.to_str().unwrap()]);
+        assert_eq!(exit_to_u8(samtools_run(argv("samtools", &sam_args))), 0);
+
+        let mut cram_args = vec!["--reference", reference.to_str().unwrap(), "fastq"];
+        cram_args.extend(extra.iter().copied());
+        cram_args.extend(["-o", cram_out.to_str().unwrap(), cram.to_str().unwrap()]);
+        assert_eq!(exit_to_u8(samtools_run(argv("samtools", &cram_args))), 0);
+
+        assert_eq!(
+            std::fs::read_to_string(cram_out).unwrap(),
+            std::fs::read_to_string(sam_out).unwrap()
+        );
+    }
+}
+
+#[test]
+fn view_cram_roundtrip_preserves_bam2fq_setup_fields() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let fixtures = fixtures_dir();
+    let tmp = tmp_dir("view-cram-bam2fq-setup");
+    let sam = fixtures.join("dat").join("bam2fq.001.sam");
+    let cram = tmp.join("bam2fq.001.cram");
+    let out = tmp.join("roundtrip.sam");
+    let reference = tmp.join("ref.fa");
+    let ref_dir = fixtures.join("dat").join("cram_md5");
+    std::fs::write(
+        &reference,
+        format!(
+            ">ref1\n{}\n>ref2\n{}\n",
+            std::fs::read_to_string(ref_dir.join("08c04d512d4797d9ba2a156c1daba468")).unwrap(),
+            std::fs::read_to_string(ref_dir.join("7c35feac7036c1cdef3bee0cc4b21437")).unwrap()
+        ),
+    )
+    .unwrap();
+    samtools_rs::reference::ensure_fai_index(&reference, None).unwrap();
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "view",
+                "-C",
+                "--no-PG",
+                "-o",
+                cram.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "view",
+                "-h",
+                "--no-PG",
+                "-o",
+                out.to_str().unwrap(),
+                cram.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let fields = |qname: &str, flag: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| !line.starts_with('@'))
+            .find_map(|line| {
+                let fields: Vec<_> = line.split('\t').collect();
+
+                if fields[0] == qname && fields[1] == flag {
+                    Some(fields.into_iter().map(String::from).collect())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("missing {qname}/{flag}"))
+    };
+
+    let primary_with_supplementary_mate = fields("ref1_grp2_p001", "99");
+    assert_eq!(primary_with_supplementary_mate[7], "27");
+    assert_eq!(primary_with_supplementary_mate[8], "34");
+
+    let reversed_tlen_pair_r1 = fields("ref2_grp3_p002", "99");
+    let reversed_tlen_pair_r2 = fields("ref2_grp3_p002", "147");
+    assert_eq!(reversed_tlen_pair_r1[8], "-45");
+    assert_eq!(reversed_tlen_pair_r2[8], "45");
+
+    let cross_reference_pair = fields("ref12_grp1_p001", "97");
+    assert_eq!(cross_reference_pair[8], "0");
+
+    let unmapped = fields("unaligned_grp3_p001", "77");
+    assert_eq!(unmapped[4], "0");
+}
+
+#[test]
 fn fixmate_sam_input_fills_mate_fields_to_sam_output() {
     let tmp = tmp_dir("fixmate-sam");
     let sam = tmp.join("in.sam");
@@ -3236,7 +3648,7 @@ fn faidx_extracts_from_bgzf_input_and_writes_bgzf_output() {
     let decoded = htslib_rs::bgzf_compat::read_auto(&std::fs::read(out).unwrap()).unwrap();
     assert_eq!(
         String::from_utf8(decoded).unwrap(),
-        ">chr1:3-10 length: 8\nGTAC\nGTAC\n"
+        ">chr1:3-10\nGTAC\nGTAC\n"
     );
 }
 
@@ -3266,7 +3678,7 @@ fn faidx_accepts_equals_output_format_option_for_bgzf_output() {
     let decoded = htslib_rs::bgzf_compat::read_auto(&std::fs::read(out).unwrap()).unwrap();
     assert_eq!(
         String::from_utf8(decoded).unwrap(),
-        ">chr1:3-10 length: 8\nGTAC\nGTAC\n"
+        ">chr1:3-10\nGTAC\nGTAC\n"
     );
 }
 
@@ -3292,7 +3704,7 @@ fn faidx_extracts_region_to_file() {
     );
     assert_eq!(
         std::fs::read_to_string(out).unwrap(),
-        ">chr1:3-10 length: 8\nGTAC\nGTAC\n"
+        ">chr1:3-10\nGTAC\nGTAC\n"
     );
 }
 
@@ -3319,7 +3731,7 @@ fn faidx_extracts_regions_from_file() {
     );
     assert_eq!(
         std::fs::read_to_string(out).unwrap(),
-        ">chr1:1-4 length: 4\nACGT\n>chr2:5-8 length: 4\nCCCC\n"
+        ">chr1:1-4\nACGT\n>chr2:5-8\nCCCC\n"
     );
 }
 
@@ -3378,7 +3790,7 @@ fn faidx_out_of_range_region_exits_successfully_with_empty_output() {
         0
     );
 
-    assert_eq!(std::fs::read_to_string(out).unwrap(), "");
+    assert_eq!(std::fs::read_to_string(out).unwrap(), ">chr1:100-105\n");
 }
 
 #[test]
@@ -3401,9 +3813,35 @@ fn faidx_truncated_region_exits_successfully_with_clamped_output() {
         0
     );
 
+    assert_eq!(std::fs::read_to_string(out).unwrap(), ">chr1:6-12\nCGT\n");
+}
+
+#[test]
+fn faidx_continue_missing_region_outputs_empty_record() {
+    let tmp = tmp_dir("fai-continue-missing");
+    let fa = tmp.join("ref.fa");
+    let out = tmp.join("out.fa");
+    std::fs::write(&fa, ">chr1\nACGTACGT\n").unwrap();
+
+    assert_eq!(
+        exit_to_u8(faidx::main(&argv(
+            "faidx",
+            &[
+                "--continue",
+                "-o",
+                out.to_str().unwrap(),
+                fa.to_str().unwrap(),
+                "chr1:1-4",
+                "missing",
+                "chr1:5-8",
+            ]
+        ))),
+        0
+    );
+
     assert_eq!(
         std::fs::read_to_string(out).unwrap(),
-        ">chr1:6-12 length: 3\nCGT\n"
+        ">chr1:1-4\nACGT\n>missing\n>chr1:5-8\nACGT\n"
     );
 }
 
@@ -3429,7 +3867,59 @@ fn fqidx_extracts_region_to_file() {
     );
     assert_eq!(
         std::fs::read_to_string(out).unwrap(),
-        "@r1:2-7 length: 6\nCGTA\nCG\n+\nbcde\nfg\n"
+        "@r1:2-7\nCGTA\nCG\n+\nbcde\nfg\n"
+    );
+}
+
+#[test]
+fn fqidx_out_of_range_region_exits_successfully_with_empty_record() {
+    let tmp = tmp_dir("fqi-zero-region");
+    let fq = tmp.join("reads.fq");
+    let out = tmp.join("out.fq");
+    std::fs::write(&fq, "@r1\nACGTACGT\n+\nabcdefgh\n").unwrap();
+
+    assert_eq!(
+        exit_to_u8(fqidx::main(&argv(
+            "fqidx",
+            &[
+                "-o",
+                out.to_str().unwrap(),
+                fq.to_str().unwrap(),
+                "r1:100-105",
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(std::fs::read_to_string(out).unwrap(), "@r1:100-105\n+\n");
+}
+
+#[test]
+fn fqidx_continue_missing_region_outputs_empty_record() {
+    let tmp = tmp_dir("fqi-continue-missing");
+    let fq = tmp.join("reads.fq");
+    let out = tmp.join("out.fq");
+    std::fs::write(&fq, "@r1\nACGTACGT\n+\nabcdefgh\n").unwrap();
+
+    assert_eq!(
+        exit_to_u8(fqidx::main(&argv(
+            "fqidx",
+            &[
+                "--continue",
+                "-o",
+                out.to_str().unwrap(),
+                fq.to_str().unwrap(),
+                "r1:1-4",
+                "missing",
+                "r1:5-8",
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        "@r1:1-4\nACGT\n+\nabcd\n@missing\n+\n@r1:5-8\nACGT\n+\nefgh\n"
     );
 }
 
@@ -3488,7 +3978,7 @@ fn fqidx_extracts_from_bgzf_input_and_writes_bgzf_output() {
     let decoded = htslib_rs::bgzf_compat::read_auto(&std::fs::read(out).unwrap()).unwrap();
     assert_eq!(
         String::from_utf8(decoded).unwrap(),
-        "@r1:2-7 length: 6\nCGTA\nCG\n+\nbcde\nfg\n"
+        "@r1:2-7\nCGTA\nCG\n+\nbcde\nfg\n"
     );
 }
 
@@ -3516,7 +4006,7 @@ fn faidx_fastq_mode_extracts_fastq_region() {
     );
     assert_eq!(
         std::fs::read_to_string(out).unwrap(),
-        "@r1:1-4 length: 4\nACGT\n+\nabcd\n"
+        "@r1:1-4\nACGT\n+\nabcd\n"
     );
 }
 
@@ -3718,18 +4208,60 @@ fn import_fastq_to_bam() {
     assert_eq!(
         exit_to_u8(import::main(&argv(
             "import",
+            &["-o", out.to_str().unwrap(), fq.to_str().unwrap()]
+        ))),
+        0
+    );
+    assert_eq!(
+        htslib_rs::alignment_compat::count_bam_records_from_path(&out).unwrap(),
+        2
+    );
+}
+
+#[test]
+fn import_fastq_to_cram() {
+    let tmp = tmp_dir("imp-cram");
+    let fq = tmp.join("in.fq");
+    std::fs::write(&fq, "@r1\nACGT\n+\n!!!!\n@r2\nTTTT\n+\n####\n").unwrap();
+    let out = tmp.join("out.cram");
+    let explicit_out = tmp.join("out.byfmt");
+
+    assert_eq!(
+        exit_to_u8(import::main(&argv(
+            "import",
+            &["-o", out.to_str().unwrap(), fq.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let records =
+        htslib_rs::alignment_compat::summarize_cram_records_from_path_synthesizing_reference(&out)
+            .unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].name_bytes(), Some(&b"r1"[..]));
+    assert_eq!(records[0].flags_u16(), 4);
+    assert_eq!(records[0].sequence_bytes(), b"ACGT");
+    assert_eq!(records[1].name_bytes(), Some(&b"r2"[..]));
+    assert_eq!(records[1].sequence_bytes(), b"TTTT");
+
+    assert_eq!(
+        exit_to_u8(import::main(&argv(
+            "import",
             &[
-                "-O",
-                "bam",
+                "--output-fmt=cram",
                 "-o",
-                out.to_str().unwrap(),
+                explicit_out.to_str().unwrap(),
                 fq.to_str().unwrap()
             ]
         ))),
         0
     );
     assert_eq!(
-        htslib_rs::alignment_compat::count_bam_records_from_path(&out).unwrap(),
+        htslib_rs::alignment_compat::summarize_cram_records_from_path_synthesizing_reference(
+            &explicit_out
+        )
+        .unwrap()
+        .len(),
         2
     );
 }
@@ -4468,6 +5000,70 @@ fn rmdup_sam_input_keeps_best_single_end_duplicate() {
 }
 
 #[test]
+fn rmdup_accepts_reference_backed_cram_input_and_output() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    set_current_global_args(SamGlobalArgs::default());
+
+    let tmp = tmp_dir("rmdup-cram");
+    let reference = tmp.join("ref.fa");
+    let sam = tmp.join("in.sam");
+    let bam = tmp.join("in.bam");
+    let cram = tmp.join("in.cram");
+    let out = tmp.join("dedup.cram");
+
+    std::fs::write(&reference, ">chr1\nACGTTGCA\n").unwrap();
+    samtools_rs::reference::ensure_fai_index(&reference, None).unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "low\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+            "reverse\t16\tchr1\t1\t30\t4M\t*\t0\t0\tCCCC\t$$$$\n",
+        ),
+    )
+    .unwrap();
+    htslib_rs::alignment_compat::write_bam_from_sam_path(
+        &sam,
+        std::fs::File::create(&bam).unwrap(),
+    )
+    .unwrap();
+    htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+        &bam,
+        &reference,
+        std::fs::File::create(&cram).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(rmdup::main(&argv(
+            "rmdup",
+            &[
+                "-s",
+                "--no-PG",
+                "-O",
+                "cram",
+                "-T",
+                reference.to_str().unwrap(),
+                cram.to_str().unwrap(),
+                out.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    set_current_global_args(SamGlobalArgs::default());
+
+    let records = htslib_rs::alignment_compat::summarize_cram_records_from_path_with_reference(
+        &out, &reference,
+    )
+    .unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].name_bytes(), Some(&b"high"[..]));
+    assert_eq!(records[1].name_bytes(), Some(&b"reverse"[..]));
+}
+
+#[test]
 fn rmdup_sam_input_removes_lower_scoring_paired_duplicate() {
     let tmp = tmp_dir("rmdup-pe-sam");
     let sam = tmp.join("in.sam");
@@ -4952,6 +5548,67 @@ fn reset_matches_upstream_test_reset_fixtures() {
 }
 
 #[test]
+fn reset_writes_cram_output() {
+    let tmp = tmp_dir("reset-cram-output");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("out.cram");
+    let explicit_out = tmp.join("out.byfmt");
+
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t16\tchr1\t2\t60\t5M\t*\t0\t0\tACGTT\t!!!!!\tNM:i:1\tMD:Z:3A\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(reset::main(&argv(
+            "reset",
+            &[
+                "--no-PG",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let records =
+        htslib_rs::alignment_compat::summarize_cram_records_from_path_synthesizing_reference(&out)
+            .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].name_bytes(), Some(&b"r1"[..]));
+    assert_eq!(records[0].flags_u16() & 4, 4);
+    assert_eq!(records[0].sequence_bytes(), b"AACGT");
+
+    assert_eq!(
+        exit_to_u8(reset::main(&argv(
+            "reset",
+            &[
+                "--no-PG",
+                "--output-fmt=cram",
+                "-o",
+                explicit_out.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        htslib_rs::alignment_compat::summarize_cram_records_from_path_synthesizing_reference(
+            &explicit_out
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+}
+
+#[test]
 fn split_by_rg() {
     let tmp = tmp_dir("split");
     let bam = tmp.join("in.bam");
@@ -4971,6 +5628,37 @@ fn split_by_rg() {
         ))),
         0
     );
+}
+
+#[test]
+fn split_cram_input_by_rg_to_sam_outputs() {
+    let tmp = tmp_dir("split-cram");
+    let cram = fixtures_dir().join("checksum").join("chk2.cram");
+    let tmpl = tmp.join("out.%!.%.");
+    let unk = tmp.join("unknown.sam");
+
+    assert_eq!(
+        exit_to_u8(split::main(&argv(
+            "split",
+            &[
+                "--output-fmt",
+                "sam",
+                "-f",
+                tmpl.to_str().unwrap(),
+                "-u",
+                unk.to_str().unwrap(),
+                cram.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let err013140 = std::fs::read_to_string(tmp.join("out.ERR013140.sam")).unwrap();
+    let err156632 = std::fs::read_to_string(tmp.join("out.ERR156632.sam")).unwrap();
+    let unknown = std::fs::read_to_string(unk).unwrap();
+    assert!(err013140.lines().any(|line| line.starts_with("ERR013140.")));
+    assert!(err156632.lines().any(|line| line.starts_with("ERR156632.")));
+    assert!(unknown.lines().any(|line| line.starts_with("ERR016352.")));
 }
 
 #[test]
@@ -5019,6 +5707,155 @@ fn split_sam_input_by_rg_to_sam_outputs() {
     assert!(g1.lines().any(|line| line.starts_with("r1\t")));
     assert!(g2.lines().any(|line| line.starts_with("r2\t")));
     assert!(unknown.lines().any(|line| line.starts_with("r3\t")));
+}
+
+#[test]
+fn split_infers_sam_output_from_template_extension() {
+    let tmp = tmp_dir("split-template-sam");
+    let sam = tmp.join("in.sam");
+    let tmpl = tmp.join("out.%#.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:g1\n",
+            "@RG\tID:g2\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:g1\n",
+            "r2\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\tRG:Z:g2\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(split::main(&argv(
+            "split",
+            &[
+                "--no-PG",
+                "-f",
+                tmpl.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        0
+    );
+
+    let g1 = std::fs::read_to_string(tmp.join("out.0.sam")).unwrap();
+    let g2 = std::fs::read_to_string(tmp.join("out.1.sam")).unwrap();
+    assert!(g1.starts_with("@HD\t"));
+    assert!(g1.lines().any(|line| line.starts_with("r1\t")));
+    assert!(g2.lines().any(|line| line.starts_with("r2\t")));
+}
+
+#[test]
+fn split_errors_on_missing_rg_without_unaccounted_output_like_upstream() {
+    let tmp = tmp_dir("split-missing-rg-error");
+    let sam = tmp.join("in.sam");
+    let tmpl = tmp.join("out.%#.sam");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:g1\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:g1\n",
+            "r2\t0\tchr1\t2\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(split::main(&argv(
+            "split",
+            &[
+                "--output-fmt",
+                "sam",
+                "--no-PG",
+                "-f",
+                tmpl.to_str().unwrap(),
+                sam.to_str().unwrap()
+            ]
+        ))),
+        1
+    );
+
+    let g1 = std::fs::read_to_string(tmp.join("out.0.sam")).unwrap();
+    assert!(g1.lines().any(|line| line.starts_with("r1\t")));
+    assert!(!g1.lines().any(|line| line.starts_with("r2\t")));
+}
+
+#[test]
+fn split_sam_input_by_rg_to_cram_outputs_with_reference() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("split-cram-output");
+    let sam = tmp.join("in.sam");
+    let reference = tmp.join("ref.fa");
+    let tmpl = tmp.join("out.%!.%.");
+    let unk = tmp.join("unknown.cram");
+    std::fs::write(&reference, ">chr1\nACGTACGT\n").unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "@RG\tID:g1\tSM:s1\n",
+            "@RG\tID:g2\tSM:s2\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:g1\n",
+            "r2\t0\tchr1\t2\t60\t4M\t*\t0\t0\tCGTA\t####\tRG:Z:g2\n",
+            "r3\t0\tchr1\t3\t60\t4M\t*\t0\t0\tGTAC\t$$$$\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "split",
+                "--output-fmt",
+                "cram",
+                "--no-PG",
+                "-f",
+                tmpl.to_str().unwrap(),
+                "-u",
+                unk.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let g1 = tmp.join("out.g1.cram");
+    let g2 = tmp.join("out.g2.cram");
+    assert!(g1.exists());
+    assert!(g2.exists());
+    assert!(unk.exists());
+    assert_eq!(
+        htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+            &g1, &reference
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+    assert_eq!(
+        htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+            &g2, &reference
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+    assert_eq!(
+        htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+            &unk, &reference
+        )
+        .unwrap()
+        .len(),
+        1
+    );
 }
 
 #[test]
@@ -5576,6 +6413,62 @@ fn addreplacerg_writes_cram_output_with_reference() {
 }
 
 #[test]
+fn addreplacerg_accepts_reference_backed_cram_input() {
+    let tmp = tmp_dir("addreplacerg-cram-input");
+    let sam = tmp.join("in.sam");
+    let bam = tmp.join("in.bam");
+    let cram = tmp.join("in.cram");
+    let reference = tmp.join("ref.fa");
+    let out = tmp.join("out.sam");
+
+    std::fs::write(&reference, ">chr1\nACGTACGT\n").unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+        ),
+    )
+    .unwrap();
+    htslib_rs::alignment_compat::write_bam_from_sam_path(
+        &sam,
+        std::fs::File::create(&bam).unwrap(),
+    )
+    .unwrap();
+    samtools_rs::reference::ensure_fai_index(&reference, None).unwrap();
+    htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+        &bam,
+        &reference,
+        std::fs::File::create(&cram).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(addreplacerg::main(&argv(
+            "addreplacerg",
+            &[
+                "--no-PG",
+                "-r",
+                "ID:g1",
+                "-T",
+                reference.to_str().unwrap(),
+                "-O",
+                "sam",
+                "-o",
+                out.to_str().unwrap(),
+                cram.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("@RG\tID:g1"));
+    assert!(text.contains("\nr1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:g1\n"));
+}
+
+#[test]
 fn addreplacerg_bam_input_to_sam_honors_orphan_only_mode() {
     let tmp = tmp_dir("addreplacerg-bam-input");
     let sam = tmp.join("in.sam");
@@ -5955,16 +6848,305 @@ fn calmd_bam_input_recomputes_md_and_nm_tags_to_sam_output() {
 }
 
 #[test]
-fn calmd_drop_baq_removes_bq_tags() {
-    let tmp = tmp_dir("calmd-drop-bq");
+fn calmd_max_nm_masks_matching_bases_and_qualities() {
+    let tmp = tmp_dir("calmd-max-nm");
     let sam = tmp.join("in.sam");
+    let reference = tmp.join("ref.fa");
     let out = tmp.join("out.sam");
+    std::fs::write(&reference, ">chr1\nACGTACGT\n").unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "low\t0\tchr1\t1\t60\t8M\t*\t0\t0\tACGTTCGT\tIIIIIIII\tNM:i:99\tMD:Z:0A0\n",
+            "high\t0\tchr1\t1\t60\t8M\t*\t0\t0\tACGTTCGA\tIIIIIIII\tNM:i:99\tMD:Z:0A0\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(calmd::main(&argv(
+            "calmd",
+            &[
+                "--no-PG",
+                "-n2",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+                reference.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let low = text.lines().find(|line| line.starts_with("low\t")).unwrap();
+    let high = text
+        .lines()
+        .find(|line| line.starts_with("high\t"))
+        .unwrap();
+
+    assert!(low.contains("\tACGTTCGT\tIIIIIIII\t"));
+    assert!(low.contains("\tNM:i:1"));
+    assert!(low.contains("\tMD:Z:4A3"));
+    assert!(high.contains("\tNNNNTNNA\t!!!!I!!I\t"));
+    assert!(high.contains("\tNM:i:2"));
+    assert!(high.contains("\tMD:Z:4A2T0"));
+    assert!(!high.contains("NM:i:99"));
+    assert!(!high.contains("MD:Z:0A0"));
+}
+
+#[test]
+fn calmd_dash_e_changes_matching_bases_for_mapped_and_unmapped_records() {
+    let tmp = tmp_dir("calmd-use-equal");
+    let sam = tmp.join("in.sam");
+    let reference = tmp.join("ref.fa");
+    let out = tmp.join("out.sam");
+    std::fs::write(&reference, ">chr1\nACGTACGT\n").unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "mapped\t0\tchr1\t1\t60\t8M\t*\t0\t0\tACGTTCGT\tIIIIIIII\tNM:i:99\tMD:Z:0A0\n",
+            "unmapped\t4\tchr1\t1\t0\t4M4S\t*\t0\t0\tACGTAAAA\t!!!!!!!!\tNM:i:99\tMD:Z:0A0\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(calmd::main(&argv(
+            "calmd",
+            &[
+                "--no-PG",
+                "-e",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+                reference.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let mapped = text
+        .lines()
+        .find(|line| line.starts_with("mapped\t"))
+        .unwrap();
+    let unmapped = text
+        .lines()
+        .find(|line| line.starts_with("unmapped\t"))
+        .unwrap();
+
+    assert!(mapped.contains("\t====T===\t"));
+    assert!(mapped.contains("\tNM:i:1"));
+    assert!(mapped.contains("\tMD:Z:4A3"));
+    assert!(unmapped.contains("\t====AAAA\t"));
+    assert!(unmapped.contains("\tNM:i:99"));
+    assert!(unmapped.contains("\tMD:Z:0A0"));
+}
+
+#[test]
+fn calmd_dash_q_bins_base_qualities() {
+    let tmp = tmp_dir("calmd-bin-qual");
+    let sam = tmp.join("in.sam");
+    let reference = tmp.join("ref.fa");
+    let out = tmp.join("out.sam");
+    std::fs::write(&reference, ">chr1\nACGTACGT\n").unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t8M\t*\t0\t0\tACGTTCGT\t!+5?IS]g\tNM:i:99\tMD:Z:0A0\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(calmd::main(&argv(
+            "calmd",
+            &[
+                "--no-PG",
+                "-q",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+                reference.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let record = text.lines().find(|line| line.starts_with("r1\t")).unwrap();
+    assert!(record.contains("\t!2<FPZdn\t"));
+    assert!(record.contains("\tNM:i:1"));
+    assert!(record.contains("\tMD:Z:4A3"));
+}
+
+#[test]
+fn calmd_dash_cap_n_preserves_existing_md_nm_tags() {
+    let tmp = tmp_dir("calmd-no-md-nm");
+    let sam = tmp.join("in.sam");
+    let reference = tmp.join("ref.fa");
+    let out = tmp.join("out.sam");
+    std::fs::write(&reference, ">chr1\nACGTACGT\n").unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t0\tchr1\t1\t60\t8M\t*\t0\t0\tACGTTCGT\tIIIIIIII\tNM:i:99\tMD:Z:0A0\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(calmd::main(&argv(
+            "calmd",
+            &[
+                "--no-PG",
+                "-N",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+                reference.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let record = text.lines().find(|line| line.starts_with("r1\t")).unwrap();
+    assert!(record.contains("\tNM:i:99"));
+    assert!(record.contains("\tMD:Z:0A0"));
+}
+
+#[test]
+fn calmd_cap_mapping_quality_uses_sam_cap_mapq() {
+    let tmp = tmp_dir("calmd-cap-mapq");
+    let sam = tmp.join("in.sam");
+    let reference = tmp.join("ref.fa");
+    let out = tmp.join("out.sam");
+    std::fs::write(&reference, ">sq0\nACGTACGT\n").unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@SQ\tSN:sq0\tLN:8\n",
+            "perfect\t0\tsq0\t1\t60\t8M\t*\t0\t0\tACGTACGT\tIIIIIIII\n",
+            "mismatch\t0\tsq0\t1\t60\t8M\t*\t0\t0\tACGTTCGT\tIIIIIIII\n",
+            "softclip\t0\tsq0\t1\t60\t2S6M\t*\t0\t0\tTTACGTAC\tIIIIIIII\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(calmd::main(&argv(
+            "calmd",
+            &[
+                "--no-PG",
+                "-C40",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+                reference.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let records: Vec<Vec<&str>> = text
+        .lines()
+        .filter(|line| !line.starts_with('@'))
+        .map(|line| line.split('\t').collect())
+        .collect();
+
+    assert_eq!(records[0][4], "40");
+    assert_eq!(records[1][4], "28");
+    assert_eq!(records[2][4], "31");
+    assert!(records[0].contains(&"NM:i:0"));
+    assert!(records[1].contains(&"NM:i:1"));
+    assert!(records[2].contains(&"NM:i:0"));
+}
+
+#[test]
+fn calmd_writes_cram_output_with_reference() {
+    let tmp = tmp_dir("calmd-cram-output");
+    let sam = tmp.join("in.sam");
+    let reference = tmp.join("ref.fa");
+    let out = tmp.join("out.cram");
+    let out_by_fmt = tmp.join("out.byfmt");
+    std::fs::write(&reference, ">chr1\nACGTACGTACGT\n").unwrap();
     std::fs::write(
         &sam,
         concat!(
             "@HD\tVN:1.6\n",
             "@SQ\tSN:chr1\tLN:12\n",
-            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tBQ:Z:abcd\tNM:i:0\n",
+            "r1\t0\tchr1\t1\t60\t4M1I2M1D2M\t*\t0\t0\tACGTTCGAC\t!!!!!!!!!\tNM:i:99\tMD:Z:0A0\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(calmd::main(&argv(
+            "calmd",
+            &[
+                "--no-PG",
+                "-o",
+                out.to_str().unwrap(),
+                sam.to_str().unwrap(),
+                reference.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(calmd::main(&argv(
+            "calmd",
+            &[
+                "--no-PG",
+                "--output-fmt=cram",
+                "-o",
+                out_by_fmt.to_str().unwrap(),
+                sam.to_str().unwrap(),
+                reference.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    for cram in [&out, &out_by_fmt] {
+        let text = htslib_rs::alignment_compat::view_cram_as_sam_text_with_reference(
+            std::io::Cursor::new(std::fs::read(cram).unwrap()),
+            &reference,
+            None,
+        )
+        .unwrap();
+        let record = text.lines().find(|line| line.starts_with("r1\t")).unwrap();
+        assert!(record.contains("\tNM:i:6"));
+        assert!(record.contains("\tMD:Z:4A0C0^G0T0A0"));
+        assert!(!record.contains("NM:i:99"));
+        assert!(!record.contains("MD:Z:0A0"));
+    }
+}
+
+#[test]
+fn calmd_dash_d_keeps_only_rg_aux_tag() {
+    let tmp = tmp_dir("calmd-drop-bq");
+    let sam = tmp.join("in.sam");
+    let reference = tmp.join("ref.fa");
+    let out = tmp.join("out.sam");
+    std::fs::write(&reference, ">chr1\nACGTACGTACGT\n").unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:12\n",
+            "r1\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\tRG:Z:g1\tBQ:Z:abcd\tXX:i:7\tNM:i:0\n",
         ),
     )
     .unwrap();
@@ -5978,6 +7160,7 @@ fn calmd_drop_baq_removes_bq_tags() {
                 "-o",
                 out.to_str().unwrap(),
                 sam.to_str().unwrap(),
+                reference.to_str().unwrap(),
             ]
         ))),
         0
@@ -5985,8 +7168,10 @@ fn calmd_drop_baq_removes_bq_tags() {
 
     let text = std::fs::read_to_string(&out).unwrap();
     let record = text.lines().find(|line| line.starts_with("r1\t")).unwrap();
+    assert!(record.ends_with("\tRG:Z:g1"));
     assert!(!record.contains("\tBQ:Z:"));
-    assert!(record.contains("\tNM:i:0"));
+    assert!(!record.contains("\tXX:i:"));
+    assert!(!record.contains("\tNM:i:"));
 }
 
 /// Mirrors upstream `test_calmd`: `calmd -uAr mpileup.1.sam
@@ -6043,6 +7228,95 @@ fn calmd_dash_u_a_r_emits_bgzf_bam_like_upstream() {
         std::fs::read_to_string(&counted).unwrap().trim(),
         in_records.to_string()
     );
+}
+
+#[test]
+fn calmd_baq_accepts_bam_and_cram_input() {
+    let dat = fixtures_dir().join("dat");
+    let sam = dat.join("mpileup.1.sam");
+    let reference = dat.join("mpileup.ref.fa");
+    let tmp = tmp_dir("calmd-baq-bam-cram");
+    let bam = tmp.join("in.bam");
+    let cram = tmp.join("in.cram");
+    let sam_out = tmp.join("sam.out");
+    let bam_out = tmp.join("bam.out");
+    let cram_out = tmp.join("cram.out");
+
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &[
+                "--no-PG",
+                "-b",
+                "-o",
+                bam.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(view::main(&argv(
+            "view",
+            &[
+                "--no-PG",
+                "-C",
+                "-T",
+                reference.to_str().unwrap(),
+                "-o",
+                cram.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    for (input, output) in [(&sam, &sam_out), (&bam, &bam_out), (&cram, &cram_out)] {
+        assert_eq!(
+            exit_to_u8(calmd::main(&argv(
+                "calmd",
+                &[
+                    "--no-PG",
+                    "-r",
+                    "-o",
+                    output.to_str().unwrap(),
+                    input.to_str().unwrap(),
+                    reference.to_str().unwrap(),
+                ]
+            ))),
+            0
+        );
+    }
+
+    let sam_records = non_header_lines(&std::fs::read_to_string(&sam_out).unwrap());
+    assert!(!sam_records.is_empty());
+    assert!(
+        sam_records.iter().any(|line| line.contains("\tBQ:Z:")),
+        "fixture should exercise recalculated BAQ tags"
+    );
+
+    let sam_qnames: Vec<&str> = sam_records
+        .iter()
+        .map(|line| line.split('\t').next().unwrap())
+        .collect();
+    for (label, output) in [("BAM", &bam_out), ("CRAM", &cram_out)] {
+        let records = non_header_lines(&std::fs::read_to_string(output).unwrap());
+        assert_eq!(records.len(), sam_records.len(), "{label} record count");
+        let qnames: Vec<&str> = records
+            .iter()
+            .map(|line| line.split('\t').next().unwrap())
+            .collect();
+        assert_eq!(qnames, sam_qnames, "{label} record order");
+        assert!(
+            records.iter().any(|line| line.contains("\tBQ:Z:")),
+            "{label} output should contain recalculated BAQ tags"
+        );
+        assert!(
+            records.iter().any(|line| line.contains("\tNM:i:"))
+                && records.iter().any(|line| line.contains("\tMD:Z:")),
+            "{label} output should contain recalculated MD/NM tags"
+        );
+    }
 }
 
 #[test]
@@ -6105,6 +7379,102 @@ fn markdup_sam_input_flags_duplicates_keeping_highest_score() {
         0,
         "different position is not a duplicate"
     );
+}
+
+#[test]
+fn markdup_accepts_reference_backed_cram_input_and_output() {
+    use samtools_rs::commands::markdup;
+
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    set_current_global_args(SamGlobalArgs::default());
+
+    let tmp = tmp_dir("markdup-cram");
+    let reference = tmp.join("ref.fa");
+    let sam = tmp.join("in.sam");
+    let bam = tmp.join("in.bam");
+    let cram = tmp.join("in.cram");
+    let out_sam = tmp.join("out.sam");
+    let out_cram = tmp.join("out.cram");
+
+    std::fs::write(&reference, ">chr1\nACGTACGTACGTACGTACGTACGTACGTACGT\n").unwrap();
+    samtools_rs::reference::ensure_fai_index(&reference, None).unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:32\n",
+            "low\t0\tchr1\t1\t10\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "high\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\tIIII\n",
+            "unique\t0\tchr1\t2\t30\t4M\t*\t0\t0\tCGTA\t####\n",
+        ),
+    )
+    .unwrap();
+    htslib_rs::alignment_compat::write_bam_from_sam_path(
+        &sam,
+        std::fs::File::create(&bam).unwrap(),
+    )
+    .unwrap();
+    htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+        &bam,
+        &reference,
+        std::fs::File::create(&cram).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "--no-PG",
+                "-T",
+                reference.to_str().unwrap(),
+                "-O",
+                "sam",
+                "-o",
+                out_sam.to_str().unwrap(),
+                cram.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let text = std::fs::read_to_string(&out_sam).unwrap();
+    let flag_of = |text: &str, name: &str| -> u32 {
+        text.lines()
+            .find(|line| line.starts_with(&format!("{name}\t")))
+            .unwrap()
+            .split('\t')
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    assert_eq!(flag_of(&text, "high") & 0x400, 0);
+    assert_eq!(flag_of(&text, "low") & 0x400, 0x400);
+
+    assert_eq!(
+        exit_to_u8(markdup::main(&argv(
+            "markdup",
+            &[
+                "--no-PG",
+                "-T",
+                reference.to_str().unwrap(),
+                "--output-fmt=cram",
+                sam.to_str().unwrap(),
+                out_cram.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let cram_text = htslib_rs::alignment_compat::view_cram_as_sam_text_with_reference(
+        std::io::Cursor::new(std::fs::read(&out_cram).unwrap()),
+        &reference,
+        None,
+    )
+    .unwrap();
+    assert_eq!(flag_of(&cram_text, "high") & 0x400, 0);
+    assert_eq!(flag_of(&cram_text, "low") & 0x400, 0x400);
+
+    set_current_global_args(SamGlobalArgs::default());
 }
 
 #[test]
@@ -6649,6 +8019,119 @@ fn ampliconstats_matches_upstream_test_ampliconstats_fixtures() {
 }
 
 #[test]
+fn ampliconstats_use_sample_name_uses_first_read_group_sample() {
+    use samtools_rs::commands::ampliconstats;
+
+    let tmp = tmp_dir("ampliconstats-sample-name");
+    let bed = tmp.join("primers.bed");
+    let sam = tmp.join("input_name.sam");
+    let out = tmp.join("out.txt");
+
+    std::fs::write(
+        &bed,
+        concat!("chr1\t0\t10\tleft\t0\t+\n", "chr1\t90\t100\tright\t0\t-\n",),
+    )
+    .unwrap();
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:100\n",
+            "@RG\tID:first\tSM:sample_from_header\n",
+            "@RG\tID:second\tSM:ignored_sample\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(ampliconstats::main(&argv(
+            "ampliconstats",
+            &[
+                "-s",
+                "-o",
+                out.to_str().unwrap(),
+                bed.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert!(text.contains("FSS\tsample_from_header\tchr1\traw total sequences:\t0"));
+    assert!(text.contains("FREADS\tsample_from_header\t0"));
+    assert!(!text.contains("FSS\tinput_name\t"));
+    assert!(!text.contains("ignored_sample"));
+}
+
+#[test]
+fn ampliconstats_accepts_bam_and_reference_backed_cram_input() {
+    use samtools_rs::commands::ampliconstats;
+
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    set_current_global_args(SamGlobalArgs::default());
+
+    let tmp = tmp_dir("ampliconstats-bam-cram");
+    let bed = tmp.join("primers.bed");
+    let bam_out = tmp.join("bam.txt");
+    let cram_out = tmp.join("cram.txt");
+    let hts = htslib_fixtures_dir();
+    let bam = hts.join("range.bam");
+    let cram = hts.join("range.cram");
+    let reference = hts.join("ce.fa");
+
+    std::fs::write(
+        &bed,
+        concat!(
+            "CHROMOSOME_II\t2960\t2970\tleft\t0\t+\n",
+            "CHROMOSOME_II\t3000\t3010\tright\t0\t-\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(ampliconstats::main(&argv(
+            "ampliconstats",
+            &[
+                "-c",
+                "0",
+                "-o",
+                bam_out.to_str().unwrap(),
+                bed.to_str().unwrap(),
+                bam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let bam_text = std::fs::read_to_string(&bam_out).unwrap();
+    assert!(bam_text.contains("FSS\trange\tCHROMOSOME_II\traw total sequences:"));
+
+    set_current_global_args(SamGlobalArgs {
+        reference: Some(reference),
+        ..SamGlobalArgs::default()
+    });
+    assert_eq!(
+        exit_to_u8(ampliconstats::main(&argv(
+            "ampliconstats",
+            &[
+                "-s",
+                "-c",
+                "0",
+                "-o",
+                cram_out.to_str().unwrap(),
+                bed.to_str().unwrap(),
+                cram.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    set_current_global_args(SamGlobalArgs::default());
+
+    let cram_text = std::fs::read_to_string(cram_out).unwrap();
+    assert!(cram_text.contains("FSS\tERS225193\tCHROMOSOME_II\traw total sequences:"));
+}
+
+#[test]
 fn stats_matches_upstream_stat_fixtures() {
     use samtools_rs::commands::stats;
     // Byte-exact end to end vs samtools' own `test/stat/*` expected
@@ -7122,6 +8605,18 @@ fn ampliconclip_matches_upstream_test_ampliconclip_fixtures() {
             &[
                 "--no-PG",
                 "--output-fmt=sam",
+                "--keep-tag",
+                "--both-ends",
+                "-b",
+                "multi_ref.bed",
+                "3_multi_ref_data.sam",
+            ],
+            "3_multi_ref_both_clip",
+        ),
+        (
+            &[
+                "--no-PG",
+                "--output-fmt=sam",
                 "--hard-clip",
                 "-b",
                 "ac_test2.bed",
@@ -7149,9 +8644,25 @@ fn ampliconclip_matches_upstream_test_ampliconclip_fixtures() {
             0,
             "ampliconclip {expected}"
         );
+        let mut expected_text =
+            std::fs::read_to_string(d.join(format!("{expected}.expected.sam"))).unwrap();
+        if *expected == "3_multi_ref_both_clip" {
+            // The dormant upstream expected file predates current
+            // bam_ampliconclip behavior. Current C samtools clips these two
+            // extra --both-ends multi-ref edges.
+            expected_text = expected_text
+                .replace(
+                    "read_3\t161\tvir1\t132\t60\t210M\t=",
+                    "read_3\t161\tvir1\t132\t60\t189M21S\t=",
+                )
+                .replace(
+                    "read_4\t97\tvir1\t407\t60\t86S124M\t=",
+                    "read_4\t97\tvir1\t411\t60\t90S120M\t=",
+                );
+        }
         assert_eq!(
             std::fs::read_to_string(&out).unwrap(),
-            std::fs::read_to_string(d.join(format!("{expected}.expected.sam"))).unwrap(),
+            expected_text,
             "ampliconclip {expected} byte-exact",
         );
     }
@@ -7206,6 +8717,116 @@ fn ampliconclip_matches_upstream_test_ampliconclip_fixtures() {
             "ampliconclip {expected} byte-exact",
         );
     }
+}
+
+#[test]
+fn ampliconclip_accepts_reference_backed_cram_input_and_output() {
+    use samtools_rs::commands::ampliconclip;
+
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    set_current_global_args(SamGlobalArgs::default());
+
+    let d = fixtures_dir().join("ampliconclip");
+    let tmp = tmp_dir("ampliconclip-cram");
+    let input_sam = d.join("1_test_data.sam");
+    let input_bam = tmp.join("in.bam");
+    let input_cram = tmp.join("in.cram");
+    let reference = tmp.join("ref.fa");
+    let baseline = tmp.join("baseline.sam");
+    let cram_input_out = tmp.join("cram-input.sam");
+    let out_cram = tmp.join("out.cram");
+    let bed = d.join("ac_test.bed");
+
+    std::fs::write(&reference, format!(">vir1\n{}\n", "N".repeat(800))).unwrap();
+    samtools_rs::reference::ensure_fai_index(&reference, None).unwrap();
+    htslib_rs::alignment_compat::write_bam_from_sam_path(
+        &input_sam,
+        std::fs::File::create(&input_bam).unwrap(),
+    )
+    .unwrap();
+    htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+        &input_bam,
+        &reference,
+        std::fs::File::create(&input_cram).unwrap(),
+    )
+    .unwrap();
+
+    let base_args = [
+        "--no-PG",
+        "--keep-tag",
+        "--output-fmt=sam",
+        "-b",
+        bed.to_str().unwrap(),
+    ];
+    let mut baseline_args: Vec<&str> = base_args.to_vec();
+    baseline_args.extend([
+        "-o",
+        baseline.to_str().unwrap(),
+        input_sam.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        exit_to_u8(ampliconclip::main(&argv("ampliconclip", &baseline_args))),
+        0
+    );
+
+    let mut cram_input_args: Vec<&str> = base_args.to_vec();
+    cram_input_args.extend([
+        "-T",
+        reference.to_str().unwrap(),
+        "-o",
+        cram_input_out.to_str().unwrap(),
+        input_cram.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        exit_to_u8(ampliconclip::main(&argv("ampliconclip", &cram_input_args))),
+        0
+    );
+    assert_eq!(
+        non_header_lines(&std::fs::read_to_string(&cram_input_out).unwrap()),
+        non_header_lines(&std::fs::read_to_string(&baseline).unwrap())
+    );
+
+    let without_md_nm = |text: &str| -> Vec<String> {
+        non_header_lines(text)
+            .into_iter()
+            .map(|line| {
+                line.split('\t')
+                    .filter(|field| !field.starts_with("MD:Z:") && !field.starts_with("NM:i:"))
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect()
+    };
+    assert_eq!(
+        exit_to_u8(ampliconclip::main(&argv(
+            "ampliconclip",
+            &[
+                "--no-PG",
+                "--keep-tag",
+                "--output-fmt=cram",
+                "-T",
+                reference.to_str().unwrap(),
+                "-b",
+                bed.to_str().unwrap(),
+                "-o",
+                out_cram.to_str().unwrap(),
+                input_sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    let cram_text = htslib_rs::alignment_compat::view_cram_as_sam_text_with_reference(
+        std::io::Cursor::new(std::fs::read(&out_cram).unwrap()),
+        &reference,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        without_md_nm(&cram_text),
+        without_md_nm(&std::fs::read_to_string(&baseline).unwrap())
+    );
+
+    set_current_global_args(SamGlobalArgs::default());
 }
 
 #[test]
@@ -7364,6 +8985,34 @@ fn markdup_matches_upstream_test_markdup_fixtures() {
 }
 
 #[test]
+fn markdup_upstream_expect_fail_cases_return_one_with_expected_partial_output() {
+    use samtools_rs::commands::markdup;
+    let d = fixtures_dir();
+    let tmp = tmp_dir("markdup-expect-fail");
+    let cases = ["1_name_sort", "2_bad_order", "3_missing_mc", "4_missing_ms"];
+
+    for stem in cases {
+        let inp = d.join("markdup").join(format!("{stem}.sam"));
+        let out = tmp.join(format!("{stem}.out.sam"));
+        let inp_s = inp.to_str().unwrap();
+        let out_s = out.to_str().unwrap();
+        assert_eq!(
+            exit_to_u8(markdup::main(&argv(
+                "markdup",
+                &["-O", "sam", "--no-PG", "-o", out_s, inp_s]
+            ))),
+            1,
+            "markdup {stem} should fail like upstream"
+        );
+        let actual = std::fs::read_to_string(&out).unwrap_or_default();
+        let expected =
+            std::fs::read_to_string(d.join("markdup").join(format!("{stem}.expected.sam")))
+                .unwrap();
+        assert_eq!(actual, expected, "markdup {stem} partial stdout");
+    }
+}
+
+#[test]
 fn markdup_paired_end_groups_pairs_and_flags_duplicates() {
     use samtools_rs::commands::markdup;
     let tmp = tmp_dir("markdup-pe");
@@ -7377,12 +9026,12 @@ fn markdup_paired_end_groups_pairs_and_flags_duplicates() {
         concat!(
             "@HD\tVN:1.6\tSO:coordinate\n",
             "@SQ\tSN:chr1\tLN:1000\n",
-            "pair_a\t99\tchr1\t1\t60\t10M\t=\t91\t100\tACGTACGTAC\tIIIIIIIIII\n",
-            "pair_a\t147\tchr1\t91\t60\t10M\t=\t1\t-100\tACGTACGTAC\tIIIIIIIIII\n",
-            "pair_b\t99\tchr1\t1\t10\t10M\t=\t91\t100\tACGTACGTAC\tIIIIIIIIII\n",
-            "pair_b\t147\tchr1\t91\t10\t10M\t=\t1\t-100\tACGTACGTAC\tIIIIIIIIII\n",
-            "pair_c\t99\tchr1\t200\t60\t10M\t=\t291\t100\tACGTACGTAC\tIIIIIIIIII\n",
-            "pair_c\t147\tchr1\t291\t60\t10M\t=\t200\t-100\tACGTACGTAC\tIIIIIIIIII\n",
+            "pair_a\t99\tchr1\t1\t60\t10M\t=\t91\t100\tACGTACGTAC\tIIIIIIIIII\tMC:Z:10M\tms:i:400\n",
+            "pair_b\t99\tchr1\t1\t10\t10M\t=\t91\t100\tACGTACGTAC\tIIIIIIIIII\tMC:Z:10M\tms:i:250\n",
+            "pair_a\t147\tchr1\t91\t60\t10M\t=\t1\t-100\tACGTACGTAC\tIIIIIIIIII\tMC:Z:10M\tms:i:400\n",
+            "pair_b\t147\tchr1\t91\t10\t10M\t=\t1\t-100\tACGTACGTAC\tIIIIIIIIII\tMC:Z:10M\tms:i:250\n",
+            "pair_c\t99\tchr1\t200\t60\t10M\t=\t291\t100\tACGTACGTAC\tIIIIIIIIII\tMC:Z:10M\tms:i:400\n",
+            "pair_c\t147\tchr1\t291\t60\t10M\t=\t200\t-100\tACGTACGTAC\tIIIIIIIIII\tMC:Z:10M\tms:i:400\n",
         ),
     )
     .unwrap();
@@ -7459,6 +9108,47 @@ fn mpileup_minus_b_ff_matches_upstream_out3() {
 }
 
 #[test]
+fn mpileup_default_baq_matches_upstream_out1() {
+    let tmp = tmp_dir("mpileup-out1-baq");
+    let list = tmp.join("inputs.list");
+    let output = tmp.join("out.1");
+    let dat = fixtures_dir().join("dat");
+    let reference = dat.join("mpileup.ref.fa");
+    let expected = dat.join("mpileup.out.1");
+    std::fs::write(
+        &list,
+        format!(
+            "{}\n{}\n{}\n",
+            dat.join("mpileup.1.sam").display(),
+            dat.join("mpileup.2.sam").display(),
+            dat.join("mpileup.3.sam").display()
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(mpileup::main(&argv(
+            "mpileup",
+            &[
+                "-b",
+                list.to_str().unwrap(),
+                "-f",
+                reference.to_str().unwrap(),
+                "-r17:100-150",
+                "-o",
+                output.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(output).unwrap(),
+        std::fs::read_to_string(expected).unwrap()
+    );
+}
+
+#[test]
 fn mpileup_overlap_removal_matches_upstream_out5() {
     let tmp = tmp_dir("mpileup-out5");
     let output = tmp.join("out.5");
@@ -7495,6 +9185,55 @@ fn index_bam_without_so_coordinate_header() {
         0
     );
     assert!(bam.with_extension("bam.bai").exists());
+}
+
+#[test]
+fn index_threads_use_bgzf_worker_reader() {
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    set_current_global_args(SamGlobalArgs::default());
+    let tmp = tmp_dir("index-threads");
+    let serial_bam = tmp.join("serial.bam");
+    let local_threaded_bam = tmp.join("local-threaded.bam");
+    let global_threaded_bam = tmp.join("global-threaded.bam");
+    let fixture = fixtures_dir().join("dat").join("test_input_1_a.bam");
+    for bam in [&serial_bam, &local_threaded_bam, &global_threaded_bam] {
+        std::fs::copy(&fixture, bam).unwrap();
+    }
+
+    assert_eq!(
+        exit_to_u8(index::main(&argv("index", &[serial_bam.to_str().unwrap()]))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(index::main(&argv(
+            "index",
+            &["--threads=2", local_threaded_bam.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    set_current_global_args(SamGlobalArgs {
+        threads: Some(2),
+        ..SamGlobalArgs::default()
+    });
+    assert_eq!(
+        exit_to_u8(index::main(&argv(
+            "index",
+            &[global_threaded_bam.to_str().unwrap()]
+        ))),
+        0
+    );
+    set_current_global_args(SamGlobalArgs::default());
+
+    let serial_index = std::fs::read(serial_bam.with_extension("bam.bai")).unwrap();
+    assert_eq!(
+        serial_index,
+        std::fs::read(local_threaded_bam.with_extension("bam.bai")).unwrap()
+    );
+    assert_eq!(
+        serial_index,
+        std::fs::read(global_threaded_bam.with_extension("bam.bai")).unwrap()
+    );
 }
 
 #[test]
@@ -7745,12 +9484,11 @@ fn checksum_cram_matches_bam_via_all_record_iterator() {
 
 #[test]
 fn view_write_index_matches_post_pass_index() {
-    // completed library batch #9: `view --write-index` BAM output must produce a BAI
-    // byte-identical to a separate `samtools index` pass.
+    // `view --write-index` BAM output follows upstream auto-indexing and writes CSI.
     let bam = htslib_fixtures_dir().join("range.bam");
     let tmp = tmp_dir("view-write-index");
     let auto = tmp.join("auto.bam");
-    let post_bai = tmp.join("post.bam.bai");
+    let post_csi = tmp.join("post.bam.csi");
 
     assert_eq!(
         exit_to_u8(view::main(&argv(
@@ -7765,21 +9503,21 @@ fn view_write_index_matches_post_pass_index() {
         ))),
         0
     );
-    let auto_bai = auto.with_extension("bam.bai");
-    assert!(auto_bai.exists(), "view --write-index did not write a .bai");
-    let auto_bytes = std::fs::read(&auto_bai).unwrap();
+    let auto_csi = auto.with_extension("bam.csi");
+    assert!(auto_csi.exists(), "view --write-index did not write a .csi");
+    let auto_bytes = std::fs::read(&auto_csi).unwrap();
 
     assert_eq!(
         exit_to_u8(index::main(&argv(
             "index",
-            &[auto.to_str().unwrap(), post_bai.to_str().unwrap()]
+            &["-c", auto.to_str().unwrap(), post_csi.to_str().unwrap()]
         ))),
         0
     );
     assert_eq!(
         auto_bytes,
-        std::fs::read(&post_bai).unwrap(),
-        "--write-index BAI must equal the post-pass BAI"
+        std::fs::read(&post_csi).unwrap(),
+        "--write-index CSI must equal the post-pass CSI"
     );
 }
 
@@ -8031,6 +9769,100 @@ fn depth_large_pos_matches_upstream() {
 }
 
 #[test]
+fn fixmate_accepts_reference_backed_cram_input() {
+    use samtools_rs::commands::fixmate;
+
+    let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    set_current_global_args(SamGlobalArgs::default());
+
+    let tmp = tmp_dir("fixmate-cram");
+    let reference = tmp.join("ref.fa");
+    let input_sam = tmp.join("in.sam");
+    let input_bam = tmp.join("in.bam");
+    let input_cram = tmp.join("in.cram");
+    let out = tmp.join("out.sam");
+    let out_cram = tmp.join("out.cram");
+
+    std::fs::write(&reference, ">chr1\nACGTTGCA\n").unwrap();
+    samtools_rs::reference::ensure_fai_index(&reference, None).unwrap();
+    std::fs::write(
+        &input_sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:queryname\n",
+            "@SQ\tSN:chr1\tLN:8\n",
+            "r1\t65\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t!!!!\n",
+            "r1\t129\tchr1\t5\t60\t4M\t*\t0\t0\tTGCA\t####\n",
+        ),
+    )
+    .unwrap();
+    htslib_rs::alignment_compat::write_bam_from_sam_path(
+        &input_sam,
+        std::fs::File::create(&input_bam).unwrap(),
+    )
+    .unwrap();
+    htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+        &input_bam,
+        &reference,
+        std::fs::File::create(&input_cram).unwrap(),
+    )
+    .unwrap();
+
+    set_current_global_args(SamGlobalArgs {
+        reference: Some(reference.clone()),
+        ..SamGlobalArgs::default()
+    });
+    assert_eq!(
+        exit_to_u8(fixmate::main(&argv(
+            "fixmate",
+            &[
+                "--no-PG",
+                "-O",
+                "sam",
+                input_cram.to_str().unwrap(),
+                out.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    set_current_global_args(SamGlobalArgs::default());
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(text.contains("r1\t65\tchr1\t1\t60\t4M\t=\t5\t4\tACGT\t!!!!"));
+    assert!(text.contains("r1\t129\tchr1\t5\t60\t4M\t=\t1\t-4\tTGCA\t####"));
+
+    set_current_global_args(SamGlobalArgs {
+        reference: Some(reference.clone()),
+        ..SamGlobalArgs::default()
+    });
+    assert_eq!(
+        exit_to_u8(fixmate::main(&argv(
+            "fixmate",
+            &[
+                "--no-PG",
+                "--output-fmt=cram",
+                input_sam.to_str().unwrap(),
+                out_cram.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    set_current_global_args(SamGlobalArgs::default());
+
+    let records = htslib_rs::alignment_compat::summarize_cram_records_from_path_with_reference(
+        &out_cram, &reference,
+    )
+    .unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].name_bytes(), Some(&b"r1"[..]));
+    assert_eq!(records[0].mate_reference_sequence_id(), Some(0));
+    assert_eq!(records[0].mate_alignment_start(), Some(5));
+    assert_eq!(records[0].template_length(), 8);
+    assert_eq!(records[1].mate_reference_sequence_id(), Some(0));
+    assert_eq!(records[1].mate_alignment_start(), Some(1));
+    assert_eq!(records[1].template_length(), -8);
+}
+
+#[test]
 fn fixmate_matches_upstream_group() {
     // TODO.md §13 / completed library batch #7: full upstream test_fixmate group
     // byte-exact (modulo @PG, which the harness strips). Exercises
@@ -8047,6 +9879,18 @@ fn fixmate_matches_upstream_group() {
         (&["-z", "off", "-O", "sam"], "7_two_read_mapped"),
         (&["-z", "off", "-O", "sam"], "8_isize_overflow_64bit"),
         (&["-O", "sam"], "sanitize"),
+        (&["-M", "-z", "off", "-O", "sam"], "mod_ok+"),
+        (&["-M", "-z", "off", "-O", "sam"], "mod_ok-"),
+        (&["-M", "-z", "off", "-O", "sam"], "mod_draft"),
+        (&["-M", "-z", "off", "-O", "sam"], "mod_not_updated"),
+        (&["-M", "-z", "off", "-O", "sam"], "mod_not_updated_noML"),
+        (&["-M", "-z", "off", "-O", "sam"], "mod_not_updated_noMN"),
+        (&["-M", "-z", "off", "-O", "sam"], "mod_bad_MN"),
+        (&["-M", "-z", "off", "-O", "sam"], "mod_MN_only"),
+        (&["-M", "-z", "off", "-O", "sam"], "mod_ML_only"),
+        (&["-M", "-z", "off", "-O", "sam"], "mod_ML_wrong_len"),
+        (&["-M", "-z", "off", "-O", "sam"], "mod_noseq"),
+        (&["-M", "-z", "off", "-O", "sam"], "mod_bounds"),
     ];
     for (args, name) in cases {
         let out = tmp.join(format!("{name}.out"));

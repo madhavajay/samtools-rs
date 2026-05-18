@@ -2,8 +2,7 @@
 //!
 //! This is a partial port of `bam_checksum.c`. It supports SAM/BAM input for
 //! the default checksum columns and common filters, plus CRAM input via the
-//! htslib-rs whole-CRAM all-record iterator (completed library batch #2; needs the global
-//! `--reference`).
+//! htslib-rs whole-CRAM all-record iterator (completed library batch #2).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -20,7 +19,7 @@ use crate::bam_flag::{
     BAM_FPAIRED, BAM_FQCFAIL, BAM_FREAD1, BAM_FREAD2, BAM_FSECONDARY, BAM_FSUPPLEMENTARY,
     flag_to_str, str_to_flag,
 };
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
 use crate::sanitize::{SanitizeFlags, parse_sanitize_options, sanitize_record};
 
@@ -149,6 +148,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
 
     let mut ret = ExitCode::SUCCESS;
     for input in inputs {
+        if input.as_os_str() != "-" && !input.exists() {
+            print_hts_open_missing(&input);
+            print_error(
+                "checksum",
+                format!(
+                    "Cannot open input file \"{}\": No such file or directory",
+                    input.display()
+                ),
+            );
+            eprintln!("[checksum] Failed to process data");
+            ret = ExitCode::from(1);
+            continue;
+        }
         if let Err(e) = checksum_path(&input, &opts, &mut writer) {
             print_error_errno(
                 "checksum",
@@ -373,21 +385,22 @@ fn checksum_path(input: &Path, opts: &ChecksumOptions, writer: &mut dyn Write) -
                 }
             }
             Exact::Cram => {
-                // completed library batch #2: whole-CRAM via the htslib-rs all-record
-                // iterator, decoded against the global --reference.
-                let Some(reference) = crate::sam_global::current_global_args().reference else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "CRAM checksum requires top-level --reference FILE",
-                    ));
-                };
+                // Completed library batch #2: whole-CRAM via the htslib-rs
+                // all-record iterator. Prefer an explicit reference when one
+                // is supplied, but allow embedded/self-contained CRAMs to
+                // decode without one like upstream checksum.
                 let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
                 let mut seen = 0u64;
-                for mut record in
+                let records = if let Some(reference) =
+                    crate::sam_global::current_global_args().reference
+                {
                     htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
                         input, &reference,
                     )?
-                {
+                } else {
+                    htslib_rs::alignment_compat::query_cram_records_all_from_path(input)?
+                };
+                for mut record in records {
                     if update_record_buf(
                         &header,
                         &mut record,
@@ -406,7 +419,7 @@ fn checksum_path(input: &Path, opts: &ChecksumOptions, writer: &mut dyn Write) -
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    "only SAM and BAM input are currently supported",
+                    "only SAM, BAM, and CRAM input are currently supported",
                 ));
             }
         }

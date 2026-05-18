@@ -462,21 +462,48 @@ fn depth_cram_region_uses_top_level_reference() {
 }
 
 #[test]
-fn depth_cram_without_reference_fails_cleanly() {
+fn depth_cram_without_reference_matches_reference_backed_region() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
+    let tmp = tmp_dir("depth-cram-no-ref");
+    let reference_out = tmp.join("depth-reference.tsv");
+    let synthetic_out = tmp.join("depth-synthetic.tsv");
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
     let cram = htslib_fixtures_dir().join("range.cram");
 
-    assert_ne!(
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "depth",
+                "-r",
+                "CHROMOSOME_II:2980-2980",
+                "-o",
+                reference_out.to_str().unwrap(),
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+    assert_eq!(
         exit_to_u8(samtools_run(argv(
             "samtools",
             &[
                 "depth",
                 "-r",
                 "CHROMOSOME_II:2980-2980",
+                "-o",
+                synthetic_out.to_str().unwrap(),
                 cram.to_str().unwrap(),
             ],
         ))),
         0
+    );
+    assert_eq!(
+        std::fs::read_to_string(reference_out).unwrap(),
+        std::fs::read_to_string(synthetic_out).unwrap()
     );
 }
 
@@ -896,6 +923,36 @@ fn coverage_min_depth_and_base_quality_filter_covbases() {
 }
 
 #[test]
+fn coverage_missing_quality_uses_htslib_sentinel_baseq() {
+    let tmp = tmp_dir("coverage-missing-quality");
+    let sam = tmp.join("in.sam");
+    let out = tmp.join("coverage.tsv");
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\n",
+            "@SQ\tSN:chr1\tLN:4\n",
+            "missing\t0\tchr1\t1\t60\t4M\t*\t0\t0\tACGT\t*\n",
+            "present\t0\tchr1\t1\t60\t4M\t*\t0\t0\tTGCA\t!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &["-H", "-o", out.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(out).unwrap(),
+        "chr1\t1\t4\t2\t4\t100\t2\t128\t60\n"
+    );
+}
+
+#[test]
 fn coverage_cram_region_uses_top_level_reference() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let tmp = tmp_dir("coverage-cram");
@@ -926,21 +983,48 @@ fn coverage_cram_region_uses_top_level_reference() {
 }
 
 #[test]
-fn coverage_cram_without_reference_fails_cleanly() {
+fn coverage_cram_without_reference_matches_reference_backed_region() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
-    let cram = htslib_fixtures_dir().join("range.cram");
+    let tmp = tmp_dir("coverage-cram-no-ref");
+    let reference_out = tmp.join("coverage-reference.tsv");
+    let synthetic_out = tmp.join("coverage-synthetic.tsv");
+    let fixtures = htslib_fixtures_dir();
+    let reference = fixtures.join("ce.fa");
+    let cram = fixtures.join("range.cram");
 
-    assert_ne!(
+    assert_eq!(
+        exit_to_u8(samtools_run(argv(
+            "samtools",
+            &[
+                "--reference",
+                reference.to_str().unwrap(),
+                "coverage",
+                "-r",
+                "CHROMOSOME_II:2980-2980",
+                "-o",
+                reference_out.to_str().unwrap(),
+                cram.to_str().unwrap(),
+            ],
+        ))),
+        0
+    );
+    assert_eq!(
         exit_to_u8(samtools_run(argv(
             "samtools",
             &[
                 "coverage",
                 "-r",
                 "CHROMOSOME_II:2980-2980",
+                "-o",
+                synthetic_out.to_str().unwrap(),
                 cram.to_str().unwrap(),
             ],
         ))),
         0
+    );
+    assert_eq!(
+        std::fs::read_to_string(reference_out).unwrap(),
+        std::fs::read_to_string(synthetic_out).unwrap()
     );
 }
 
@@ -1569,14 +1653,14 @@ fn bedcov_cram_uses_top_level_reference() {
 }
 
 #[test]
-fn bedcov_cram_without_reference_fails_cleanly() {
+fn bedcov_cram_without_reference_succeeds() {
     let _guard = GLOBAL_ARGS_LOCK.lock().unwrap();
     let tmp = tmp_dir("bedcov-cram-no-ref");
     let bed = tmp.join("r.bed");
     let cram = htslib_fixtures_dir().join("range.cram");
     std::fs::write(&bed, "CHROMOSOME_II\t2979\t2980\n").unwrap();
 
-    assert_ne!(
+    assert_eq!(
         exit_to_u8(samtools_run(argv(
             "samtools",
             &["bedcov", bed.to_str().unwrap(), cram.to_str().unwrap()],
@@ -2020,6 +2104,7 @@ r2\t0\tchr1\t1\t60\t40M\t*\t0\t0\tACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\t!!!!
             "coverage",
             &[
                 "-m",
+                "-A",
                 "-w",
                 "20",
                 "-o",
@@ -2040,6 +2125,63 @@ r2\t0\tchr1\t1\t60\t40M\t*\t0\t0\tACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\t!!!!
         .find(|l| l.contains("0.00%"))
         .expect("histogram has a 0% row");
     assert!(bottom.contains(':') || bottom.contains('.'));
+    assert!(text.contains("          1         40         80   \n"));
+}
+
+#[test]
+fn coverage_depth_plot_uses_depth_bins_not_breadth_histogram() {
+    let tmp = tmp_dir("coverage-depth-plot");
+    let sam = tmp.join("in.sam");
+    let hist = tmp.join("hist.txt");
+    let depth = tmp.join("depth.txt");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:80
+r1\t0\tchr1\t1\t60\t40M\t*\t0\t0\tACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\t!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+r2\t0\tchr1\t1\t60\t40M\t*\t0\t0\tACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\t!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-A",
+                "-w",
+                "20",
+                "-o",
+                hist.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+    assert_eq!(
+        exit_to_u8(coverage::main(&argv(
+            "coverage",
+            &[
+                "-D",
+                "-A",
+                "-w",
+                "20",
+                "-o",
+                depth.to_str().unwrap(),
+                sam.to_str().unwrap(),
+            ]
+        ))),
+        0
+    );
+
+    let hist_text = std::fs::read_to_string(&hist).unwrap();
+    let depth_text = std::fs::read_to_string(&depth).unwrap();
+    assert_ne!(hist_text, depth_text);
+    assert!(hist_text.contains("Histo max bin:"));
+    assert!(depth_text.contains("Histo max cov:"));
+    assert!(depth_text.lines().any(|line| line.starts_with(">     1.")));
+    assert!(depth_text.contains("          1         40         80   \n"));
 }
 
 #[test]
@@ -2076,6 +2218,42 @@ r1\t147\tchr1\t91\t60\t10M\t=\t1\t-100\tACGTACGTAC\tIIIIIIIIII
     assert_eq!(stats_sn_text(&text, "average length"), "10");
     // Quality 'I' is ASCII 73 → Phred 73-33=40.
     assert_eq!(stats_sn_text(&text, "average quality"), "40.0");
+}
+
+#[test]
+fn stats_read_other_affects_average_quality_and_proper_pair_denominator_like_upstream() {
+    let tmp = tmp_dir("stats-read-other");
+    let sam = tmp.join("read-other.sam");
+    let out = tmp.join("read-other.stats");
+    std::fs::write(
+        &sam,
+        "\
+@HD\tVN:1.6\tSO:coordinate
+@SQ\tSN:chr1\tLN:1000
+pair\t99\tchr1\t1\t60\t10M\t=\t91\t100\tACGTACGTAC\tIIIIIIIIII
+pair\t147\tchr1\t91\t60\t10M\t=\t1\t-100\tTGCATGCATG\tIIIIIIIIII
+other\t1\tchr1\t200\t60\t10M\t*\t0\t0\tAAAAAAAAAA\t!!!!!!!!!!
+",
+    )
+    .unwrap();
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &["-o", out.to_str().unwrap(), sam.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    assert_eq!(stats_sn_value(&text, "sequences"), 3);
+    assert_eq!(stats_sn_value(&text, "1st fragments"), 1);
+    assert_eq!(stats_sn_value(&text, "last fragments"), 1);
+    assert_eq!(stats_sn_text(&text, "average quality"), "26.7");
+    assert_eq!(
+        stats_sn_text(&text, "percentage of properly paired reads (%)"),
+        "66.7"
+    );
 }
 
 #[test]
@@ -2236,6 +2414,34 @@ r6\t0\tchr1\t5\t60\t2M\t*\t0\t0\tCC\tII
     assert!(!text.contains("COV\t[1-1]"));
     assert!(text.contains("COV\t[2-3]\t2\t4\n"));
     assert!(text.contains("COV\t[4-4]\t4\t2\n"));
+}
+
+#[test]
+fn stats_no_reference_gcd_matches_upstream_multibin_shape() {
+    let tmp = tmp_dir("stats-gcd");
+    let input = fixtures_dir().join("dat").join("test_input_1_a.bam");
+    let out = tmp.join("gcd.stats");
+
+    assert_eq!(
+        exit_to_u8(stats::main(&argv(
+            "stats",
+            &["-o", out.to_str().unwrap(), input.to_str().unwrap()]
+        ))),
+        0
+    );
+
+    let text = std::fs::read_to_string(out).unwrap();
+    let gcd = text
+        .lines()
+        .filter(|line| line.starts_with("GCD\t"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        gcd,
+        "GCD\t0.0\t50.000\t0.000\t0.000\t0.000\t0.000\t0.000\n\
+         GCD\t1.4\t75.000\t0.005\t0.005\t0.005\t0.005\t0.005\n\
+         GCD\t15.0\t100.000\t0.002\t0.002\t0.002\t0.002\t0.002"
+    );
 }
 
 #[test]
@@ -2409,6 +2615,7 @@ secondary\t256\tchr1\t9\t60\t4M\t*\t0\t0\tTTTT\tIIII
     assert!(required_text.contains("SN\tsequences:\t1\n"));
     assert!(required_text.contains("SN\t1st fragments:\t1\n"));
     assert!(required_text.contains("SN\tnon-primary alignments:\t0\n"));
+    assert_eq!(stats_sn_text(&required_text, "average length"), "4");
 
     assert_eq!(
         exit_to_u8(stats::main(&argv(

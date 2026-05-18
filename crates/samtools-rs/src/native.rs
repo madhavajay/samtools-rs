@@ -2,6 +2,7 @@
 
 use std::fs::File;
 use std::io::{self, Write};
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
 
 use flate2::Compression;
@@ -196,6 +197,8 @@ where
             exclude_flags: depth_command::default_exclude_flags(),
             include_any_flags: 0,
             require_flags: 0,
+            include_deletions: false,
+            remove_overlaps: false,
             region: Some(region.as_ref()),
             bed: None,
             reference: None,
@@ -306,6 +309,7 @@ where
         false,
         None,
         0,
+        None,
         merge_command::MergeRestriction::None,
     )
 }
@@ -362,7 +366,7 @@ pub fn extract_unmapped_pairs_native<P, Q>(
     input_alignment: P,
     output_bam: Q,
     flag: u16,
-    _threads: Option<usize>,
+    threads: Option<usize>,
     reference_fasta: Option<&Path>,
 ) -> io::Result<()>
 where
@@ -370,14 +374,26 @@ where
     Q: AsRef<Path>,
 {
     let input_alignment = input_alignment.as_ref();
-    let output = File::create(output_bam)?;
+    let output_bam = output_bam.as_ref();
+    let worker_count = worker_count(threads);
     match sam_io::sam_open_format(input_alignment)?.exact {
         Exact::Bam => {
-            htslib_rs::alignment_compat::write_bam_records_with_required_flags_from_path(
-                input_alignment,
-                flag,
-                output,
-            )?;
+            if let Some(worker_count) = worker_count {
+                let data =
+                    htslib_rs::alignment_compat::write_bam_records_with_required_flags_from_path_with_worker_count(
+                        input_alignment,
+                        flag,
+                        worker_count,
+                    )?;
+                std::fs::write(output_bam, data)?;
+            } else {
+                let output = File::create(output_bam)?;
+                htslib_rs::alignment_compat::write_bam_records_with_required_flags_from_path(
+                    input_alignment,
+                    flag,
+                    output,
+                )?;
+            }
         }
         Exact::Cram => {
             let reference_fasta = reference_fasta.ok_or_else(|| {
@@ -386,12 +402,24 @@ where
                     "CRAM extraction requires reference_fasta",
                 )
             })?;
-            htslib_rs::alignment_compat::write_cram_records_with_required_flags_as_bam_from_path_with_reference(
-                input_alignment,
-                reference_fasta,
-                flag,
-                output,
-            )?;
+            if let Some(worker_count) = worker_count {
+                let data =
+                    htslib_rs::alignment_compat::write_cram_records_with_required_flags_as_bam_from_path_with_reference_with_worker_count(
+                        input_alignment,
+                        reference_fasta,
+                        flag,
+                        worker_count,
+                    )?;
+                std::fs::write(output_bam, data)?;
+            } else {
+                let output = File::create(output_bam)?;
+                htslib_rs::alignment_compat::write_cram_records_with_required_flags_as_bam_from_path_with_reference(
+                    input_alignment,
+                    reference_fasta,
+                    flag,
+                    output,
+                )?;
+            }
         }
         _ => {
             return Err(io::Error::new(
@@ -428,7 +456,7 @@ pub fn view_region_native<P, Q, S>(
     input_bam: P,
     region: S,
     output_bam: Q,
-    _threads: Option<usize>,
+    threads: Option<usize>,
     reference_fasta: Option<&Path>,
 ) -> io::Result<()>
 where
@@ -438,10 +466,22 @@ where
 {
     let input = input_bam.as_ref();
     let region = parse_region(region.as_ref())?;
-    let output = File::create(output_bam)?;
+    let output_bam = output_bam.as_ref();
+    let worker_count = worker_count(threads);
     match sam_io::sam_open_format(input)?.exact {
         Exact::Bam => {
-            htslib_rs::alignment_compat::write_bam_regions_from_path(input, &[region], output)?;
+            if let Some(worker_count) = worker_count {
+                let data =
+                    htslib_rs::alignment_compat::write_bam_regions_from_path_with_worker_count(
+                        input,
+                        &[region],
+                        worker_count,
+                    )?;
+                std::fs::write(output_bam, data)?;
+            } else {
+                let output = File::create(output_bam)?;
+                htslib_rs::alignment_compat::write_bam_regions_from_path(input, &[region], output)?;
+            }
         }
         Exact::Cram => {
             let reference_fasta = reference_fasta.ok_or_else(|| {
@@ -450,12 +490,24 @@ where
                     "CRAM region slicing requires reference_fasta",
                 )
             })?;
-            htslib_rs::alignment_compat::write_cram_regions_as_bam_from_path_with_reference(
-                input,
-                reference_fasta,
-                &[region],
-                output,
-            )?;
+            if let Some(worker_count) = worker_count {
+                let data =
+                    htslib_rs::alignment_compat::write_cram_regions_as_bam_from_path_with_reference_with_worker_count(
+                        input,
+                        reference_fasta,
+                        &[region],
+                        worker_count,
+                    )?;
+                std::fs::write(output_bam, data)?;
+            } else {
+                let output = File::create(output_bam)?;
+                htslib_rs::alignment_compat::write_cram_regions_as_bam_from_path_with_reference(
+                    input,
+                    reference_fasta,
+                    &[region],
+                    output,
+                )?;
+            }
         }
         _ => {
             return Err(io::Error::new(
@@ -491,7 +543,7 @@ pub fn view_bed_native<P, Q, R>(
     input_bam: P,
     bed_file: R,
     output_bam: Q,
-    _threads: Option<usize>,
+    threads: Option<usize>,
     reference_fasta: Option<&Path>,
 ) -> io::Result<()>
 where
@@ -501,10 +553,22 @@ where
 {
     let input = input_bam.as_ref();
     let regions = load_bed_regions(bed_file.as_ref())?;
-    let output = File::create(output_bam)?;
+    let output_bam = output_bam.as_ref();
+    let worker_count = worker_count(threads);
     match sam_io::sam_open_format(input)?.exact {
         Exact::Bam => {
-            htslib_rs::alignment_compat::write_bam_regions_from_path(input, &regions, output)?;
+            if let Some(worker_count) = worker_count {
+                let data =
+                    htslib_rs::alignment_compat::write_bam_regions_from_path_with_worker_count(
+                        input,
+                        &regions,
+                        worker_count,
+                    )?;
+                std::fs::write(output_bam, data)?;
+            } else {
+                let output = File::create(output_bam)?;
+                htslib_rs::alignment_compat::write_bam_regions_from_path(input, &regions, output)?;
+            }
         }
         Exact::Cram => {
             let reference_fasta = reference_fasta.ok_or_else(|| {
@@ -513,12 +577,24 @@ where
                     "CRAM region slicing requires reference_fasta",
                 )
             })?;
-            htslib_rs::alignment_compat::write_cram_regions_as_bam_from_path_with_reference(
-                input,
-                reference_fasta,
-                &regions,
-                output,
-            )?;
+            if let Some(worker_count) = worker_count {
+                let data =
+                    htslib_rs::alignment_compat::write_cram_regions_as_bam_from_path_with_reference_with_worker_count(
+                        input,
+                        reference_fasta,
+                        &regions,
+                        worker_count,
+                    )?;
+                std::fs::write(output_bam, data)?;
+            } else {
+                let output = File::create(output_bam)?;
+                htslib_rs::alignment_compat::write_cram_regions_as_bam_from_path_with_reference(
+                    input,
+                    reference_fasta,
+                    &regions,
+                    output,
+                )?;
+            }
         }
         _ => {
             return Err(io::Error::new(
@@ -541,6 +617,10 @@ fn parse_region(region: &str) -> io::Result<htslib_rs::core::Region> {
 
 fn load_bed_regions(path: &Path) -> io::Result<Vec<htslib_rs::core::Region>> {
     load_bed_index(path)?.to_htslib_regions()
+}
+
+fn worker_count(threads: Option<usize>) -> Option<NonZero<usize>> {
+    threads.and_then(NonZero::new)
 }
 
 fn append_extension(path: &Path, ext: &str) -> PathBuf {

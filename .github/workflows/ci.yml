@@ -61,7 +61,4 @@ jobs:
         run: |
           cp "$GITHUB_WORKSPACE/target/release/samtools" "$GITHUB_WORKSPACE/samtools/samtools"
           cd samtools
-          perl test/test.pl || true
-          # The passing subset above is required. The full harness still covers
-          # partial/out-of-scope rows as an advisory regression watch, so its
-          # exit code is intentionally not propagated yet.
+          perl test/test.pl

@@ -6,16 +6,18 @@
 //!  - `-m` / `--min-shift INT` — CSI min-shift (also implies `-c`)
 //!  - `-M` — interpret all arguments as files to index (vs legacy `<in> <out.idx>`)
 //!  - `-o` / `--output FILE` — write index to FILE
-//!  - `-@` / `--threads INT` — accepted, not yet wired through
+//!  - `-@` / `--threads INT` — BGZF worker count for BAM/BGZF-SAM inputs
 
 use std::ffi::OsString;
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use htslib_rs::format::{Category, Exact};
 
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
 /// Entry point for `samtools index`.
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -57,7 +59,24 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 
     for src in &inputs {
-        if let Err(e) = build_index(src, explicit_idx.as_deref(), opts.csi, opts.min_shift) {
+        if !src.exists() {
+            print_hts_open_missing(src);
+            print_error(
+                "index",
+                format!(
+                    "failed to open \"{}\": No such file or directory",
+                    src.display()
+                ),
+            );
+            return ExitCode::from(1);
+        }
+        if let Err(e) = build_index(
+            src,
+            explicit_idx.as_deref(),
+            opts.csi,
+            opts.min_shift,
+            opts.worker_count(),
+        ) {
             print_error_errno(
                 "index",
                 format!("failed to create index for \"{}\"", src.display()),
@@ -75,7 +94,16 @@ struct Opts {
     min_shift: Option<u8>,
     multiple: bool,
     output: Option<PathBuf>,
+    threads: Option<usize>,
     inputs: Vec<PathBuf>,
+}
+
+impl Opts {
+    fn worker_count(&self) -> Option<NonZero<usize>> {
+        self.threads
+            .or_else(|| current_global_args().threads)
+            .and_then(NonZero::new)
+    }
 }
 
 enum ParseError {
@@ -128,10 +156,25 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
             }
             "-@" | "--threads" => {
                 i += 1;
-                args.get(i)
-                    .and_then(|a| a.to_str())
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .ok_or_else(|| ParseError::Err("invalid thread count".into()))?;
+                opts.threads = Some(
+                    args.get(i)
+                        .and_then(|a| a.to_str())
+                        .ok_or_else(|| ParseError::Err("invalid thread count".into()))
+                        .and_then(parse_thread_count)?,
+                );
+                i += 1;
+            }
+            _ if s.starts_with("-@") && s.len() > 2 => {
+                opts.threads = Some(parse_thread_count(&s[2..])?);
+                i += 1;
+            }
+            _ if s.starts_with("--threads=") => {
+                opts.threads = Some(
+                    s.split_once('=')
+                        .map(|(_, v)| v)
+                        .ok_or_else(|| ParseError::Err("invalid thread count".into()))
+                        .and_then(parse_thread_count)?,
+                );
                 i += 1;
             }
             "--help" => return Err(ParseError::Usage(0)),
@@ -150,8 +193,22 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
     Ok(opts)
 }
 
+fn parse_thread_count(raw: &str) -> Result<usize, ParseError> {
+    raw.parse()
+        .map_err(|_| ParseError::Err("invalid thread count".into()))
+}
+
 fn nonexistent_or_index(path: &Path) -> bool {
     if !path.exists() {
+        return true;
+    }
+    if matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("bai" | "csi" | "crai" | "tbi")
+    ) {
         return true;
     }
     matches!(
@@ -165,21 +222,39 @@ fn build_index(
     fn_idx: Option<&Path>,
     csi: bool,
     min_shift: Option<u8>,
+    worker_count: Option<NonZero<usize>>,
 ) -> std::io::Result<()> {
     let format = sam_io::sam_open_format(src)?;
     match format.exact {
         Exact::Bam => {
             if csi {
-                let index = match min_shift {
-                    Some(m) => htslib_rs::index_compat::build_bam_csi_with_min_shift(src, m)?,
-                    None => htslib_rs::index_compat::build_bam_csi(src)?,
+                let index = match (min_shift, worker_count) {
+                    (Some(m), Some(worker_count)) => {
+                        htslib_rs::index_compat::build_bam_csi_with_min_shift_and_worker_count(
+                            src,
+                            m,
+                            worker_count,
+                        )?
+                    }
+                    (Some(m), None) => {
+                        htslib_rs::index_compat::build_bam_csi_with_min_shift(src, m)?
+                    }
+                    (None, Some(worker_count)) => {
+                        htslib_rs::index_compat::build_bam_csi_with_worker_count(src, worker_count)?
+                    }
+                    (None, None) => htslib_rs::index_compat::build_bam_csi(src)?,
                 };
                 let out = fn_idx
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| append_extension(src, "csi"));
                 htslib_rs::index_compat::write_csi(out, &index)?;
             } else {
-                let index = htslib_rs::index_compat::build_bai(src)?;
+                let index = match worker_count {
+                    Some(worker_count) => {
+                        htslib_rs::index_compat::build_bai_with_worker_count(src, worker_count)?
+                    }
+                    None => htslib_rs::index_compat::build_bai(src)?,
+                };
                 let out = fn_idx
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| append_extension(src, "bai"));
@@ -189,16 +264,33 @@ fn build_index(
         }
         Exact::Sam => {
             if csi {
-                let index = match min_shift {
-                    Some(m) => htslib_rs::index_compat::build_sam_csi_with_min_shift(src, m)?,
-                    None => htslib_rs::index_compat::build_sam_csi(src)?,
+                let index = match (min_shift, worker_count) {
+                    (Some(m), Some(worker_count)) => {
+                        htslib_rs::index_compat::build_sam_csi_with_min_shift_and_worker_count(
+                            src,
+                            m,
+                            worker_count,
+                        )?
+                    }
+                    (Some(m), None) => {
+                        htslib_rs::index_compat::build_sam_csi_with_min_shift(src, m)?
+                    }
+                    (None, Some(worker_count)) => {
+                        htslib_rs::index_compat::build_sam_csi_with_worker_count(src, worker_count)?
+                    }
+                    (None, None) => htslib_rs::index_compat::build_sam_csi(src)?,
                 };
                 let out = fn_idx
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| append_extension(src, "csi"));
                 htslib_rs::index_compat::write_csi(out, &index)?;
             } else {
-                let index = htslib_rs::index_compat::build_sam_bai(src)?;
+                let index = match worker_count {
+                    Some(worker_count) => {
+                        htslib_rs::index_compat::build_sam_bai_with_worker_count(src, worker_count)?
+                    }
+                    None => htslib_rs::index_compat::build_sam_bai(src)?,
+                };
                 let out = fn_idx
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| append_extension(src, "bai"));

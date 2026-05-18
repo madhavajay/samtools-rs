@@ -1,12 +1,12 @@
 //! `samtools import` — convert FASTA / FASTQ records to SAM/BAM/CRAM.
 //!
 //! Mirrors `main_import` in `bam_import.c`. The initial Rust port supports
-//! single FASTA/FASTQ and paired FASTQ → SAM/BAM (stdout or `-o FILE`). All emitted
-//! SAM records are unmapped, with paired FASTQ records using the standard
+//! single FASTA/FASTQ and paired FASTQ → SAM/BAM/CRAM (stdout or `-o FILE`). All
+//! emitted SAM records are unmapped, with paired FASTQ records using the standard
 //! unmapped read1/read2 flags.
 //!
 //! **Not yet supported:** paired singleton/other grouping beyond `-0` with
-//! paired inputs, full read group validation, CRAM output.
+//! paired inputs and full read group validation.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -16,7 +16,7 @@ use std::process::ExitCode;
 
 use flate2::read::MultiGzDecoder;
 
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
 
 /// Entry point for `samtools import`.
@@ -54,6 +54,16 @@ pub fn main(args: &[OsString]) -> ExitCode {
                             "import",
                             format!("unsupported --output-fmt \"{}\"", value.to_string_lossy()),
                         );
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            _ if s.starts_with("--output-fmt=") => {
+                let value = &s["--output-fmt=".len()..];
+                match OutputFormat::parse(value) {
+                    Some(format) => output_format = format,
+                    None => {
+                        print_error("import", format!("unsupported --output-fmt \"{value}\""));
                         return ExitCode::from(1);
                     }
                 }
@@ -166,14 +176,6 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     }
 
-    if output_format == OutputFormat::Cram {
-        print_error(
-            "import",
-            "CRAM output is not yet supported in samtools-rs import",
-        );
-        return ExitCode::from(1);
-    }
-
     if single_input.is_none()
         && interleaved_input.is_none()
         && read1_input.is_none()
@@ -183,6 +185,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
             [input] => match positional_fastq_looks_interleaved(input) {
                 Ok(true) => interleaved_input = Some(input.clone()),
                 Ok(false) => single_input = Some(input.clone()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    print_hts_open_missing(input);
+                    eprintln!("{}: No such file or directory", input.display());
+                    return ExitCode::from(1);
+                }
                 Err(e) => {
                     print_error_errno("import", format!("inspect \"{}\"", input.display()), &e);
                     return ExitCode::from(1);
@@ -227,6 +234,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
         (None, None) => None,
     };
+
+    if output_format == OutputFormat::Sam
+        && let Some(format) = output
+            .as_deref()
+            .and_then(OutputFormat::from_path_extension)
+    {
+        output_format = format;
+    }
 
     let mut out = match sam_io::open_text_output(output.as_deref()) {
         Ok(out) => out,
@@ -357,6 +372,20 @@ impl OutputFormat {
             "sam" => Some(Self::Sam),
             "bam" => Some(Self::Bam),
             "cram" => Some(Self::Cram),
+            _ => None,
+        }
+    }
+
+    fn from_path_extension(path: &std::path::Path) -> Option<Self> {
+        match path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("sam") => Some(Self::Sam),
+            Some("bam") => Some(Self::Bam),
+            Some("cram") => Some(Self::Cram),
             _ => None,
         }
     }
@@ -575,11 +604,32 @@ fn write_import_output(
             htslib_rs::alignment_compat::write_bam_from_sam_reader(Cursor::new(sam), out)?;
             Ok(())
         }
-        OutputFormat::Cram => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "CRAM output is not yet supported",
-        )),
+        OutputFormat::Cram => write_import_cram_output(out, sam),
     }
+}
+
+fn write_import_cram_output(out: &mut dyn Write, sam: Vec<u8>) -> io::Result<()> {
+    use htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference;
+
+    let (mut reference_file, reference_path) =
+        crate::tmp_file::create_temp_file("import-reference", Some("fa"))?;
+    reference_file.flush()?;
+    drop(reference_file);
+    let fai_path = crate::reference::ensure_fai_index(reference_path.path(), None)?;
+
+    let (tmp_bam_file, tmp_bam_path) = crate::tmp_file::create_temp_file("import", Some("bam"))?;
+    let tmp_bam_file =
+        htslib_rs::alignment_compat::write_bam_from_sam_reader(Cursor::new(sam), tmp_bam_file)?;
+    drop(tmp_bam_file);
+
+    let result =
+        write_cram_from_bam_path_with_reference(tmp_bam_path.path(), reference_path.path(), out)
+            .map(|_| ());
+
+    tmp_bam_path.close().ok();
+    reference_path.close().ok();
+    std::fs::remove_file(fai_path).ok();
+    result
 }
 
 fn reverse_comment_for_single(
@@ -679,7 +729,8 @@ fn print_usage() -> io::Result<()> {
         w,
         "  -o FILE      write SAM output to FILE (default stdout)"
     )?;
-    writeln!(w, "  -O sam|bam   output format [sam]")?;
+    writeln!(w, "  -O sam|bam|cram")?;
+    writeln!(w, "               output format [sam]")?;
     writeln!(
         w,
         "  -s FILE      single-end input (alias for positional arg)"

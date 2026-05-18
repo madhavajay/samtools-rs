@@ -18,7 +18,7 @@ use htslib_rs::sam;
 
 use crate::bam_flag::{BAM_FDUP, BAM_FQCFAIL, BAM_FSECONDARY, BAM_FUNMAP, str_to_flag};
 use crate::bedidx::parse_bed_line;
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
 use crate::sam_global::current_global_args;
 
@@ -117,6 +117,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
 
     let mut has_cram = false;
     for path in &bams {
+        if path.as_os_str() != "-" && !path.exists() {
+            print_hts_open_missing(path);
+            eprintln!("ERROR: fail to open index BAM file '{}'", path.display());
+            return ExitCode::from(2);
+        }
         let format = match sam_io::sam_open_format(path) {
             Ok(f) => f,
             Err(e) => {
@@ -130,24 +135,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
             _ => {
                 print_error(
                     "bedcov",
-                    "only SAM, BAM, and reference-backed CRAM input are currently supported",
+                    "only SAM, BAM, and CRAM input are currently supported",
                 );
                 return ExitCode::from(1);
             }
         }
     }
-
-    let reference = if has_cram {
-        match current_global_args().reference {
-            Some(reference) => Some(reference),
-            None => {
-                print_error("bedcov", "CRAM input requires top-level --reference FILE");
-                return ExitCode::from(1);
-            }
-        }
-    } else {
-        None
-    };
+    let reference = has_cram.then(|| current_global_args().reference).flatten();
 
     let opts = BedcovOpts {
         min_mapq,
@@ -395,18 +389,20 @@ fn compute_region_metrics(
             }
         }
         Exact::Cram => {
-            let Some(reference) = opts.reference else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "CRAM input requires top-level --reference FILE",
-                ));
-            };
             let header = htslib_rs::alignment_compat::read_cram_header_from_path(alignment_path)?;
-            for rec in htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
-                alignment_path,
-                &region,
-                reference,
-            )? {
+            let records = if let Some(reference) = opts.reference {
+                htslib_rs::alignment_compat::query_cram_records_from_path_with_reference(
+                    alignment_path,
+                    &region,
+                    reference,
+                )?
+            } else {
+                htslib_rs::alignment_compat::query_cram_records_from_path_synthesizing_reference(
+                    alignment_path,
+                    &region,
+                )?
+            };
+            for rec in records {
                 update_region_metrics(
                     &header,
                     &rec,
@@ -425,7 +421,7 @@ fn compute_region_metrics(
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "only SAM, BAM, and reference-backed CRAM input are currently supported",
+                "only SAM, BAM, and CRAM input are currently supported",
             ));
         }
     }

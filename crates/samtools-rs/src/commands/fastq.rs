@@ -18,19 +18,18 @@
 //! record lacking its own `BC` inherits the R1 mate's barcode in its
 //! CASAVA comment (upstream `bam_fastq.c:952`).
 //!
-//! **Not yet supported:** CRAM input.
-
 use std::collections::HashSet;
 use std::ffi::OsString;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use htslib_rs::{bam, format::Exact};
+use htslib_rs::{bam, format::Exact, sam};
 
 use crate::aux_list::parse_aux_list;
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
 use crate::sam_render::format_aux_float;
 
@@ -56,6 +55,8 @@ struct FastqRenderOptions<'a> {
     casava: bool,
     barcode_tag: [u8; 2],
     aux_selection: &'a AuxSelection,
+    strip_soft_clips: bool,
+    soft_clip_backup_tag: Option<[u8; 2]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,6 +65,12 @@ struct FlagFilters {
     include_any: u16,
     exclude: u16,
     exclude_all: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FastqStats {
+    processed_reads: usize,
+    discarded_singletons: usize,
 }
 
 impl FlagFilters {
@@ -126,6 +133,23 @@ fn merge_aux_selection(selection: &mut AuxSelection, extra: &[[u8; 2]]) {
     }
 }
 
+fn apply_aux_selection_arg(raw: &str, selection: &mut AuxSelection) -> Result<(), String> {
+    match raw {
+        "" | "*" => {
+            *selection = AuxSelection::All;
+            Ok(())
+        }
+        _ => {
+            let tags = parse_aux_list(raw)
+                .map_err(|e| format!("invalid -T value \"{raw}\": {e}"))?
+                .into_iter()
+                .collect::<Vec<_>>();
+            merge_aux_selection(selection, &tags);
+            Ok(())
+        }
+    }
+}
+
 /// Entry point for `samtools fastq` / `samtools fasta` / `samtools bam2fq`.
 pub fn main(args: &[OsString]) -> ExitCode {
     let sub_name = args.first().and_then(|a| a.to_str()).unwrap_or("fastq");
@@ -154,6 +178,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut index_file_1: Option<PathBuf> = None;
     let mut index_file_2: Option<PathBuf> = None;
     let mut index_format_arg: Option<String> = None;
+    let mut strip_soft_clips = false;
+    let mut soft_clip_backup_tag = Some(*b"s0");
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
         let s = arg.to_str().unwrap_or("");
@@ -202,18 +228,16 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     print_error(sub_name, "missing value for -T");
                     return ExitCode::from(1);
                 };
-                match raw {
-                    "" | "*" => aux_selection = AuxSelection::All,
-                    _ => match parse_aux_list(raw) {
-                        Ok(tags) => {
-                            let tags: Vec<[u8; 2]> = tags.into_iter().collect();
-                            merge_aux_selection(&mut aux_selection, &tags);
-                        }
-                        Err(e) => {
-                            print_error(sub_name, format!("invalid -T value \"{raw}\": {e}"));
-                            return ExitCode::from(1);
-                        }
-                    },
+                if let Err(e) = apply_aux_selection_arg(raw, &mut aux_selection) {
+                    print_error(sub_name, e);
+                    return ExitCode::from(1);
+                }
+            }
+            _ if s.starts_with("-T") && s.len() > 2 => {
+                let raw = &s[2..];
+                if let Err(e) = apply_aux_selection_arg(raw, &mut aux_selection) {
+                    print_error(sub_name, e);
+                    return ExitCode::from(1);
                 }
             }
             "-t" => {
@@ -322,6 +346,25 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 };
                 index_format_arg = Some(raw.to_string());
             }
+            "--no-sc" => {
+                strip_soft_clips = true;
+            }
+            "--no-sc-bkp" => {
+                soft_clip_backup_tag = None;
+            }
+            "--sc-aux" => {
+                let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error(sub_name, "missing value for --sc-aux");
+                    return ExitCode::from(1);
+                };
+                soft_clip_backup_tag = match parse_filter_tag(raw) {
+                    Ok(tag) => Some(tag),
+                    Err(e) => {
+                        print_error(sub_name, e);
+                        return ExitCode::from(1);
+                    }
+                };
+            }
             "-v" => {
                 let Some(raw) = iter.next().and_then(|a| a.to_str()) else {
                     print_error(sub_name, "missing value for -v");
@@ -401,6 +444,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
         None
     } else {
         let input = input.as_ref().expect("non-stdin input exists");
+        if !input.exists() {
+            print_hts_open_missing(input);
+            print_error(
+                "bam2fq",
+                format!(
+                    "Cannot read file \"{}\": No such file or directory",
+                    input.display()
+                ),
+            );
+            return ExitCode::from(1);
+        }
         match sam_io::sam_open_format(input) {
             Ok(f) => Some(f),
             Err(e) => {
@@ -409,6 +463,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
         }
     };
+    let input_exact = effective_fastq_input_exact(input.as_deref(), format.as_ref());
 
     let flag_filters = FlagFilters {
         require: require_flags,
@@ -425,7 +480,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
         && read1_output.is_none()
         && read2_output.is_none()
         && other_output.is_none();
-    let append_read_number = append_read_number_override.unwrap_or(!split_mode || singleton_only);
+    let other_only = other_output.is_some()
+        && read1_output.is_none()
+        && read2_output.is_none()
+        && singleton_output.is_none();
+    let append_read_number =
+        append_read_number_override.unwrap_or(!split_mode || singleton_only || other_only);
+    let append_index_read_number =
+        append_read_number_override.unwrap_or(!split_mode || singleton_only);
     let render_options = FastqRenderOptions {
         append_read_number,
         use_original_quality,
@@ -434,6 +496,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
         casava,
         barcode_tag,
         aux_selection: &aux_selection,
+        strip_soft_clips,
+        soft_clip_backup_tag: strip_soft_clips.then_some(soft_clip_backup_tag).flatten(),
     };
 
     if split_mode {
@@ -470,7 +534,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
             }
         } else {
             let input = input.as_ref().expect("non-stdin input exists");
-            match (format.expect("non-stdin format exists").exact, fasta_mode) {
+            match (input_exact.expect("non-stdin format exists"), fasta_mode) {
                 (Exact::Sam, false) => view_sam_path_as_fastq_split(
                     input,
                     flag_filters,
@@ -503,10 +567,26 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     barcode_tag,
                     singleton_set,
                 ),
+                (Exact::Cram, false) => view_cram_path_as_fastq_split_with_aux(
+                    input,
+                    flag_filters,
+                    render_options,
+                    &tag_filters,
+                    singleton_set,
+                ),
+                (Exact::Cram, true) => view_cram_path_as_fasta_split(
+                    input,
+                    flag_filters,
+                    append_read_number,
+                    umi_tags.as_deref(),
+                    casava,
+                    barcode_tag,
+                    singleton_set,
+                ),
                 _ => {
                     print_error(
                         sub_name,
-                        "only SAM and BAM input are currently supported (CRAM TODO)",
+                        "only SAM, BAM, and CRAM input are currently supported",
                     );
                     return ExitCode::from(1);
                 }
@@ -555,6 +635,28 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 return ExitCode::from(1);
             }
         }
+        if read1_output.is_none() && read2_output.is_none() && !singleton_only {
+            let interleaved = interleave_paired_records(&split.read1, &split.read2);
+            let mut out = match sam_io::open_text_output(None) {
+                Ok(out) => out,
+                Err(e) => {
+                    print_error_errno(sub_name, "open stdout", &e);
+                    return ExitCode::from(1);
+                }
+            };
+            if let Err(e) = out.write_all(&interleaved)
+                && e.kind() != io::ErrorKind::BrokenPipe
+            {
+                print_error_errno(sub_name, "write output", &e);
+                return ExitCode::from(1);
+            }
+            if let Err(e) = sam_io::check_sam_close(&mut out)
+                && e.kind() != io::ErrorKind::BrokenPipe
+            {
+                print_error_errno(sub_name, "close output", &e);
+                return ExitCode::from(1);
+            }
+        }
         if let Some(path) = singleton_output.as_ref() {
             let payload = if singleton_only {
                 let mut all = Vec::new();
@@ -594,11 +696,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
         if (index_file_1.is_some() || index_file_2.is_some())
             && let Err(e) = emit_index_files(
                 input.as_deref(),
-                format.as_ref(),
+                input_exact,
                 stdin_input,
                 flag_filters,
                 IndexEmitOptions {
-                    append_read_number,
+                    append_read_number: append_index_read_number,
                     use_original_quality,
                     default_quality,
                     umi_tags: umi_tags.as_deref(),
@@ -616,6 +718,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
 
+        print_bam2fq_summary(FastqStats {
+            processed_reads: count_split_records(&split, fasta_mode),
+            discarded_singletons: count_fastx_records(&split.singleton, fasta_mode),
+        });
         return ExitCode::SUCCESS;
     }
 
@@ -629,14 +735,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
         let stdin = io::stdin().lock();
         let mut reader = htslib_rs::sam::io::Reader::new(BufReader::new(stdin));
-        if !fasta_mode
-            && (use_original_quality
-                || default_quality.is_some()
-                || umi_tags.is_some()
-                || casava
-                || aux_selection.is_enabled()
-                || !tag_filters.is_empty())
-        {
+        if !fasta_mode {
             view_sam_reader_as_fastq_text_with_aux(
                 &mut reader,
                 flag_filters,
@@ -664,7 +763,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     } else {
         let input = input.as_ref().expect("non-stdin input exists");
         match (
-            format.expect("non-stdin format exists").exact,
+            input_exact.expect("non-stdin format exists"),
             fasta_mode,
             filtering,
             use_original_quality
@@ -675,112 +774,112 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 || !tag_filters.is_empty()
                 || (!fasta_mode && flag_filters.include_any != 0),
         ) {
-        (Exact::Sam, false, _, true) => view_sam_path_as_fastq_text_with_aux(
-            input,
-            flag_filters,
-            render_options,
-            &tag_filters,
-        ),
-        (Exact::Sam, true, _, true)
-            if (umi_tags.is_some() || casava)
-                && !use_original_quality
-                && default_quality.is_none()
-                && !aux_selection.is_enabled()
-                && tag_filters.is_empty() =>
-        {
-            view_sam_path_as_fasta_text(
+            (Exact::Sam, false, _, _) => view_sam_path_as_fastq_text_with_aux(
+                input,
+                flag_filters,
+                render_options,
+                &tag_filters,
+            ),
+            (Exact::Sam, true, _, true)
+                if (umi_tags.is_some() || casava)
+                    && !use_original_quality
+                    && default_quality.is_none()
+                    && !aux_selection.is_enabled()
+                    && tag_filters.is_empty() =>
+            {
+                view_sam_path_as_fasta_text(
+                    input,
+                    flag_filters,
+                    append_read_number,
+                    umi_tags.as_deref(),
+                    casava,
+                    barcode_tag,
+                )
+            }
+            (Exact::Bam, true, _, true)
+                if (umi_tags.is_some() || casava)
+                    && !use_original_quality
+                    && default_quality.is_none()
+                    && !aux_selection.is_enabled()
+                    && tag_filters.is_empty() =>
+            {
+                view_bam_path_as_fasta_text(
+                    input,
+                    flag_filters,
+                    append_read_number,
+                    umi_tags.as_deref(),
+                    casava,
+                    barcode_tag,
+                )
+            }
+            (Exact::Cram, true, _, true)
+                if (umi_tags.is_some() || casava)
+                    && !use_original_quality
+                    && default_quality.is_none()
+                    && !aux_selection.is_enabled()
+                    && tag_filters.is_empty() =>
+            {
+                view_cram_path_as_fasta_text(
+                    input,
+                    flag_filters,
+                    append_read_number,
+                    umi_tags.as_deref(),
+                    casava,
+                    barcode_tag,
+                )
+            }
+            (Exact::Sam, true, _, true)
+            | (Exact::Bam, true, _, true)
+            | (Exact::Cram, true, _, true) => {
+                print_error(
+                    sub_name,
+                    "-d/-D tag filtering is currently supported for FASTQ single-output mode only",
+                );
+                return ExitCode::from(1);
+            }
+            (Exact::Sam, true, _, _) => view_sam_path_as_fasta_text(
                 input,
                 flag_filters,
                 append_read_number,
                 umi_tags.as_deref(),
                 casava,
                 barcode_tag,
-            )
-        }
-        (Exact::Bam, true, _, true)
-            if (umi_tags.is_some() || casava)
-                && !use_original_quality
-                && default_quality.is_none()
-                && !aux_selection.is_enabled()
-                && tag_filters.is_empty() =>
-        {
-            view_bam_path_as_fasta_text(
+            ),
+            (Exact::Bam, false, _, _) => view_bam_path_as_fastq_text_with_aux(
+                input,
+                flag_filters,
+                render_options,
+                &tag_filters,
+            ),
+            (Exact::Bam, true, _, _) => view_bam_path_as_fasta_text(
                 input,
                 flag_filters,
                 append_read_number,
                 umi_tags.as_deref(),
                 casava,
                 barcode_tag,
-            )
-        }
-        (Exact::Sam, true, _, true) | (Exact::Bam, true, _, true) => {
-            print_error(
-                sub_name,
-                "-d/-D tag filtering is currently supported for FASTQ single-output mode only",
-            );
-            return ExitCode::from(1);
-        }
-        (Exact::Sam, false, false, false) => {
-            htslib_rs::alignment_compat::view_sam_as_fastq_text_from_path_with_limit_and_suffix(
+            ),
+            (Exact::Cram, false, _, _) => view_cram_path_as_fastq_text_with_aux(
                 input,
-                None,
-                append_read_number,
-            )
-        }
-        (Exact::Sam, false, true, false) => {
-            htslib_rs::alignment_compat::view_sam_as_fastq_text_from_path_with_flag_filter_and_suffix(
+                flag_filters,
+                render_options,
+                &tag_filters,
+            ),
+            (Exact::Cram, true, _, _) => view_cram_path_as_fasta_text(
                 input,
-                require_flags,
-                exclude_flags,
-                exclude_all_flags,
+                flag_filters,
                 append_read_number,
-            )
-        }
-        (Exact::Sam, true, _, _) => view_sam_path_as_fasta_text(
-            input,
-            flag_filters,
-            append_read_number,
-            umi_tags.as_deref(),
-            casava,
-            barcode_tag,
-        ),
-        (Exact::Bam, false, false, false) => {
-            htslib_rs::alignment_compat::view_bam_as_fastq_text_from_path_with_limit_and_suffix(
-                input,
-                None,
-                append_read_number,
-            )
-        }
-        (Exact::Bam, false, true, false) => {
-            htslib_rs::alignment_compat::view_bam_as_fastq_text_from_path_with_flag_filter_and_suffix(
-                input,
-                require_flags,
-                exclude_flags,
-                exclude_all_flags,
-                append_read_number,
-            )
-        }
-        (Exact::Bam, false, _, true) => view_bam_path_as_fastq_text_with_aux(
-            input,
-            flag_filters,
-            render_options,
-            &tag_filters,
-        ),
-        (Exact::Bam, true, _, _) => view_bam_path_as_fasta_text(
-            input,
-            flag_filters,
-            append_read_number,
-            umi_tags.as_deref(),
-            casava,
-            barcode_tag,
-        ),
-        _ => {
-            print_error(
-                sub_name,
-                "only SAM and BAM input are currently supported (CRAM TODO)",
-            );
-            return ExitCode::from(1);
-        }
+                umi_tags.as_deref(),
+                casava,
+                barcode_tag,
+            ),
+            _ => {
+                print_error(
+                    sub_name,
+                    "only SAM, BAM, and CRAM input are currently supported",
+                );
+                return ExitCode::from(1);
+            }
         }
     };
 
@@ -828,7 +927,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     if (index_file_1.is_some() || index_file_2.is_some())
         && let Err(e) = emit_index_files(
             input.as_deref(),
-            format.as_ref(),
+            input_exact,
             stdin_input,
             flag_filters,
             IndexEmitOptions {
@@ -850,12 +949,65 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     }
 
+    print_bam2fq_summary(FastqStats {
+        processed_reads: count_fastx_records(text.as_bytes(), fasta_mode),
+        discarded_singletons: 0,
+    });
     ExitCode::SUCCESS
+}
+
+fn effective_fastq_input_exact(
+    input: Option<&std::path::Path>,
+    format: Option<&htslib_rs::format::Format>,
+) -> Option<Exact> {
+    let exact = format.map(|f| f.exact)?;
+    if exact == Exact::Unknown
+        && input
+            .and_then(|path| path.extension())
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("sam"))
+    {
+        return Some(Exact::Sam);
+    }
+    Some(exact)
 }
 
 fn write_text_file(path: &std::path::Path, text: &[u8]) -> io::Result<()> {
     let mut file = File::create(path)?;
     file.write_all(text)
+}
+
+fn print_bam2fq_summary(stats: FastqStats) {
+    eprintln!(
+        "[M::bam2fq_mainloop] discarded {} singletons",
+        stats.discarded_singletons
+    );
+    eprintln!(
+        "[M::bam2fq_mainloop] processed {} reads",
+        stats.processed_reads
+    );
+}
+
+fn count_split_records(split: &FastqSplitBuffers, fasta_mode: bool) -> usize {
+    count_fastx_records(&split.read1, fasta_mode)
+        + count_fastx_records(&split.read2, fasta_mode)
+        + count_fastx_records(&split.singleton, fasta_mode)
+        + count_fastx_records(&split.other, fasta_mode)
+}
+
+fn count_fastx_records(text: &[u8], fasta_mode: bool) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+
+    if fasta_mode {
+        return text.iter().filter(|&&b| b == b'>').count();
+    }
+
+    text.split(|&b| b == b'\n')
+        .enumerate()
+        .filter(|(i, line)| i % 4 == 0 && line.first() == Some(&b'@'))
+        .count()
 }
 
 fn view_sam_path_as_fastq_split(
@@ -1056,6 +1208,276 @@ fn view_bam_path_as_fasta_split(
     grouper.flush(&mut split);
 
     Ok(split)
+}
+
+fn view_cram_path_as_fastq_text_with_aux(
+    input: &Path,
+    flag_filters: FlagFilters,
+    options: FastqRenderOptions<'_>,
+    tag_filters: &[TagFilter],
+) -> io::Result<String> {
+    let (_header, records) = read_cram_records_for_fastq(input)?;
+    let mut writer = Vec::new();
+
+    for record in records {
+        if record_passes_flag_filter(&record, flag_filters)?
+            && record_passes_tag_filters(&record, tag_filters)?
+        {
+            write_fastq_record_with_aux(&mut writer, &record, options)?;
+        }
+    }
+
+    String::from_utf8(writer).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn view_cram_path_as_fasta_text(
+    input: &Path,
+    flag_filters: FlagFilters,
+    append_read_number: bool,
+    umi_tags: Option<&[[u8; 2]]>,
+    casava: bool,
+    barcode_tag: [u8; 2],
+) -> io::Result<String> {
+    let (_header, records) = read_cram_records_for_fastq(input)?;
+    let mut writer = Vec::new();
+
+    for record in records {
+        if record_passes_flag_filter(&record, flag_filters)? {
+            write_fasta_record(
+                &mut writer,
+                &record,
+                append_read_number,
+                umi_tags,
+                casava,
+                barcode_tag,
+            )?;
+        }
+    }
+
+    String::from_utf8(writer).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn view_cram_path_as_fastq_split_with_aux(
+    input: &Path,
+    flag_filters: FlagFilters,
+    options: FastqRenderOptions<'_>,
+    tag_filters: &[TagFilter],
+    singleton_set: bool,
+) -> io::Result<FastqSplitBuffers> {
+    let (_header, records) = read_cram_records_for_fastq(input)?;
+    let mut split = FastqSplitBuffers::default();
+    let mut grouper = GroupedSplitWriter::new(singleton_set, options.casava, options.barcode_tag);
+
+    for record in records {
+        if record_passes_flag_filter(&record, flag_filters)?
+            && record_passes_tag_filters(&record, tag_filters)?
+        {
+            let text = render_fastq_record_with_aux_to_vec(&record, options)?;
+            grouper.add_text(&record, text, &mut split)?;
+        }
+    }
+    grouper.flush(&mut split);
+
+    Ok(split)
+}
+
+fn view_cram_path_as_fasta_split(
+    input: &Path,
+    flag_filters: FlagFilters,
+    append_read_number: bool,
+    umi_tags: Option<&[[u8; 2]]>,
+    casava: bool,
+    barcode_tag: [u8; 2],
+    singleton_set: bool,
+) -> io::Result<FastqSplitBuffers> {
+    let (_header, records) = read_cram_records_for_fastq(input)?;
+    let mut split = FastqSplitBuffers::default();
+    let mut grouper = GroupedSplitWriter::new(singleton_set, casava, barcode_tag);
+
+    for record in records {
+        if record_passes_flag_filter(&record, flag_filters)? {
+            let text = render_fasta_record_to_vec(
+                &record,
+                append_read_number,
+                umi_tags,
+                casava,
+                barcode_tag,
+            )?;
+            grouper.add_text(&record, text, &mut split)?;
+        }
+    }
+    grouper.flush(&mut split);
+
+    Ok(split)
+}
+
+fn read_cram_records_for_fastq(
+    input: &Path,
+) -> io::Result<(sam::Header, Vec<sam::alignment::RecordBuf>)> {
+    let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
+
+    if let Some(reference) = crate::sam_global::current_global_args().reference {
+        let records = htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+            input, &reference,
+        )?;
+        return Ok((header, records));
+    }
+
+    if let Some(reference) = fastq_cram_reference_from_header(&header)? {
+        let records = htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+            input,
+            reference.path(),
+        )?;
+        return Ok((header, records));
+    }
+
+    let records = htslib_rs::alignment_compat::query_cram_records_all_from_path(input)?;
+    Ok((header, records))
+}
+
+struct FastqReferenceGuard {
+    path: PathBuf,
+    cleanup: Vec<PathBuf>,
+}
+
+impl FastqReferenceGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            cleanup: Vec::new(),
+        }
+    }
+
+    fn temporary(path: PathBuf, cleanup: Vec<PathBuf>) -> Self {
+        Self { path, cleanup }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for FastqReferenceGuard {
+    fn drop(&mut self) {
+        for path in self.cleanup.iter().rev() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn fastq_cram_reference_from_header(
+    header: &sam::Header,
+) -> io::Result<Option<FastqReferenceGuard>> {
+    let mut header_text = Vec::new();
+    crate::sam_render::write_header(&mut header_text, header)?;
+    let header_text = String::from_utf8(header_text)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    if let Some(reference) = reference_from_header_uri_text(&header_text) {
+        return Ok(Some(FastqReferenceGuard::new(reference)));
+    }
+
+    let Some(ref_path) = std::env::var_os("REF_PATH") else {
+        return Ok(None);
+    };
+    reference_from_ref_path_header(&header_text, &ref_path.to_string_lossy())
+}
+
+fn reference_from_header_uri_text(header_text: &str) -> Option<PathBuf> {
+    for line in header_text.lines().filter(|line| line.starts_with("@SQ\t")) {
+        for field in line.split('\t').skip(1) {
+            let Some(uri) = field.strip_prefix("UR:") else {
+                continue;
+            };
+            let path = PathBuf::from(uri.strip_prefix("file://").unwrap_or(uri));
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn reference_from_ref_path_header(
+    header_text: &str,
+    ref_path: &str,
+) -> io::Result<Option<FastqReferenceGuard>> {
+    let mut sequences = Vec::new();
+
+    for line in header_text.lines().filter(|line| line.starts_with("@SQ\t")) {
+        let mut name = None;
+        let mut md5 = None;
+        let mut len = None;
+        for field in line.split('\t').skip(1) {
+            if let Some(value) = field.strip_prefix("SN:") {
+                name = Some(value);
+            } else if let Some(value) = field.strip_prefix("LN:") {
+                len = value.parse::<usize>().ok();
+            } else if let Some(value) = field.strip_prefix("M5:") {
+                md5 = Some(value);
+            }
+        }
+
+        let (Some(name), Some(md5)) = (name, md5) else {
+            continue;
+        };
+        if let Some(sequence) = read_ref_path_md5_sequence(ref_path, md5)? {
+            sequences.push((name.to_string(), sequence));
+        } else if let Some(len) = len {
+            sequences.push((name.to_string(), "N".repeat(len)));
+        }
+    }
+
+    if sequences.is_empty() {
+        return Ok(None);
+    }
+
+    let fasta = temporary_reference_path("fastq-ref-path", "fa");
+    {
+        let mut out = File::create(&fasta)?;
+        for (name, sequence) in &sequences {
+            writeln!(out, ">{name}")?;
+            out.write_all(sequence.as_bytes())?;
+            out.write_all(b"\n")?;
+        }
+    }
+    let fai = crate::reference::ensure_fai_index(&fasta, None)?;
+    Ok(Some(FastqReferenceGuard::temporary(
+        fasta.clone(),
+        vec![fai, fasta],
+    )))
+}
+
+fn read_ref_path_md5_sequence(ref_path: &str, md5: &str) -> io::Result<Option<String>> {
+    for template in ref_path.split(':').filter(|part| !part.is_empty()) {
+        let candidate = if template.contains("%s") {
+            PathBuf::from(template.replace("%s", md5))
+        } else {
+            Path::new(template).join(md5)
+        };
+        match fs::read_to_string(&candidate) {
+            Ok(text) => {
+                let sequence: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                if !sequence.is_empty() {
+                    return Ok(Some(sequence));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
+fn temporary_reference_path(stem: &str, ext: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "samtools-rs-{stem}-{}-{nanos}.{ext}",
+        std::process::id()
+    ))
 }
 
 fn view_sam_reader_as_fastq_text_with_aux<R>(
@@ -1474,12 +1896,12 @@ where
     let name = fastq_record_name(record)?;
     let name = append_fastq_umi(name, record, options.umi_tags)?;
     let name = append_fastq_read_number(name, record, options.append_read_number)?;
-    let sequence = fastq_sequence_string(record);
-    let quality = fastq_quality_scores_string(
-        record,
-        options.use_original_quality,
-        options.default_quality,
-    )?;
+    let payload = fastq_payload(record, options)?;
+    let sequence = payload.sequence;
+    let quality = payload.quality;
+    if options.strip_soft_clips && sequence.is_empty() {
+        return Ok(());
+    }
 
     if sequence.len() != quality.len() {
         return Err(io::Error::new(
@@ -1496,7 +1918,11 @@ where
             fastq_casava_comment(record, options.barcode_tag)?
         )?;
     } else {
-        for field in fastq_aux_fields(record, options.aux_selection)? {
+        for field in fastq_aux_fields_with_soft_clip(
+            record,
+            options.aux_selection,
+            payload.soft_clip_aux.as_ref(),
+        )? {
             write!(writer, "\t{field}")?;
         }
     }
@@ -1533,6 +1959,141 @@ where
     writeln!(writer, "{sequence}")?;
 
     Ok(())
+}
+
+struct FastqPayload {
+    sequence: String,
+    quality: String,
+    soft_clip_aux: Option<SoftClipAux>,
+}
+
+struct SoftClipAux {
+    tag: [u8; 2],
+    field: String,
+}
+
+fn fastq_payload<R>(record: &R, options: FastqRenderOptions<'_>) -> io::Result<FastqPayload>
+where
+    R: htslib_rs::sam::alignment::Record + ?Sized,
+{
+    if !options.strip_soft_clips {
+        return Ok(FastqPayload {
+            sequence: fastq_sequence_string(record),
+            quality: fastq_quality_scores_string(
+                record,
+                options.use_original_quality,
+                options.default_quality,
+            )?,
+            soft_clip_aux: None,
+        });
+    }
+
+    let seq = record.sequence().iter().collect::<Vec<_>>();
+    let qual = fastq_quality_scores_storage_string(
+        record,
+        options.use_original_quality,
+        options.default_quality,
+    )?
+    .into_bytes();
+    if seq.len() != qual.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "FASTQ quality length differs from sequence length",
+        ));
+    }
+
+    let mut kept_seq = Vec::with_capacity(seq.len());
+    let mut kept_qual = Vec::with_capacity(qual.len());
+    let mut clipped_seq = Vec::new();
+    let mut clipped_qual = Vec::new();
+    let mut cigar_ops = Vec::new();
+
+    if record.cigar().as_ref().is_empty() {
+        kept_seq.extend_from_slice(&seq);
+        kept_qual.extend_from_slice(&qual);
+    } else {
+        use htslib_rs::sam::alignment::record::cigar::op::Kind;
+
+        let mut cursor = 0usize;
+        for op in record.cigar().as_ref() {
+            let op = op?;
+            let kind = op.kind();
+            cigar_ops.push((op.len(), kind));
+            if !kind.consumes_read() {
+                continue;
+            }
+
+            let len = op.len();
+            let end = cursor.checked_add(len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "CIGAR read length overflow")
+            })?;
+            if end > seq.len() || end > qual.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CIGAR consumes more read bases than available",
+                ));
+            }
+
+            if kind == Kind::SoftClip {
+                clipped_seq.extend_from_slice(&seq[cursor..end]);
+                clipped_qual.extend_from_slice(&qual[cursor..end]);
+            } else {
+                kept_seq.extend_from_slice(&seq[cursor..end]);
+                kept_qual.extend_from_slice(&qual[cursor..end]);
+            }
+            cursor = end;
+        }
+    }
+
+    let is_reverse = record.flags()?.is_reverse_complemented();
+    if is_reverse {
+        kept_seq = kept_seq.into_iter().rev().map(complement_base).collect();
+        clipped_seq = clipped_seq.into_iter().rev().map(complement_base).collect();
+        kept_qual.reverse();
+        clipped_qual.reverse();
+        cigar_ops.reverse();
+    }
+
+    let soft_clip_aux = options
+        .soft_clip_backup_tag
+        .filter(|_| !clipped_seq.is_empty())
+        .map(|tag| {
+            let cigar = cigar_ops
+                .iter()
+                .map(|(len, kind)| format!("{len}{}", cigar_kind_char(*kind)))
+                .collect::<String>();
+            let clipped_seq = String::from_utf8_lossy(&clipped_seq);
+            let clipped_qual = String::from_utf8_lossy(&clipped_qual);
+            let field = format!(
+                "{}{}:Z:{cigar}:{clipped_seq}:{clipped_qual}",
+                char::from(tag[0]),
+                char::from(tag[1])
+            );
+            SoftClipAux { tag, field }
+        });
+
+    Ok(FastqPayload {
+        sequence: String::from_utf8_lossy(&kept_seq).into_owned(),
+        quality: String::from_utf8(kept_qual)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        soft_clip_aux,
+    })
+}
+
+fn cigar_kind_char(kind: htslib_rs::sam::alignment::record::cigar::op::Kind) -> char {
+    use htslib_rs::sam::alignment::record::cigar::op::Kind;
+
+    match kind {
+        Kind::Match => 'M',
+        Kind::Insertion => 'I',
+        Kind::Deletion => 'D',
+        Kind::Skip => 'N',
+        Kind::SoftClip => 'S',
+        Kind::HardClip => 'H',
+        Kind::Pad => 'P',
+        Kind::SequenceMatch => '=',
+        Kind::SequenceMismatch => 'X',
+    }
 }
 
 fn fastq_record_name<R>(record: &R) -> io::Result<String>
@@ -1725,10 +2286,23 @@ fn fastq_quality_scores_string<R>(
 where
     R: htslib_rs::sam::alignment::Record + ?Sized,
 {
-    if use_original_quality && let Some(mut oq) = original_quality_string(record)? {
-        if record.flags()?.is_reverse_complemented() {
-            oq = oq.chars().rev().collect();
-        }
+    let mut quality =
+        fastq_quality_scores_storage_string(record, use_original_quality, default_quality)?;
+    if record.flags()?.is_reverse_complemented() {
+        quality = quality.chars().rev().collect();
+    }
+    Ok(quality)
+}
+
+fn fastq_quality_scores_storage_string<R>(
+    record: &R,
+    use_original_quality: bool,
+    default_quality: Option<u8>,
+) -> io::Result<String>
+where
+    R: htslib_rs::sam::alignment::Record + ?Sized,
+{
+    if use_original_quality && let Some(oq) = original_quality_string(record)? {
         return Ok(oq);
     }
 
@@ -1742,7 +2316,7 @@ where
         let len = record.sequence().iter().count();
         return Ok(std::iter::repeat_n(char::from(default_quality + b'!'), len).collect());
     }
-    let mut bytes = scores
+    let bytes = scores
         .into_iter()
         .map(|score| {
             score.checked_add(b'!').ok_or_else(|| {
@@ -1750,10 +2324,6 @@ where
             })
         })
         .collect::<io::Result<Vec<_>>>()?;
-
-    if record.flags()?.is_reverse_complemented() {
-        bytes.reverse();
-    }
 
     String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
@@ -1845,6 +2415,57 @@ where
             Err(e) => Some(Err(e)),
         })
         .collect()
+}
+
+fn fastq_aux_fields_with_soft_clip<R>(
+    record: &R,
+    aux_selection: &AuxSelection,
+    soft_clip_aux: Option<&SoftClipAux>,
+) -> io::Result<Vec<String>>
+where
+    R: htslib_rs::sam::alignment::Record + ?Sized,
+{
+    let Some(soft_clip_aux) = soft_clip_aux else {
+        return fastq_aux_fields(record, aux_selection);
+    };
+    if !aux_selection_includes(aux_selection, soft_clip_aux.tag) {
+        return fastq_aux_fields(record, aux_selection);
+    }
+
+    use htslib_rs::sam::alignment::record::data::field::Tag;
+
+    let soft_clip_tag = Tag::from(soft_clip_aux.tag);
+    let mut fields = record
+        .data()
+        .iter()
+        .filter_map(|result| match result {
+            Ok((tag, value)) => {
+                if tag == soft_clip_tag {
+                    return None;
+                }
+                let tag_bytes = <[u8; 2]>::from(tag);
+                if !aux_selection_includes(aux_selection, tag_bytes) {
+                    return None;
+                }
+                match format_fastq_aux_field(&tag_bytes, value) {
+                    Ok(Some(field)) => Some(Ok(field)),
+                    Ok(None) => None,
+                    Err(e) => Some(Err(e)),
+                }
+            }
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    fields.push(soft_clip_aux.field.clone());
+    Ok(fields)
+}
+
+fn aux_selection_includes(selection: &AuxSelection, tag: [u8; 2]) -> bool {
+    match selection {
+        AuxSelection::All => true,
+        AuxSelection::Tags(tags) => tags.iter().any(|wanted| wanted == &tag),
+        AuxSelection::None => false,
+    }
 }
 
 fn format_fastq_aux_field(
@@ -2146,7 +2767,7 @@ struct IndexEmitOptions<'a> {
 
 fn emit_index_files(
     input: Option<&std::path::Path>,
-    format: Option<&htslib_rs::format::Format>,
+    exact: Option<Exact>,
     stdin_input: bool,
     flag_filters: FlagFilters,
     options: IndexEmitOptions<'_>,
@@ -2180,9 +2801,8 @@ fn emit_index_files(
     }
     let input =
         input.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing input path"))?;
-    let exact = format
-        .map(|f| f.exact)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing input format"))?;
+    let exact =
+        exact.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing input format"))?;
 
     match exact {
         Exact::Sam => {

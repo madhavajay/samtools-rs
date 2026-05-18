@@ -46,6 +46,38 @@ pub fn write_record<W: Write + ?Sized>(
     out.write_all(b"\n")
 }
 
+/// Writes a SAM record like [`write_record`], replacing the TLEN column
+/// with `template_length`. This is only for SAM text paths that need to
+/// preserve HTSlib's large-reference `hts_pos_t` TLEN values; `RecordBuf`
+/// stores TLEN as `i32`.
+pub fn write_record_with_template_length<W: Write + ?Sized>(
+    out: &mut W,
+    header: &sam::Header,
+    record: &RecordBuf,
+    template_length: i64,
+) -> io::Result<()> {
+    use sam::alignment::io::Write as _;
+
+    let mut buf = Vec::new();
+    {
+        let mut w = sam::io::Writer::new(&mut buf);
+        w.write_alignment_record(header, record)?;
+    }
+    let line = std::str::from_utf8(&buf)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        .trim_end_matches('\n');
+    let mut fields: Vec<&str> = line.split('\t').collect();
+    if fields.len() >= 11 {
+        let tlen = template_length.to_string();
+        fields[8] = &tlen;
+        let line = fields.join("\t");
+        out.write_all(fix_sam_aux_floats(&line).as_bytes())?;
+    } else {
+        out.write_all(fix_sam_aux_floats(line).as_bytes())?;
+    }
+    out.write_all(b"\n")
+}
+
 /// Formats a single `f32` aux value the way htslib's `%g`/`kputd` does:
 /// scientific notation with a signed, ≥2-digit exponent outside the
 /// `[1e-4, 1e6)` magnitude window, plain decimal otherwise.

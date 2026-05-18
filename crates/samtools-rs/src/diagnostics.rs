@@ -6,6 +6,7 @@
 //! some tests grep stderr for the subcommand tag.
 
 use std::io::{self, Write};
+use std::path::Path;
 
 /// Print `[subcommand] message` to stderr followed by a newline.
 ///
@@ -29,5 +30,14 @@ pub fn print_error_errno(subcommand: &str, message: impl AsRef<str>, err: &io::E
         subcommand,
         message.as_ref(),
         err
+    );
+}
+
+/// Print htslib's missing-input open diagnostic.
+pub fn print_hts_open_missing(path: &Path) {
+    let _ = writeln!(
+        io::stderr(),
+        "[E::hts_open_format] Failed to open file \"{}\" : No such file or directory",
+        path.display()
     );
 }

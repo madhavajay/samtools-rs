@@ -18,8 +18,9 @@
 //! `--coords-order` / `--barcode-rgx` / `--barcode-name` supported (via
 //! the `regex` crate). Raw-header SAM output preserves input `@RG`/`@SQ`
 //! order. **Byte-exact vs the entire upstream `test_markdup` SAM
-//! harness — `markdup/{5..18}` (all 14 fixtures)**. **Not yet:** exact
-//! `-s` stats counts, CRAM, the `1..4` expect-fail error-message cases.
+//! harness — `markdup/{5..18}` (all 14 fixtures), upstream-shaped
+//! `1..4` expect-fail exits/partial output, and `-s` stats counts for
+//! the promoted fixture matrix**.
 //!
 //! Supported flags:
 //!  - `-r` — remove duplicates from the output (rather than just flagging).
@@ -34,12 +35,13 @@
 //!  - `-m t|s` / `--mode t|s` — accepted duplicate-decision mode selector.
 //!  - `-b TAG` / `--barcode-tag TAG` — include a string aux tag in the
 //!    duplicate key.
-//!  - `-O sam|bam` / `--output-fmt sam|bam` — output format (default `bam`).
+//!  - `-O sam|bam|cram` / `--output-fmt sam|bam|cram` — output format
+//!    (default `bam`); CRAM output requires `-T` / `--reference` or top-level
+//!    `--reference`.
+//!  - `-T FILE` / `--reference FILE` — reference for CRAM input/output.
 //!  - `-o FILE` — output file (default stdout).
 //!  - `--no-PG` — suppress the default samtools `@PG` line.
 //!
-//! Not yet supported: exact upstream stats output, CRAM.
-
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
@@ -63,13 +65,17 @@ use crate::bam_flag::{
     BAM_FDUP, BAM_FMUNMAP, BAM_FPAIRED, BAM_FQCFAIL, BAM_FREVERSE, BAM_FSECONDARY,
     BAM_FSUPPLEMENTARY, BAM_FUNMAP,
 };
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
+use crate::sam_global::current_global_args;
 
-#[derive(Clone, Copy)]
+const MARKDUP_EARLY_FAILURE: &str = "__samtools_rs_markdup_early_failure__";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum OutFmt {
     Sam,
     Bam,
+    Cram,
 }
 
 /// Duplicate-decision mode (`-m`/`--mode`). Upstream default is
@@ -115,6 +121,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut coords_order = String::from("txy");
     let mut barcode_rgx: Option<String> = None;
     let mut barcode_name = false;
+    let mut reference: Option<PathBuf> = None;
 
     let mut iter = args.iter().skip(1).peekable();
     while let Some(arg) = iter.next() {
@@ -172,11 +179,20 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     print_error("markdup", format!("missing value for {}", s));
                     return ExitCode::from(1);
                 };
-                output_fmt = match v.to_ascii_lowercase().as_str() {
-                    "sam" => OutFmt::Sam,
-                    "bam" => OutFmt::Bam,
-                    _ => {
-                        print_error("markdup", format!("unsupported output format \"{}\"", v));
+                output_fmt = match parse_output_format(v) {
+                    Ok(fmt) => fmt,
+                    Err(e) => {
+                        print_error("markdup", e);
+                        return ExitCode::from(1);
+                    }
+                };
+            }
+            _ if s.starts_with("--output-fmt=") => {
+                let v = &s["--output-fmt=".len()..];
+                output_fmt = match parse_output_format(v) {
+                    Ok(fmt) => fmt,
+                    Err(e) => {
+                        print_error("markdup", e);
                         return ExitCode::from(1);
                     }
                 };
@@ -198,7 +214,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 };
             }
             "--no-PG" => no_pg = true,
-            "-@" | "--threads" | "-l" | "-T" => {
+            "-T" | "--reference" => {
+                reference = iter.next().map(PathBuf::from);
+            }
+            _ if s.starts_with("--reference=") => {
+                reference = Some(PathBuf::from(&s["--reference=".len()..]));
+            }
+            "-@" | "--threads" | "-l" => {
                 // Accepted-but-ignored for compatibility.
                 let _ = iter.next();
             }
@@ -229,6 +251,18 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::from(1);
     };
 
+    if input.as_os_str() != "-" && !input.exists() {
+        print_hts_open_missing(&input);
+        print_error(
+            "markdup",
+            format!(
+                "error, failed to open \"{}\" for input: No such file or directory",
+                input.display()
+            ),
+        );
+        return ExitCode::from(1);
+    }
+
     let format = match sam_io::sam_open_format(&input) {
         Ok(f) => f,
         Err(e) => {
@@ -236,10 +270,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if !matches!(format.exact, Exact::Sam | Exact::Bam) {
+    if !matches!(format.exact, Exact::Sam | Exact::Bam | Exact::Cram) {
         print_error(
             "markdup",
-            "only SAM and BAM input are currently supported (CRAM TODO)",
+            "only SAM, BAM, and reference-backed CRAM input are supported",
         );
         return ExitCode::from(1);
     }
@@ -311,31 +345,169 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
     let cfg = Cfg { coord, bc };
 
-    let result = match format.exact {
-        Exact::Sam => run_sam_markdup(
-            &input,
-            output.as_deref(),
-            output_fmt,
-            pg_argv,
-            options,
-            &cfg,
-        ),
-        Exact::Bam => run_bam_markdup(
-            &input,
-            output.as_deref(),
-            output_fmt,
-            pg_argv,
-            options,
-            &cfg,
-        ),
-        _ => unreachable!("format checked above"),
-    };
+    let reference = markdup_reference(reference.as_deref());
+    let result = run_markdup(
+        &input,
+        format.exact,
+        output.as_deref(),
+        output_fmt,
+        pg_argv,
+        options,
+        &cfg,
+        reference.as_deref(),
+    );
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.to_string() == MARKDUP_EARLY_FAILURE => ExitCode::from(1),
         Err(e) => {
             print_error_errno("markdup", "markdup failed", &e);
             ExitCode::from(1)
+        }
+    }
+}
+
+fn parse_output_format(value: &str) -> Result<OutFmt, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "sam" => Ok(OutFmt::Sam),
+        "bam" => Ok(OutFmt::Bam),
+        "cram" => Ok(OutFmt::Cram),
+        _ => Err(format!("unsupported output format \"{}\"", value)),
+    }
+}
+
+fn markdup_reference(local: Option<&Path>) -> Option<PathBuf> {
+    local
+        .map(Path::to_path_buf)
+        .or_else(|| current_global_args().reference)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_markdup(
+    input: &Path,
+    exact: Exact,
+    output: Option<&Path>,
+    output_fmt: OutFmt,
+    pg_argv: Option<&[OsString]>,
+    options: MarkdupOptions,
+    cfg: &Cfg,
+    reference: Option<&Path>,
+) -> io::Result<()> {
+    if output_fmt == OutFmt::Cram {
+        let reference = reference.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CRAM output requires -T/--reference FILE or top-level --reference FILE",
+            )
+        })?;
+        crate::reference::ensure_fai_index(reference, None)?;
+
+        let (tmp_bam_file, tmp_bam_path) =
+            crate::tmp_file::create_temp_file("markdup", Some("bam"))?;
+        drop(tmp_bam_file);
+        let mark_result = run_markdup_non_cram(
+            input,
+            exact,
+            Some(tmp_bam_path.path()),
+            OutFmt::Bam,
+            pg_argv,
+            options,
+            cfg,
+            Some(reference),
+        );
+        if let Err(e) = mark_result {
+            tmp_bam_path.close().ok();
+            return Err(e);
+        }
+
+        let result = write_cram_from_bam(tmp_bam_path.path(), output, reference);
+        tmp_bam_path.close().ok();
+        return result;
+    }
+
+    run_markdup_non_cram(
+        input, exact, output, output_fmt, pg_argv, options, cfg, reference,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_markdup_non_cram(
+    input: &Path,
+    exact: Exact,
+    output: Option<&Path>,
+    output_fmt: OutFmt,
+    pg_argv: Option<&[OsString]>,
+    options: MarkdupOptions,
+    cfg: &Cfg,
+    reference: Option<&Path>,
+) -> io::Result<()> {
+    match exact {
+        Exact::Sam => run_sam_markdup(input, output, output_fmt, pg_argv, options, cfg),
+        Exact::Bam => run_bam_markdup(input, output, output_fmt, pg_argv, options, cfg),
+        Exact::Cram => {
+            run_cram_markdup(input, output, output_fmt, pg_argv, options, cfg, reference)
+        }
+        _ => unreachable!("format checked above"),
+    }
+}
+
+fn run_cram_markdup(
+    input: &Path,
+    output: Option<&Path>,
+    output_fmt: OutFmt,
+    pg_argv: Option<&[OsString]>,
+    options: MarkdupOptions,
+    cfg: &Cfg,
+    reference: Option<&Path>,
+) -> io::Result<()> {
+    let reference = reference.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CRAM input requires -T/--reference FILE or top-level --reference FILE",
+        )
+    })?;
+    crate::reference::ensure_fai_index(reference, None)?;
+    let sam_text =
+        htslib_rs::alignment_compat::view_cram_as_sam_text_from_path_with_reference_and_limit(
+            input, reference, None,
+        )?;
+    let (mut tmp_sam, tmp_sam_path) =
+        crate::tmp_file::create_temp_file("markdup-cram", Some("sam"))?;
+    tmp_sam.write_all(sam_text.as_bytes())?;
+    tmp_sam.flush()?;
+    drop(tmp_sam);
+
+    let result = run_sam_markdup(
+        tmp_sam_path.path(),
+        output,
+        output_fmt,
+        pg_argv,
+        options,
+        cfg,
+    );
+    tmp_sam_path.close().ok();
+    result
+}
+
+fn write_cram_from_bam(
+    input_bam: &Path,
+    output: Option<&Path>,
+    reference: &Path,
+) -> io::Result<()> {
+    match output {
+        Some(path) => {
+            let out = File::create(path)?;
+            htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+                input_bam, reference, out,
+            )
+            .map(|_| ())
+        }
+        None => {
+            let out = io::stdout().lock();
+            htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+                input_bam, reference, out,
+            )
+            .map(|_| ())
         }
     }
 }
@@ -377,6 +549,71 @@ impl DuplicateType {
 struct DuplicateMetadata {
     origin: Vec<u8>,
     duplicate_type: Option<DuplicateType>,
+}
+
+struct EarlyMarkdupError {
+    emit_header: bool,
+    partial_records: usize,
+    messages: &'static [&'static str],
+}
+
+fn validate_markdup_input(
+    raw_header_text: &str,
+    records: &[RecordBuf],
+) -> Result<(), EarlyMarkdupError> {
+    if raw_header_text.lines().any(|line| {
+        line.starts_with("@HD\t") && line.split('\t').any(|field| field == "SO:queryname")
+    }) {
+        return Err(EarlyMarkdupError {
+            emit_header: false,
+            partial_records: 0,
+            messages: &["[markdup] error: queryname sorted, must be sorted by coordinate."],
+        });
+    }
+
+    let mut prev_key: Option<(i32, i64)> = None;
+    for (i, record) in records.iter().enumerate() {
+        if let (Some(tid), Some(pos)) = (record.reference_sequence_id(), record.alignment_start()) {
+            let key = (tid as i32, pos.get() as i64);
+            if prev_key.is_some_and(|prev| key < prev) {
+                return Err(EarlyMarkdupError {
+                    emit_header: true,
+                    partial_records: i.saturating_sub(1),
+                    messages: &["[markdup] error: bad coordinate order."],
+                });
+            }
+            prev_key = Some(key);
+        }
+    }
+
+    for record in records {
+        let flag = rec_flags(record);
+        if flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY) != 0 || !has_mate(record) {
+            continue;
+        }
+        if mc_string(record).is_none() {
+            return Err(EarlyMarkdupError {
+                emit_header: true,
+                partial_records: 0,
+                messages: &[
+                    "[markdup] error: no MC tag.",
+                    "[markdup] error: unable to assign pair hash key.",
+                ],
+            });
+        }
+        if record.data().get(&Tag::from([b'm', b's'])).is_none() {
+            return Err(EarlyMarkdupError {
+                emit_header: true,
+                partial_records: 0,
+                messages: &[
+                    "[markdup] error: no ms score tag.",
+                    "[markdup] error: no ms score tag.",
+                ],
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Per-record read-group number (`--use-read-groups`): the 1-based index
@@ -431,39 +668,33 @@ fn run_bam_markdup(
     if options.clear_existing_dups {
         clear_duplicate_marks(&mut records);
     }
+    let raw_header_text = crate::header_text::read_raw_header_text(input)?;
+    if let Err(err) = validate_markdup_input(&raw_header_text, &records) {
+        emit_early_markdup_failure(
+            &header,
+            &raw_header_text,
+            &records,
+            err,
+            output,
+            fmt,
+            pg_argv,
+            options,
+            cfg,
+        )?;
+        return Err(io::Error::other(MARKDUP_EARLY_FAILURE));
+    }
     let rg_of = compute_rg_of(&header, &records, options.use_read_groups);
     let mut stats = mark_duplicates(&mut records, options, &rg_of, cfg);
     stats.written = output_record_count(&records, options.remove_dups);
-    if matches!(fmt, OutFmt::Sam) {
-        // Byte-faithful: emit the raw input header (preserving @RG/@SQ
-        // order) + the samtools @PG, then records via the float-correct
-        // renderer (mirrors merge/sort/ampliconclip).
-        let mut header_text = crate::header_text::read_raw_header_text(input)?;
-        if let Some(argv) = pg_argv {
-            header_text =
-                crate::pg::add_samtools_pg(&header_text, argv).map_err(io::Error::other)?;
-        }
-        let mut out: Box<dyn Write> = match output {
-            Some(p) => Box::new(io::BufWriter::new(File::create(p)?)),
-            None => Box::new(io::BufWriter::new(io::stdout().lock())),
-        };
-        out.write_all(header_text.as_bytes())?;
-        for rec in &records {
-            if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
-                continue;
-            }
-            crate::sam_render::write_record(&mut out, &header, rec)?;
-        }
-        out.flush()?;
-    } else {
-        let mut sink = open_output(output, fmt, &header)?;
-        for rec in &records {
-            if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
-                continue;
-            }
-            sink.write_record(&header, rec)?;
-        }
-    }
+    write_markdup_records(
+        &header,
+        &raw_header_text,
+        &records,
+        output,
+        fmt,
+        pg_argv,
+        options.remove_dups,
+    )?;
     if options.emit_stats {
         write_markdup_stats(&mut io::stderr().lock(), &stats)?;
     }
@@ -494,14 +725,86 @@ fn run_sam_markdup(
     if options.clear_existing_dups {
         clear_duplicate_marks(&mut records);
     }
+    let raw_header_text = crate::header_text::read_raw_header_text(input)?;
+    if let Err(err) = validate_markdup_input(&raw_header_text, &records) {
+        emit_early_markdup_failure(
+            &header,
+            &raw_header_text,
+            &records,
+            err,
+            output,
+            fmt,
+            pg_argv,
+            options,
+            cfg,
+        )?;
+        return Err(io::Error::other(MARKDUP_EARLY_FAILURE));
+    }
     let rg_of = compute_rg_of(&header, &records, options.use_read_groups);
     let mut stats = mark_duplicates(&mut records, options, &rg_of, cfg);
     stats.written = output_record_count(&records, options.remove_dups);
+    write_markdup_records(
+        &header,
+        &raw_header_text,
+        &records,
+        output,
+        fmt,
+        pg_argv,
+        options.remove_dups,
+    )?;
+    if options.emit_stats {
+        write_markdup_stats(&mut io::stderr().lock(), &stats)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_early_markdup_failure(
+    header: &sam::Header,
+    raw_header_text: &str,
+    records: &[RecordBuf],
+    err: EarlyMarkdupError,
+    output: Option<&Path>,
+    fmt: OutFmt,
+    pg_argv: Option<&[OsString]>,
+    options: MarkdupOptions,
+    cfg: &Cfg,
+) -> io::Result<()> {
+    if err.emit_header {
+        let mut partial = records[..err.partial_records].to_vec();
+        let rg_of = compute_rg_of(header, &partial, options.use_read_groups);
+        mark_duplicates(&mut partial, options, &rg_of, cfg);
+        write_markdup_records(
+            header,
+            raw_header_text,
+            &partial,
+            output,
+            fmt,
+            pg_argv,
+            options.remove_dups,
+        )?;
+    }
+
+    for message in err.messages {
+        eprintln!("{message}");
+    }
+    Ok(())
+}
+
+fn write_markdup_records(
+    header: &sam::Header,
+    raw_header_text: &str,
+    records: &[RecordBuf],
+    output: Option<&Path>,
+    fmt: OutFmt,
+    pg_argv: Option<&[OsString]>,
+    remove_dups: bool,
+) -> io::Result<()> {
     if matches!(fmt, OutFmt::Sam) {
         // Byte-faithful: emit the raw input header (preserving @RG/@SQ
         // order) + the samtools @PG, then records via the float-correct
         // renderer (mirrors merge/sort/ampliconclip).
-        let mut header_text = crate::header_text::read_raw_header_text(input)?;
+        let mut header_text = raw_header_text.to_string();
         if let Some(argv) = pg_argv {
             header_text =
                 crate::pg::add_samtools_pg(&header_text, argv).map_err(io::Error::other)?;
@@ -511,24 +814,21 @@ fn run_sam_markdup(
             None => Box::new(io::BufWriter::new(io::stdout().lock())),
         };
         out.write_all(header_text.as_bytes())?;
-        for rec in &records {
-            if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
+        for rec in records {
+            if remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
                 continue;
             }
-            crate::sam_render::write_record(&mut out, &header, rec)?;
+            crate::sam_render::write_record(&mut out, header, rec)?;
         }
         out.flush()?;
     } else {
-        let mut sink = open_output(output, fmt, &header)?;
-        for rec in &records {
-            if options.remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
+        let mut sink = open_output(output, fmt, header)?;
+        for rec in records {
+            if remove_dups && rec.flags().bits() as u32 & BAM_FDUP != 0 {
                 continue;
             }
-            sink.write_record(&header, rec)?;
+            sink.write_record(header, rec)?;
         }
-    }
-    if options.emit_stats {
-        write_markdup_stats(&mut io::stderr().lock(), &stats)?;
     }
     Ok(())
 }
@@ -1851,6 +2151,10 @@ fn open_output(out: Option<&Path>, fmt: OutFmt, header: &sam::Header) -> io::Res
             w.write_header(header)?;
             Ok(Box::new(BamStdout(w)))
         }
+        (_, OutFmt::Cram) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CRAM output must be written through the markdup CRAM bridge",
+        )),
     }
 }
 
@@ -1872,7 +2176,8 @@ fn print_usage() -> io::Result<()> {
         w,
         "  -b TAG        include barcode aux tag in duplicate key"
     )?;
-    writeln!(w, "  -O sam|bam    output format (default: bam)")?;
+    writeln!(w, "  -O sam|bam|cram output format (default: bam)")?;
+    writeln!(w, "  -T FILE       reference for CRAM input/output")?;
     writeln!(w, "  -o FILE       output file (default stdout)")?;
     writeln!(w, "  --no-PG       do not add a @PG line")?;
     Ok(())
@@ -1881,6 +2186,219 @@ fn print_usage() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn base_options() -> MarkdupOptions {
+        MarkdupOptions {
+            remove_dups: false,
+            emit_stats: true,
+            clear_existing_dups: false,
+            duplicate_origin_tag: false,
+            optical_distance: None,
+            include_fails: false,
+            mode: DupMode::Template,
+            supp: false,
+            use_read_groups: false,
+            duplicate_count: false,
+        }
+    }
+
+    fn default_cfg() -> Cfg {
+        Cfg {
+            coord: CoordCfg {
+                rx: None,
+                x: 0,
+                y: 0,
+                t: 0,
+            },
+            bc: BcMode::None,
+        }
+    }
+
+    fn regex_coord_cfg(pattern: &str, order: &str) -> CoordCfg {
+        let (x, y, t) = match order {
+            "xyt" => (1, 2, 3),
+            "xy" => (1, 2, 0),
+            _ => unreachable!("test only uses known coordinate orders"),
+        };
+        CoordCfg {
+            rx: Some(regex::Regex::new(pattern).unwrap()),
+            x,
+            y,
+            t,
+        }
+    }
+
+    fn markdup_stats_for_fixture(stem: &str, options: MarkdupOptions, cfg: &Cfg) -> String {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("samtools")
+            .join("test")
+            .join("markdup")
+            .join(format!("{stem}.sam"));
+        let mut reader = crate::sam_compat::open_sam_reader_tolerant(&fixture).unwrap();
+        let header = reader.read_header().unwrap();
+        let mut records = Vec::new();
+        loop {
+            let mut record = RecordBuf::default();
+            if reader.read_record_buf(&header, &mut record).unwrap() == 0 {
+                break;
+            }
+            records.push(record);
+        }
+
+        let rg_of = compute_rg_of(&header, &records, options.use_read_groups);
+        let mut stats = mark_duplicates(&mut records, options, &rg_of, cfg);
+        stats.written = output_record_count(&records, options.remove_dups);
+        let mut out = Vec::new();
+        write_markdup_stats(&mut out, &stats).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn markdup_stats_match_upstream_fixture_counts() {
+        let mut cases: Vec<(&str, MarkdupOptions, Cfg, &str)> = Vec::new();
+
+        let mut opts = base_options();
+        cases.push(("5_markdup", opts, default_cfg(), "READ: 16\nWRITTEN: 16\nEXCLUDED: 0\nEXAMINED: 13\nPAIRED: 10\nSINGLE: 3\nDUPLICATE PAIR: 4\nDUPLICATE SINGLE: 2\nDUPLICATE PAIR OPTICAL: 0\nDUPLICATE SINGLE OPTICAL: 0\nDUPLICATE NON PRIMARY: 0\nDUPLICATE NON PRIMARY OPTICAL: 0\nDUPLICATE PRIMARY TOTAL: 6\nDUPLICATE TOTAL: 6\nESTIMATED_LIBRARY_SIZE: 4\n"));
+
+        opts = base_options();
+        opts.remove_dups = true;
+        cases.push(("6_remove_dups", opts, default_cfg(), "READ: 16\nWRITTEN: 10\nEXCLUDED: 0\nEXAMINED: 13\nPAIRED: 10\nSINGLE: 3\nDUPLICATE PAIR: 4\nDUPLICATE SINGLE: 2\nDUPLICATE PAIR OPTICAL: 0\nDUPLICATE SINGLE OPTICAL: 0\nDUPLICATE NON PRIMARY: 0\nDUPLICATE NON PRIMARY OPTICAL: 0\nDUPLICATE PRIMARY TOTAL: 6\nDUPLICATE TOTAL: 6\nESTIMATED_LIBRARY_SIZE: 4\n"));
+
+        opts = base_options();
+        opts.supp = true;
+        cases.push(("7_mark_supp_dup", opts, default_cfg(), "READ: 22\nWRITTEN: 22\nEXCLUDED: 0\nEXAMINED: 17\nPAIRED: 14\nSINGLE: 3\nDUPLICATE PAIR: 6\nDUPLICATE SINGLE: 2\nDUPLICATE PAIR OPTICAL: 0\nDUPLICATE SINGLE OPTICAL: 0\nDUPLICATE NON PRIMARY: 3\nDUPLICATE NON PRIMARY OPTICAL: 0\nDUPLICATE PRIMARY TOTAL: 8\nDUPLICATE TOTAL: 11\nESTIMATED_LIBRARY_SIZE: 5\n"));
+
+        opts = base_options();
+        opts.supp = true;
+        opts.optical_distance = Some(100);
+        opts.mode = DupMode::Sequence;
+        opts.duplicate_origin_tag = true;
+        cases.push(("8_optical_dup", opts, default_cfg(), "READ: 10\nWRITTEN: 10\nEXCLUDED: 0\nEXAMINED: 10\nPAIRED: 10\nSINGLE: 0\nDUPLICATE PAIR: 8\nDUPLICATE SINGLE: 0\nDUPLICATE PAIR OPTICAL: 2\nDUPLICATE SINGLE OPTICAL: 0\nDUPLICATE NON PRIMARY: 0\nDUPLICATE NON PRIMARY OPTICAL: 0\nDUPLICATE PRIMARY TOTAL: 8\nDUPLICATE TOTAL: 8\nESTIMATED_LIBRARY_SIZE: 1\n"));
+
+        opts = base_options();
+        opts.supp = true;
+        opts.optical_distance = Some(2500);
+        opts.mode = DupMode::Sequence;
+        opts.duplicate_origin_tag = true;
+        opts.include_fails = true;
+        cases.push(("9_optical_dup_qcfail", opts, default_cfg(), "READ: 6\nWRITTEN: 6\nEXCLUDED: 0\nEXAMINED: 6\nPAIRED: 6\nSINGLE: 0\nDUPLICATE PAIR: 4\nDUPLICATE SINGLE: 0\nDUPLICATE PAIR OPTICAL: 4\nDUPLICATE SINGLE OPTICAL: 0\nDUPLICATE NON PRIMARY: 0\nDUPLICATE NON PRIMARY OPTICAL: 0\nDUPLICATE PRIMARY TOTAL: 4\nDUPLICATE TOTAL: 4\nESTIMATED_LIBRARY_SIZE: 0\n"));
+
+        opts = base_options();
+        opts.supp = true;
+        opts.optical_distance = Some(2500);
+        opts.mode = DupMode::Sequence;
+        opts.duplicate_origin_tag = true;
+        cases.push(("10_optical_chain", opts, default_cfg(), "READ: 6\nWRITTEN: 6\nEXCLUDED: 0\nEXAMINED: 6\nPAIRED: 6\nSINGLE: 0\nDUPLICATE PAIR: 4\nDUPLICATE SINGLE: 0\nDUPLICATE PAIR OPTICAL: 2\nDUPLICATE SINGLE OPTICAL: 0\nDUPLICATE NON PRIMARY: 0\nDUPLICATE NON PRIMARY OPTICAL: 0\nDUPLICATE PRIMARY TOTAL: 4\nDUPLICATE TOTAL: 4\nESTIMATED_LIBRARY_SIZE: 1\n"));
+
+        opts = base_options();
+        opts.supp = true;
+        opts.optical_distance = Some(100);
+        opts.mode = DupMode::Sequence;
+        opts.duplicate_origin_tag = true;
+        cases.push(("11_optical_dup_regex", opts, Cfg { coord: regex_coord_cfg("^([0-9]+):([0-9]+):([[:print:]]+)", "xyt"), bc: BcMode::None }, "READ: 10\nWRITTEN: 10\nEXCLUDED: 0\nEXAMINED: 10\nPAIRED: 10\nSINGLE: 0\nDUPLICATE PAIR: 8\nDUPLICATE SINGLE: 0\nDUPLICATE PAIR OPTICAL: 2\nDUPLICATE SINGLE OPTICAL: 0\nDUPLICATE NON PRIMARY: 0\nDUPLICATE NON PRIMARY OPTICAL: 0\nDUPLICATE PRIMARY TOTAL: 8\nDUPLICATE TOTAL: 8\nESTIMATED_LIBRARY_SIZE: 1\n"));
+
+        opts = base_options();
+        opts.supp = true;
+        opts.optical_distance = Some(2500);
+        opts.mode = DupMode::Sequence;
+        opts.duplicate_origin_tag = true;
+        cases.push(("12_optical_chain_regex", opts, Cfg { coord: regex_coord_cfg("([[:digit:]]+):([[:digit:]]+)$", "xy"), bc: BcMode::None }, "READ: 8\nWRITTEN: 8\nEXCLUDED: 0\nEXAMINED: 8\nPAIRED: 8\nSINGLE: 0\nDUPLICATE PAIR: 6\nDUPLICATE SINGLE: 0\nDUPLICATE PAIR OPTICAL: 4\nDUPLICATE SINGLE OPTICAL: 0\nDUPLICATE NON PRIMARY: 0\nDUPLICATE NON PRIMARY OPTICAL: 0\nDUPLICATE PRIMARY TOTAL: 6\nDUPLICATE TOTAL: 6\nESTIMATED_LIBRARY_SIZE: 1\n"));
+
+        let optical_barcode_stats = "READ: 18\nWRITTEN: 18\nEXCLUDED: 0\nEXAMINED: 18\nPAIRED: 18\nSINGLE: 0\nDUPLICATE PAIR: 15\nDUPLICATE SINGLE: 0\nDUPLICATE PAIR OPTICAL: 12\nDUPLICATE SINGLE OPTICAL: 0\nDUPLICATE NON PRIMARY: 0\nDUPLICATE NON PRIMARY OPTICAL: 0\nDUPLICATE PRIMARY TOTAL: 15\nDUPLICATE TOTAL: 15\nESTIMATED_LIBRARY_SIZE: 1\n";
+
+        opts = base_options();
+        opts.supp = true;
+        opts.optical_distance = Some(100);
+        opts.mode = DupMode::Sequence;
+        opts.duplicate_origin_tag = true;
+        cases.push((
+            "13_optical_barcode_tag",
+            opts,
+            Cfg {
+                coord: default_cfg().coord,
+                bc: BcMode::Tag(parse_tag("BX").unwrap()),
+            },
+            optical_barcode_stats,
+        ));
+
+        opts = base_options();
+        opts.supp = true;
+        opts.optical_distance = Some(100);
+        opts.mode = DupMode::Sequence;
+        opts.duplicate_origin_tag = true;
+        cases.push((
+            "14_optical_barcode_name",
+            opts,
+            Cfg {
+                coord: default_cfg().coord,
+                bc: BcMode::Rgx(regex::Regex::new("[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:[0-9A-Za-z]+:([!-?A-~]+)").unwrap()),
+            },
+            optical_barcode_stats,
+        ));
+
+        opts = base_options();
+        opts.supp = true;
+        opts.optical_distance = Some(100);
+        opts.mode = DupMode::Sequence;
+        opts.duplicate_origin_tag = true;
+        cases.push((
+            "15_optical_barcode_rgx_name",
+            opts,
+            Cfg {
+                coord: regex_coord_cfg("^[!-9;-?A-~]+:([0-9]+):([0-9]+)", "xy"),
+                bc: BcMode::Rgx(regex::Regex::new("^([!-9;-?A-~]+):[0-9]+:").unwrap()),
+            },
+            optical_barcode_stats,
+        ));
+
+        opts = base_options();
+        opts.supp = true;
+        opts.optical_distance = Some(100);
+        opts.mode = DupMode::Sequence;
+        opts.duplicate_origin_tag = true;
+        cases.push((
+            "16_optical_barcode_rgx_name_test_2",
+            opts,
+            Cfg {
+                coord: regex_coord_cfg("^[!-9;-?A-~]+:([0-9]{4})([0-9]{4})", "xy"),
+                bc: BcMode::Rgx(regex::Regex::new("^([!-9;-?A-~]+):[0-9]+:").unwrap()),
+            },
+            optical_barcode_stats,
+        ));
+
+        opts = base_options();
+        opts.optical_distance = Some(100);
+        opts.mode = DupMode::Sequence;
+        opts.duplicate_origin_tag = true;
+        opts.use_read_groups = true;
+        cases.push((
+            "17_read_group",
+            opts,
+            Cfg {
+                coord: default_cfg().coord,
+                bc: BcMode::None,
+            },
+            optical_barcode_stats,
+        ));
+
+        opts = base_options();
+        opts.supp = true;
+        opts.duplicate_origin_tag = true;
+        opts.duplicate_count = true;
+        cases.push(("18_primary_duplicate_count", opts, Cfg { coord: default_cfg().coord, bc: BcMode::Tag(parse_tag("BC").unwrap()) }, "READ: 56\nWRITTEN: 56\nEXCLUDED: 0\nEXAMINED: 36\nPAIRED: 36\nSINGLE: 0\nDUPLICATE PAIR: 28\nDUPLICATE SINGLE: 0\nDUPLICATE PAIR OPTICAL: 0\nDUPLICATE SINGLE OPTICAL: 0\nDUPLICATE NON PRIMARY: 15\nDUPLICATE NON PRIMARY OPTICAL: 0\nDUPLICATE PRIMARY TOTAL: 28\nDUPLICATE TOTAL: 43\nESTIMATED_LIBRARY_SIZE: 4\n"));
+
+        for (stem, options, cfg, expected) in cases {
+            assert_eq!(
+                markdup_stats_for_fixture(stem, options, &cfg),
+                expected,
+                "markdup -s stats for {stem}"
+            );
+        }
+    }
 
     #[test]
     fn markdup_stats_text_uses_upstream_field_names() {

@@ -135,6 +135,14 @@ pub(crate) fn check_file<W: Write>(
             let _ = writeln!(stderr, "{} is sequence data", path.display());
         }
         match read_header_nref(path, format.exact) {
+            Err(_) if format.exact == Exact::Bam => qc_err(
+                &mut state,
+                QC_NOT_SEQUENCE,
+                verbose,
+                quiet,
+                stderr,
+                &format!("{} was not identified as sequence data.", path.display()),
+            ),
             Err(_) => qc_err(
                 &mut state,
                 QC_BAD_HEADER,

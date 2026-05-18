@@ -1,14 +1,14 @@
 //! `samtools split` — split an alignment file by `@RG` ID or aux tag value.
 //!
 //! Mirrors `main_split` in `bam_split.c`. The initial Rust port supports:
-//!  - Input BAM and SAM (CRAM TODO).
+//!  - Input BAM, SAM, and whole-file CRAM.
 //!  - Output template via `-f` with `%*` (input basename), `%!` (RG ID or
 //!    tag value), `%#` (output index), and `%.` (extension).
 //!  - `-u <path>` — write records with unknown/missing RG/tag to this file.
 //!  - `-h <path>` — use an alternate SAM header for the unaccounted output.
 //!  - `-d TAG` — split by a string or integer aux tag instead of header `@RG`.
 //!  - `-M N` / `--max-split N` — cap dynamically-created `-d` outputs.
-//!  - `--output-fmt sam|bam` — only `bam` (default) and `sam` are honored.
+//!  - `--output-fmt sam|bam|cram` — CRAM output requires `--reference`.
 //!  - `--no-PG` — suppress the default `@PG` line.
 //!  - `--write-index` — build BAI indexes for BAM outputs.
 //!  - `-p N` — width for `%#` padding.
@@ -23,10 +23,11 @@ use std::process::ExitCode;
 
 use htslib_rs::bam;
 use htslib_rs::bgzf;
+use htslib_rs::cram;
 use htslib_rs::format::Exact;
 use htslib_rs::sam::{self, alignment::RecordBuf};
 
-use crate::diagnostics::{print_error, print_error_errno};
+use crate::diagnostics::{print_error, print_error_errno, print_hts_open_missing};
 use crate::io as sam_io;
 use crate::sam_global::current_global_args;
 
@@ -35,7 +36,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let mut template = String::from("%*_%!.%.");
     let mut unaccounted: Option<PathBuf> = None;
     let mut unaccounted_header: Option<PathBuf> = None;
-    let mut output_fmt = OutFmt::Bam;
+    let mut output_fmt: Option<OutFmt> = None;
     let mut pad_width: usize = 0;
     let mut split_tag: Option<[u8; 2]> = None;
     let mut max_split: usize = 100;
@@ -93,13 +94,18 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
             }
-            "--output-fmt" => {
-                let v = iter.next().and_then(|a| a.to_str()).unwrap_or("bam");
-                output_fmt = match v.to_lowercase().as_str() {
-                    "sam" => OutFmt::Sam,
-                    "bam" => OutFmt::Bam,
-                    _ => OutFmt::Bam,
+            "--output-fmt" | "-O" => {
+                let Some(v) = iter.next().and_then(|a| a.to_str()) else {
+                    print_error("split", format!("missing argument for {}", s));
+                    return ExitCode::from(1);
                 };
+                output_fmt = Some(match parse_output_format(v) {
+                    Ok(fmt) => fmt,
+                    Err(e) => {
+                        print_error("split", e);
+                        return ExitCode::from(1);
+                    }
+                });
             }
             "--no-PG" => add_pg = false,
             "--write-index" => local_write_index = true,
@@ -131,6 +137,17 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
 
     if input.as_os_str() != "-" {
+        if !input.exists() {
+            print_hts_open_missing(&input);
+            print_error(
+                "split",
+                format!(
+                    "Could not open \"{}\": No such file or directory",
+                    input.display()
+                ),
+            );
+            return ExitCode::from(1);
+        }
         let format = match sam_io::sam_open_format(&input) {
             Ok(f) => f,
             Err(e) => {
@@ -138,13 +155,27 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        if !matches!(format.exact, Exact::Sam | Exact::Bam) {
+        if !matches!(format.exact, Exact::Sam | Exact::Bam | Exact::Cram) {
             print_error(
                 "split",
-                "only SAM and BAM input are currently supported (CRAM TODO)",
+                "only SAM, BAM, and CRAM input are currently supported",
             );
             return ExitCode::from(1);
         }
+    }
+
+    let globals = current_global_args();
+    let write_index = local_write_index || globals.write_index;
+    if write_index && matches!(output_fmt, Some(fmt) if !matches!(fmt, OutFmt::Bam)) {
+        print_error("split", "--write-index is only supported for BAM output");
+        return ExitCode::from(1);
+    }
+    if matches!(output_fmt, Some(OutFmt::Cram)) && globals.reference.is_none() {
+        print_error(
+            "split",
+            "CRAM output requires a reference (use top-level --reference FILE)",
+        );
+        return ExitCode::from(1);
     }
 
     let options = SplitOptions {
@@ -152,17 +183,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
         unaccounted: unaccounted.as_deref(),
         unaccounted_header: unaccounted_header.as_deref(),
         fmt: output_fmt,
+        reference: globals.reference.as_deref(),
         pad_width,
         split_tag,
         max_split,
         add_pg,
-        write_index: local_write_index || current_global_args().write_index,
+        write_index,
         argv: args,
     };
 
     match run_split(&input, options) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+        Err(SplitError::AlreadyReported) => ExitCode::from(1),
+        Err(SplitError::Io(e)) => {
             print_error_errno("split", "split failed", &e);
             ExitCode::from(1)
         }
@@ -173,13 +206,25 @@ pub fn main(args: &[OsString]) -> ExitCode {
 enum OutFmt {
     Sam,
     Bam,
+    Cram,
+}
+
+fn parse_output_format(raw: &str) -> Result<OutFmt, String> {
+    let head = raw.split(',').next().unwrap_or("").to_ascii_lowercase();
+    match head.as_str() {
+        "sam" => Ok(OutFmt::Sam),
+        "bam" => Ok(OutFmt::Bam),
+        "cram" => Ok(OutFmt::Cram),
+        _ => Err(format!("unsupported output format \"{}\"", raw)),
+    }
 }
 
 struct SplitOptions<'a> {
     template: &'a str,
     unaccounted: Option<&'a Path>,
     unaccounted_header: Option<&'a Path>,
-    fmt: OutFmt,
+    fmt: Option<OutFmt>,
+    reference: Option<&'a Path>,
     pad_width: usize,
     split_tag: Option<[u8; 2]>,
     max_split: usize,
@@ -188,7 +233,56 @@ struct SplitOptions<'a> {
     argv: &'a [OsString],
 }
 
-fn run_split(input: &Path, options: SplitOptions<'_>) -> io::Result<()> {
+enum SplitError {
+    Io(io::Error),
+    AlreadyReported,
+}
+
+impl From<io::Error> for SplitError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+type SplitResult<T> = Result<T, SplitError>;
+
+impl SplitOptions<'_> {
+    fn render_fmt(&self) -> OutFmt {
+        self.fmt.unwrap_or(OutFmt::Bam)
+    }
+
+    fn fmt_for_path(&self, path: &Path) -> io::Result<OutFmt> {
+        let fmt = self.fmt.unwrap_or_else(|| infer_output_format(path));
+        if self.write_index && !matches!(fmt, OutFmt::Bam) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--write-index is only supported for BAM output",
+            ));
+        }
+        if matches!(fmt, OutFmt::Cram) && self.reference.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CRAM output requires a reference (use top-level --reference FILE)",
+            ));
+        }
+        Ok(fmt)
+    }
+}
+
+fn infer_output_format(path: &Path) -> OutFmt {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("sam") => OutFmt::Sam,
+        Some("cram") => OutFmt::Cram,
+        _ => OutFmt::Bam,
+    }
+}
+
+fn run_split(input: &Path, options: SplitOptions<'_>) -> SplitResult<()> {
     let (header, records) = if input.as_os_str() == "-" {
         read_stdin_records()?
     } else {
@@ -196,11 +290,13 @@ fn run_split(input: &Path, options: SplitOptions<'_>) -> io::Result<()> {
         match format.exact {
             Exact::Sam => read_sam_records(input)?,
             Exact::Bam => read_bam_records(input)?,
+            Exact::Cram => read_cram_records(input)?,
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "only SAM and BAM input are currently supported (CRAM TODO)",
-                ));
+                    "only SAM, BAM, and CRAM input are currently supported",
+                )
+                .into());
             }
         }
     };
@@ -235,14 +331,15 @@ fn run_split(input: &Path, options: SplitOptions<'_>) -> io::Result<()> {
             input_base,
             tag_value,
             idx,
-            options.fmt,
+            options.render_fmt(),
             options.pad_width,
-        );
+        )?;
         let path = PathBuf::from(path);
-        track_index_path(&mut index_paths, options.write_index, options.fmt, &path);
+        let fmt = options.fmt_for_path(&path)?;
+        track_index_path(&mut index_paths, options.write_index, fmt, &path);
         outputs.push(SplitOutput {
             header: output_header.clone(),
-            sink: open_output(&path, options.fmt, &output_header)?,
+            sink: open_output(&path, fmt, &output_header, options.reference)?,
         });
         id_to_index.insert(tag_value.clone(), idx);
     }
@@ -258,41 +355,48 @@ fn run_split(input: &Path, options: SplitOptions<'_>) -> io::Result<()> {
     )?;
     let mut unaccounted_out: Option<Box<dyn SplitSink>> = match options.unaccounted {
         Some(p) => {
-            track_index_path(&mut index_paths, options.write_index, options.fmt, p);
-            Some(open_output(p, options.fmt, &unaccounted_output_header)?)
+            let fmt = options.fmt_for_path(p)?;
+            track_index_path(&mut index_paths, options.write_index, fmt, p);
+            Some(open_output(
+                p,
+                fmt,
+                &unaccounted_output_header,
+                options.reference,
+            )?)
         }
         None => None,
     };
 
     for record in &records {
         let tag_value = record_split_tag_value(record, options.split_tag, options.pad_width);
-        let target = match tag_value {
-            Some(value) => match id_to_index.get(&value).copied() {
+        let target = match tag_value.as_ref() {
+            Some(value) => match id_to_index.get(value).copied() {
                 Some(i) => Some(SplitTarget::Output(i)),
                 None if options.split_tag.is_some() && outputs.len() < options.max_split => {
                     let idx = outputs.len();
                     let output_header = prepare_output_header(
                         &header,
                         options.split_tag,
-                        &value,
+                        value,
                         options.add_pg,
                         options.argv,
                     )?;
                     let path = render_template(
                         options.template,
                         input_base,
-                        &value,
+                        value,
                         idx,
-                        options.fmt,
+                        options.render_fmt(),
                         options.pad_width,
-                    );
+                    )?;
                     let path = PathBuf::from(path);
-                    track_index_path(&mut index_paths, options.write_index, options.fmt, &path);
+                    let fmt = options.fmt_for_path(&path)?;
+                    track_index_path(&mut index_paths, options.write_index, fmt, &path);
                     outputs.push(SplitOutput {
                         header: output_header.clone(),
-                        sink: open_output(&path, options.fmt, &output_header)?,
+                        sink: open_output(&path, fmt, &output_header, options.reference)?,
                     });
-                    id_to_index.insert(value, idx);
+                    id_to_index.insert(value.clone(), idx);
                     Some(SplitTarget::Output(idx))
                 }
                 None => unaccounted_out.as_ref().map(|_| SplitTarget::Unaccounted),
@@ -309,16 +413,41 @@ fn run_split(input: &Path, options: SplitOptions<'_>) -> io::Result<()> {
                     sink.write_record(&unaccounted_output_header, record)?;
                 }
             }
-            None => {}
+            None => {
+                report_unaccounted_record(record, options.split_tag, tag_value.as_deref());
+                return Err(SplitError::AlreadyReported);
+            }
         }
     }
 
+    for output in &mut outputs {
+        output.sink.finish(&output.header)?;
+    }
+    if let Some(sink) = unaccounted_out.as_deref_mut() {
+        sink.finish(&unaccounted_output_header)?;
+    }
     drop(outputs);
     drop(unaccounted_out);
     for path in index_paths {
         write_bam_index(&path)?;
     }
     Ok(())
+}
+
+fn report_unaccounted_record(record: &RecordBuf, split_tag: Option<[u8; 2]>, value: Option<&str>) {
+    let read_name = record
+        .name()
+        .map(|name| String::from_utf8_lossy(name.as_ref()))
+        .map(std::borrow::Cow::into_owned)
+        .unwrap_or_else(|| "*".to_string());
+
+    if let Some(value) = value {
+        eprintln!("Read \"{read_name}\" with unaccounted for tag \"{value}\".");
+    } else {
+        let tag = split_tag.unwrap_or(*b"RG");
+        let tag = String::from_utf8_lossy(&tag);
+        eprintln!("Read \"{read_name}\" has no {tag} tag.");
+    }
 }
 
 struct SplitOutput {
@@ -447,6 +576,18 @@ where
     Ok((header, records))
 }
 
+fn read_cram_records(input: &Path) -> io::Result<(sam::Header, Vec<RecordBuf>)> {
+    let header = htslib_rs::alignment_compat::read_cram_header_from_path(input)?;
+    let records = if let Some(reference) = current_global_args().reference {
+        htslib_rs::alignment_compat::query_cram_records_all_from_path_with_reference(
+            input, &reference,
+        )?
+    } else {
+        htslib_rs::alignment_compat::query_cram_records_all_from_path(input)?
+    };
+    Ok((header, records))
+}
+
 fn read_stdin_records() -> io::Result<(sam::Header, Vec<RecordBuf>)> {
     let mut bytes = Vec::new();
     io::stdin().read_to_end(&mut bytes)?;
@@ -506,10 +647,11 @@ fn render_template(
     idx: usize,
     fmt: OutFmt,
     pad: usize,
-) -> String {
+) -> io::Result<String> {
     let ext = match fmt {
         OutFmt::Sam => "sam",
         OutFmt::Bam => "bam",
+        OutFmt::Cram => "cram",
     };
     let idx_str = if pad > 0 {
         format!("{:0width$}", idx, width = pad)
@@ -526,21 +668,33 @@ fn render_template(
                 Some('#') => out.push_str(&idx_str),
                 Some('.') => out.push_str(ext),
                 Some('*') => out.push_str(input_base),
+                Some('%') => out.push('%'),
                 Some(other) => {
-                    out.push('%');
-                    out.push(other);
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid split output format escape `%{}`", other),
+                    ));
                 }
-                None => out.push('%'),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid split output format: trailing `%`",
+                    ));
+                }
             }
         } else {
             out.push(c);
         }
     }
-    out
+    Ok(out)
 }
 
 trait SplitSink {
     fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()>;
+
+    fn finish(&mut self, _header: &sam::Header) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct BamFile(bam::io::Writer<bgzf::io::Writer<File>>);
@@ -560,7 +714,24 @@ impl SplitSink for SamFile {
     }
 }
 
-fn open_output(path: &Path, fmt: OutFmt, header: &sam::Header) -> io::Result<Box<dyn SplitSink>> {
+struct CramFile(cram::io::Writer<File>);
+impl SplitSink for CramFile {
+    fn write_record(&mut self, header: &sam::Header, record: &RecordBuf) -> io::Result<()> {
+        use sam::alignment::io::Write as _;
+        self.0.write_alignment_record(header, record)
+    }
+
+    fn finish(&mut self, header: &sam::Header) -> io::Result<()> {
+        self.0.try_finish(header)
+    }
+}
+
+fn open_output(
+    path: &Path,
+    fmt: OutFmt,
+    header: &sam::Header,
+    reference: Option<&Path>,
+) -> io::Result<Box<dyn SplitSink>> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -578,6 +749,22 @@ fn open_output(path: &Path, fmt: OutFmt, header: &sam::Header) -> io::Result<Box
             writer.write_header(header)?;
             Ok(Box::new(BamFile(writer)))
         }
+        OutFmt::Cram => {
+            let reference = reference.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "CRAM output requires --reference",
+                )
+            })?;
+            crate::reference::ensure_fai_index(reference, None)?;
+            let repository =
+                htslib_rs::alignment_compat::cram_reference_repository_from_fasta_path(reference)?;
+            let mut writer = cram::io::writer::Builder::default()
+                .set_reference_sequence_repository(repository)
+                .build_from_writer(file);
+            writer.write_header(header)?;
+            Ok(Box::new(CramFile(writer)))
+        }
     }
 }
 
@@ -594,8 +781,127 @@ fn print_usage() -> io::Result<()> {
     writeln!(w, "  -d TAG     split by aux TAG instead of @RG")?;
     writeln!(w, "  -M N       maximum number of outputs created by -d")?;
     writeln!(w, "  -p N       pad the %# index to N digits")?;
-    writeln!(w, "  --output-fmt sam|bam")?;
+    writeln!(w, "  --output-fmt sam|bam|cram")?;
     writeln!(w, "  --no-PG    do not add a @PG line")?;
     writeln!(w, "  --write-index")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bstr::BString;
+    use htslib_rs::sam::alignment::record::data::field::Tag;
+    use htslib_rs::sam::alignment::record_buf::data::field::Value;
+    use std::io::Cursor;
+
+    fn argv(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn exit_to_u8(code: ExitCode) -> u8 {
+        format!("{:?}", code)
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(255)
+    }
+
+    fn parse_header(text: &str) -> sam::Header {
+        let mut reader = sam::io::Reader::new(BufReader::new(Cursor::new(text.as_bytes())));
+        reader.read_header().unwrap()
+    }
+
+    fn string_tag_record(tag: [u8; 2], value: &str) -> RecordBuf {
+        let mut record = RecordBuf::default();
+        record
+            .data_mut()
+            .insert(Tag::from(tag), Value::String(BString::from(value)));
+        record
+    }
+
+    #[test]
+    fn render_template_matches_upstream_split_format_cases() {
+        assert_eq!(
+            render_template("%*_%#.%.", "basename", "1#2.3", 4, OutFmt::Bam, 0).unwrap(),
+            "basename_4.bam"
+        );
+        assert_eq!(
+            render_template("%*_%!.%.", "basename", "1#2.3", 4, OutFmt::Bam, 0).unwrap(),
+            "basename_1#2.3.bam"
+        );
+        assert_eq!(
+            render_template("%*_%#.%.", "basename", "1#2.3", 4, OutFmt::Sam, 0).unwrap(),
+            "basename_4.sam"
+        );
+        assert_eq!(
+            render_template("%*_%#.%.", "basename", "1#2.3", 4, OutFmt::Cram, 0).unwrap(),
+            "basename_4.cram"
+        );
+        assert_eq!(
+            render_template("%*_%#.%.", "basename", "1#2.3", 4, OutFmt::Bam, 5).unwrap(),
+            "basename_00004.bam"
+        );
+        assert_eq!(
+            render_template("%%%*_%#.%.%%", "basename", "1#2.3", 4, OutFmt::Bam, 0).unwrap(),
+            "%basename_4.bam%"
+        );
+    }
+
+    #[test]
+    fn render_template_rejects_bad_percent_escapes() {
+        assert!(render_template("%%%*_%#.%.%", "basename", "1#2.3", 4, OutFmt::Bam, 0).is_err());
+        assert!(render_template("%s_%#.%.", "basename", "1#2.3", 4, OutFmt::Bam, 0).is_err());
+    }
+
+    #[test]
+    fn header_for_split_output_filters_read_groups() {
+        let header = parse_header("@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:8\n@RG\tID:grp1\n@RG\tID:grp2\n");
+
+        let filtered = header_for_split_output(&header, None, "grp1");
+        assert!(filtered.read_groups().contains_key("grp1".as_bytes()));
+        assert!(!filtered.read_groups().contains_key("grp2".as_bytes()));
+
+        let synthesized = header_for_split_output(&header, Some(*b"RG"), "grp3");
+        assert!(synthesized.read_groups().contains_key("grp3".as_bytes()));
+        assert!(!synthesized.read_groups().contains_key("grp1".as_bytes()));
+
+        let non_rg = header_for_split_output(&header, Some(*b"an"), "aardvark");
+        assert_eq!(non_rg.read_groups().len(), 2);
+    }
+
+    #[test]
+    fn record_split_tag_value_formats_string_and_integer_tags() {
+        let string_record = string_tag_record(*b"an", "aardvark");
+        assert_eq!(
+            record_split_tag_value(&string_record, Some(*b"an"), 0).as_deref(),
+            Some("aardvark")
+        );
+
+        let mut int_record = RecordBuf::default();
+        int_record
+            .data_mut()
+            .insert(Tag::from(*b"nn"), Value::Int8(-2));
+        assert_eq!(
+            record_split_tag_value(&int_record, Some(*b"nn"), 2).as_deref(),
+            Some("-02")
+        );
+    }
+
+    #[test]
+    fn split_parse_args_handles_help_and_early_errors() {
+        assert_eq!(exit_to_u8(main(&argv(&["split", "--help"]))), 0);
+        assert_eq!(exit_to_u8(main(&argv(&["split"]))), 1);
+        assert_eq!(exit_to_u8(main(&argv(&["split", "-d", "R", "in.sam"]))), 1);
+        assert_eq!(exit_to_u8(main(&argv(&["split", "-M", "0", "in.sam"]))), 1);
+        assert_eq!(
+            exit_to_u8(main(&argv(&["split", "--output-fmt", "vcf", "in.sam"]))),
+            1
+        );
+        assert_eq!(
+            exit_to_u8(main(&argv(&["split", "--unknown", "in.sam"]))),
+            1
+        );
+    }
 }
