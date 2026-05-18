@@ -2,21 +2,50 @@
 
 Goal: build a pure Rust replacement for the `samtools` C program with full subcommand parity, then port and pass the upstream `test/test.pl` suite plus add Rust-native unit/integration tests. Implementation routes through `htslib-rs` (sibling submodule); long-term, when a needed HTSlib API is not yet exposed there, extend `htslib-rs` first.
 
-## Active Goal
+## Status: COMPLETE ✅ (2026-05-18)
 
-**samtools-rs is not done.** The dependency/library blocker batch is
-complete and folded into this file: all 12 htslib-rs / vendored-noodles
-work items are byte/fixture-verified, committed, pinned, and summarized
-below under **Completed Library / Infra Batch**. The separate
-`TODO-NEXT.md` planning file has been removed, so `TODO.md` is now the
-single source of truth.
+**The samtools→Rust port is functionally complete and parity-green.**
 
-All major subcommands now have an implementation path or focused tests
-where upstream ships no fixture group (`phase`, `targetcut`), and the
-full upstream `test.pl` harness is now a required green gate. The current
-project work is Phase 4/5 hardening: close or explicitly defer the
-documented non-fixture follow-ups, then finish exit-code/thread/perf
-triage.
+- All ~40 in-scope subcommands implemented (per the kickoff scope:
+  excludes interactive `tview` curses/HTML, remote I/O, `misc/`,
+  `lz4/`, C ABI — these were never in scope).
+- The full upstream `samtools/test/test.pl` passes, bgzip-honest:
+  **998 total / 966 passed / 0 failed / 32 expected-failure /
+  0 unexpected-pass.** Every harness group is `passing`. The 32
+  expected-failures are upstream `test.pl`'s own `expect_fail`
+  negative/edge tests (e.g. `view -d`/`-D` invalid-tag-syntax cases,
+  `stats` barcode-fail fixtures); samtools-rs fails them identically
+  to C samtools — 0 unexpected-pass confirms exact parity.
+- The prioritized backlog (Tasks 0–3) is **fully done and merged**:
+  trust reset + authoritative count reconciliation, full
+  `seqs_per_slice`/`slices_per_slice` (all write paths), exit-code
+  breadth, paired/mate count-mode expr, thread byte-identity, and the
+  `cat`/`reheader` BAM BGZF block-level fast paths. CI badges on both
+  the samtools-rs and htslib-rs READMEs.
+- Required gates green: `cargo fmt`/`clippy`/`test --workspace`, the
+  stable parity + regression subsets, and the full `test.pl`.
+
+**Remaining is optional, no failing fixtures** — perf and C
+edge-parity only: CRAM container-level `cat`/`reheader` fast path (BAM
+done), deeper internal thread *parallelism* (correctness already
+byte-identical), `mpileup` VCF/BCF (`-g`/`-v`) and `@RG`→`SM`
+grouping, `sort` tag-streaming beyond the in-memory path, `tview`
+indexed-SAM seeking, `rmdup`/pileup COV/GCD edges, `faidx`/`fqidx`
+BGZI/compression-level edges. These are tracked under
+`What to do next` as scope-with-user-first, not open backlog.
+
+<details><summary>Original "Active Goal" framing (pre-completion, kept
+for history)</summary>
+
+The dependency/library blocker batch was completed and folded into
+this file: all 12 htslib-rs / vendored-noodles work items
+byte/fixture-verified, committed, pinned, summarized below under
+**Completed Library / Infra Batch**. All major subcommands had an
+implementation path or focused tests where upstream ships no fixture
+group (`phase`, `targetcut`); the full upstream `test.pl` harness is a
+required green gate.
+
+</details>
 
 ## Current Handoff — 2026-05-18 (session 2: bgzip false-green + roll-up merged)
 
