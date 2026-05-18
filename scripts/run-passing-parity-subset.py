@@ -15,6 +15,8 @@ import re
 import subprocess
 from pathlib import Path
 
+import _parity_preflight
+
 
 DEFAULT_GROUPS = [
     "test_reference",
@@ -112,7 +114,10 @@ def main() -> int:
         default=None,
         help="Rust samtools binary to stage at samtools/samtools before running",
     )
+    _parity_preflight.add_preflight_arg(parser)
     args = parser.parse_args()
+
+    _parity_preflight.enforce(args.allow_missing_bgzip)
 
     root = repo_root()
     samtools_dir = root / "samtools"
