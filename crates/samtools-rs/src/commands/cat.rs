@@ -238,6 +238,57 @@ fn run_bam_cat(
         header = crate::pg::add_samtools_pg_to_header(&header, argv)?;
     }
 
+    // Fast path: when not filtering by region, and every input's BAM
+    // header ends exactly on a BGZF block boundary, concatenate the
+    // alignment sections by copying compressed BGZF frames verbatim
+    // (samtools cat's BAM fast path) instead of decoding and
+    // re-encoding every record. Strictly all-or-nothing: if any input
+    // is not block-aligned the existing record-level path below runs
+    // unchanged as the universal fallback.
+    if parsed_region.is_none() && !inputs.is_empty() {
+        let mut all_block_aligned = true;
+        for input in inputs {
+            let mut probe = bam::io::Reader::new(File::open(input)?);
+            probe.read_header()?;
+            if probe.get_ref().virtual_position().uncompressed() != 0 {
+                all_block_aligned = false;
+                break;
+            }
+        }
+
+        if all_block_aligned {
+            // Block-aligned header bytes for the chosen header: write
+            // it through a BGZF writer, finish (flushes the block and
+            // appends the EOF marker), then drop the trailing 28-byte
+            // EOF so raw alignment frames can be appended after it.
+            let mut header_writer = bam::io::Writer::new(Vec::new());
+            header_writer.write_header(&header)?;
+            let mut header_bytes = header_writer.into_inner().finish()?;
+            let eof = htslib_rs::bgzf::io::EOF;
+            header_bytes.truncate(header_bytes.len() - eof.len());
+
+            let mut out: Box<dyn Write> = match output {
+                Some(p) => Box::new(io::BufWriter::new(File::create(p)?)),
+                None => Box::new(io::BufWriter::new(io::stdout())),
+            };
+            out.write_all(&header_bytes)?;
+            for input in inputs {
+                match htslib_rs::bgzf_compat::append_bam_alignment_frames(input, &mut out)? {
+                    htslib_rs::bgzf_compat::BamFrameCopy::Copied => {}
+                    htslib_rs::bgzf_compat::BamFrameCopy::NotBlockAligned => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "BAM cat fast path: input not block-aligned after probe",
+                        ));
+                    }
+                }
+            }
+            out.write_all(&eof)?;
+            out.flush()?;
+            return Ok(());
+        }
+    }
+
     // Open output writer.
     let mut writer: Box<dyn BamSink> = match output {
         Some(p) => Box::new(FileSink::new(p)?),
