@@ -3,9 +3,12 @@
 //! Mirrors `main_reheader` in `bam_reheader.c`. The basic mode is
 //! `samtools reheader <new.hdr.sam> <in.bam>` → write a new BAM to stdout
 //! with the records from `<in.bam>` and the header from `<new.hdr.sam>`.
+//! Also supports `-i`/`--in-place`, `-c`/`--command`, and a BGZF
+//! block-level fast path for BAM input whose header ends on a block
+//! boundary (falls back to a record-level rewrite otherwise).
 //!
-//! Not yet supported: `--in-place` (CRAM rewrite) and BGZF block-level fast
-//! paths.
+//! Remaining follow-up: a CRAM container-level in-place fast path
+//! (CRAM input is currently rewritten via the SAM-visible stream).
 
 use std::ffi::OsString;
 use std::fs::{self, File};
