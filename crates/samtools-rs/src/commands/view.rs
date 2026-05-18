@@ -352,6 +352,12 @@ struct Opts {
     output_fmt: OutputFmt,
     /// `-O cram,embed_ref=1`: embed the reference in CRAM output.
     embed_reference: bool,
+    /// `-O cram,seqs_per_slice=N`: max records per CRAM slice
+    /// (`None` keeps the encoder default).
+    records_per_slice: Option<usize>,
+    /// `-O cram,slices_per_slice=N`: max slices per CRAM container
+    /// (`None` keeps the encoder default).
+    slices_per_container: Option<usize>,
     header: HeaderMode,
     count: bool,
     no_pg: bool,
@@ -1031,9 +1037,14 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
                 };
                 for opt in parts {
                     let opt = opt.trim();
-                    if opt == "embed_ref" || opt == "embed_ref=1" || opt == "embed_ref=2" {
-                        opts.embed_reference = true;
+                    if opt.is_empty() {
+                        continue;
                     }
+                    // Honor the options we support (embed_ref incl.
+                    // embed_ref=1/2, seqs_per_slice, slices_per_slice,
+                    // version, level); silently ignore other suffixes,
+                    // matching the previous lenient `-O` behavior.
+                    let _ = apply_output_fmt_option(&mut opts, opt);
                 }
                 i += 1;
             }
@@ -1137,15 +1148,40 @@ fn parse_args(args: &[OsString]) -> Result<Opts, ParseError> {
 }
 
 fn apply_output_fmt_option(opts: &mut Opts, raw: &str) -> Result<(), ParseError> {
-    let key = raw.split_once('=').map_or(raw, |(key, _)| key).trim();
+    let (key, value) = match raw.split_once('=') {
+        Some((key, value)) => (key.trim(), Some(value.trim())),
+        None => (raw.trim(), None),
+    };
+
+    fn parse_count(key: &str, value: Option<&str>) -> Result<usize, ParseError> {
+        let value = value.ok_or_else(|| {
+            ParseError::Err(format!("missing value for --output-fmt-option {key}"))
+        })?;
+        value
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| ParseError::Err(format!("invalid {key} value \"{value}\"")))
+    }
+
     match key {
         "embed_ref" => {
             opts.embed_reference = true;
             Ok(())
         }
+        // CRAM slice/container sizing (htslib `seqs_per_slice` /
+        // `slices_per_slice`), forwarded to the noodles CRAM encoder.
+        "seqs_per_slice" => {
+            opts.records_per_slice = Some(parse_count(key, value)?);
+            Ok(())
+        }
+        "slices_per_slice" => {
+            opts.slices_per_container = Some(parse_count(key, value)?);
+            Ok(())
+        }
         // Accepted for command-line parity. The current CRAM writer uses
         // noodles' default version/compression settings.
-        "version" | "level" | "seqs_per_slice" => Ok(()),
+        "version" | "level" => Ok(()),
         "" => Err(ParseError::Err(
             "missing value for --output-fmt-option".into(),
         )),
@@ -1689,8 +1725,11 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                         input, reference, expr, dst_file,
                     )?;
                 } else {
-                    htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
-                        input, reference, dst_file,
+                    htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference_and_options(
+                        input,
+                        reference,
+                        cram_write_options(opts),
+                        dst_file,
                     )?;
                 }
             }
@@ -1762,8 +1801,11 @@ fn run(opts: &Opts, input: &Path, input_exact: Exact) -> io::Result<ExitCode> {
                         input, reference, expr, dst_file,
                     )?;
                 } else {
-                    htslib_rs::alignment_compat::write_cram_from_path_with_reference(
-                        input, reference, dst_file,
+                    htslib_rs::alignment_compat::write_cram_from_path_with_reference_and_options(
+                        input,
+                        reference,
+                        cram_write_options(opts),
+                        dst_file,
                     )?;
                 }
             }
@@ -2725,9 +2767,19 @@ fn header_rg_id(line: &str) -> Option<&str> {
         .find_map(|field| field.strip_prefix("ID:"))
 }
 
+/// Builds the CRAM encoder options from `-O cram,...` flags
+/// (`embed_ref`, `seqs_per_slice`, `slices_per_slice`).
+fn cram_write_options(opts: &Opts) -> htslib_rs::alignment_compat::CramWriteOptions {
+    htslib_rs::alignment_compat::CramWriteOptions {
+        embed_reference: opts.embed_reference,
+        records_per_slice: opts.records_per_slice,
+        slices_per_container: opts.slices_per_container,
+    }
+}
+
 /// SAM-reader → CRAM writer, honoring `-O cram,embed_ref=1`
-/// (`opts.embed_reference`): embeds the reference in-container so the
-/// output decodes with no external reference.
+/// (`opts.embed_reference`) and the `seqs_per_slice` /
+/// `slices_per_slice` slice/container sizing options.
 fn cram_sam_reader_writer<R, Q, W>(
     opts: &Opts,
     reader: &mut htslib_rs::sam::io::Reader<R>,
@@ -2739,15 +2791,12 @@ where
     Q: AsRef<Path>,
     W: io::Write,
 {
-    if opts.embed_reference {
-        htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference_embedded(
-            reader, reference, writer,
-        )
-    } else {
-        htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference(
-            reader, reference, writer,
-        )
-    }
+    htslib_rs::alignment_compat::write_cram_from_sam_reader_with_reference_and_options(
+        reader,
+        reference,
+        cram_write_options(opts),
+        writer,
+    )
 }
 
 fn write_cram_from_sam_text_via_bam<Q, W>(
@@ -2775,9 +2824,10 @@ where
     )?;
     drop(tmp_bam);
 
-    htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference(
+    htslib_rs::alignment_compat::write_cram_from_bam_path_with_reference_and_options(
         tmp_bam_path.path(),
         reference,
+        cram_write_options(opts),
         writer,
     )
 }
