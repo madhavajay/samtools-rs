@@ -18,6 +18,42 @@ project work is Phase 4/5 hardening: close or explicitly defer the
 documented non-fixture follow-ups, then finish exit-code/thread/perf
 triage.
 
+## Current Handoff — 2026-05-18 (session 2: bgzip false-green + roll-up merged)
+
+> **Merged baseline:** samtools-rs PR #43 merged to `main`
+> (`39d22d5`). htslib-rs submodule pinned at `815428b` (htslib-rs PR #8
+> + PR #9 merged to its `main`). Vendored noodles at `f998c0f`
+> (noodles PR #8 merged to `madhava/bioscript`). All three repos'
+> CIs were green at merge.
+
+**Critical discovery — false-green parity gate.** The local parity
+gate had been **silently passing while skipping `test_view`,
+`test_cat`, `test_reheader`** (and any other `bgzip`-dependent group)
+because `bgzip` was not on `PATH`; upstream `test.pl` treats the
+missing tool as a skip, not a failure. This invalidated prior
+"promoted/passing" claims in this file and hid **7 real bugs**, all
+fixed and merged in PR #43:
+
+1. `view -X` ignored the explicit index path (only "worked" via a
+   stale `dat/*.bai`); now stages a temp dir under the default name.
+2. CRAM region **count** over-counted ~2× — `query_cram_records_*`
+   now applies `record_intersects_region` (noodles CRAM `query` is
+   slice-granular). [htslib-rs #9]
+3. CRAM `-m`/min-qlen used sequence length, not CIGAR query length —
+   added `AlignmentRecordSummary::cigar_query_len()`. [htslib-rs #9]
+4. `view -t`/`-T` rejected no-`@SQ` SAM instead of injecting `@SQ`.
+5. `cat` wrote SAM text into `.cram` outputs (broke re-`cat`); now
+   re-encodes a real CRAM.
+6. `reheader` wrote SAM text into CRAM (broke `-c`/`--in-place`); now
+   re-encodes a real CRAM.
+7. Two rustfmt-version-sensitive lines (CI stable rustfmt ≠ local
+   1.9.0); rewritten to format identically across versions.
+
+After the fixes the **full** parity + regression subset and the full
+upstream `test.pl` pass in CI (and locally with `bgzip`/`tabix`).
+See `What to do next` for the resulting remaining tasks (trust reset,
+TODO reconciliation, `seqs_per_slice`, hardening/perf).
+
 ## Current Handoff — 2026-05-18
 
 > **Library/infra batch COMPLETE (12/12) and rolled into `TODO.md`.**
@@ -45,7 +81,11 @@ Dependency changes for the current Phase 4/5 branch:
   the CRAM-visible aux tail in upstream order.
 
 Current Phase 4/5 branch work:
-- Promoted full upstream groups into the required parity subset:
+- Promoted full upstream groups into the required parity subset
+  (counts below are **pre-bgzip and unverified** — see the session-2
+  caution; `test_view`/`test_cat`/`test_reheader` in particular were
+  silently skipped when first promoted and only genuinely passed after
+  the PR #43 fixes):
   `test_merge` (28/28), `test_fixmate` (42 total: 40 passed,
   2 expected failures), `test_reheader` (7/7), `test_cat` (26/26),
   `test_index` (26/26), `test_checksum` (14/14),
@@ -175,12 +215,32 @@ validation on `work-sam-float-renderer`:
 `cargo test --workspace` (**2601 passing, 0 failing**) all green; the
 upstream `bam2fq/{5,8,10,12}` fixtures now match byte-for-byte.
 
-Latest known validation (on `main` at `b312c99`, post-merge):
-- Rust tests: 416 `samtools-rs` passing, 0 failing (`cargo test --workspace`: 2587 passing).
-- Full gate green in CI on PR #16: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and the parity gate that was advisory at the time.
+Latest known validation (on `main` at `39d22d5`, post-PR-#43-merge):
+- Full samtools-rs CI green on PR #43: rust-gate (`cargo fmt --all
+  --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace`) **and** the parity-gate
+  (`run-passing-parity-subset.py`, `run-passing-regression-subset.py`,
+  and the full upstream `perl test/test.pl`) — the parity-gate is now a
+  required, honest signal (CI installs `tabix`).
+- Reproduced locally with `bgzip`/`tabix` on `PATH`: full parity +
+  regression subset rc=0; `cargo test --workspace` green for both
+  samtools-rs and htslib-rs.
+- Older note (stale, kept for history): "on `main` at `b312c99`: 416
+  `samtools-rs` passing, `cargo test --workspace` 2587 passing; PR #16
+  parity gate advisory at the time." Pre-dates the bgzip trust reset —
+  do not rely on its counts.
 - New focused tests added across PRs: `fastq_index_files_extract_from_barcode_tag`, `fastq_routes_r1_only_singletons_to_singleton_output`, `fastq_dash_t_and_dash_cap_t_combine_aux_tags`, `fastq_interleaves_read1_read2_when_paths_alias`, `fastq_repeated_dash_d_unions_same_tag_values`, `fasta_reverse_strand_record_reverse_complemented_in_output`, `view_qname_file_filters_records_by_name`, `view_r_and_dash_cap_r_filter_by_read_group`, `view_d_and_dash_cap_d_filter_by_aux_tag`, `addreplacerg_defaults_to_first_header_rg_and_preserves_lines`, `addreplacerg_r_overwrite_all_removes_other_header_rg_lines`, and `addreplacerg_dash_cap_r_unknown_id_is_rejected`.
 
-Estimated whole-project completion:
+Estimated whole-project completion: **~80–85% (moderate confidence)**.
+- Breadth ~95% (all ~40 subcommands implemented). Parity on the gated
+  path is now credible: PR #43's parity-gate (full `test.pl` + subsets,
+  with `tabix`) is green and was independently reproduced locally with
+  `bgzip`. Remaining ~15–20% is genuine non-fixture hardening + perf +
+  the trust reset (preflight guard, count reconciliation).
+- Confidence is only *moderate*: every per-group "promoted/passing"
+  tally elsewhere in this file was measured pre-bgzip and is suspect
+  until re-reconciled (task 1 in `What to do next`). A tight estimate
+  is blocked on that reconciliation, not on more implementation.
 - **Not done.** The library/infra blockers and Phase 3 command
   implementation are complete, and the full upstream `test/test.pl` harness
   is now required, but `TODO.md` still tracks non-fixture hardening and
@@ -201,18 +261,56 @@ working branch after that PR has merged to `main`. (PRs #8–#15 were the
 fragmented anti-pattern; #16 consolidated them — keep it to one large PR
 branch going forward.)
 
-What to do next:
-1. Continue Phase 4/5 leaf-node parity work from synced `main`, one
-   short-lived branch at a time. There are no current `partial` rows in
-   `docs/test-status.md`; the remaining work is the explicit
-   non-fixture hardening/perf/thread/exit-code follow-ups documented below.
-2. Keep the full local gate green after every commit:
-   `cargo fmt --all --check`,
-   `cargo clippy --workspace --all-targets -- -D warnings`,
-   `cargo test --workspace`, plus the required parity/regression subset.
-3. Update `TODO.md`, `docs/subcommand-coverage.md`, and
-   `docs/test-status.md` whenever a fixture group is promoted, deferred,
-   or newly understood.
+What to do next (remaining tasks, priority order):
+
+0. **Trust reset — local gate honesty (do first).** The local parity
+   gate silently false-greens: `scripts/run-passing-parity-subset.py`
+   and `run-passing-regression-subset.py` drive upstream `test.pl`,
+   which **skips** any group whose data-gen needs `bgzip` when `bgzip`
+   is missing from `PATH`, then returns 0. This hid 7 real bugs (see
+   the 2026-05-18 session-2 handoff). CI is honest (installs `tabix`);
+   only local runs lie.
+   - [ ] Add a preflight check to both subset scripts that hard-errors
+     (non-zero, loud message) if `bgzip`/`tabix` are not on `PATH`,
+     instead of letting test.pl skip silently.
+   - [ ] Document the requirement (`README`/dev setup): prebuilt at
+     `htslib-rs/htslib/{bgzip,tabix}` via
+     `make -C htslib-rs/htslib tabix bgzip`; export that dir on `PATH`.
+
+1. **Reconcile TODO.md / `docs/test-status.md` with reality.** Every
+   "promoted/passing" count below (e.g. *"test_view 445: 427 passed,
+   18 expected failures"*, the promoted-group tallies) was measured
+   **without `bgzip`** and is untrustworthy. Re-run the full suite WITH
+   `bgzip`/`tabix`, then correct or annotate the counts. Until done,
+   treat all such numbers as suspect, not fact.
+
+2. **`seqs_per_slice` is ignored by the CRAM writer.** `view -O
+   CRAM,seqs_per_slice=N` produces a single container/slice regardless
+   of N (`cram-size` confirms 1 container/1 slice for 962 records).
+   Latent — not currently failing a fixture, but a real CRAM-encoder
+   correctness gap. Plumb `seqs_per_slice` (and likely
+   `records_per_container`) through to the noodles CRAM writer.
+
+3. **Continue Phase 4/5 non-fixture hardening** from synced `main`,
+   one short-lived branch at a time (one large PR per batch — see the
+   workflow rule). Tracked follow-ups:
+   - `view`: reference-dependent expression counts, multi-file inputs,
+     paired-aware filters, deeper CRAM performance/streaming parity.
+   - `cat`/`reheader`: now re-encode CRAM (correct but slow) — upstream
+     does container/BGZF block-level copy; perf parity pending.
+   - Threads: propagate worker pools through remaining BAM/CRAM
+     readers/writers, then compare parallelism vs C samtools.
+   - Exit codes / byte-parity smoke: broaden direct C-vs-Rust coverage
+     across all subcommands and error classes.
+   - `rmdup`, broader pileup/COV/GCD edge cases, `stats` CRAM no-region
+     per-cycle/quality parity.
+
+4. After every commit keep the full local gate green (with `bgzip`/
+   `tabix` on `PATH`): `cargo fmt --all --check`, `cargo clippy
+   --workspace --all-targets -- -D warnings`, `cargo test --workspace`,
+   plus the required parity/regression subset. Update `TODO.md`,
+   `docs/subcommand-coverage.md`, and `docs/test-status.md` whenever a
+   group is promoted, deferred, or newly understood.
 
 Completed samtools-rs-only batch (no htslib-rs / noodles changes required):
 - ~~**SAM aux float formatting — remaining commands.**~~ **Done.** The shared `samtools_rs::sam_render` module (`format_aux_float`, `format_htslib_exponent`, `fix_sam_aux_floats`, `fix_sam_text`, `write_record`, `write_header`) now backs every noodles-`sam::io::Writer` SAM-output path: `view`, `split`, plus `reheader` SAM→SAM, `sort`, `merge`, `collate`, `addreplacerg`, `reset`, `fixmate`, `rmdup`, `markdup`, and `cat` (their `SamFile`/`SamStdout`/`Sam*Sink` sinks now wrap a plain `File`/`Stdout` and render through `sam_render`). So every SAM-text output path emits htslib `%g`-style float aux spelling. Regression covered by `sort_sam_output_uses_htslib_float_aux_spelling` plus the existing `view`/`split` fixtures.
@@ -240,6 +338,13 @@ RESOLVED** (see **Completed Library / Infra Batch** below; the
 - ~~SAM aux float formatting~~ — resolved via `sam_render`.
 
 ## Progress Snapshot
+
+> ⚠️ **Counts caution:** specific per-group tallies in this snapshot and
+> the sections below (e.g. *"test_view 445: 427 passed"*) were measured
+> **before** the bgzip trust reset and may be wrong. The credible signal
+> is "PR #43 parity-gate green in CI" (full `test.pl` + subsets with
+> `tabix`). Re-reconcile the numbers per `What to do next` task 1 before
+> citing them as fact.
 
 **Phases 0–2 complete; Waves A/B/C/D substantially complete and
 byte-exact for the upstream-fixtured subcommands. The completed
@@ -464,7 +569,7 @@ The waves are ordered to land foundational machinery first (read/write/index) an
 
 ### Wave A — Read/Write/Index Foundation
 
-- [x] `view` (`sam_view.c`, 68k) — the full upstream `test_view` group passes (445 total: 427 passed, 18 expected failures). Implemented surface includes SAM↔SAM passthrough, SAM→BAM/CRAM, SAM/BAM/reference-backed CRAM stdin count/text/BAM/CRAM paths, stdin CRAM reference discovery from `-T`, `@SQ UR:`, or M5/`REF_PATH`, reference-backed CRAM→SAM text/count paths including flag/MAPQ filtered count mode, reference-backed CRAM→BAM full-file and region output, reference-backed BAM→CRAM and CRAM→CRAM full-file and region output, header-only / count modes, `-h` `-H` `-c` `-b` `-C` `-T` `-t` `-o` `--no-PG`, filter flags `-f`/`-F`/`-G`/`--exclude-flags`/`-q`, count-only no-reference CRAM `--save-counts` for simple summary-backed filters, reference-independent MAPQ/flag expressions, and read-group/library/aux-tag filters, region queries including `chr:pos` open-ended semantics, `-L FILE` BED restriction with two-column point semantics and positional-region intersection, `-U FILE`/`-p` for SAM/BAM/CRAM input to SAM/BAM/reference-backed CRAM output, `-e EXPR`, `--save-counts FILE`, `-m INT`, `-x`/`--remove-tag`, `--keep-tag` for SAM/BAM/CRAM input to SAM/BAM/reference-backed CRAM output, htslib-style aux float spelling for filtered SAM-input, binary→SAM, and CRAM-stdin SAM output, `-O FORMAT`, default `@PG`, `-N`, `-r`/`-R`, `-n`, `-d`/`-D`, `-B`, `-s`, `--remove-flags`, and `--fetch-pairs`. **Non-fixture follow-up:** reference-dependent expression counts, multi-file inputs, paired filters, and deeper CRAM performance/streaming parity.
+- [x] `view` (`sam_view.c`, 68k) — the full upstream `test_view` group passes in CI (PR #43 parity-gate, with `tabix`). The "445 total: 427 passed, 18 expected failures" tally is pre-bgzip and unverified; the trustworthy statement is "green in the PR #43 parity-gate". Implemented surface includes SAM↔SAM passthrough, SAM→BAM/CRAM, SAM/BAM/reference-backed CRAM stdin count/text/BAM/CRAM paths, stdin CRAM reference discovery from `-T`, `@SQ UR:`, or M5/`REF_PATH`, reference-backed CRAM→SAM text/count paths including flag/MAPQ filtered count mode, reference-backed CRAM→BAM full-file and region output, reference-backed BAM→CRAM and CRAM→CRAM full-file and region output, header-only / count modes, `-h` `-H` `-c` `-b` `-C` `-T` `-t` `-o` `--no-PG`, filter flags `-f`/`-F`/`-G`/`--exclude-flags`/`-q`, count-only no-reference CRAM `--save-counts` for simple summary-backed filters, reference-independent MAPQ/flag expressions, and read-group/library/aux-tag filters, region queries including `chr:pos` open-ended semantics, `-L FILE` BED restriction with two-column point semantics and positional-region intersection, `-U FILE`/`-p` for SAM/BAM/CRAM input to SAM/BAM/reference-backed CRAM output, `-e EXPR`, `--save-counts FILE`, `-m INT`, `-x`/`--remove-tag`, `--keep-tag` for SAM/BAM/CRAM input to SAM/BAM/reference-backed CRAM output, htslib-style aux float spelling for filtered SAM-input, binary→SAM, and CRAM-stdin SAM output, `-O FORMAT`, default `@PG`, `-N`, `-r`/`-R`, `-n`, `-d`/`-D`, `-B`, `-s`, `--remove-flags`, and `--fetch-pairs`. **Non-fixture follow-up:** reference-dependent expression counts, multi-file inputs, paired filters, and deeper CRAM performance/streaming parity.
 - [x] `head` (`sam_view.c` shared) — SAM and BAM input; SAM/BAM/CRAM stdin header/record output; CRAM header-only modes; reference-backed CRAM record extraction for `-n N`; `-h N`, `-n N`, all-default.
 - [x] `quickcheck` (`bam_quickcheck.c`) — passes byte-for-byte against `quickcheck/all.expected`.
 - [x] `index` (`bam_index.c`) — full upstream `test_index` group passes (26/26), including threaded duplicates: large-reference CSI indexing/query, default BAI output, explicit `-o` and legacy `<in> <out.idx>` index destinations, `-M` multi-file indexing, `view -X` custom-index queries, `merge -X -R` with one custom index per BAM input, and `view --write-index` auto-indexing for BAM/CRAM/BGZF-SAM outputs. Local `-@ N`, attached `-@N`, `--threads N`, `--threads=N`, and top-level `--threads` now route BAM/BGZF-SAM BAI/CSI index construction through noodles multithreaded BGZF readers when nonzero. **Pending (non-fixture):** CRAI thread parity and broader throughput comparison against C samtools.
