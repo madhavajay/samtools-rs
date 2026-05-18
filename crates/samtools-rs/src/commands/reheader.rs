@@ -318,6 +318,39 @@ fn rewrite_bam_with_header<W: Write>(
         new_header
     };
 
+    // Fast path: reheader only swaps the header and copies the
+    // alignment data unchanged. If the input BAM's header ends exactly
+    // on a BGZF block boundary, emit the new header then copy the
+    // input's compressed alignment frames verbatim (upstream
+    // bam_reheader's fast path) instead of decoding and re-encoding
+    // every record. All-or-nothing: a non-block-aligned input falls
+    // back to the record-level path below, so there is no correctness
+    // risk.
+    let mut probe = bam::io::Reader::new(File::open(input_bam)?);
+    probe.read_header()?;
+    if probe.get_ref().virtual_position().uncompressed() == 0 {
+        let mut header_writer = bam::io::Writer::new(Vec::new());
+        header_writer.write_header(&new_header)?;
+        let mut header_bytes = header_writer.into_inner().finish()?;
+        let eof = htslib_rs::bgzf::io::EOF;
+        header_bytes.truncate(header_bytes.len() - eof.len());
+
+        let mut output = output;
+        output.write_all(&header_bytes)?;
+        match htslib_rs::bgzf_compat::append_bam_alignment_frames(input_bam, &mut output)? {
+            htslib_rs::bgzf_compat::BamFrameCopy::Copied => {}
+            htslib_rs::bgzf_compat::BamFrameCopy::NotBlockAligned => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "BAM reheader fast path: input not block-aligned after probe",
+                ));
+            }
+        }
+        output.write_all(&eof)?;
+        output.flush()?;
+        return Ok(());
+    }
+
     let mut input = bam::io::Reader::new(File::open(input_bam)?);
     let input_header = input.read_header()?;
 
