@@ -873,6 +873,63 @@ fn view_expr_supports_mate_symbols_on_sam_line_path() {
 }
 
 #[test]
+fn view_count_mode_supports_paired_and_mate_expressions() {
+    // The SAM-output expression path already covers mate/paired
+    // symbols; this locks the same symbols in `-c` count mode (and
+    // BAM input), the combination the Task 3 follow-up called out.
+    let tmp = tmp_dir("count-paired-mate-expr");
+    let sam = tmp.join("input.sam");
+    let bam = tmp.join("input.bam");
+
+    std::fs::write(
+        &sam,
+        concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n",
+            "@SQ\tSN:chr1\tLN:200\n",
+            // r1: a proper pair on chr1 (two records), TLEN +/-35.
+            "r1\t99\tchr1\t10\t60\t5M\t=\t40\t35\tACGTA\t!!!!!\n",
+            "r1\t147\tchr1\t40\t60\t5M\t=\t10\t-35\tTTTTT\t!!!!!\n",
+            // r2: an unpaired single record.
+            "r2\t0\tchr1\t80\t30\t5M\t*\t0\t0\tGGGGG\t!!!!!\n",
+        ),
+    )
+    .unwrap();
+
+    // Stage a BAM copy so the count path is exercised on binary input
+    // too (not just the SAM line path).
+    assert_eq!(
+        run(&[
+            "-b",
+            "--no-PG",
+            "-o",
+            bam.to_str().unwrap(),
+            sam.to_str().unwrap(),
+        ]),
+        0
+    );
+
+    for input in [&sam, &bam] {
+        let path = input.to_str().unwrap();
+        let count = |expr: &str| -> String {
+            let out = tmp.join("c.txt");
+            assert_eq!(
+                run(&["-c", "-e", expr, "-o", out.to_str().unwrap(), path]),
+                0,
+                "count -e {expr} on {path}"
+            );
+            std::fs::read_to_string(&out).unwrap().trim().to_string()
+        };
+
+        assert_eq!(count("flag.proper_pair"), "2", "proper_pair count");
+        assert_eq!(count("flag.paired"), "2", "paired count");
+        assert_eq!(count("tlen>0"), "1", "tlen>0 count");
+        assert_eq!(count("mpos==40"), "1", "mate-position count");
+        assert_eq!(count("pnext==40"), "1", "pnext alias count");
+        assert_eq!(count("mrname==\"chr1\""), "2", "mate-reference count");
+    }
+}
+
+#[test]
 fn view_unmap_unselected_sam_output_keeps_failed_records() {
     let tmp = tmp_dir("unmap-unselected-sam");
     let input = tmp.join("input.sam");
