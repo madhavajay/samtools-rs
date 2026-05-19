@@ -4,3 +4,4 @@
 [submodule "htslib-rs"]
 	path = htslib-rs
 	url = git@github.com:madhavajay/htslib-rs.git
+	branch = main
