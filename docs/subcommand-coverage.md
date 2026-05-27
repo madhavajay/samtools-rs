@@ -2,7 +2,7 @@
 
 For each upstream `samtools` subcommand, this document lists:
 
-- the C source file(s) that implement it (under `samtools/`)
+- the C source file(s) that implement it (under `repos/samtools/`)
 - the HTSlib APIs it depends on
 - the corresponding `htslib-rs` API coverage status
 - the samtools-rs implementation status
@@ -314,7 +314,7 @@ samtools-rs status legend:
 
 ## htslib-rs Extensions Required (rolled up from above)
 
-The following items are blockers for one or more samtools-rs subcommands. They should be added to `htslib-rs/TODO.md`:
+The following items are blockers for one or more samtools-rs subcommands. They should be added to `repos/htslib-rs/TODO.md`:
 
 1. **`sam_hdr_add_pg`** — programmatic `@PG` chain insertion with PP linkage. Required by every subcommand that writes output without `--no-PG`.
 2. **`bam_aux_update_*`** — string/int/array aux updates. Still useful for closer HTSlib parity; remaining blockers include deeper `fixmate`, `markdup`, and BAM/CRAM-output `calmd` aux-tag behavior.

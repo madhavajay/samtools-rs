@@ -40,7 +40,7 @@ def repo_root() -> Path:
 
 
 def default_cases(root: Path) -> list[Case]:
-    test = root / "samtools" / "test"
+    test = root / "repos" / "samtools" / "test"
     dat = test / "dat"
     bedcov = test / "bedcov"
     checksum = test / "checksum"
@@ -836,7 +836,7 @@ def default_cases(root: Path) -> list[Case]:
             ("tview", "-d", "T", "-p", "CHROMOSOME_I:10000000000", "{tmp}/longref.sam.gz"),
             setup_external=(
                 (
-                    "{root}/htslib-rs/htslib/bgzip",
+                    "{root}/repos/htslib-rs/repos/htslib/bgzip",
                     "-c",
                     str(large_pos / "longref.sam"),
                     ">",
@@ -1891,7 +1891,7 @@ def compare_case(case: Case, c_samtools: Path, rust_samtools: Path, root: Path, 
 def main() -> int:
     root = repo_root()
     parser = argparse.ArgumentParser()
-    parser.add_argument("--c-samtools", type=Path, default=root / "samtools" / "samtools")
+    parser.add_argument("--c-samtools", type=Path, default=root / "repos" / "samtools" / "samtools")
     parser.add_argument("--rust-samtools", type=Path, default=root / "target" / "debug" / "samtools")
     parser.add_argument("--keep-tmp", action="store_true")
     args = parser.parse_args()

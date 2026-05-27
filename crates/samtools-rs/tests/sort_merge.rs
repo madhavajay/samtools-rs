@@ -19,6 +19,7 @@ fn fixtures_dir() -> PathBuf {
         .unwrap()
         .parent()
         .unwrap()
+        .join("repos")
         .join("samtools")
         .join("test")
 }
@@ -49,7 +50,9 @@ fn htslib_fixtures_dir() -> PathBuf {
         .unwrap()
         .parent()
         .unwrap()
+        .join("repos")
         .join("htslib-rs")
+        .join("repos")
         .join("htslib")
         .join("test")
 }

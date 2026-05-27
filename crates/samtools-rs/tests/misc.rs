@@ -27,6 +27,7 @@ fn fixtures_dir() -> PathBuf {
         .unwrap()
         .parent()
         .unwrap()
+        .join("repos")
         .join("samtools")
         .join("test")
 }
@@ -38,7 +39,9 @@ fn htslib_fixtures_dir() -> PathBuf {
         .unwrap()
         .parent()
         .unwrap()
+        .join("repos")
         .join("htslib-rs")
+        .join("repos")
         .join("htslib")
         .join("test")
 }
@@ -8832,7 +8835,7 @@ fn ampliconclip_accepts_reference_backed_cram_input_and_output() {
 #[test]
 fn markdup_matches_upstream_test_markdup_fixtures() {
     use samtools_rs::commands::markdup;
-    // Byte-exact vs upstream `samtools/test/markdup` expected SAMs
+    // Byte-exact vs upstream `repos/samtools/test/markdup` expected SAMs
     // (modulo @PG, suppressed by --no-PG): default template mode,
     // `-r` removal, `-S` supplementary propagation, and `--mode s`
     // sequence mode with optical-distance + barcode-tag keying.

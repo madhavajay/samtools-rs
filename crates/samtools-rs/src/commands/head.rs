@@ -492,6 +492,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap()
+            .join("repos")
             .join("samtools")
             .join("test")
             .join("dat")
@@ -504,7 +505,9 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap()
+            .join("repos")
             .join("htslib-rs")
+            .join("repos")
             .join("htslib")
             .join("test")
     }

@@ -1,7 +1,7 @@
 //! `samtools cram-size` — per-Content-ID / Data-Series CRAM block size
 //! and codec inventory.
 //!
-//! Faithful port of `samtools/cram_size.c`. The default and `-v`
+//! Faithful port of `repos/samtools/cram_size.c`. The default and `-v`
 //! (verbose) reports are **byte-exact** vs the upstream
 //! `test/cram_size/cram_size.reg` fixtures (`normal.out`,
 //! `verbose.out`): the `method` module ports htslib

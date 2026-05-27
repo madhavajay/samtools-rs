@@ -565,7 +565,7 @@ fn collate_requires_explicit_output_destination() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let input = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../samtools/test/dat/test_input_1_a.bam")
+        .join("../../repos/samtools/test/dat/test_input_1_a.bam")
         .canonicalize()
         .unwrap();
 

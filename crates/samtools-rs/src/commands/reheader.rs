@@ -716,6 +716,7 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap()
+            .join("repos")
             .join("samtools")
             .join("test")
     }

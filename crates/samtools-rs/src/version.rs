@@ -1,6 +1,6 @@
 //! samtools version string emitted in `@PG VN:` and `--version`.
 //!
-//! Pinned to the upstream samtools tag tracked by the `samtools/` submodule.
+//! Pinned to the upstream samtools tag tracked by the `repos/samtools/` submodule.
 //! When the submodule is bumped, update [`SAMTOOLS_VERSION`] to match the
 //! upstream `version.sh` output for that commit.
 

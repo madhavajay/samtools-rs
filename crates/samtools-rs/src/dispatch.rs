@@ -1,7 +1,7 @@
 //! Top-level `samtools <subcommand>` dispatcher.
 //!
 //! Mirrors the upstream `main()` and `usage()` in
-//! `samtools/bamtk.c`, including subcommand aliases.
+//! `repos/samtools/bamtk.c`, including subcommand aliases.
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};

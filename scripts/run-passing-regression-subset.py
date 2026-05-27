@@ -41,7 +41,7 @@ def stage_binary(root: Path, samtools: Path | None) -> None:
     if samtools is None:
         return
 
-    target = root / "samtools" / "samtools"
+    target = root / "repos" / "samtools" / "samtools"
     target.write_bytes(samtools.read_bytes())
     target.chmod(0o755)
 
@@ -66,7 +66,7 @@ def main() -> int:
         "--samtools",
         type=Path,
         default=None,
-        help="Rust samtools binary to stage at samtools/samtools before running",
+        help="Rust samtools binary to stage at repos/samtools/samtools before running",
     )
     _parity_preflight.add_preflight_arg(parser)
     args = parser.parse_args()
@@ -74,7 +74,7 @@ def main() -> int:
     _parity_preflight.enforce(args.allow_missing_bgzip)
 
     root = repo_root()
-    samtools_dir = root / "samtools"
+    samtools_dir = root / "repos" / "samtools"
     stage_binary(root, args.samtools)
 
     for regression in args.regressions:

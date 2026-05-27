@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Run the upstream samtools test harness for the stable CI subset.
 
-The upstream `samtools/test/test.pl` script has no group-selection flag. This
+The upstream `repos/samtools/test/test.pl` script has no group-selection flag. This
 helper keeps the vendored harness unmodified: it writes a temporary copy beside
 `test.pl`, comments out top-level `test_*($opts...)` calls that are not in the
-allow-list, then executes the filtered copy from `samtools/`.
+allow-list, then executes the filtered copy from `repos/samtools/`.
 """
 
 from __future__ import annotations
@@ -81,20 +81,20 @@ def filtered_harness(src: Path, dst: Path, groups: set[str]) -> None:
 def prepare_sort_prereqs(root: Path) -> list[Path]:
     """Stage files that upstream test_sort expects test_index to create."""
 
-    dat = root / "samtools" / "test" / "dat"
+    dat = root / "repos" / "samtools" / "test" / "dat"
     bam = dat / "auto_indexed.tmp.bam"
     bai = dat / "auto_indexed.tmp.bam.bai"
     existed = {path: path.exists() for path in (bam, bai)}
     subprocess.run(
         [
-            str(root / "samtools" / "samtools"),
+            str(root / "repos" / "samtools" / "samtools"),
             "view",
             "--write-index",
             "-o",
             str(bam),
             str(dat / "mpileup.1.sam"),
         ],
-        cwd=root / "samtools",
+        cwd=root / "repos" / "samtools",
         check=True,
     )
     return [path for path in (bam, bai) if not existed[path]]
@@ -112,7 +112,7 @@ def main() -> int:
         "--samtools",
         type=Path,
         default=None,
-        help="Rust samtools binary to stage at samtools/samtools before running",
+        help="Rust samtools binary to stage at repos/samtools/samtools before running",
     )
     _parity_preflight.add_preflight_arg(parser)
     args = parser.parse_args()
@@ -120,7 +120,7 @@ def main() -> int:
     _parity_preflight.enforce(args.allow_missing_bgzip)
 
     root = repo_root()
-    samtools_dir = root / "samtools"
+    samtools_dir = root / "repos" / "samtools"
     test_dir = samtools_dir / "test"
     src = test_dir / "test.pl"
     dst = test_dir / ".samtools-rs-passing-subset.pl"

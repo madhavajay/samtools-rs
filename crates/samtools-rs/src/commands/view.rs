@@ -3,7 +3,7 @@
 //! This is the anchor subcommand and the upstream `sam_view.c` is the
 //! largest file in samtools (68k LOC). The current Rust port covers the
 //! common conversion and counting paths required by the basic
-//! `test_view` cases in `samtools/test/test.pl`. Filters, region queries,
+//! `test_view` cases in `repos/samtools/test/test.pl`. Filters, region queries,
 //! BED files, aux-tag manipulation, and the long tail of flags are still
 //! TODO.
 //!
@@ -5103,7 +5103,9 @@ mod tests {
             .unwrap()
             .parent()
             .unwrap()
+            .join("repos")
             .join("htslib-rs")
+            .join("repos")
             .join("htslib")
             .join("test")
     }
