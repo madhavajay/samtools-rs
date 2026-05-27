@@ -23,6 +23,17 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy --component rustfmt
           rustup default stable
 
+      - name: Use local htslib-rs/noodles submodule checkouts for cargo
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch."https://github.com/madhavajay/htslib-rs.git"]
+          htslib-rs = { path = "repos/htslib-rs/crates/htslib-rs" }
+
+          [patch."https://github.com/madhavajay/noodles.git"]
+          noodles = { path = "repos/htslib-rs/repos/noodles/noodles" }
+          EOF
+
       - name: Cargo fmt --check
         run: cargo fmt --all --check
 
@@ -44,6 +55,17 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+
+      - name: Use local htslib-rs/noodles submodule checkouts for cargo
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch."https://github.com/madhavajay/htslib-rs.git"]
+          htslib-rs = { path = "repos/htslib-rs/crates/htslib-rs" }
+
+          [patch."https://github.com/madhavajay/noodles.git"]
+          noodles = { path = "repos/htslib-rs/repos/noodles/noodles" }
+          EOF
 
       - name: Install Perl + bgzip
         run: sudo apt-get update && sudo apt-get install -y perl tabix
