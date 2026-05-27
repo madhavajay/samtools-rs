@@ -36,6 +36,7 @@ fn htslib_fixtures_dir() -> PathBuf {
         .unwrap()
         .join("repos")
         .join("htslib-rs")
+        .join("repos")
         .join("htslib")
         .join("test")
 }
