@@ -8,7 +8,7 @@
 > signal. The parity subset runners now hard-fail without bgzip/tabix
 > (preflight guard), so this cannot silently regress to a false green.
 
-This tracks the upstream `samtools/test/test.pl` groups against the Rust
+This tracks the upstream `repos/samtools/test/test.pl` groups against the Rust
 `samtools-rs-cli` binary. CI now fails on both the stable subset helper and
 the full upstream harness. `test_bgzip` is supplied by the external htslib
 `bgzip` tool (`tabix` package in CI), matching the upstream harness contract
@@ -48,7 +48,7 @@ Status values:
   direct C-vs-Rust smoke also locks `cram-size`, `cram-size -v`, and
   `cram-size -e` text output.
 - Full parity gate: CI stages the Rust binary at the ignored
-  `samtools/samtools` path and runs `cd samtools && perl test/test.pl` as a
+  `repos/samtools/samtools` path and runs `cd repos/samtools && perl test/test.pl` as a
   required gate.
 
 ## Harness Groups

@@ -959,14 +959,14 @@ fn emit_pileup_row(
 
 /// Bayesian (`--mode bayesian`/default `recall`) consensus probability
 /// tables — a faithful port of `consensus_init` in
-/// `samtools/bam_consensus.c` (the Gap5-derived model). This is the
+/// `repos/samtools/bam_consensus.c` (the Gap5-derived model). This is the
 /// foundational table-construction step of the Bayesian engine; the
 /// `calculate_consensus_gap5` accumulation/call is wired on top of it.
 ///
 /// Not yet reachable from the CLI (only `--mode simple` is dispatched),
 /// so this is regression-safe scaffolding verified by its own tests.
 pub mod bayes {
-    /// `samtools/bam_consensus.c` defaults: `P_HET`, `P_INDEL`,
+    /// `repos/samtools/bam_consensus.c` defaults: `P_HET`, `P_INDEL`,
     /// `P_HET_SCALE`, and `homopoly_redux` (poly_mul) for `MODE_RECALL`.
     pub const P_HET: f64 = 1e-3;
     pub const P_INDEL: f64 = 2e-4;

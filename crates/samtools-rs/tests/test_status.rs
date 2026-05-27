@@ -14,8 +14,13 @@ fn repo_root() -> PathBuf {
 #[test]
 fn test_status_lists_all_top_level_test_pl_groups() {
     let root = repo_root();
-    let test_pl =
-        std::fs::read_to_string(root.join("samtools").join("test").join("test.pl")).unwrap();
+    let test_pl = std::fs::read_to_string(
+        root.join("repos")
+            .join("samtools")
+            .join("test")
+            .join("test.pl"),
+    )
+    .unwrap();
     let status = std::fs::read_to_string(root.join("docs").join("test-status.md")).unwrap();
 
     let mut groups = BTreeSet::new();

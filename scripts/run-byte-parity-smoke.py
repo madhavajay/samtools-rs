@@ -836,7 +836,7 @@ def default_cases(root: Path) -> list[Case]:
             ("tview", "-d", "T", "-p", "CHROMOSOME_I:10000000000", "{tmp}/longref.sam.gz"),
             setup_external=(
                 (
-                    "{root}/htslib-rs/htslib/bgzip",
+                    "{root}/repos/htslib-rs/repos/htslib/bgzip",
                     "-c",
                     str(large_pos / "longref.sam"),
                     ">",

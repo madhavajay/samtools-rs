@@ -1,6 +1,6 @@
 //! Integration tests for `samtools dict`.
 //!
-//! Runs the library entry point against the upstream `samtools/test/dat/`
+//! Runs the library entry point against the upstream `repos/samtools/test/dat/`
 //! fixtures and asserts byte-for-byte parity with the checked-in expected
 //! output files.
 
@@ -16,6 +16,7 @@ fn fixtures_dir() -> PathBuf {
         .unwrap()
         .parent()
         .unwrap()
+        .join("repos")
         .join("samtools")
         .join("test")
         .join("dat")

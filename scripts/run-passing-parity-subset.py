@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Run the upstream samtools test harness for the stable CI subset.
 
-The upstream `samtools/test/test.pl` script has no group-selection flag. This
+The upstream `repos/samtools/test/test.pl` script has no group-selection flag. This
 helper keeps the vendored harness unmodified: it writes a temporary copy beside
 `test.pl`, comments out top-level `test_*($opts...)` calls that are not in the
-allow-list, then executes the filtered copy from `samtools/`.
+allow-list, then executes the filtered copy from `repos/samtools/`.
 """
 
 from __future__ import annotations
@@ -112,7 +112,7 @@ def main() -> int:
         "--samtools",
         type=Path,
         default=None,
-        help="Rust samtools binary to stage at samtools/samtools before running",
+        help="Rust samtools binary to stage at repos/samtools/samtools before running",
     )
     _parity_preflight.add_preflight_arg(parser)
     args = parser.parse_args()

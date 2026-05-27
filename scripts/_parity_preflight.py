@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Shared preflight guard for the parity/regression subset runners.
 
-The upstream `samtools/test/test.pl` (and several `regression.sh` data-gen
+The upstream `repos/samtools/test/test.pl` (and several `regression.sh` data-gen
 steps) need `bgzip` and `tabix` to build their inputs. When those tools are
 absent from PATH, test.pl does **not** fail the affected groups -- it aborts
 their data generation on `sh: bgzip: command not found` and treats the group
@@ -76,8 +76,8 @@ def enforce(allow_missing: bool) -> None:
         "input generation needs these tools, so running now would produce "
         "a FALSE GREEN.\n"
         "Fix: build and expose the vendored copies, e.g.\n"
-        "  make -C htslib-rs/htslib tabix bgzip\n"
-        '  export PATH="$PWD/htslib-rs/htslib:$PATH"\n'
+        "  make -C repos/htslib-rs/repos/htslib tabix bgzip\n"
+        '  export PATH="$PWD/repos/htslib-rs/repos/htslib:$PATH"\n'
         "then re-run. To deliberately run a degraded, non-authoritative "
         "subset anyway, pass --allow-missing-bgzip (or set "
         f"{_ALLOW_ENV}=1).",

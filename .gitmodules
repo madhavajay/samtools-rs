@@ -1,7 +1,7 @@
-[submodule "samtools"]
-	path = samtools
+[submodule "repos/samtools"]
+	path = repos/samtools
 	url = git@github.com:madhavajay/samtools.git
-[submodule "htslib-rs"]
-	path = htslib-rs
+[submodule "repos/htslib-rs"]
+	path = repos/htslib-rs
 	url = git@github.com:madhavajay/htslib-rs.git
 	branch = main

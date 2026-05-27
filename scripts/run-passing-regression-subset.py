@@ -66,7 +66,7 @@ def main() -> int:
         "--samtools",
         type=Path,
         default=None,
-        help="Rust samtools binary to stage at samtools/samtools before running",
+        help="Rust samtools binary to stage at repos/samtools/samtools before running",
     )
     _parity_preflight.add_preflight_arg(parser)
     args = parser.parse_args()

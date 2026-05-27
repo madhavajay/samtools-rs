@@ -27,8 +27,8 @@ samtools-rs/
 ├── crates/
 │   ├── samtools-rs/        # library: shared infra + one module per subcommand
 │   └── samtools-rs-cli/    # binary: `samtools`
-├── samtools/               # upstream C source + test suite (submodule, reference only)
-├── htslib-rs/              # pure-Rust HTSlib compatibility layer (submodule)
+├── repos/samtools/               # upstream C source + test suite (submodule, reference only)
+├── repos/htslib-rs/              # pure-Rust HTSlib compatibility layer (submodule)
 └── TODO.md
 ```
 
@@ -57,7 +57,7 @@ cargo run -p samtools-rs-cli -- <subcommand> [args]
 
 ## Parity testing
 
-The upstream `samtools/test/test.pl` Perl harness is used as the parity gate.
+The upstream `repos/samtools/test/test.pl` Perl harness is used as the parity gate.
 Once a subcommand is implemented, its tests are enabled. Until then, the
 harness fails on `not yet implemented` exits — see [`TODO.md`](TODO.md)
 Phase 3 and [`docs/test-status.md`](docs/test-status.md) for the rolling
@@ -65,13 +65,13 @@ status.
 
 ```sh
 cargo build --release -p samtools-rs-cli
-cp target/release/samtools samtools/samtools
-cd samtools
+cp target/release/samtools repos/samtools/samtools
+cd repos/samtools
 perl test/test.pl
 ```
 
 The pinned upstream harness constructs most commands from `./samtools`, so the
-Rust binary is staged at the ignored `samtools/samtools` path before running it.
+Rust binary is staged at the ignored `repos/samtools/samtools` path before running it.
 
 `bgzip` and `tabix` **must** be on `PATH` before running the parity or
 regression subsets. Upstream `test.pl` *silently skips* (does not fail)
@@ -81,8 +81,8 @@ run into a false green. The subset runners
 unless both tools are found. They are prebuilt in the vendored htslib:
 
 ```sh
-make -C htslib-rs/htslib tabix bgzip
-export PATH="$PWD/htslib-rs/htslib:$PATH"
+make -C repos/htslib-rs/repos/htslib tabix bgzip
+export PATH="$PWD/repos/htslib-rs/repos/htslib:$PATH"
 ```
 
 (CI installs the `tabix` apt package, which provides both.)
@@ -91,7 +91,7 @@ Local developers may regenerate expected outputs from the C samtools
 (requires `autoconf`, a C toolchain, and the `htslib` C library):
 
 ```sh
-cd samtools && autoreconf -i && ./configure && make
+cd repos/samtools && autoreconf -i && ./configure && make
 cd test && perl test.pl --redo-outputs
 ```
 
@@ -100,15 +100,15 @@ CI does not build C samtools.
 ## Versioning
 
 `samtools --version` reports the upstream samtools version tracked by the
-`samtools/` submodule (currently `1.23.1`, see
+`repos/samtools/` submodule (currently `1.23.1`, see
 [`crates/samtools-rs/src/version.rs`](crates/samtools-rs/src/version.rs)). The
 `@PG VN:` field emitted into output headers uses the same string so that
 upstream's byte-comparison tests pass.
 
 Current submodule pins:
 
-- `samtools/`: upstream tag `1.23.1`, commit `6efb9b6da35224cf804921dedecf9fb8f411365d`.
-- `htslib-rs/`: commit `88bd29f5f0d5e87d3f5d28da1f106a4b518e3926`.
+- `repos/samtools/`: upstream tag `1.23.1`, commit `6efb9b6da35224cf804921dedecf9fb8f411365d`.
+- `repos/htslib-rs/`: commit `88bd29f5f0d5e87d3f5d28da1f106a4b518e3926`.
 
 ## License
 

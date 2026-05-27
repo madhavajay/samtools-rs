@@ -1,7 +1,7 @@
 //! Integration tests for `samtools quickcheck`.
 //!
 //! Drives the library entry point directly with absolute paths to the
-//! upstream `samtools/test/quickcheck/` fixtures, then asserts the
+//! upstream `repos/samtools/test/quickcheck/` fixtures, then asserts the
 //! per-file exit code. The CLI-level `quickcheck` test locks the
 //! byte-for-byte `-v` output against `quickcheck/all.expected`.
 
@@ -18,6 +18,7 @@ fn fixtures_dir() -> PathBuf {
         .unwrap()
         .parent()
         .unwrap()
+        .join("repos")
         .join("samtools")
         .join("test")
         .join("quickcheck")
