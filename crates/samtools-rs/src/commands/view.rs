@@ -5105,6 +5105,7 @@ mod tests {
             .unwrap()
             .join("repos")
             .join("htslib-rs")
+            .join("repos")
             .join("htslib")
             .join("test")
     }

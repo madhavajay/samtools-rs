@@ -81,20 +81,20 @@ def filtered_harness(src: Path, dst: Path, groups: set[str]) -> None:
 def prepare_sort_prereqs(root: Path) -> list[Path]:
     """Stage files that upstream test_sort expects test_index to create."""
 
-    dat = root / "samtools" / "test" / "dat"
+    dat = root / "repos" / "samtools" / "test" / "dat"
     bam = dat / "auto_indexed.tmp.bam"
     bai = dat / "auto_indexed.tmp.bam.bai"
     existed = {path: path.exists() for path in (bam, bai)}
     subprocess.run(
         [
-            str(root / "samtools" / "samtools"),
+            str(root / "repos" / "samtools" / "samtools"),
             "view",
             "--write-index",
             "-o",
             str(bam),
             str(dat / "mpileup.1.sam"),
         ],
-        cwd=root / "samtools",
+        cwd=root / "repos" / "samtools",
         check=True,
     )
     return [path for path in (bam, bai) if not existed[path]]
@@ -120,7 +120,7 @@ def main() -> int:
     _parity_preflight.enforce(args.allow_missing_bgzip)
 
     root = repo_root()
-    samtools_dir = root / "samtools"
+    samtools_dir = root / "repos" / "samtools"
     test_dir = samtools_dir / "test"
     src = test_dir / "test.pl"
     dst = test_dir / ".samtools-rs-passing-subset.pl"
