@@ -1204,9 +1204,9 @@ fn combined_checksum(sums: &Sums, row: usize, opts: &ChecksumOptions) -> u64 {
 }
 
 fn crc32(initial: u32, bytes: &[u8]) -> u32 {
-    let mut crc = libdeflater::Crc::with_initial(initial);
+    let mut crc = crc32fast::Hasher::new_with_initial(initial);
     crc.update(bytes);
-    crc.sum()
+    crc.finalize()
 }
 
 fn complement_base(base: u8) -> u8 {
