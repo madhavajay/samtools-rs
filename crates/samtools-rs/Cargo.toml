@@ -19,9 +19,9 @@ anyhow.workspace = true
 bstr.workspace = true
 bytes.workspace = true
 clap.workspace = true
+crc32fast.workspace = true
 flate2.workspace = true
 indexmap.workspace = true
-libdeflater.workspace = true
 md-5 = { workspace = true }
 memchr.workspace = true
 regex.workspace = true

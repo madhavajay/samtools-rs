@@ -2587,9 +2587,9 @@ impl StatsCounts {
 
 /// zlib `crc32(initial, buf, len)` over `bytes`.
 fn crc32_bytes(initial: u32, bytes: &[u8]) -> u32 {
-    let mut crc = libdeflater::Crc::with_initial(initial);
+    let mut crc = crc32fast::Hasher::new_with_initial(initial);
     crc.update(bytes);
-    crc.sum()
+    crc.finalize()
 }
 
 /// Packs an ASCII sequence into BAM 4-bit-per-base nibbles
